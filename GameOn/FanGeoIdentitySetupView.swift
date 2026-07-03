@@ -36,6 +36,14 @@ struct FanGeoIdentitySetupView: View {
     private static let displayNameMaxLength = 40
     private static let bioCharacterLimit = 160
 
+    private var existingDisplayName: String {
+        viewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var needsDisplayNameEntry: Bool {
+        mode == .complete && existingDisplayName.isEmpty
+    }
+
     var body: some View {
         let avatarSnapshot = IdentityAvatarSnapshot(
             thumbnailURL: viewModel.currentUserAvatarThumbnailURL,
@@ -51,7 +59,9 @@ struct FanGeoIdentitySetupView: View {
 
                     if mode == .complete {
                         avatarSection(snapshot: avatarSnapshot)
-                        displayNameSection
+                        if needsDisplayNameEntry {
+                            displayNameSection
+                        }
                         bioSection
                         favoriteTeamsSection
                     }
@@ -83,7 +93,7 @@ struct FanGeoIdentitySetupView: View {
             .navigationBarTitleDisplayMode(.inline)
             .interactiveDismissDisabled(mode == .complete)
             .onAppear {
-                if mode == .handleOnly {
+                if mode == .handleOnly || mode == .complete {
                     displayNameDraft = viewModel.currentUserDisplayName
                 }
             }
@@ -236,7 +246,9 @@ struct FanGeoIdentitySetupView: View {
         let handleOK = FanGeoHandleRules.validate(handleDraft) == nil && handleIsConfirmedAvailable
         switch mode {
         case .complete:
-            let trimmedName = displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedName = needsDisplayNameEntry
+                ? displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                : existingDisplayName
             return !trimmedName.isEmpty
                 && trimmedName.count <= Self.displayNameMaxLength
                 && handleOK
@@ -312,10 +324,12 @@ struct FanGeoIdentitySetupView: View {
         refreshDisplayNameValidation(markTouched: true)
 
         let name = mode == .complete
-            ? displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+            ? (needsDisplayNameEntry
+                ? displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                : existingDisplayName)
             : viewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if mode == .complete, name.isEmpty {
+        if mode == .complete, needsDisplayNameEntry, name.isEmpty {
             displayNameError = "Display name is required."
             print("[SignupProfileDebug] validationError field=displayName")
             return

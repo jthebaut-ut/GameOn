@@ -1396,12 +1396,6 @@ struct BusinessUsageCenterView: View {
     private var planDetailText: String? {
         guard let status else { return nil }
         if status.computedIsPro {
-            if let promoText = status.businessProPromoEndDateText {
-                return promoText
-            }
-            if let subscriptionText = status.businessProSubscriptionExpiryText {
-                return subscriptionText
-            }
             if let formatted = formattedBusinessProExpiry(status.proExpiresAt) {
                 return "Expires \(formatted)"
             }
@@ -1796,6 +1790,10 @@ struct VenueOwnerDashboardView: View {
     @State private var manageGamesRefreshInFlight = false
     @State private var manageGamesFeedback = ""
     @State private var manageGamesError = ""
+    @State private var manageGamesWarning = ""
+    @State private var importedLiveGameDuplicateDetected = false
+    @State private var importedLiveGameDuplicateCount = 0
+    @State private var showImportDuplicateConfirmDialog = false
 #if DEBUG
     @State private var manageGamesDebugErrorDetails = ""
 #endif
@@ -1826,7 +1824,8 @@ struct VenueOwnerDashboardView: View {
     @State private var schedulePickerDate = Date()
     @State private var importGamesDate = Date()
     @State private var importGamesBrowserExpanded = true
-    @State private var importGamesCalendarExpanded = false
+    @State private var importFeaturedEventFilterSlug: String?
+    @State private var showImportGamesDatePicker = false
     @State private var addGameFormScrollRequestID = 0
     @State private var importGamesSportFilter = "All"
     @State private var importGamesMatches: [LiveMatch] = []
@@ -2015,6 +2014,16 @@ struct VenueOwnerDashboardView: View {
         } message: {
             Text("This will remove the game from your venue schedule and FanGeo discovery.")
         }
+        .alert("Duplicate Game", isPresented: $showImportDuplicateConfirmDialog) {
+            Button("Cancel", role: .cancel) { }
+            Button("Add Anyway") {
+                Task {
+                    await saveNewVenueGameFromForm(allowImportDuplicate: true)
+                }
+            }
+        } message: {
+            Text(Self.importDuplicateConfirmMessage(count: importedLiveGameDuplicateCount))
+        }
         .sheet(item: $titleEditTarget) { target in
             titleEditSheet(for: target)
         }
@@ -2115,6 +2124,7 @@ struct VenueOwnerDashboardView: View {
                 }
                 .padding()
             }
+            .scrollDismissesKeyboard(.interactively)
         .background(FGAdaptiveSurface.sheetRoot)
         .onChange(of: addGameFormScrollRequestID) { _, _ in
             guard effectiveSection == .games, manageGamesListTab == .add else { return }
@@ -2738,18 +2748,7 @@ struct VenueOwnerDashboardView: View {
             }
             return parts.joined(separator: " • ")
         }
-        if let promoText = status.businessProPromoEndDateText {
-            return promoText
-        }
-        if status.isBusinessSubscriptionPro {
-            return [
-                "Launch Promotion",
-                status.businessProSubscriptionExpiryText
-            ]
-            .compactMap { $0 }
-            .joined(separator: " • ")
-        }
-        return "Unlimited venues • Unlimited hosted games"
+        return status.businessPlanDisplaySubtitle
     }
 
     private func formattedBusinessProExpiry(_ raw: String?) -> String? {
@@ -7386,6 +7385,13 @@ struct VenueOwnerDashboardView: View {
 
     @ViewBuilder
     private var manageGamesStatusBanners: some View {
+        if !manageGamesWarning.isEmpty {
+            Text(manageGamesWarning)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(Color.orange)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
         if !manageGamesFeedback.isEmpty {
             Text(manageGamesFeedback)
                 .font(.caption)
@@ -7993,6 +7999,10 @@ struct VenueOwnerDashboardView: View {
         return suggestedFeaturedEvent(for: match)?.title ?? league
     }
 
+    private var selectedHostedGameVenuePresentation: BusinessHostedGameVenuePresentation {
+        BusinessHostedGameVenuePresentation.resolveSelectedVenue(viewModel: viewModel)
+    }
+
     private func suggestedGameCard(_ opportunity: BusinessGameOpportunity) -> some View {
         let match = opportunity.match
         let sportLabel = AppSportCatalog.displayLabel(forSportToken: match.sport)
@@ -8027,6 +8037,13 @@ struct VenueOwnerDashboardView: View {
                 Text(suggestedMatchTitle(for: match))
                     .font(.headline.weight(.bold))
                     .foregroundStyle(.primary)
+                    .lineLimit(2)
+
+                BusinessHostedGameVenueNameLabel(presentation: selectedHostedGameVenuePresentation)
+
+                Text("\(sportLabel) • \(importedCompetitionLabel(for: match))")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
                     .lineLimit(2)
 
                 Text("\(Self.dateFormatter.string(from: match.startTime)) • \(Self.timeFormatter.string(from: match.startTime))")
@@ -8076,6 +8093,8 @@ struct VenueOwnerDashboardView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+
+                BusinessHostedGameVenueLocationLines(presentation: selectedHostedGameVenuePresentation)
 
                 Button {
                     Task {
@@ -8846,15 +8865,27 @@ struct VenueOwnerDashboardView: View {
 
     private var importLiveGamesBrowser: some View {
         VStack(alignment: .leading, spacing: 12) {
-            importGamesDateSelector
+            CalendarProSportFilterStrip(
+                sportFilter: $importGamesSportFilter,
+                featuredEventFilterSlug: $importFeaturedEventFilterSlug,
+                featuredEvents: viewModel.activeFeaturedEvents
+            )
 
-            importSportFilterChips
+            CalendarProHorizontalDateStrip(
+                selectedDate: $importGamesDate,
+                onCalendarPickerTap: {
+                    showImportGamesDatePicker = true
+                },
+                onDateSelected: {
+                    Task { await fetchImportGames(forceRefresh: true) }
+                }
+            )
 
             if isLoadingImportGames {
                 HStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Loading live/API games...")
+                    Text("Loading live games...")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
@@ -8868,91 +8899,84 @@ struct VenueOwnerDashboardView: View {
             } else if filteredImportMatches.isEmpty {
                 importMessageCard(
                     icon: "calendar.badge.exclamationmark",
-                    title: "No games found for this day.",
-                    message: "You can still add one manually."
+                    title: importGamesEmptyStateTitle,
+                    message: "Try another date or add one manually."
                 )
             } else {
                 VStack(spacing: 10) {
                     ForEach(filteredImportMatches) { match in
-                        Button {
+                        BusinessImportLiveGameCard(
+                            viewModel: viewModel,
+                            match: match,
+                            featuredEvents: viewModel.activeFeaturedEvents
+                        ) {
                             Task { await selectImportedLiveGame(match) }
-                        } label: {
-                            importedGameCard(match)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
         }
+        .sheet(isPresented: $showImportGamesDatePicker) {
+            NavigationStack {
+                VStack(spacing: 0) {
+                    DatePicker(
+                        "Game day",
+                        selection: $importGamesDate,
+                        in: minimumSelectableGameCalendarDate...Date.distantFuture,
+                        displayedComponents: .date
+                    )
+                    .datePickerStyle(.graphical)
+                    .labelsHidden()
+                    .padding()
+                }
+                .navigationTitle("Choose date")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") {
+                            showImportGamesDatePicker = false
+                            Task { await fetchImportGames(forceRefresh: true) }
+                        }
+                        .fontWeight(.semibold)
+                    }
+                }
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .onChange(of: importGamesDate) { _, _ in
+#if DEBUG
+            print("[BusinessGameImportDebug] selectedDate=\(Self.debugDateFormatter.string(from: importGamesDate))")
+#endif
+        }
     }
 
-    private var importGamesDateSelector: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.20)) {
-                    importGamesCalendarExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: "calendar")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(Color.orange)
-                        .accessibilityHidden(true)
+    private var selectedImportFeaturedEvent: FeaturedEvent? {
+        guard let importFeaturedEventFilterSlug else { return nil }
+        return viewModel.activeFeaturedEvents.first { $0.slug == importFeaturedEventFilterSlug }
+    }
 
-                    Text("Game day")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-
-                    Spacer(minLength: 8)
-
-                    Text(Self.dateFormatter.string(from: importGamesDate))
-                        .font(.caption.weight(.heavy))
-                        .foregroundStyle(Color.orange)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.orange.opacity(0.12))
-                        .clipShape(Capsule(style: .continuous))
-
-                    Image(systemName: importGamesCalendarExpanded ? "chevron.up" : "chevron.down")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.secondary)
-                }
-                .padding()
-                .background(FGAdaptiveSurface.sheetRoot.opacity(0.72))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Select import game day")
-
-            if importGamesCalendarExpanded {
-                DatePicker(
-                    "Game day",
-                    selection: $importGamesDate,
-                    in: minimumSelectableGameCalendarDate...Date.distantFuture,
-                    displayedComponents: .date
-                )
-                .datePickerStyle(.graphical)
-                .labelsHidden()
-                .padding(.horizontal, 8)
-                .padding(.bottom, 8)
-                .background(FGAdaptiveSurface.sheetRoot.opacity(0.72))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .transition(.opacity.combined(with: .move(edge: .top)))
-            }
+    private var importGamesEmptyStateTitle: String {
+        let dateLabel = importGamesEmptyStateDateLabel
+        if let featured = selectedImportFeaturedEvent {
+            return "No \(featured.emptyStateTitle) games found for \(dateLabel)."
         }
-        .onChange(of: importGamesDate) { _, newDate in
-#if DEBUG
-            print("[BusinessGameImportDebug] selectedDate=\(Self.debugDateFormatter.string(from: newDate))")
-#endif
-            withAnimation(.easeInOut(duration: 0.20)) {
-                importGamesCalendarExpanded = false
-            }
-            Task { await fetchImportGames(forceRefresh: true) }
+        if importGamesSportFilter != "All" {
+            let sportLabel = AppSportCatalog.displayLabel(forSportToken: importGamesSportFilter)
+            return "No \(sportLabel) games found for \(dateLabel)."
         }
+        return "No games found for \(dateLabel)."
+    }
+
+    private var importGamesEmptyStateDateLabel: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMM d"
+        return formatter.string(from: importGamesDate)
     }
 
     private var importedLiveGameSummaryCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let venue = selectedHostedGameVenuePresentation
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 ZStack {
                     Circle()
@@ -8975,6 +8999,8 @@ struct VenueOwnerDashboardView: View {
                         .foregroundStyle(.primary)
                         .lineLimit(2)
 
+                    BusinessHostedGameVenueNameLabel(presentation: venue)
+
                     Text(importedLiveGameSummaryCompetitionLine)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
@@ -8983,9 +9009,18 @@ struct VenueOwnerDashboardView: View {
                     Text("\(Self.dateFormatter.string(from: gameStartTime)) • \(Self.timeFormatter.string(from: gameStartTime))")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
+
+                    BusinessHostedGameVenueLocationLines(presentation: venue)
                 }
 
                 Spacer(minLength: 0)
+            }
+
+            if importedLiveGameDuplicateDetected {
+                Text(Self.importDuplicateWarningMessage(count: importedLiveGameDuplicateCount))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             Button {
@@ -9046,54 +9081,13 @@ struct VenueOwnerDashboardView: View {
         return parts.joined(separator: " • ")
     }
 
-    private var availableImportSports: [String] {
-        var seen = Set<String>()
-        return importGamesMatches.compactMap { match in
-            let sport = Self.mappedVenueSport(for: match).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !sport.isEmpty, seen.insert(sport.lowercased()).inserted else { return nil }
-            return sport
-        }.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
-    }
-
     private var filteredImportMatches: [LiveMatch] {
-        importGamesMatches.filter { match in
-            guard importGamesSportFilter != "All" else { return true }
-            let mapped = Self.mappedVenueSport(for: match)
-            return mapped.localizedCaseInsensitiveCompare(importGamesSportFilter) == .orderedSame
-                || SportFilterCatalog.storedSport(mapped, matchesSearchQuery: importGamesSportFilter)
-        }
-    }
-
-    private var importSportFilterChips: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                importSportChip("All")
-                ForEach(availableImportSports, id: \.self) { sport in
-                    importSportChip(sport)
-                }
-            }
-            .padding(.vertical, 2)
-        }
-    }
-
-    private func importSportChip(_ sport: String) -> some View {
-        let isSelected = importGamesSportFilter == sport
-        return Button {
-            importGamesSportFilter = sport
-#if DEBUG
-            print("[BusinessGameImportDebug] apiFetchStarted sport=\(sport)")
-#endif
-            Task { await fetchImportGames(forceRefresh: false) }
-        } label: {
-            Text(AppSportCatalog.displayLabel(forSportToken: sport))
-                .font(.caption.weight(.bold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(isSelected ? Color.orange : FGAdaptiveSurface.sheetRoot.opacity(0.72))
-                .foregroundStyle(isSelected ? .white : .primary)
-                .clipShape(Capsule(style: .continuous))
-        }
-        .buttonStyle(.plain)
+        CalendarProGamesFilterSupport.filtered(
+            matches: importGamesMatches,
+            selectedDate: importGamesDate,
+            sportFilter: importGamesSportFilter,
+            featuredEvent: selectedImportFeaturedEvent
+        )
     }
 
     private func importMessageCard(icon: String, title: String, message: String) -> some View {
@@ -9115,61 +9109,6 @@ struct VenueOwnerDashboardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(FGAdaptiveSurface.sheetRoot.opacity(0.72))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-
-    private func importedGameCard(_ match: LiveMatch) -> some View {
-        let sport = Self.mappedVenueSport(for: match)
-        let status = VenueOwnerScheduledGameChoice(match: match).statusLabel
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(Self.importedGameTitle(for: match))
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                Spacer(minLength: 8)
-                Text(status)
-                    .font(.caption2.weight(.heavy))
-                    .foregroundStyle(match.matchStatus.isHappeningNow ? Color.green : Color.orange)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background((match.matchStatus.isHappeningNow ? Color.green : Color.orange).opacity(0.14))
-                    .clipShape(Capsule(style: .continuous))
-            }
-
-            HStack(spacing: 6) {
-                Text(AppSportCatalog.displayLabel(forSportToken: sport))
-                    .font(.caption.weight(.semibold))
-                Text("/")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(match.league)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            HStack(spacing: 8) {
-                Text("\(Self.dateFormatter.string(from: match.startTime)) at \(Self.timeFormatter.string(from: match.startTime))")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                Text("Imported game")
-                    .font(.caption2.weight(.heavy))
-                    .foregroundStyle(Color.orange)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.orange.opacity(0.12))
-                    .clipShape(Capsule(style: .continuous))
-            }
-        }
-        .padding()
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(FGAdaptiveSurface.sheetRoot.opacity(0.72))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color(.separator).opacity(0.34), lineWidth: 1)
-        )
     }
 
     private var pickFromSportsScheduleCard: some View {
@@ -9391,6 +9330,7 @@ struct VenueOwnerDashboardView: View {
 #if DEBUG
                     print("[ManageGamesAddPane] save tapped")
 #endif
+                    guard !isSavingNewGame else { return }
                     Task {
                         await saveNewVenueGameFromForm()
                     }
@@ -9643,9 +9583,23 @@ struct VenueOwnerDashboardView: View {
 #endif
     }
 
+    private static func importDuplicateListingPhrase(count: Int) -> String {
+        let safeCount = max(count, 1)
+        return safeCount == 1 ? "1 listing" : "\(safeCount) listings"
+    }
+
+    private static func importDuplicateWarningMessage(count: Int) -> String {
+        "⚠️ This game already has \(importDuplicateListingPhrase(count: count)) for this venue. Add another listing only if you're showing it on multiple TVs or hosting multiple watch areas."
+    }
+
+    private static func importDuplicateConfirmMessage(count: Int) -> String {
+        "This game already has \(importDuplicateListingPhrase(count: count)) for this venue. Do you want to add another listing anyway?"
+    }
+
     private func clearManageGamesBanners() {
         manageGamesFeedback = ""
         manageGamesError = ""
+        manageGamesWarning = ""
 #if DEBUG
         manageGamesDebugErrorDetails = ""
 #endif
@@ -9729,10 +9683,6 @@ struct VenueOwnerDashboardView: View {
             )
             await MainActor.run {
                 importGamesMatches = matches
-                if importGamesSportFilter != "All",
-                   !availableImportSports.contains(where: { $0.localizedCaseInsensitiveCompare(importGamesSportFilter) == .orderedSame }) {
-                    importGamesSportFilter = "All"
-                }
                 isLoadingImportGames = false
             }
 #if DEBUG
@@ -9762,21 +9712,19 @@ struct VenueOwnerDashboardView: View {
         print("[BusinessGameImportDebug] selectedExternalGame id=\(match.id)")
 #endif
 
-        let duplicate = await viewModel.venueGameImportDuplicateExists(
+        let duplicateCount = await viewModel.venueGameImportDuplicateCount(
             externalGameID: match.id,
             externalSource: externalSource,
             venueId: venueId,
             gameDate: match.startTime
         )
-        guard !duplicate else {
-            await MainActor.run {
-                manageGamesError = "This game already exists for this venue."
-                manageGamesFeedback = ""
-            }
-            return false
-        }
 
         await MainActor.run {
+            importedLiveGameDuplicateCount = duplicateCount
+            importedLiveGameDuplicateDetected = duplicateCount > 0
+            manageGamesWarning = duplicateCount > 0
+                ? Self.importDuplicateWarningMessage(count: duplicateCount)
+                : ""
             gameTitle = title
             lastGeneratedGameTitle = title
             titleManuallyEdited = false
@@ -9795,7 +9743,6 @@ struct VenueOwnerDashboardView: View {
             importedAwayTeam = match.awayTeam
             importedFromAPI = true
             importGamesBrowserExpanded = false
-            importGamesCalendarExpanded = false
             addGameFormScrollRequestID += 1
             manageGamesError = ""
             manageGamesFeedback = "Game details imported — review and save."
@@ -9993,7 +9940,14 @@ struct VenueOwnerDashboardView: View {
         }
     }
 
-    private func saveNewVenueGameFromForm() async {
+    private func saveNewVenueGameFromForm(allowImportDuplicate: Bool = false) async {
+        let acquiredSaveLock = await MainActor.run { () -> Bool in
+            guard !isSavingNewGame else { return false }
+            isSavingNewGame = true
+            return true
+        }
+        guard acquiredSaveLock else { return }
+
         let trimmedTitle: String
         let scheduleStillPast: Bool
         let requiresStructuredTeams: Bool
@@ -10031,6 +9985,7 @@ struct VenueOwnerDashboardView: View {
 
         if requiresStructuredTeams, manualTeam1.isEmpty || manualTeam2.isEmpty {
             await MainActor.run {
+                isSavingNewGame = false
                 manageGamesError = manualPredictionCompetitorValidationMessage
                 manageGamesFeedback = ""
                 logBusinessManualGameTeamDebug()
@@ -10042,6 +9997,7 @@ struct VenueOwnerDashboardView: View {
         if supportsOptionalParticipants,
            (manualTeam1.isEmpty != manualTeam2.isEmpty) {
             await MainActor.run {
+                isSavingNewGame = false
                 manageGamesError = "Add both participants to show a matchup, or leave both blank."
                 manageGamesFeedback = ""
                 logBusinessManualGameTeamDebug()
@@ -10055,6 +10011,7 @@ struct VenueOwnerDashboardView: View {
            !manualTeam2.isEmpty,
            manualTeam1.localizedCaseInsensitiveCompare(manualTeam2) == .orderedSame {
             await MainActor.run {
+                isSavingNewGame = false
                 manageGamesError = manualGameUsesPlayerCompetitorLabels ? "Player 1 and Player 2 must be different." : "Team 1 and Team 2 must be different."
                 manageGamesFeedback = ""
                 logBusinessManualGameTeamDebug()
@@ -10065,6 +10022,7 @@ struct VenueOwnerDashboardView: View {
 
         guard !trimmedTitle.isEmpty else {
             await MainActor.run {
+                isSavingNewGame = false
                 manageGamesError = "Enter a game title before saving."
                 manageGamesFeedback = ""
             }
@@ -10073,14 +10031,44 @@ struct VenueOwnerDashboardView: View {
 
         if scheduleStillPast {
             await MainActor.run {
+                isSavingNewGame = false
                 manageGamesError = VenueOwnerGameScheduleValidation.futureDateTimeMessage
                 manageGamesFeedback = ""
             }
             return
         }
 
+        let shouldConfirmImportDuplicate = await MainActor.run {
+            importedFromAPI && !allowImportDuplicate
+        }
+        if shouldConfirmImportDuplicate {
+            let importContext = await MainActor.run {
+                (
+                    externalGameID: importedExternalGameID,
+                    externalSource: importedExternalSource,
+                    venueId: viewModel.ownerVenueDatabaseId,
+                    gameDate: gameDate
+                )
+            }
+            let duplicateCount = await viewModel.venueGameImportDuplicateCount(
+                externalGameID: importContext.externalGameID,
+                externalSource: importContext.externalSource,
+                venueId: importContext.venueId,
+                gameDate: importContext.gameDate
+            )
+            if duplicateCount > 0 {
+                await MainActor.run {
+                    isSavingNewGame = false
+                    importedLiveGameDuplicateCount = duplicateCount
+                    importedLiveGameDuplicateDetected = true
+                    manageGamesWarning = Self.importDuplicateWarningMessage(count: duplicateCount)
+                    showImportDuplicateConfirmDialog = true
+                }
+                return
+            }
+        }
+
         await MainActor.run {
-            isSavingNewGame = true
             clearManageGamesBanners()
         }
 
@@ -10139,22 +10127,7 @@ struct VenueOwnerDashboardView: View {
             )
         }
 
-        if snapshot.importedFromAPI {
-            let duplicate = await viewModel.venueGameImportDuplicateExists(
-                externalGameID: snapshot.externalGameID,
-                externalSource: snapshot.externalSource,
-                venueId: viewModel.ownerVenueDatabaseId,
-                gameDate: snapshot.gameDate
-            )
-            if duplicate {
-                await MainActor.run {
-                    isSavingNewGame = false
-                    manageGamesError = "This game already exists for this venue."
-                    manageGamesFeedback = ""
-                }
-                return
-            }
-        } else {
+        if !snapshot.importedFromAPI {
             let duplicate = await viewModel.venueGameManualDuplicateExists(
                 venueId: viewModel.ownerVenueDatabaseId,
                 gameTitle: trimmedTitle,
@@ -10200,9 +10173,9 @@ struct VenueOwnerDashboardView: View {
         )
 
         await MainActor.run {
-            isSavingNewGame = false
             switch result {
             case .failure(let err):
+                isSavingNewGame = false
                 manageGamesError = err.localizedDescription
                 manageGamesFeedback = ""
 #if DEBUG
@@ -10229,6 +10202,9 @@ struct VenueOwnerDashboardView: View {
         if case .success = result {
             await refreshManageGamesList(isInitialPick: false)
             await refreshBusinessPlanStatus(source: "postMutation", force: true)
+            await MainActor.run {
+                isSavingNewGame = false
+            }
         }
     }
 
@@ -10254,8 +10230,10 @@ struct VenueOwnerDashboardView: View {
         importedHomeTeam = nil
         importedAwayTeam = nil
         importedFromAPI = false
+        importedLiveGameDuplicateDetected = false
+        importedLiveGameDuplicateCount = 0
+        manageGamesWarning = ""
         importGamesBrowserExpanded = true
-        importGamesCalendarExpanded = false
     }
 
     private func refreshAnalyticsGameHistory() async {
@@ -11159,6 +11137,144 @@ private struct VenueOwnerSchedulePickerSheet: View {
     }()
 }
 
+private struct BusinessHostedGameVenuePresentation {
+    let name: String
+    let city: String?
+    let address: String?
+
+    var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Venue" : trimmed
+    }
+
+    static func resolve(for row: VenueEventRow, viewModel: MapViewModel) -> BusinessHostedGameVenuePresentation {
+        let managed = viewModel.managedVenuesForOwner()
+        let matchedVenue = managed.first { managedRow in
+            guard let managedId = managedRow.id else { return false }
+            return managedId == row.venue_id
+        }
+        let selectedVenue = viewModel.ownerVenueDatabaseId.flatMap { selectedId in
+            managed.first { $0.id == selectedId }
+        }
+
+        let resolvedName = firstNonEmpty(
+            matchedVenue?.venue_name,
+            row.venue_name,
+            selectedVenue?.venue_name,
+            viewModel.ownerVenueName
+        )
+
+        return BusinessHostedGameVenuePresentation(
+            name: resolvedName,
+            city: cityLine(for: matchedVenue ?? selectedVenue),
+            address: streetAddress(for: matchedVenue ?? selectedVenue)
+        )
+    }
+
+    static func resolveSelectedVenue(viewModel: MapViewModel) -> BusinessHostedGameVenuePresentation {
+        let managed = viewModel.managedVenuesForOwner()
+        let matchedVenue = viewModel.ownerVenueDatabaseId.flatMap { selectedId in
+            managed.first { $0.id == selectedId }
+        }
+
+        return BusinessHostedGameVenuePresentation(
+            name: firstNonEmpty(
+                matchedVenue?.venue_name,
+                viewModel.ownerVenueName
+            ),
+            city: cityLine(for: matchedVenue),
+            address: streetAddress(for: matchedVenue)
+        )
+    }
+
+    private static func cityLine(for venue: VenueProfileRow?) -> String? {
+        guard let venue else { return nil }
+        let locality = [venue.city, venue.state]
+            .compactMap { trimmedNonEmpty($0) }
+            .joined(separator: ", ")
+        return locality.isEmpty ? nil : locality
+    }
+
+    private static func streetAddress(for venue: VenueProfileRow?) -> String? {
+        guard let venue else { return nil }
+        let formatted = firstNonEmpty(venue.formatted_address, venue.address)
+        if !formatted.isEmpty, formatted.count <= 58 {
+            return formatted
+        }
+
+        let street = firstNonEmpty(venue.address_line1, venue.address)
+        guard !street.isEmpty else { return nil }
+        return street.count <= 58 ? street : String(street.prefix(58))
+    }
+
+    private static func firstNonEmpty(_ values: String?...) -> String {
+        for value in values {
+            if let trimmed = trimmedNonEmpty(value) {
+                return trimmed
+            }
+        }
+        return ""
+    }
+
+    private static func trimmedNonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private struct BusinessHostedGameVenueNameLabel: View {
+    let presentation: BusinessHostedGameVenuePresentation
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "building.2")
+                .font(.subheadline.weight(.semibold))
+                .accessibilityHidden(true)
+            Text(presentation.displayName)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .font(.subheadline.weight(.semibold))
+        .foregroundStyle(.primary)
+        .accessibilityLabel("Venue: \(presentation.displayName)")
+    }
+}
+
+private struct BusinessHostedGameVenueLocationLines: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let presentation: BusinessHostedGameVenuePresentation
+
+    var body: some View {
+        if presentation.city != nil || presentation.address != nil {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Image(systemName: "mappin.and.ellipse")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.78))
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    if let city = presentation.city {
+                        Text(city)
+                            .font(.caption2.weight(.heavy))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+
+                    if let address = presentation.address {
+                        Text(address)
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.82))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            }
+        }
+    }
+}
+
 private struct VenueOwnerManageGameRow: View {
     @ObservedObject var viewModel: MapViewModel
     @Environment(\.colorScheme) private var colorScheme
@@ -11173,6 +11289,10 @@ private struct VenueOwnerManageGameRow: View {
     let onViewChat: () -> Void
     let onEditTitle: () -> Void
     let onCancel: () -> Void
+
+    private var venuePresentation: BusinessHostedGameVenuePresentation {
+        BusinessHostedGameVenuePresentation.resolve(for: row, viewModel: viewModel)
+    }
 
     var body: some View {
         let identity = HostedVenueGameCardIdentity(row: row)
@@ -11207,6 +11327,8 @@ private struct VenueOwnerManageGameRow: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
 
+                    BusinessHostedGameVenueNameLabel(presentation: venuePresentation)
+
                     Text(identity.secondaryLine)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(FGColor.primaryText(colorScheme).opacity(0.82))
@@ -11217,7 +11339,7 @@ private struct VenueOwnerManageGameRow: View {
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .lineLimit(1)
 
-                    scheduledVenueLine
+                    BusinessHostedGameVenueLocationLines(presentation: venuePresentation)
                 }
 
                 Spacer(minLength: 8)
@@ -11331,89 +11453,6 @@ private struct VenueOwnerManageGameRow: View {
             return formattedDateTime
         }
         return Self.dashboardDateTimeFormatter.string(from: start)
-    }
-
-    private var scheduledVenueLine: some View {
-        let venue = resolvedScheduledVenue
-        return HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Image(systemName: "mappin.and.ellipse")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.78))
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(venue.name)
-                    .font(.caption2.weight(.heavy))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-
-                if let address = venue.address {
-                    Text(address)
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.82))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-        }
-        .accessibilityLabel("Venue: \(venue.name)")
-    }
-
-    private var resolvedScheduledVenue: (name: String, address: String?) {
-        let managed = viewModel.managedVenuesForOwner()
-        let matchedVenue = managed.first { managedRow in
-            guard let managedId = managedRow.id else { return false }
-            return managedId == row.venue_id
-        }
-
-        let name = firstNonEmpty(
-            matchedVenue?.venue_name,
-            row.venue_name,
-            selectedManagedVenue?.venue_name,
-            viewModel.ownerVenueName,
-            "Venue"
-        )
-        let address = compactVenueAddress(for: matchedVenue ?? selectedManagedVenue)
-        return (name, address)
-    }
-
-    private var selectedManagedVenue: VenueProfileRow? {
-        guard let selectedId = viewModel.ownerVenueDatabaseId else { return nil }
-        return viewModel.managedVenuesForOwner().first { $0.id == selectedId }
-    }
-
-    private func compactVenueAddress(for venue: VenueProfileRow?) -> String? {
-        guard let venue else { return nil }
-        let formatted = firstNonEmpty(venue.formatted_address, venue.address)
-        if !formatted.isEmpty, formatted.count <= 58 {
-            return formatted
-        }
-
-        let street = firstNonEmpty(venue.address_line1, venue.address)
-        let locality = [venue.city, venue.state]
-            .compactMap { trimmedNonEmpty($0) }
-            .joined(separator: ", ")
-        let compact = [street, locality]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
-        guard !compact.isEmpty, compact.count <= 58 else { return nil }
-        return compact
-    }
-
-    private func firstNonEmpty(_ values: String?...) -> String {
-        for value in values {
-            if let trimmed = trimmedNonEmpty(value) {
-                return trimmed
-            }
-        }
-        return ""
-    }
-
-    private func trimmedNonEmpty(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     private var momentumState: (label: String, tint: Color, isHighEnergy: Bool) {

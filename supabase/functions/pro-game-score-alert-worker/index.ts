@@ -1014,21 +1014,26 @@ function validGoalScorerName(
   )
   for (const token of playerTokens) {
     if (rejectTokens.has(token)) return null
+    if (genericGoalScorerTokens.has(token)) return null
   }
   return player
 }
+
+const genericGoalScorerTokens = new Set([
+  "goal",
+  "score",
+  "scoring play",
+])
 
 function goalNotificationFirstLine(
   gameClock: string | null | undefined,
   scorerName: string | null,
 ): string {
-  const minute = normalizedGoalMinute(gameClock)
   const scorer = scorerName?.trim()
-  if (scorer) {
-    return minute ? `${minute} ${scorer}` : scorer
-  }
-  if (minute) return `${minute} Goal`
-  return "Goal"
+  if (scorer) return scorer
+  const minute = normalizedGoalMinute(gameClock)
+  if (minute) return `Goal scored (${minute})`
+  return "Score update"
 }
 
 function homeFirstScoreNotificationBody(game: TrackedGame, live: LiveMatchRow): string {
@@ -1044,13 +1049,12 @@ function goalNotificationBody(
     player?: string | null
     gameClock?: string | null
     scoringTeamPlain: string
+    scoringSummary?: string | null
   },
 ): string {
-  const scorer = validGoalScorerName(
-    options.player,
-    options.scoringTeamPlain,
-    [game.homeTeam, game.awayTeam, live.home_team, live.away_team],
-  )
+  const teams = [game.homeTeam, game.awayTeam, live.home_team, live.away_team]
+  const scorer = validGoalScorerName(options.player, options.scoringTeamPlain, teams)
+    ?? validGoalScorerName(options.scoringSummary ?? null, options.scoringTeamPlain, teams)
   const firstLine = goalNotificationFirstLine(options.gameClock, scorer)
   const secondLine = homeFirstScoreNotificationBody(game, live)
   return `${firstLine}\n${secondLine}`
@@ -1604,6 +1608,7 @@ function scoringNotificationContent(game: TrackedGame, live: LiveMatchRow, previ
       player: scoringEvent.player,
       gameClock: scoringEvent.gameClock,
       scoringTeamPlain: scoringEvent.scoringTeamPlain,
+      scoringSummary: scoringEvent.summary,
     }),
     goalDebug: {
       notificationType: "goal",

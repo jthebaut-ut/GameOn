@@ -7,6 +7,7 @@ struct FanGeoAppleSignInButton: View {
     @ObservedObject var viewModel: MapViewModel
     let accountMode: AppleAuthAccountMode
     var entryPoint: AppleAuthEntryPoint = .signIn
+    var isEnabled: Bool = true
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var currentNonce: String?
@@ -34,8 +35,8 @@ struct FanGeoAppleSignInButton: View {
         .signInWithAppleButtonStyle(colorScheme == .dark ? .white : .black)
         .frame(height: 48)
         .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
-        .disabled(isAuthorizing)
-        .opacity(isAuthorizing ? 0.72 : 1)
+        .disabled(isAuthorizing || !isEnabled)
+        .opacity(isAuthorizing || !isEnabled ? 0.72 : 1)
     }
 
     private func handleAuthorizationResult(_ result: Result<ASAuthorization, Error>) {

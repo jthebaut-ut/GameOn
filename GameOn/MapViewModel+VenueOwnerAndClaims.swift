@@ -378,8 +378,113 @@ extension MapViewModel {
             return
         }
 
+        await registerVenueOwnerAfterEstablishedSession(
+            ownerEmail: ownerEmail,
+            ownerUserId: ownerUserId,
+            signup: signup,
+            coverPhotoJPEGData: coverPhotoJPEGData,
+            menuPhotoJPEGData: menuPhotoJPEGData,
+            recordVenueGuidelinesAcceptance: recordVenueGuidelinesAcceptance
+        )
+    }
+
+    /// Completes business + first-location signup after Sign in with Apple has already established a Supabase session.
+    func completeApplePendingBusinessRegistration(
+        signup: BusinessOwnerSignupPayload,
+        coverPhotoJPEGData: Data?,
+        menuPhotoJPEGData: Data?,
+        recordVenueGuidelinesAcceptance: Bool = false
+    ) async {
+        await MainActor.run { venueAuthErrorMessage = "" }
+
+        let session: Session
+        do {
+            session = try await supabase.auth.session
+        } catch {
+            await MainActor.run {
+                venueAuthErrorMessage = "Continue with Apple again to finish creating your business account."
+            }
+            return
+        }
+
+        let ownerEmail = OwnerBusinessEmail.normalized(session.user.email ?? applePendingBusinessSignupEmail)
+        let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard OwnerBusinessEmail.isValidStrict(ownerEmail) else {
+            await MainActor.run { venueAuthErrorMessage = "Apple did not return a usable email address." }
+            return
+        }
+
+        guard let coverData = coverPhotoJPEGData, !coverData.isEmpty else {
+            await MainActor.run { venueAuthErrorMessage = "Main venue photo is required." }
+            return
+        }
+
+        if let formError = validationErrorForAddLocationClaimForm(signup.firstLocation, requireCoverPhotoURL: false) {
+            await MainActor.run { venueAuthErrorMessage = formError }
+            return
+        }
+
+        guard !businessName.isEmpty else {
+            await MainActor.run { venueAuthErrorMessage = "Please enter your business name." }
+            return
+        }
+
+        if await blockBusinessSignupIfEmailAlreadyReserved(ownerEmail) {
+            return
+        }
+
+        if await businessBanGuardBlocks(
+            path: "businessSignup",
+            action: "completeApplePendingBusinessRegistration",
+            ownerEmail: ownerEmail,
+            ownerUserId: session.user.id
+        ) {
+            return
+        }
+
+        if await activeFanUserProfileExistsForEmail(ownerEmail) {
+            await undoPartialSupabaseSessionAfterAccountTypeMismatch()
+            await MainActor.run { venueAuthErrorMessage = Self.businessSignupBlockedBecauseFanMessage }
+            return
+        }
+
+        guard await claimAccountIdentity(.business, context: "completeApplePendingBusinessRegistration") else {
+            return
+        }
+
+        await registerVenueOwnerAfterEstablishedSession(
+            ownerEmail: ownerEmail,
+            ownerUserId: session.user.id,
+            signup: signup,
+            coverPhotoJPEGData: coverPhotoJPEGData,
+            menuPhotoJPEGData: menuPhotoJPEGData,
+            recordVenueGuidelinesAcceptance: recordVenueGuidelinesAcceptance
+        )
+
+        await MainActor.run {
+            applePendingBusinessSignupEmail = ""
+            applePendingBusinessSignupDisplayName = ""
+            clearAppleAuthMessage(accountMode: .business, reason: "businessProfileCreated")
+        }
+    }
+
+    private func registerVenueOwnerAfterEstablishedSession(
+        ownerEmail: String,
+        ownerUserId: UUID,
+        signup: BusinessOwnerSignupPayload,
+        coverPhotoJPEGData: Data?,
+        menuPhotoJPEGData: Data?,
+        recordVenueGuidelinesAcceptance: Bool
+    ) async {
+        let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let coverData = coverPhotoJPEGData, !coverData.isEmpty else {
+            await MainActor.run { venueAuthErrorMessage = "Main venue photo is required." }
+            return
+        }
+
 #if DEBUG
-        let jwtEmail = session.user.email ?? "nil"
+        let jwtEmail = (try? await supabase.auth.session)?.user.email ?? "nil"
         print(
             "[BusinessSignup] auth signup success authenticated_session_user_id=\(ownerUserId.uuidString) owner_user_id=\(ownerUserId.uuidString) jwt_email=\(jwtEmail)"
         )
@@ -6438,18 +6543,18 @@ extension MapViewModel {
             || s.contains("pgrst202")
     }
 
-    func venueGameImportDuplicateExists(
+    func venueGameImportDuplicateCount(
         externalGameID: String?,
         externalSource: String?,
         venueId: UUID?,
         gameDate: Date
-    ) async -> Bool {
+    ) async -> Int {
         let trimmedExternalGameID = externalGameID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmedExternalGameID.isEmpty else {
 #if DEBUG
-            print("[BusinessGameImportDebug] duplicateCheckResult=false reason=missing_external_id")
+            print("[BusinessGameImportDebug] duplicateCheckCount=0 reason=missing_external_id")
 #endif
-            return false
+            return 0
         }
 
         let trimmedExternalSource = externalSource?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -6473,24 +6578,39 @@ extension MapViewModel {
                     query = query.eq("owner_email", value: ownerRowEmail)
                 } else {
 #if DEBUG
-                    print("[BusinessGameImportDebug] duplicateCheckResult=false reason=missing_venue_scope")
+                    print("[BusinessGameImportDebug] duplicateCheckCount=0 reason=missing_venue_scope")
 #endif
-                    return false
+                    return 0
                 }
             }
 
-            let rows: [VenueEventDuplicateCheckRow] = try await query.limit(1).execute().value
-            let exists = !rows.isEmpty
+            let rows: [VenueEventDuplicateCheckRow] = try await query.execute().value
+            let count = rows.count
 #if DEBUG
-            print("[BusinessGameImportDebug] duplicateCheckResult=\(exists)")
+            print("[BusinessGameImportDebug] duplicateCheckCount=\(count)")
 #endif
-            return exists
+            return count
         } catch {
 #if DEBUG
-            print("[BusinessGameImportDebug] duplicateCheckResult=false error=\(error.localizedDescription)")
+            print("[BusinessGameImportDebug] duplicateCheckCount=0 error=\(error.localizedDescription)")
 #endif
-            return false
+            return 0
         }
+    }
+
+    func venueGameImportDuplicateExists(
+        externalGameID: String?,
+        externalSource: String?,
+        venueId: UUID?,
+        gameDate: Date
+    ) async -> Bool {
+        let count = await venueGameImportDuplicateCount(
+            externalGameID: externalGameID,
+            externalSource: externalSource,
+            venueId: venueId,
+            gameDate: gameDate
+        )
+        return count > 0
     }
 
     func venueGameManualDuplicateExists(

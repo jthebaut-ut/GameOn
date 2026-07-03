@@ -1,5 +1,3 @@
-import AdSupport
-import AppTrackingTransparency
 import Foundation
 import GoogleMobileAds
 import UIKit
@@ -51,9 +49,6 @@ enum AdDebugDiagnostics {
         let configuredAppID = AdMobConfiguration.applicationID
         let skItems = Bundle.main.object(forInfoDictionaryKey: "SKAdNetworkItems") as? [[String: Any]]
         let skCount = skItems?.count ?? 0
-        let idfa = ASIdentifierManager.shared().advertisingIdentifier.uuidString
-        let attPromptKey = "NSUserTrackingUsageDescription"
-        let attPromptConfigured = Bundle.main.object(forInfoDictionaryKey: attPromptKey) != nil
 
         log(
             event: "bootstrap",
@@ -80,9 +75,7 @@ enum AdDebugDiagnostics {
                 "deviceModel": UIDevice.current.model,
                 "userInterfaceIdiom": idiomLabel(UIDevice.current.userInterfaceIdiom),
                 "systemVersion": UIDevice.current.systemVersion,
-                "idfa": idfa,
-                "attStatus": currentATTStatusLabel(),
-                "attPromptConfigured": "\(attPromptConfigured)"
+                "attStatus": currentATTStatusLabel()
             ]
         )
 
@@ -613,16 +606,7 @@ enum AdDebugDiagnostics {
     }
 
     static func currentATTStatusLabel() -> String {
-        if #available(iOS 14, *) {
-            switch ATTrackingManager.trackingAuthorizationStatus {
-            case .notDetermined: return "notDetermined"
-            case .restricted: return "restricted"
-            case .denied: return "denied"
-            case .authorized: return "authorized"
-            @unknown default: return "unknown"
-            }
-        }
-        return "unavailable_pre_iOS14"
+        "not_requested"
     }
 
     private static func buildIsDebugDescription() -> String {

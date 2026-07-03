@@ -83,7 +83,10 @@ extension MapViewModel {
         currentTabRaw: String = "discover"
     ) {
         let action = announcement.trimmedCTAAction
-        guard !action.isEmpty else { return }
+        if action.isEmpty {
+            dismissDiscoverBannerAnnouncement(announcement)
+            return
+        }
 
         FanGeoAnnouncementCTAAction.perform(
             action,

@@ -37,7 +37,7 @@ struct BusinessSponsorInquirySheet: View {
     }
 
     private static let defaultMessage =
-        "I’m interested in paid advertising or sponsored placement for my venue on FanGeo. Please contact me with sponsorship options."
+        "I’m interested in learning more about advertising and sponsored placement opportunities for my venue on FanGeo. Please contact me with available sponsorship options and pricing."
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -85,7 +85,7 @@ struct BusinessSponsorInquirySheet: View {
                 businessDetailsSection
                 sponsorshipInterestSection
             }
-            .navigationTitle("Sponsor Inquiry")
+            .navigationTitle("Advertising & Sponsorship Inquiry")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -135,7 +135,7 @@ struct BusinessSponsorInquirySheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 Label("Advertise with FanGeo", systemImage: "megaphone.fill")
                     .font(.headline.weight(.bold))
-                Text("Tell the FanGeo team how you’d like to promote your bar, venue, or watch party to local fans.")
+                Text("Tell the FanGeo team about your advertising goals. We’ll contact you with available sponsorship opportunities and pricing.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -164,7 +164,7 @@ struct BusinessSponsorInquirySheet: View {
         } header: {
             Text("Sponsorship interest")
         } footer: {
-            Text("Sponsored placement is available to Business Regular and Business Pro accounts.")
+            Text("Submitting this inquiry does not purchase advertising. A FanGeo representative will contact you with available sponsorship opportunities and pricing.")
         }
     }
 

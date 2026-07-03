@@ -1780,6 +1780,11 @@ extension MapViewModel {
                     continue
                 }
 
+                guard GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(row: game) else {
+                    if st == "approved" { filteredExpiredGamesCount += 1 }
+                    continue
+                }
+
                 let playable = isPickupGameEligibleForFollowingGamesToPlay(game)
                 if st == "approved" {
                     if playable {

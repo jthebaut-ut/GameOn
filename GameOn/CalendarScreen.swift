@@ -354,6 +354,9 @@ struct CalendarScreen: View {
             calendarTopControls
             calendarSearchSuggestionsSlot
             eventsHeader
+            if effectiveCalendarGameFilter == .venueGames && !isCalendarSearchModeActive {
+                calendarVenueGamesRegionNotice
+            }
             eventsList
         }
         .padding(.top, 14)
@@ -1177,6 +1180,14 @@ struct CalendarScreen: View {
         return formatter.string(from: viewModel.calendarTabSelectedDate)
     }
 
+    private var calendarVenueGamesRegionNotice: some View {
+        Text("Only games in your current Discover area are shown.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal)
+    }
+
     private var eventsHeader: some View {
         HStack {
             Text(eventsHeaderTitle)
@@ -1284,7 +1295,7 @@ struct CalendarScreen: View {
     }
 
     private var calendarWatchPartiesEmptyStateTitle: String {
-        "🍻 No watch parties scheduled for \(compactCalendarDateTitle)"
+        "No watch parties found in this Discover area."
     }
 
     private var calendarPickupGamesEmptyState: some View {
@@ -1326,7 +1337,7 @@ struct CalendarScreen: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(calendarColorScheme))
 
-                Text("No watch parties found in the current map area. Move the map, zoom out, or search another city to discover more.")
+                Text("Move the map or search another city to find venue games.")
                     .font(.subheadline)
                     .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -1687,12 +1698,12 @@ struct CalendarScreen: View {
         }
     }
 
-    private func handleEventTap(_ event: SportsEvent) {
+    private func handleVenueCalendarEventTap(_ event: SportsEvent) {
         if viewModel.isGuestDiscoverMode {
             viewModel.discoverNavigateToAccountForUserAuth = true
             return
         }
-        openSelectionInDiscover(event)
+        openVenueEventInDiscover(event)
     }
 
     private func openDiscoverForVenueGames() {
@@ -1714,24 +1725,18 @@ struct CalendarScreen: View {
         selectedTab = .discover
     }
 
-    private func openSelectionInDiscover(_ event: SportsEvent) {
-        let isPickup = event.league == MapViewModel.calendarTabPickupLeagueMarker
-        let targetMode: DiscoverMapContentMode = isPickup ? .pickupGames : .venues
-        if viewModel.discoverMapContentMode != targetMode {
-            viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: targetMode)
-            viewModel.discoverMapContentMode = targetMode
+    private func openVenueEventInDiscover(_ event: SportsEvent) {
+        if viewModel.discoverMapContentMode != .venues {
+            viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: .venues)
+            viewModel.discoverMapContentMode = .venues
         }
         let requestID = viewModel.beginDiscoverDateChange(to: event.date)
         viewModel.scheduleDiscoverSelectedDayRefresh(requestID: requestID)
-        if isPickup {
-            if let row = viewModel.resolvedPickupGameRow(for: event.id) {
-                viewModel.selectPickupGameOnMap(row)
-            } else {
-                viewModel.clearPickupMapSelection()
-            }
-        } else {
-            viewModel.selectEvent(event)
+        guard let bar = viewModel.snapshotBarVenueForCalendarVenueEventFocus(event) else {
+            viewModel.showSocialActionToast("Couldn't find this venue on the map.", isError: true)
+            return
         }
+        viewModel.requestDiscoverFocusForSavedVenue(bar)
         selectedTab = .discover
     }
 
@@ -2117,50 +2122,86 @@ struct CalendarScreen: View {
     private func venueCalendarEventCard(_ event: SportsEvent) -> some View {
         let isVenueEvent = event.league == "Venue Event"
         let venueBar = isVenueEvent ? viewModel.barVenueForCalendarVenueEvent(event) : nil
-        let venueBizEmail = venueBar.flatMap { VenueGameBusinessEmail.resolvedDisplayEmail(for: $0) }
+        let venueRow = isVenueEvent ? viewModel.matchingCalendarVenueEventRow(for: event) : nil
+        let presentation = CalendarVenueEventPresentation.resolve(event: event, bar: venueBar, row: venueRow)
+        let featuredEvent = calendarVenueFeaturedEvent(for: venueRow, sport: presentation.sportToken)
         let watchPartyCount = watchPartyCount(forVenueEventTitle: event.title)
+        let venueFeatureChips = venueBar.map { compactVenueFeaturesForCards($0, limit: 2) } ?? []
 
         return Button {
-            handleEventTap(event)
+            handleVenueCalendarEventTap(event)
         } label: {
-            HStack(spacing: 14) {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                calendarVenueCardThumbnail(
+                    bar: venueBar,
+                    sportToken: presentation.sportToken,
+                    featuredEvent: featuredEvent,
+                    watchPartyCount: watchPartyCount
+                )
+
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 6) {
                         Text(viewModel.displayTime(for: event))
                             .font(.caption.weight(.bold))
                             .foregroundStyle(FGColor.accentGreen)
-                        Spacer(minLength: 0)
-                        Text(watchPartyCount == 1 ? "1 watch party" : "\(watchPartyCount) watch parties")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(FGColor.accentGreen)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(FGColor.accentGreen.opacity(calendarColorScheme == .dark ? 0.18 : 0.10), in: Capsule())
+
+                        calendarVenueCardTitleRow(event: event, presentation: presentation)
+
+                        calendarVenueCardSportCompetitionRow(
+                            presentation: presentation,
+                            featuredEvent: featuredEvent
+                        )
+
+                        if let venueName = presentation.venueDisplayName {
+                            HStack(spacing: 5) {
+                                Image(systemName: "building.2.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .accessibilityHidden(true)
+                                Text(venueName)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(.primary)
+                        }
+
+                        if let address = presentation.addressLine {
+                            HStack(alignment: .top, spacing: 5) {
+                                Image(systemName: "mappin.and.ellipse")
+                                    .font(.caption)
+                                    .accessibilityHidden(true)
+                                Text(address)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.leading)
+                            }
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        }
+
+                        calendarVenueCardDetailChips(
+                            watchPartyCount: watchPartyCount,
+                            featureChips: venueFeatureChips
+                        )
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                    Text(event.title)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-
-                    Text(venueEventSubtitle(event))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-
-                    if let venueBizEmail {
-                        VenueGameBusinessContactEmailRow(email: venueBizEmail)
-                            .padding(.top, 1)
-                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 4)
+                        .accessibilityHidden(true)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                calendarVenueThumbnail(venueBar, sport: event.sport)
             }
             .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(.secondarySystemGroupedBackground))
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(calendarColorScheme == .dark ? 0.12 : 0.08), lineWidth: 1)
+            )
             .shadow(color: Color.black.opacity(calendarColorScheme == .dark ? 0.14 : 0.04), radius: 7, y: 3)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onAppear {
@@ -2170,12 +2211,216 @@ struct CalendarScreen: View {
         }
     }
 
-    private func venueEventSubtitle(_ event: SportsEvent) -> String {
-        let venue = event.venueName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let city = event.venueCity?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let location = [venue, city].filter { !$0.isEmpty }.joined(separator: " • ")
-        let sport = AppSportCatalog.displayLabel(forSportToken: event.sport)
-        return location.isEmpty ? "\(sport) watch party" : "\(sport) • \(location)"
+    @ViewBuilder
+    private func calendarVenueCardThumbnail(
+        bar: BarVenue?,
+        sportToken: String,
+        featuredEvent: FeaturedEvent?,
+        watchPartyCount: Int
+    ) -> some View {
+        let width: CGFloat = 92
+        let height: CGFloat = 112
+        let sportKey = sportToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (bar?.primarySport ?? "Soccer")
+            : sportToken
+        let sportVisual = SportFilterCatalog.resolve(sportKey)
+
+        ZStack(alignment: .bottomLeading) {
+            Group {
+                if let bar,
+                   let urlString = ImageDisplayURL.forList(
+                       thumbnail: bar.coverPhotoThumbnailURL,
+                       full: bar.coverPhotoURL
+                   ),
+                   let url = URL(string: urlString) {
+                    DiscoverCachedRemoteImage(url: url, contentMode: .fill) {
+                        calendarVenueCardThumbnailFallback(sportVisual: sportVisual)
+                    }
+                } else {
+                    calendarVenueCardThumbnailFallback(sportVisual: sportVisual)
+                }
+            }
+            .frame(width: width, height: height)
+            .clipped()
+
+            if watchPartyCount > 0 {
+                Text(watchPartyCount == 1 ? "1 watch party" : "\(watchPartyCount) watch parties")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(FGColor.accentGreen.opacity(0.92), in: Capsule(style: .continuous))
+                    .padding(6)
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .accessibilityHidden(true)
+    }
+
+    private func calendarVenueCardThumbnailFallback(sportVisual: SportFilterCatalog.ChipVisual) -> some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    sportVisual.accent.opacity(calendarColorScheme == .dark ? 0.34 : 0.22),
+                    sportVisual.accent.opacity(calendarColorScheme == .dark ? 0.16 : 0.10)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            Image(systemName: sportVisual.systemImage)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(sportVisual.accent)
+        }
+    }
+
+    @ViewBuilder
+    private func calendarVenueCardTitleRow(event: SportsEvent, presentation: CalendarVenueEventPresentation) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            Text(presentation.gameTitle(fallback: event.title))
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if presentation.hasTeamMatchup {
+                HStack(spacing: 4) {
+                    calendarTeamLeadingContent(for: presentation.awayTeam ?? "", badgeURL: nil)
+                    Text("vs")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                    calendarTeamLeadingContent(for: presentation.homeTeam ?? "", badgeURL: nil)
+                }
+                .layoutPriority(1)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func calendarVenueCardSportCompetitionRow(
+        presentation: CalendarVenueEventPresentation,
+        featuredEvent: FeaturedEvent?
+    ) -> some View {
+        let sportVisual = SportFilterCatalog.resolve(presentation.sportToken)
+        let competitionLabel = presentation.competitionBadgeLabel(featuredEvent: featuredEvent)
+
+        HStack(spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: sportVisual.systemImage)
+                    .font(.caption2.weight(.bold))
+                    .accessibilityHidden(true)
+                Text(AppSportCatalog.displayLabel(forSportToken: presentation.sportToken))
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(sportVisual.accent)
+
+            if let competitionLabel {
+                Text(competitionLabel)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(FGColor.accentGreen)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(FGColor.accentGreen.opacity(calendarColorScheme == .dark ? 0.18 : 0.10))
+                    )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func calendarVenueCardDetailChips(
+        watchPartyCount: Int,
+        featureChips: [VenueFeatureDisplayItem]
+    ) -> some View {
+        let chips = calendarVenueCardDetailChipModels(
+            watchPartyCount: watchPartyCount,
+            featureChips: featureChips
+        )
+        if !chips.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(chips) { chip in
+                        calendarVenueDetailChip(icon: chip.iconName, label: chip.label)
+                    }
+                }
+            }
+        }
+    }
+
+    private struct CalendarVenueDetailChipModel: Identifiable {
+        let id: String
+        let iconName: String
+        let label: String
+    }
+
+    private func calendarVenueCardDetailChipModels(
+        watchPartyCount: Int,
+        featureChips: [VenueFeatureDisplayItem]
+    ) -> [CalendarVenueDetailChipModel] {
+        var chips: [CalendarVenueDetailChipModel] = []
+        if watchPartyCount > 0 {
+            chips.append(
+                CalendarVenueDetailChipModel(
+                    id: "watch-party",
+                    iconName: "person.2.fill",
+                    label: watchPartyCount == 1 ? "1 watch party" : "\(watchPartyCount) watch parties"
+                )
+            )
+        }
+        for feature in featureChips.prefix(3 - chips.count) {
+            chips.append(
+                CalendarVenueDetailChipModel(
+                    id: feature.id,
+                    iconName: feature.iconName,
+                    label: feature.label
+                )
+            )
+        }
+        return chips
+    }
+
+    private func calendarVenueDetailChip(icon: String, label: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+                .accessibilityHidden(true)
+            Text(label)
+                .lineLimit(1)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.primary.opacity(calendarColorScheme == .dark ? 0.10 : 0.06))
+        )
+    }
+
+    private func calendarVenueFeaturedEvent(for row: VenueEventRow?, sport: String) -> FeaturedEvent? {
+        let league = row?.external_league?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !league.isEmpty else { return nil }
+        let normalizedLeague = LiveMatchFilters.normalizedSearchText(league)
+        if let direct = calendarFeaturedEvents.first(where: { featuredEvent in
+            let candidates = [
+                LiveMatchFilters.normalizedSearchText(featuredEvent.slug),
+                LiveMatchFilters.normalizedSearchText(featuredEvent.title),
+                featuredEvent.shortTitle.map(LiveMatchFilters.normalizedSearchText) ?? ""
+            ]
+            return candidates.contains(normalizedLeague)
+        }) {
+            return direct
+        }
+        return calendarFeaturedEvents.first { featuredEvent in
+            featuredEvent.includeKeywords.contains { keyword in
+                let normalizedKeyword = LiveMatchFilters.normalizedSearchText(keyword)
+                return normalizedLeague.contains(normalizedKeyword) || normalizedKeyword.contains(normalizedLeague)
+            }
+        }
     }
 
     private func watchPartyCount(forVenueEventTitle title: String) -> Int {
@@ -2212,43 +2457,6 @@ struct CalendarScreen: View {
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
-    }
-
-    @ViewBuilder
-    private func calendarVenueThumbnail(_ venue: BarVenue?, sport: String) -> some View {
-        let imageURL = venue?.coverPhotoThumbnailURL ?? venue?.coverPhotoURL
-        if let imageURL, let url = URL(string: imageURL) {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    image
-                        .resizable()
-                        .scaledToFill()
-                default:
-                    calendarVenueThumbnailFallback(sport)
-                }
-            }
-            .frame(width: 88, height: 76)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        } else {
-            calendarVenueThumbnailFallback(sport)
-                .frame(width: 88, height: 76)
-        }
-    }
-
-    private func calendarVenueThumbnailFallback(_ sport: String) -> some View {
-        ZStack {
-            LinearGradient(
-                colors: [
-                    viewModel.colorForSport(sport).opacity(calendarColorScheme == .dark ? 0.35 : 0.20),
-                    FGColor.accentGreen.opacity(calendarColorScheme == .dark ? 0.24 : 0.12)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            SportArtworkIconView(sport: sport, diameter: 38)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func scheduleCalendarSearchRefresh() {
@@ -3170,5 +3378,52 @@ private struct CalendarLeagueCountryFilterSheet: View {
         } else {
             selectedCountries.insert(country)
         }
+    }
+}
+
+private struct CalendarVenueEventPresentation {
+    let venueDisplayName: String?
+    let addressLine: String?
+    let awayTeam: String?
+    let homeTeam: String?
+    let competitionLabel: String?
+    let sportToken: String
+
+    var hasTeamMatchup: Bool {
+        Self.trimmedNonEmpty(awayTeam) != nil && Self.trimmedNonEmpty(homeTeam) != nil
+    }
+
+    func gameTitle(fallback: String) -> String {
+        if hasTeamMatchup,
+           let away = Self.trimmedNonEmpty(awayTeam),
+           let home = Self.trimmedNonEmpty(homeTeam) {
+            return "\(away) vs \(home)"
+        }
+        let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedFallback.isEmpty ? "Watch Party" : trimmedFallback
+    }
+
+    func competitionBadgeLabel(featuredEvent: FeaturedEvent?) -> String? {
+        if let featuredEvent {
+            return featuredEvent.emptyStateTitle
+        }
+        return Self.trimmedNonEmpty(competitionLabel)
+    }
+
+    static func resolve(event: SportsEvent, bar: BarVenue?, row: VenueEventRow?) -> CalendarVenueEventPresentation {
+        let sportToken = Self.trimmedNonEmpty(row?.sport) ?? Self.trimmedNonEmpty(event.sport) ?? "Soccer"
+        return CalendarVenueEventPresentation(
+            venueDisplayName: Self.trimmedNonEmpty(bar?.name) ?? Self.trimmedNonEmpty(row?.venue_name),
+            addressLine: Self.trimmedNonEmpty(bar?.address),
+            awayTeam: Self.trimmedNonEmpty(row?.away_team),
+            homeTeam: Self.trimmedNonEmpty(row?.home_team),
+            competitionLabel: Self.trimmedNonEmpty(row?.external_league),
+            sportToken: sportToken
+        )
+    }
+
+    private static func trimmedNonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

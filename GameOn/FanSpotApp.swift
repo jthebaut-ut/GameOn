@@ -96,6 +96,7 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
     ) async {
         await MainActor.run {
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            SupportReplyNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }
     }
 }

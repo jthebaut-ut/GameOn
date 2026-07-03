@@ -70,6 +70,20 @@ struct PublicUserProfilePreviewView: View {
                             } label: {
                                 Label("Share Profile", systemImage: "square.and.arrow.up")
                             }
+
+                            if canShowBottomSafetyActions {
+                                Button {
+                                    showReportFanSheet = true
+                                } label: {
+                                    Label("Report Fan", systemImage: "flag.fill")
+                                }
+
+                                Button(role: .destructive) {
+                                    showBlockFanConfirmation = true
+                                } label: {
+                                    Label("Block Fan", systemImage: "nosign")
+                                }
+                            }
                         } label: {
                             Image(systemName: "ellipsis.circle")
                         }

@@ -386,6 +386,7 @@ extension MapViewModel {
             venueOwnerMode = false
             authSessionState = .signedIn
             applePendingFanSignupEmail = ""
+            applePendingFanSignupDisplayName = ""
             authErrorMessage = ""
             clearAppleAuthMessage(accountMode: .fan, reason: "profileCreated")
             bumpCurrentUserAvatarDisplayRefresh()

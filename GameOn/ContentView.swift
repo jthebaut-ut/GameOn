@@ -7,6 +7,9 @@ struct ContentView: View {
     @StateObject private var chatViewModel = ChatViewModel()
     @StateObject private var bootstrapCoordinator = BootstrapLoadingCoordinator()
     @Environment(\.scenePhase) private var scenePhase
+    @State private var queuedSupportDeepLinkRequest: SupportReplyNotificationDeepLinkRequest?
+    @State private var supportNotificationPresentation: SupportNotificationPresentation?
+    @State private var lastPresentedSupportDeepLinkRequestID: UUID?
     #if DEBUG
     @State private var debugSplashMinimumElapsed = false
     #endif
@@ -47,11 +50,37 @@ struct ContentView: View {
         .onAppear {
             FanGeoAnalyticsService.recordAppOpen()
             ProGameNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            SupportReplyNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             #if DEBUG
             print("[LaunchPathDebug] ContentViewMounted=true")
             print("[LaunchPathDebug] isBootstrapping=\(bootstrapCoordinator.isBootstrapping)")
             print("[LaunchPathDebug] splashMinDurationActive=\(!debugSplashMinimumElapsed)")
             #endif
+        }
+        .onChange(of: viewModel.pendingSupportReplyNotificationDeepLink) { _, request in
+            guard let request else { return }
+            viewModel.clearPendingSupportReplyNotificationDeepLink()
+            queueSupportDeepLinkRequest(request)
+        }
+        .onChange(of: shouldShowSplash) { _, isShowingSplash in
+            guard !isShowingSplash else { return }
+            presentQueuedSupportDeepLinkIfReady()
+        }
+        .onChange(of: bootstrapCoordinator.isBootstrapping) { _, isBootstrapping in
+            guard !isBootstrapping else { return }
+            presentQueuedSupportDeepLinkIfReady()
+        }
+        .sheet(item: $supportNotificationPresentation) { presentation in
+            NavigationStack {
+                ContactGameOnSupportSheet(
+                    viewModel: viewModel,
+                    onRequestSignIn: {},
+                    embedsInNavigationStack: false,
+                    showsCloseButton: true,
+                    initialTicketID: presentation.initialTicketID
+                )
+                .environmentObject(chatViewModel)
+            }
         }
         .onChange(of: bootstrapCoordinator.isBootstrapping) {
             #if DEBUG
@@ -114,6 +143,59 @@ struct ContentView: View {
         return bootstrapCoordinator.isBootstrapping
         #endif
     }
+
+    private func queueSupportDeepLinkRequest(_ request: SupportReplyNotificationDeepLinkRequest) {
+        if lastPresentedSupportDeepLinkRequestID == request.id {
+#if DEBUG
+            print("[SupportDeepLink] ignored duplicate requestId=\(request.id.uuidString.lowercased())")
+#endif
+            return
+        }
+        queuedSupportDeepLinkRequest = request
+#if DEBUG
+        print("[SupportDeepLink] queued conversationId=\(request.conversationID.uuidString.lowercased())")
+#endif
+        presentQueuedSupportDeepLinkIfReady()
+    }
+
+    private func presentQueuedSupportDeepLinkIfReady() {
+        guard let request = queuedSupportDeepLinkRequest else { return }
+        guard !shouldShowSplash else {
+#if DEBUG
+            print("[SupportDeepLink] queued waitingForSplash conversationId=\(request.conversationID.uuidString.lowercased())")
+#endif
+            return
+        }
+        guard supportNotificationPresentation == nil else {
+#if DEBUG
+            print("[SupportDeepLink] queued waitingForDismissedSheet conversationId=\(request.conversationID.uuidString.lowercased())")
+#endif
+            return
+        }
+
+        queuedSupportDeepLinkRequest = nil
+        lastPresentedSupportDeepLinkRequestID = request.id
+
+        let opensTicket = SupportReplyNotificationDeepLinkConfiguration.opensTicketDirectly
+            && (viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn)
+        let initialTicketID = opensTicket ? request.conversationID : nil
+
+#if DEBUG
+        print("[SupportDeepLink] presenting Support Center opensTicketDirectly=\(opensTicket) conversationId=\(request.conversationID.uuidString.lowercased())")
+#endif
+
+        supportNotificationPresentation = SupportNotificationPresentation(
+            requestID: request.id,
+            initialTicketID: initialTicketID
+        )
+    }
+}
+
+private struct SupportNotificationPresentation: Identifiable {
+    let requestID: UUID
+    let initialTicketID: UUID?
+
+    var id: UUID { requestID }
 }
 
 private struct AccountSuspensionGateView: View {

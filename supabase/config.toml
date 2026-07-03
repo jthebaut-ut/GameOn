@@ -452,3 +452,8 @@ entrypoint = "./functions/pro-game-score-alert-worker/index.ts"
 enabled = true
 verify_jwt = true
 entrypoint = "./functions/cleanup-expired-game-social/index.ts"
+
+[functions.notify-support-reply]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/notify-support-reply/index.ts"

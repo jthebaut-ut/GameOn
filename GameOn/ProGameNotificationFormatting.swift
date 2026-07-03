@@ -173,25 +173,95 @@ nonisolated enum ProGameNotificationFormatting {
         "\(formattedTeam(homeTeam, source: source)) \(homeScore) - \(awayScore) \(formattedTeam(awayTeam, source: source))"
     }
 
-    static func validGoalScorerName(_ raw: String?, scoringTeam: String) -> String? {
+    static func validGoalScorerName(
+        _ raw: String?,
+        scoringTeam: String,
+        otherTeams: [String] = []
+    ) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-        guard normalizedTeamToken(raw) != normalizedTeamToken(scoringTeam) else { return nil }
+
+        let teams = [scoringTeam] + otherTeams
+        if isFlagPlusTeamNameOnly(raw, teams: teams) {
+            return nil
+        }
+
+        let playerTokens = scorerNameComparisonTokens(for: raw)
+        guard !playerTokens.isEmpty else { return nil }
+
+        var rejectTokens = Set<String>()
+        for team in teams {
+            rejectTokens.formUnion(scorerNameComparisonTokens(for: team))
+            rejectTokens.formUnion(scorerNameComparisonTokens(for: ProGameTeamScoreIdentity.cleanTeamName(team)))
+            rejectTokens.formUnion(scorerNameComparisonTokens(for: formattedTeam(team)))
+        }
+        guard playerTokens.isDisjoint(with: rejectTokens) else { return nil }
+        guard !playerTokens.contains(where: { genericScoringTokens.contains($0) }) else { return nil }
         return raw
     }
 
+    private static func scorerNameComparisonTokens(for value: String) -> Set<String> {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return Set(
+            [
+                trimmed,
+                ProGameTeamScoreIdentity.cleanTeamName(trimmed),
+                stripLeadingFlagEmojis(trimmed),
+                formattedTeam(trimmed),
+            ]
+                .map(normalizedTeamToken)
+                .filter { !$0.isEmpty }
+        )
+    }
+
+    private static func isFlagPlusTeamNameOnly(_ raw: String, teams: [String]) -> Bool {
+        let stripped = stripLeadingFlagEmojis(raw)
+        guard !stripped.isEmpty else { return false }
+        let strippedToken = normalizedTeamToken(stripped)
+        return teams.contains {
+            let cleaned = ProGameTeamScoreIdentity.cleanTeamName($0)
+            return !cleaned.isEmpty && normalizedTeamToken(cleaned) == strippedToken
+        }
+    }
+
+    private static func stripLeadingFlagEmojis(_ raw: String) -> String {
+        var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        while !text.isEmpty {
+            let scalars = Array(text.unicodeScalars)
+            if scalars.count >= 2,
+               isRegionalIndicatorScalar(scalars[0]),
+               isRegionalIndicatorScalar(scalars[1]) {
+                text = String(String.UnicodeScalarView(scalars.dropFirst(2)))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.hasPrefix("•") || text.hasPrefix("-") {
+                    text = String(text.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                continue
+            }
+            break
+        }
+        return ProGameTeamScoreIdentity.cleanTeamName(text)
+    }
+
+    private static func isRegionalIndicatorScalar(_ scalar: Unicode.Scalar) -> Bool {
+        (0x1F1E6...0x1F1FF).contains(scalar.value)
+    }
+
+    private static let genericScoringTokens: Set<String> = [
+        "goal",
+        "score",
+        "scoring play",
+    ]
+
     static func goalNotificationFirstLine(minuteText: String?, scorerName: String?) -> String {
-        let minute = normalizedGoalMinute(minuteText)
         let scorer = scorerName?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let scorer, !scorer.isEmpty {
-            if let minute {
-                return "\(minute) \(scorer)"
-            }
             return scorer
         }
-        if let minute {
-            return "\(minute) Goal"
+        if let minute = normalizedGoalMinute(minuteText) {
+            return "Goal scored (\(minute))"
         }
-        return "Goal"
+        return "Score update"
     }
 
     static func goalNotificationBody(

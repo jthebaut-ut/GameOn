@@ -4,6 +4,7 @@ struct AdminScreen: View {
     @ObservedObject var viewModel: MapViewModel
     @State private var password = ""
     @State private var selectedBusiness: AdminBusinessVenueOverrideSummary?
+    @State private var showSupportInbox = false
     
     var body: some View {
         ZStack {
@@ -26,6 +27,7 @@ struct AdminScreen: View {
                         adminLoginCard
                     } else {
                         liveOperationsMetricsCard
+                        adminSupportInboxCard
                         businessVenueOverridesSection
                         claimsList
                     }
@@ -42,6 +44,39 @@ struct AdminScreen: View {
         .sheet(item: $selectedBusiness) { business in
             AdminBusinessVenueDetailsSheet(viewModel: viewModel, business: business)
         }
+        .sheet(isPresented: $showSupportInbox) {
+            NavigationStack {
+                AdminSupportInboxView(viewModel: viewModel)
+            }
+        }
+    }
+
+    private var adminSupportInboxCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Support Inbox")
+                .font(.headline)
+                .fontWeight(.bold)
+                .foregroundStyle(.white)
+
+            Text("Live user support conversations. Replies appear instantly in the iOS Support chat.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.72))
+
+            Button {
+                showSupportInbox = true
+            } label: {
+                Label("Open Support Inbox", systemImage: "bubble.left.and.bubble.right.fill")
+                    .font(.subheadline.weight(.bold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white)
+            .background(Color.green.opacity(0.85), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .padding()
+        .background(Color.white.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
     
     private var adminLoginCard: some View {

@@ -172,6 +172,7 @@ struct FriendsTabView: View {
     @State private var fansLiveNowEntries: [ChatFansLiveNowEntry] = []
     /// Programmatic push (in-app DM banner → Chat tab → ``DirectChatView``).
     @State private var dmBannerNavigationFriend: UserPreview?
+    @State private var openSupportChat = false
 
     private enum ChatSection: String, CaseIterable, Identifiable {
         case chats = "Chats"
@@ -217,65 +218,81 @@ struct FriendsTabView: View {
     }
 
     var body: some View {
+        friendsTabNavigationStack
+            .background(chatRootBackground.ignoresSafeArea())
+            .sheet(isPresented: $showingAddFriendSheet) {
+                addFriendSheetContent
+            }
+            .sheet(isPresented: $showingBlockedUsersSheet) {
+                ChatBlockedUsersSheet(
+                    viewModel: viewModel,
+                    onContactSupport: {
+                        showingBlockedUsersSheet = false
+                        openSupportChat = true
+                    }
+                )
+            }
+            .modifier(FriendsTabLifecycleModifier(
+                viewModel: viewModel,
+                mapViewModel: mapViewModel,
+                isTabSelected: isTabSelected,
+                friendDirectorySearchText: $friendDirectorySearchText,
+                onTabSelectedChange: handleTabSelectedChange,
+                onAppear: handleAppear,
+                onFriendsChange: {
+                    rebuildFriendDisplaySnapshots(reason: "friendsChanged")
+                    logFriendsDirectoryLoadedCount()
+                    refreshFansLiveNowAfterFirstPaint(reason: "friendsPresenceChanged")
+                },
+                onSearchChange: { query in
+                    rebuildFriendDisplaySnapshots(reason: "searchChanged")
+                    logFriendsDirectorySearchQuery(query)
+                },
+                onPendingDmOpen: consumePendingDmOpenPreviewIfNeeded,
+                onRequiresSignInChange: { logChatAuthGate(reason: "requiresSignInChanged") },
+                onChatUserAuthIdChange: { logChatAuthGate(reason: "chatUserAuthIdChanged") },
+                onMapUserAuthIdChange: {
+                    logChatAuthGate(reason: "mapUserAuthIdChanged")
+                    fansLiveNowEntries = []
+                    ChatFansLiveNowSessionCache.clear(authId: nil)
+                },
+                onBusinessAccountChange: { logChatAuthGate(reason: "businessAccountChanged") }
+            ))
+            .modifier(ChatErrorAlertsModifier(viewModel: viewModel))
+    }
+
+    private var friendsTabNavigationStack: some View {
         NavigationStack {
             chatRootContent
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(chatRootBackground)
-            .navigationDestination(item: $dmBannerNavigationFriend) { friend in
-                DirectChatView(friend: friend)
-            }
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar(.hidden, for: .navigationBar)
-        }
-        .background(chatRootBackground.ignoresSafeArea())
-        .sheet(isPresented: $showingAddFriendSheet) {
-            AddFriendGlassSheet(
-                lookupDraft: $manualFriendLookupDraft,
-                viewModel: viewModel,
-                onClose: {
-                    showingAddFriendSheet = false
-                    manualFriendLookupDraft = ""
-                    viewModel.clearAddFriendSearch()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(chatRootBackground)
+                .navigationDestination(item: $dmBannerNavigationFriend) { friend in
+                    DirectChatView(friend: friend)
                 }
-            )
+                .navigationDestination(isPresented: $openSupportChat) {
+                    FanGeoSupportHubView(
+                        mapViewModel: mapViewModel,
+                        chatViewModel: viewModel,
+                        embedsInNavigationStack: false,
+                        showsCloseButton: false,
+                        screenTitle: "Support Center"
+                    )
+                }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar(.hidden, for: .navigationBar)
         }
-        .sheet(isPresented: $showingBlockedUsersSheet) {
-            BlockedUsersSheet(viewModel: viewModel)
-        }
-        .onChange(of: isTabSelected) { _, on in
-            handleTabSelectedChange(on)
-        }
-        .onAppear {
-            handleAppear()
-        }
-        .onChange(of: viewModel.friends) { _, _ in
-            rebuildFriendDisplaySnapshots(reason: "friendsChanged")
-            logFriendsDirectoryLoadedCount()
-            refreshFansLiveNowAfterFirstPaint(reason: "friendsPresenceChanged")
-        }
-        .onChange(of: friendDirectorySearchText) { _, query in
-            rebuildFriendDisplaySnapshots(reason: "searchChanged")
-            logFriendsDirectorySearchQuery(query)
-        }
-        .onChange(of: viewModel.pendingDmOpenPreview) { _, preview in
-            guard preview != nil else { return }
-            consumePendingDmOpenPreviewIfNeeded()
-        }
-        .onChange(of: viewModel.requiresSignIn) { _, _ in
-            logChatAuthGate(reason: "requiresSignInChanged")
-        }
-        .onChange(of: viewModel.currentUserAuthId) { _, _ in
-            logChatAuthGate(reason: "chatUserAuthIdChanged")
-        }
-        .onChange(of: mapViewModel.currentUserAuthId) { _, _ in
-            logChatAuthGate(reason: "mapUserAuthIdChanged")
-            fansLiveNowEntries = []
-            ChatFansLiveNowSessionCache.clear(authId: nil)
-        }
-        .onChange(of: mapViewModel.currentUserIsBusinessAccount) { _, _ in
-            logChatAuthGate(reason: "businessAccountChanged")
-        }
-        .modifier(ChatErrorAlertsModifier(viewModel: viewModel))
+    }
+
+    private var addFriendSheetContent: some View {
+        AddFriendGlassSheet(
+            lookupDraft: $manualFriendLookupDraft,
+            viewModel: viewModel,
+            onClose: {
+                showingAddFriendSheet = false
+                manualFriendLookupDraft = ""
+                viewModel.clearAddFriendSearch()
+            }
+        )
     }
 
     private func handleTabSelectedChange(_ on: Bool) {
@@ -437,12 +454,40 @@ struct FriendsTabView: View {
                     }
                 }
 
-                chatHeaderButton(systemImage: "ellipsis", accessibilityLabel: "Chat options") {
-                    showingBlockedUsersSheet = true
-                }
+                chatOptionsMenu
             }
         }
         .padding(.horizontal, 16)
+    }
+
+    private var chatOptionsMenu: some View {
+        Menu {
+            Button {
+                openSupportChat = true
+            } label: {
+                Text("💬 Support Center")
+            }
+
+            Divider()
+
+            Button {
+                showingBlockedUsersSheet = true
+            } label: {
+                Text("🚫 Blocked Users")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .frame(width: 38, height: 38)
+                .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.74 : 0.96), in: Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(FGColor.divider(colorScheme).opacity(0.55), lineWidth: 1)
+                }
+                .softCardShadow()
+        }
+        .accessibilityLabel("Chat options")
     }
 
     private func chatHeaderButton(systemImage: String, accessibilityLabel: String, action: @escaping () -> Void) -> some View {
@@ -672,6 +717,22 @@ struct FriendsTabView: View {
             }
         }
         .padding(.horizontal, 0)
+    }
+
+    private var supportInboxCardButton: some View {
+        Button {
+            openSupportChat = true
+        } label: {
+            FanGeoSupportInboxCard()
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var supportInboxListRow: some View {
+        supportInboxCardButton
+            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
     }
 
     private var chatEmptyState: some View {
@@ -1253,48 +1314,46 @@ private struct ChatErrorAlertsModifier: ViewModifier {
 
 // MARK: - Blocked Users
 
-private struct BlockedUsersSheet: View {
+private struct ChatBlockedUsersSheet: View {
     @ObservedObject var viewModel: ChatViewModel
+    var onContactSupport: () -> Void
+
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         NavigationStack {
-            Group {
-                if viewModel.blockedUserIds.isEmpty {
-                    ContentUnavailableView(
-                        "No blocked users",
-                        systemImage: "hand.raised.slash",
-                        description: Text("People you block will appear here.")
-                    )
-                    .padding(.top, 24)
-                } else {
-                    List {
+            List {
+                Section {
+                    if blockedItems.isEmpty {
+                        Text("No blocked users.")
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    } else {
                         ForEach(blockedItems, id: \.id) { item in
-                            HStack(spacing: 12) {
-                                ProfileAvatarView(preview: item.preview, size: 40)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.title)
-                                        .font(.subheadline.weight(.semibold))
-                                    if let subtitle = item.subtitle, !subtitle.isEmpty {
-                                        Text(subtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
-                                }
-                                Spacer(minLength: 0)
-                                Button("Unblock") {
-                                    Task { await viewModel.unblockUser(item.id) }
-                                }
-                                .font(.caption.weight(.semibold))
-                                .buttonStyle(.bordered)
-                            }
-                            .padding(.vertical, 4)
+                            blockedUserRow(item)
                         }
                     }
-                    .listStyle(.insetGrouped)
+                } header: {
+                    Text("Manage people you have blocked.")
+                        .font(.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .textCase(nil)
+                }
+
+                Section {
+                    Text("Need help? Contact FanGeo Support.")
+                        .font(.subheadline)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+                    Button {
+                        dismiss()
+                        onContactSupport()
+                    } label: {
+                        Label("Contact FanGeo Support", systemImage: "bubble.left.and.bubble.right.fill")
+                    }
                 }
             }
+            .listStyle(.insetGrouped)
             .navigationTitle("Blocked Users")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1309,8 +1368,30 @@ private struct BlockedUsersSheet: View {
         .presentationDetents([.medium, .large])
     }
 
+    private func blockedUserRow(_ item: BlockedUserDisplay) -> some View {
+        HStack(spacing: 12) {
+            ProfileAvatarView(preview: item.preview, size: 40)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.subheadline.weight(.semibold))
+                if let subtitle = item.subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+            Button("Unblock") {
+                Task { await viewModel.unblockUser(item.id) }
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+        }
+        .padding(.vertical, 4)
+    }
+
     private var blockedItems: [BlockedUserDisplay] {
-        // If we can resolve previews, show them; otherwise show ids with fallback text.
         let byId = Dictionary(uniqueKeysWithValues: viewModel.blockedUserPreviews.map { ($0.id, $0) })
         return viewModel.blockedUserIds
             .map { id -> BlockedUserDisplay in
@@ -1330,12 +1411,11 @@ private struct BlockedUsersSheet: View {
                     subtitle: shortId(id)
                 )
             }
-            .sorted { $0.title < $1.title }
+            .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
     private func shortId(_ id: UUID) -> String {
-        let s = id.uuidString
-        return "\(s.prefix(8))…"
+        "\(id.uuidString.prefix(8))…"
     }
 
     private struct BlockedUserDisplay: Identifiable {
@@ -1343,6 +1423,54 @@ private struct BlockedUsersSheet: View {
         let preview: UserPreview
         let title: String
         let subtitle: String?
+    }
+}
+
+private struct FriendsTabLifecycleModifier: ViewModifier {
+    @ObservedObject var viewModel: ChatViewModel
+    @ObservedObject var mapViewModel: MapViewModel
+
+    let isTabSelected: Bool
+    @Binding var friendDirectorySearchText: String
+
+    let onTabSelectedChange: (Bool) -> Void
+    let onAppear: () -> Void
+    let onFriendsChange: () -> Void
+    let onSearchChange: (String) -> Void
+    let onPendingDmOpen: () -> Void
+    let onRequiresSignInChange: () -> Void
+    let onChatUserAuthIdChange: () -> Void
+    let onMapUserAuthIdChange: () -> Void
+    let onBusinessAccountChange: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: isTabSelected) { _, on in
+                onTabSelectedChange(on)
+            }
+            .onAppear(perform: onAppear)
+            .onChange(of: viewModel.friends) { _, _ in
+                onFriendsChange()
+            }
+            .onChange(of: friendDirectorySearchText) { _, query in
+                onSearchChange(query)
+            }
+            .onChange(of: viewModel.pendingDmOpenPreview) { _, preview in
+                guard preview != nil else { return }
+                onPendingDmOpen()
+            }
+            .onChange(of: viewModel.requiresSignIn) { _, _ in
+                onRequiresSignInChange()
+            }
+            .onChange(of: viewModel.currentUserAuthId) { _, _ in
+                onChatUserAuthIdChange()
+            }
+            .onChange(of: mapViewModel.currentUserAuthId) { _, _ in
+                onMapUserAuthIdChange()
+            }
+            .onChange(of: mapViewModel.currentUserIsBusinessAccount) { _, _ in
+                onBusinessAccountChange()
+            }
     }
 }
 

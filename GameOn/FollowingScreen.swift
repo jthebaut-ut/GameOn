@@ -561,38 +561,8 @@ struct FollowingScreen: View {
     // MARK: - Logged out
 
     private var loggedOutContent: some View {
-        VStack(spacing: 22) {
-            Spacer(minLength: 24)
-
-            FanGeoBrandHeroView(
-                title: "Sign in required",
-                subtitle: "Sign in to save venues and track games you plan to attend.",
-                variant: followingColorScheme == .dark ? .white : .dark,
-                logoWidth: 128,
-                alignment: .center,
-                textAlignment: .center
-            )
-            .padding(.horizontal, 28)
-
-            Button {
-                viewModel.discoverNavigateToAccountForUserAuth = true
-            } label: {
-                Text("Sign in or create account")
-                    .font(.headline)
-                    .fontWeight(.bold)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .tint(.accentColor)
-            .padding(.horizontal, 28)
-            .padding(.top, 8)
-
-            Spacer(minLength: 24)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.bottom, 110)
+        AuthenticationRequiredView.going
+            .padding(.bottom, 92)
     }
 
     // MARK: - Logged in
@@ -631,6 +601,9 @@ struct FollowingScreen: View {
             .onReceive(followingMyPickupMinuteTicker) { date in
                 followingMyPickupClockTick = date
                 scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: date)
+                guard isFollowingTabSelected else { return }
+                rebuildFollowingDisplayCaches(reason: "goingCompletedVisibilityTick", prefetchAvatars: false)
+                scheduleGoingProGamesDisplayCacheRebuild(reason: "goingCompletedVisibilityTick")
             }
         }
         .onAppear {
@@ -744,6 +717,7 @@ struct FollowingScreen: View {
         let sorted = MapViewModel.sortFollowingGoingItemsChronologically(
             viewModel.followingTabGoingItems
                 .filter(\.isActiveGoingTabPlan)
+                .filter { GoingTabCompletedGameVisibility.isVenueGameVisibleInGoingTab(row: $0.venueEvent) }
         )
         cachedGoingVenueGameItems = sorted
         cachedPlayingGameCards = viewModel.myPickupGameJoinRequestCards.filter { card in
@@ -753,6 +727,9 @@ struct FollowingScreen: View {
             case .cancelled, .withdrawing, .canceledByOrganizer:
                 return false
             }
+        }.filter { card in
+            guard let game = viewModel.pickupGamesFollowingTabCache[card.pickupGameId] else { return true }
+            return GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(row: game)
         }
         logGoingTabSortDebug(sorted)
         if prefetchAvatars {
@@ -974,6 +951,7 @@ struct FollowingScreen: View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 10) {
                 sectionEyebrow("Saved Games")
+                goingSavedProGamesCompletedVisibilityNote
                 if manualSavedProGamesForDisplay.isEmpty {
                     goingRichEmptyCard(
                         title: "📺 No saved pro games",
@@ -1063,6 +1041,7 @@ struct FollowingScreen: View {
     private var businessSavedProGamesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             sectionEyebrow("Saved Games")
+            goingSavedProGamesCompletedVisibilityNote
             if manualSavedProGamesForDisplay.isEmpty {
                 emptyCard(
                     icon: "heart",
@@ -1284,12 +1263,15 @@ struct FollowingScreen: View {
     }
 
     private func rebuildGoingProGamesDisplayCaches(reason: String) async {
-        let snapshots = viewModel.savedProGames.map { viewModel.currentSavedProGameSnapshot($0) }
+        let snapshots = viewModel.savedProGames
+            .map { viewModel.currentSavedProGameSnapshot($0) }
+            .filter { GoingTabCompletedGameVisibility.isProGameVisibleInGoingTab($0) }
         let manualKeys = Set(snapshots.map(\.stableKey))
         let filteredFavorites = viewModel.favoriteTeamProGames
             .map(currentFavoriteTeamProGameSnapshot)
             .filter { !manualKeys.contains($0.game.stableKey) }
             .filter { !isCompletedFavoriteTeamProGameCleared($0.game, scope: "fan") }
+            .filter { GoingTabCompletedGameVisibility.isProGameVisibleInGoingTab($0.game) }
 
         let sortedManual: [SavedProGame]
         let sortedFavorites: [FavoriteTeamProGame]
@@ -1330,7 +1312,17 @@ struct FollowingScreen: View {
             .map(currentFavoriteTeamProGameSnapshot)
             .filter { !manualKeys.contains($0.game.stableKey) }
             .filter { !isCompletedFavoriteTeamProGameCleared($0.game, scope: "business") }
+            .filter { GoingTabCompletedGameVisibility.isProGameVisibleInGoingTab($0.game) }
             .sorted { SavedProGame.displaySort($0.game, $1.game) }
+    }
+
+    private var goingPickupHostingGamesForDisplay: [PickupGameRow] {
+        viewModel.myPickupGamesForSettings.filter {
+            GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(
+                row: $0,
+                now: followingMyPickupClockTick
+            )
+        }
     }
 
     private func currentFavoriteTeamProGameSnapshot(_ item: FavoriteTeamProGame) -> FavoriteTeamProGame {
@@ -1383,6 +1375,25 @@ struct FollowingScreen: View {
 
     private func businessMyTeamProGameBadges() -> [String] {
         ["My Teams"]
+    }
+
+    private var goingSavedProGamesShowsCompletedVisibilityNote: Bool {
+        manualSavedProGamesForDisplay.contains(where: \.isFinal)
+    }
+
+    @ViewBuilder
+    private var goingSavedProGamesCompletedVisibilityNote: some View {
+        if goingSavedProGamesShowsCompletedVisibilityNote {
+            Text("ⓘ Completed games remain visible for 48 hours after they finish.")
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 2)
+                .padding(.top, 2)
+                .padding(.bottom, 4)
+                .accessibilityAddTraits(.isStaticText)
+        }
     }
 
     private func sectionEyebrow(_ text: String) -> some View {
@@ -2846,13 +2857,13 @@ struct FollowingScreen: View {
     }
 
     private var hostedGamesListContent: some View {
-        let hostingRowCount = viewModel.myPickupGamesForSettings.count + viewModel.myRemovedPickupGamesForSettings.count
+        let hostingRowCount = goingPickupHostingGamesForDisplay.count + viewModel.myRemovedPickupGamesForSettings.count
         let _: Void = logPickupPerfRender(mode: "Hosting", rowCount: hostingRowCount, renderPath: "LazyVStack+EquatableRenderCard")
         return LazyVStack(alignment: .leading, spacing: 12) {
-            if viewModel.myPickupGamesForSettings.isEmpty, viewModel.myRemovedPickupGamesForSettings.isEmpty {
+            if goingPickupHostingGamesForDisplay.isEmpty, viewModel.myRemovedPickupGamesForSettings.isEmpty {
                 hostingEmptyStateCard
             } else {
-                ForEach(viewModel.myPickupGamesForSettings) { row in
+                ForEach(goingPickupHostingGamesForDisplay) { row in
                     let pendingHere = viewModel.organizerPendingPickupJoinRequests(for: row.id)
                     let withdrawnRows = viewModel.pickupOrganizerWithdrawnRequestsByGameId[row.id] ?? []
                     EquatableRenderCard(
@@ -3849,7 +3860,13 @@ struct FollowingScreen: View {
     }
 
     private func openDiscoverFromGoing() {
+#if DEBUG
+        print("[AppleReviewFix] exploreDiscoverTapped")
+#endif
         selectedTab = .discover
+#if DEBUG
+        print("[AppleReviewFix] selectedTab=\(MainTabView.AppTab.discover.rawValue)")
+#endif
     }
 
     private func openDiscoverForPickupGamesFromGoing() {
@@ -3864,8 +3881,14 @@ struct FollowingScreen: View {
     }
 
     private func openCalendarProGamesFromGoing() {
+#if DEBUG
+        print("[AppleReviewFix] browseProGamesTapped")
+#endif
         viewModel.calendarTabGameFilter = .proGames
         selectedTab = .calendar
+#if DEBUG
+        print("[AppleReviewFix] selectedTab=\(MainTabView.AppTab.calendar.rawValue)")
+#endif
     }
 
     @ViewBuilder
@@ -3888,15 +3911,21 @@ struct FollowingScreen: View {
             }
 
             if let buttonTitle, let buttonAction {
-                Button(action: buttonAction) {
+                Button {
+                    buttonAction()
+                } label: {
                     Text(buttonTitle)
                         .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 11)
+                        .background(
+                            FGColor.accentGreen,
+                            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        )
+                        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .background(FGColor.accentGreen, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

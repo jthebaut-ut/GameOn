@@ -52,6 +52,9 @@ extension MapViewModel {
             if entryPoint == .fanSignup {
                 print("[FanSignupDebug] appleSupabaseSignInStart=true")
             }
+            if entryPoint == .businessSignup {
+                print("[BusinessSignup] appleSupabaseSignInStart=true")
+            }
             await MainActor.run {
                 clearEmailVerificationPending()
                 clearAppleAuthMessage(accountMode: accountMode, reason: "authorizationStarted")
@@ -91,7 +94,12 @@ extension MapViewModel {
                     entryPoint: entryPoint
                 )
             case .business:
-                await finishAppleBusinessSignIn(session: session, sessionEmail: sessionEmail, fullName: fullName)
+                await finishAppleBusinessSignIn(
+                    session: session,
+                    sessionEmail: sessionEmail,
+                    fullName: fullName,
+                    entryPoint: entryPoint
+                )
             }
         } catch {
             let nsError = error as NSError
@@ -145,10 +153,11 @@ extension MapViewModel {
             return
         }
 
-        if entryPoint == .fanSignup,
-           !(await appleCurrentFanProfileExists(session: session)) {
+        if !(await appleCurrentFanProfileExists(session: session)) {
+            let displayName = Self.appleDisplayName(from: fullName)
             await MainActor.run {
                 applePendingFanSignupEmail = sessionEmail
+                applePendingFanSignupDisplayName = displayName
                 currentUserAuthId = session.user.id
                 currentUserEmail = sessionEmail
                 authErrorMessage = ""
@@ -156,9 +165,9 @@ extension MapViewModel {
             print("[AppleAuthDebug] profileMissing=true")
             print("[AppleAuthDebug] enteringPendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased())")
             print("[AppleAuthDebug] routedToOnboarding=true")
-            print("[FanSignupDebug] applePendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased())")
+            print("[FanSignupDebug] applePendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased()) displayNameProvided=\(!displayName.isEmpty)")
             presentAppleAuthMessage(
-                "We found your Apple account. Finish setting up your FanGeo profile.",
+                "Signed in with Apple. Finish setting up your FanGeo profile.",
                 accountMode: .fan,
                 isError: false,
                 autoClearAfterSeconds: nil
@@ -208,7 +217,8 @@ extension MapViewModel {
     private func finishAppleBusinessSignIn(
         session: Session,
         sessionEmail: String,
-        fullName: PersonNameComponents?
+        fullName: PersonNameComponents?,
+        entryPoint: AppleAuthEntryPoint
     ) async {
         guard OwnerBusinessEmail.isValidStrict(sessionEmail) else {
             await forceLogout(reason: "appleBusinessMissingEmail", source: "MapViewModel.finishAppleBusinessSignIn")
@@ -248,6 +258,26 @@ extension MapViewModel {
                 appleAuthBusinessMessage = venueAuthErrorMessage
                 appleAuthBusinessMessageIsError = true
             }
+            return
+        }
+
+        if entryPoint == .businessSignup,
+           !(await appleCurrentBusinessProfileExists(session: session)) {
+            let businessDisplayName = Self.appleBusinessDisplayName(email: sessionEmail, fullName: fullName)
+            await MainActor.run {
+                applePendingBusinessSignupEmail = sessionEmail
+                applePendingBusinessSignupDisplayName = businessDisplayName
+                venueOwnerEmail = sessionEmail
+                currentUserAuthId = session.user.id
+                venueAuthErrorMessage = ""
+            }
+            print("[AppleAuthDebug] applePendingBusinessSignup=true email=\(sessionEmail) displayNameProvided=\(!businessDisplayName.isEmpty)")
+            presentAppleAuthMessage(
+                "Signed in with Apple. Continue setting up your business.",
+                accountMode: .business,
+                isError: false,
+                autoClearAfterSeconds: nil
+            )
             return
         }
 
@@ -406,6 +436,48 @@ extension MapViewModel {
                 return true
             }
             return true
+        } catch {
+            print("[AppleAuthDebug] authError=\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private func appleCurrentBusinessProfileExists(session: Session) async -> Bool {
+        do {
+            let rowsByUser: [BusinessRow] = try await supabase
+                .from("businesses")
+                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
+                .eq("owner_user_id", value: session.user.id)
+                .eq("admin_status", value: "active")
+                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
+                .limit(1)
+                .execute()
+                .value
+
+            if rowsByUser.first != nil {
+                print("[AppleAuthDebug] existingProfileFound=true")
+                return true
+            }
+
+            let email = OwnerBusinessEmail.normalized(session.user.email ?? "")
+            guard OwnerBusinessEmail.isValidStrict(email) else {
+                print("[AppleAuthDebug] existingProfileFound=false")
+                return false
+            }
+
+            let rowsByEmail: [BusinessRow] = try await supabase
+                .from("businesses")
+                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
+                .eq("owner_email", value: email)
+                .eq("admin_status", value: "active")
+                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
+                .limit(1)
+                .execute()
+                .value
+
+            let exists = rowsByEmail.first != nil
+            print("[AppleAuthDebug] existingProfileFound=\(exists)")
+            return exists
         } catch {
             print("[AppleAuthDebug] authError=\(error.localizedDescription)")
             return false

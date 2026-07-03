@@ -3,7 +3,6 @@ import CoreLocation
 import SwiftUI
 import MapKit
 import UIKit
-
 enum VenueGameCardDiagnostics {
     static let enabled = false
 }
@@ -881,7 +880,7 @@ struct DiscoverScreen: View {
     @State private var pickupPostCreateInviteGame: PickupGameRow?
     @State private var pickupPlaceClusterForSheet: PickupPlaceCluster?
     @State private var pendingPickupPlaceHostFromClusterDismiss: PickupPlaceRow?
-    @State private var discoverWeather: DiscoverWeather?
+    @State private var discoverWeather: DiscoverWeatherSnapshot?
     @State private var discoverWeatherRefreshTask: Task<Void, Never>?
     @State private var isDiscoverHomeCrowdToggleInFlight = false
     @State private var venuePreviewDetailEvent: SportsEvent?
@@ -2556,7 +2555,8 @@ struct DiscoverScreen: View {
                 isHomeCrowdVenue: viewModel.isHomeCrowdVenue(selectedBar.id),
                 onToggleHomeCrowd: {
                     await viewModel.toggleHomeCrowd(for: selectedBar)
-                }
+                },
+                showsVenueReportAction: viewModel.isAuthenticatedForSocialFeatures && !viewModel.isGuestDiscoverMode
             )
             .onAppear {
                 if let startedAt = venueDetailOpenStartedAt {
@@ -4671,22 +4671,26 @@ struct DiscoverScreen: View {
     @ViewBuilder
     private var discoverWeatherPill: some View {
         if let discoverWeather {
-            HStack(spacing: 6) {
-                Image(systemName: discoverWeather.symbolName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color.orange)
-                    .symbolRenderingMode(.multicolor)
-                Text("\(discoverWeather.temperature)°F")
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .discoverLightGlassCard(cornerRadius: 15, style: .weather)
-            .frame(minHeight: 44, alignment: .leading)
-            .contentShape(Rectangle())
-            .accessibilityLabel("Weather \(discoverWeather.temperature) degrees")
+            discoverWeatherTemperatureChip(discoverWeather.weather)
         }
+    }
+
+    private func discoverWeatherTemperatureChip(_ weather: DiscoverWeather) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: weather.symbolName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(Color.orange)
+                .symbolRenderingMode(.multicolor)
+            Text("\(weather.temperature)°F")
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .discoverLightGlassCard(cornerRadius: 15, style: .weather)
+        .frame(minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+        .accessibilityLabel("Weather \(weather.temperature) degrees")
     }
 
     private var discoverMapCenterCoordinate: CLLocationCoordinate2D? {
@@ -4716,17 +4720,17 @@ struct DiscoverScreen: View {
 
             discoverLogWeatherRequest(decision, mapCenter: mapCenter)
 
-            let weather = await DiscoverWeatherService.shared.weather(
+            let snapshot = await DiscoverWeatherService.shared.weather(
                 for: decision.coordinate,
                 force: force,
                 requestedBasis: decision.requestedBasisLabel
             )
             guard !Task.isCancelled else { return }
 
-            discoverLogWeatherResult(decision, mapCenter: mapCenter, weather: weather)
+            discoverLogWeatherResult(decision, mapCenter: mapCenter, snapshot: snapshot)
 
-            if let weather {
-                discoverWeather = weather
+            if let snapshot {
+                discoverWeather = snapshot
             } else {
                 discoverWeather = nil
             }
@@ -4788,12 +4792,20 @@ struct DiscoverScreen: View {
     private func discoverLogWeatherResult(
         _ decision: DiscoverWeatherCoordinateDecision,
         mapCenter: CLLocationCoordinate2D?,
-        weather: DiscoverWeather?
+        snapshot: DiscoverWeatherSnapshot?
     ) {
 #if DEBUG
         _ = mapCenter
         print("[DiscoverWeatherDebug] finalBasis=\(decision.basisLabel)")
-        print("[DiscoverWeatherDebug] temp=\(weather.map { String($0.temperature) } ?? "nil")")
+        print("[DiscoverWeatherDebug] temp=\(snapshot.map { String($0.weather.temperature) } ?? "nil")")
+        let sourceLabel: String = {
+            guard let snapshot else { return "nil" }
+            switch snapshot.source {
+            case .weatherKit: return "weatherkit"
+            case .openMeteo: return "open-meteo"
+            }
+        }()
+        print("[DiscoverWeatherDebug] source=\(sourceLabel)")
 #endif
     }
 

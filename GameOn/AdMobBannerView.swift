@@ -1,5 +1,4 @@
 import Foundation
-import AppTrackingTransparency
 import GoogleMobileAds
 import UIKit
 import UserMessagingPlatform
@@ -223,7 +222,6 @@ enum GoogleMobileAdsBootstrap {
         AdMobConfiguration.configureRequestConfiguration()
         AdDiagnostics.logStartupTestDeviceConfigurationIfNeeded()
         AdMobDiagnostics.logBootstrap()
-        AdDebugDiagnostics.logConsent("attStatus=\(AdDebugDiagnostics.currentATTStatusLabel())")
         guard FanGeoAdConsentPrePromptStore.hasAcknowledged else {
             isWaitingForPreConsentPrompt = true
             AdDebugDiagnostics.logConsent("preConsentPromptRequired=true")
@@ -263,7 +261,6 @@ enum GoogleMobileAdsBootstrap {
     private static func resolveConsentAndStartAdsIfAllowed() async {
         await updateUMPConsentInformation()
         await loadAndPresentUMPFormIfNeeded()
-        await requestATTIfAppropriate()
 
         adsCanBeRequested = ConsentInformation.shared.canRequestAds
         didFinishConsentFlow = true
@@ -304,25 +301,6 @@ enum GoogleMobileAdsBootstrap {
                     AdDebugDiagnostics.logConsent("umpFormFailed=\(error.localizedDescription)")
                 }
                 continuation.resume()
-            }
-        }
-    }
-
-    private static func requestATTIfAppropriate() async {
-        guard #available(iOS 14, *) else {
-            AdDebugDiagnostics.logConsent("attStatus=unavailable_pre_iOS14")
-            return
-        }
-        guard ATTrackingManager.trackingAuthorizationStatus == .notDetermined else {
-            AdDebugDiagnostics.logConsent("attStatus=\(AdDebugDiagnostics.currentATTStatusLabel())")
-            return
-        }
-        await withCheckedContinuation { continuation in
-            ATTrackingManager.requestTrackingAuthorization { _ in
-                Task { @MainActor in
-                    AdDebugDiagnostics.logConsent("attStatus=\(AdDebugDiagnostics.currentATTStatusLabel())")
-                    continuation.resume()
-                }
             }
         }
     }

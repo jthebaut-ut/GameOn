@@ -8,15 +8,10 @@ struct BusinessProSubscriptionView: View {
         self.businessStatus = businessStatus
     }
 
-    private static let billingComingSoonMessage = "Business Pro billing is coming soon."
-    private static let fanGeoPlusFootnote =
-        "FanGeo+ provides an ad-free experience. During the launch promotion, Business Pro accounts may still see ads unless FanGeo+ is enabled separately."
-
     private let proFeatureListItems = [
         "Unlimited venues",
         "Unlimited hosted games",
-        "Analytics access",
-        "FanGeo+ included with Paid Pro (coming soon)"
+        "Analytics access"
     ]
 
     private var regularFeatureListItems: [String] {
@@ -93,15 +88,19 @@ struct BusinessProSubscriptionView: View {
                 .foregroundStyle(FGColor.primaryText(colorScheme))
                 .fixedSize(horizontal: false, vertical: true)
 
-            Text(futureBillingText)
+            Text("Business Pro subscriptions will be available in a future update.")
                 .font(.caption.weight(.heavy))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .fixedSize(horizontal: false, vertical: true)
 
-            planFeatureList(entitlementFeatures, tint: entitlementFeatureTint)
+            planFeatureList(
+                entitlementFeatures,
+                tint: entitlementFeatureTint,
+                includeProFanGeoPlusBullet: !isCurrentBusinessRegular
+            )
 
             if !isCurrentBusinessRegular {
-                Text(Self.fanGeoPlusFootnote)
+                Text("During the launch promotion, Business Pro accounts may continue to display advertisements. FanGeo+ will be available in a future update.")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -182,7 +181,11 @@ struct BusinessProSubscriptionView: View {
         }
     }
 
-    private func planFeatureList(_ features: [String], tint: Color) -> some View {
+    private func planFeatureList(
+        _ features: [String],
+        tint: Color,
+        includeProFanGeoPlusBullet: Bool = false
+    ) -> some View {
         VStack(alignment: .leading, spacing: 11) {
             ForEach(features, id: \.self) { feature in
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -190,6 +193,18 @@ struct BusinessProSubscriptionView: View {
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(tint)
                     Text(feature)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+            }
+            if includeProFanGeoPlusBullet {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(tint)
+                    Text("FanGeo+ included with future Business Pro subscriptions")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .fixedSize(horizontal: false, vertical: true)
@@ -205,38 +220,26 @@ struct BusinessProSubscriptionView: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .fixedSize(horizontal: false, vertical: true)
-
-            Text("Business Pro billing and subscriptions will be available in a future update.")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 2)
     }
 
-    private var futureBillingText: String {
-        Self.billingComingSoonMessage
-    }
-
     private var entitlementTitle: String {
-        guard businessStatus != nil else { return "Checking plan status" }
-        if isCurrentBusinessFreePromo { return "Free User Promotion" }
-        if isCurrentBusinessSubscriptionPro { return "Business Pro Active" }
-        return "Business Regular"
+        guard let businessStatus else { return "Checking plan status" }
+        return businessStatus.businessPlanDisplayTitle
     }
 
     private var entitlementSubtitle: String {
-        guard businessStatus != nil else { return "Refreshing entitlement" }
-        if isCurrentBusinessFreePromo { return "Promotion access" }
-        if isCurrentBusinessSubscriptionPro { return "Launch Promotion" }
-        return "Free plan"
+        guard let businessStatus else { return "Refreshing entitlement" }
+        guard businessStatus.computedIsPro else { return "Free plan" }
+        return businessStatus.businessPlanDisplaySubtitle
     }
 
     private var entitlementBadge: String {
         guard businessStatus != nil else { return "CHECKING" }
         if isCurrentBusinessFreePromo { return "FREE" }
-        if isCurrentBusinessSubscriptionPro { return "ACTIVE" }
+        if isCurrentBusinessSubscriptionPro { return "PROMOTIONAL" }
         return "REGULAR"
     }
 
@@ -259,12 +262,11 @@ struct BusinessProSubscriptionView: View {
         guard businessStatus != nil else {
             return "Business Pro details are refreshing from your business account."
         }
-        if isCurrentBusinessFreePromo {
-            return businessStatus?.businessProPromoEndDateText
-                ?? "Promotion end date refreshes from your business account."
-        }
-        if isCurrentBusinessSubscriptionPro {
-            return businessStatus?.businessProSubscriptionExpiryText ?? "No scheduled expiration."
+        if businessStatus?.computedIsPro == true {
+            if let formatted = BusinessProPromoDisplay.formattedExpiry(from: businessStatus?.proExpiresAt) {
+                return "Promotion ends on \(formatted)"
+            }
+            return "Promotion end date refreshes from your business account."
         }
         return "Upgrade to Business Pro for unlimited venues and hosted games."
     }

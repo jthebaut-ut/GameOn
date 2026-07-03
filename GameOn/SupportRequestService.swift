@@ -2,14 +2,32 @@ import Foundation
 import Supabase
 
 enum SupportRequestCategory: String, CaseIterable, Identifiable {
-    case bugReport = "bug_report"
     case question = "question"
+    case bugReport = "bug_report"
     case featureRequest = "feature_request"
-    case accountIssue = "account_issue"
     case businessSupport = "business_support"
+    case accountIssue = "account_issue"
+    case reportUser = "report_user"
+    case reportVenue = "report_venue"
     case other = "other"
 
     var id: String { rawValue }
+
+    /// Maps Contact Support UI issue types to legacy `support_requests.category` / edge-function values.
+    var backendCategoryValue: String {
+        switch self {
+        case .question, .accountIssue:
+            return "account_help"
+        case .bugReport:
+            return "technical_issue"
+        case .featureRequest, .other:
+            return "billing_other"
+        case .businessSupport:
+            return "venue_support"
+        case .reportUser, .reportVenue:
+            return "report_problem"
+        }
+    }
 
     var displayTitle: String {
         switch self {
@@ -18,6 +36,8 @@ enum SupportRequestCategory: String, CaseIterable, Identifiable {
         case .featureRequest: return "Feature Request"
         case .accountIssue: return "Account Issue"
         case .businessSupport: return "Business Support"
+        case .reportUser: return "Report User"
+        case .reportVenue: return "Report Venue"
         case .other: return "Other"
         }
     }
@@ -35,6 +55,10 @@ enum SupportRequestCategory: String, CaseIterable, Identifiable {
             return "Example: I cannot sign in or reset my password."
         case .businessSupport:
             return "Example: I need help claiming or editing my venue."
+        case .reportUser:
+            return "Example: A user is harassing me or posting inappropriate content."
+        case .reportVenue:
+            return "Example: A venue listing is incorrect or needs moderation."
         case .other:
             return "Example: General feedback or anything else we can help with."
         }
@@ -142,9 +166,10 @@ struct SupportRequestService {
 
         let appVer = Self.appVersionLine()
         let appVerField: String? = appVer.isEmpty ? nil : appVer
+        let backendCategory = category.backendCategoryValue
         let row = SupportRequestRow(
             user_id: userId,
-            category: category.rawValue,
+            category: backendCategory,
             subject: sub,
             message: msg,
             app_version: appVerField
@@ -155,15 +180,18 @@ struct SupportRequestService {
                 .from("support_requests")
                 .insert(row)
                 .execute()
+#if DEBUG
+            SupportRequestDebugLog.logInsertSuccess(userId: userId)
+#endif
         } catch {
 #if DEBUG
-            print("[Support] support_requests insert skipped or failed:", error)
+            SupportRequestDebugLog.logInsertFailure(error)
 #endif
         }
 
         let ts = Self.iso.string(from: Date())
         let payload = NotifySupportRequestPayload(
-            category: category.rawValue,
+            category: backendCategory,
             subject: sub,
             message: msg,
             app_version: appVerField,
@@ -172,6 +200,8 @@ struct SupportRequestService {
 
 #if DEBUG
         print("[Support] support email queued")
+        print("[SupportRequestDebug] category ui=\(category.rawValue) backend=\(backendCategory)")
+        SupportRequestDebugLog.logEdgeFunctionInvokeStart()
 #endif
 
         do {
@@ -179,6 +209,12 @@ struct SupportRequestService {
                 "notify-support-request",
                 options: FunctionInvokeOptions(method: .post, body: payload)
             )
+#if DEBUG
+            SupportRequestDebugLog.logEdgeFunctionDecodedResponse(
+                ok: response.ok,
+                error: response.error
+            )
+#endif
             if response.ok != true {
                 if response.error == "prohibited_content" {
                     throw SupportRequestSubmitError.prohibitedContent
@@ -187,12 +223,7 @@ struct SupportRequestService {
             }
         } catch let error as FunctionsError {
 #if DEBUG
-            if case let .httpError(status, data) = error {
-                let body = String(data: data, encoding: .utf8) ?? ""
-                print("[Support] notify-support-request httpError status=\(status) body=\(body)")
-            } else {
-                print("[Support] notify-support-request FunctionsError:", error)
-            }
+            SupportRequestDebugLog.logFunctionsError(error)
 #endif
             if case let .httpError(_, data) = error,
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -201,10 +232,13 @@ struct SupportRequestService {
             }
             throw SupportRequestSubmitError.emailSendFailed
         } catch let err as SupportRequestSubmitError {
+#if DEBUG
+            SupportRequestDebugLog.logThrownError(err)
+#endif
             throw err
         } catch {
 #if DEBUG
-            print("[Support] notify-support-request failed:", error)
+            SupportRequestDebugLog.logThrownError(error)
 #endif
             throw SupportRequestSubmitError.emailSendFailed
         }
@@ -212,3 +246,100 @@ struct SupportRequestService {
         RateLimitService.recordSupportRequestSubmit(userId: userId)
     }
 }
+
+#if DEBUG
+private enum SupportRequestDebugLog {
+    private static let edgeFunctionName = "notify-support-request"
+
+    static var edgeFunctionURL: String {
+        supabaseProjectURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            + "/functions/v1/\(edgeFunctionName)"
+    }
+
+    static func logInsertSuccess(userId: UUID) {
+        print("[SupportRequestDebug] support_requests insert success userId=\(userId.uuidString.lowercased())")
+    }
+
+    static func logInsertFailure(_ error: Error) {
+        if let postgrest = error as? PostgrestError {
+            print(
+                "[SupportRequestDebug] support_requests insert failure " +
+                "code=\(postgrest.code ?? "nil") " +
+                "message=\(postgrest.message) " +
+                "detail=\(postgrest.detail ?? "nil") " +
+                "hint=\(postgrest.hint ?? "nil")"
+            )
+        } else {
+            print(
+                "[SupportRequestDebug] support_requests insert failure " +
+                "error=\(error.localizedDescription) " +
+                "type=\(String(reflecting: type(of: error))) " +
+                "full=\(String(reflecting: error))"
+            )
+        }
+    }
+
+    static func logEdgeFunctionInvokeStart() {
+        print("[SupportRequestDebug] edge function URL=\(edgeFunctionURL)")
+    }
+
+    static func logEdgeFunctionDecodedResponse(ok: Bool?, error: String?) {
+        print(
+            "[SupportRequestDebug] notify-support-request decoded response " +
+            "ok=\(ok?.description ?? "nil") " +
+            "error=\(error ?? "nil")"
+        )
+    }
+
+    static func logFunctionsError(_ error: FunctionsError) {
+        switch error {
+        case .relayError:
+            print(
+                "[SupportRequestDebug] notify-support-request FunctionsError " +
+                "localized=\(error.localizedDescription) " +
+                "full=\(String(reflecting: error))"
+            )
+        case let .httpError(status, data):
+            let body = String(data: data, encoding: .utf8) ?? "<non-utf8 body len=\(data.count)>"
+            print("[SupportRequestDebug] notify-support-request http status=\(status)")
+            print("[SupportRequestDebug] notify-support-request http response body=\(body)")
+            if let decoded = decodeNotifySupportError(from: data) {
+                print(
+                    "[SupportRequestDebug] notify-support-request decoded error field " +
+                    "ok=\(decoded.ok?.description ?? "nil") " +
+                    "error=\(decoded.error ?? "nil")"
+                )
+            }
+            print(
+                "[SupportRequestDebug] notify-support-request FunctionsError " +
+                "localized=\(error.localizedDescription) " +
+                "full=\(String(reflecting: error))"
+            )
+        @unknown default:
+            print(
+                "[SupportRequestDebug] notify-support-request FunctionsError " +
+                "localized=\(error.localizedDescription) " +
+                "full=\(String(reflecting: error))"
+            )
+        }
+    }
+
+    static func logThrownError(_ error: Error) {
+        print(
+            "[SupportRequestDebug] submitSupportRequest threw " +
+            "error=\(error.localizedDescription) " +
+            "type=\(String(reflecting: type(of: error))) " +
+            "full=\(String(reflecting: error))"
+        )
+    }
+
+    private struct NotifySupportErrorBody: Decodable {
+        let ok: Bool?
+        let error: String?
+    }
+
+    private static func decodeNotifySupportError(from data: Data) -> NotifySupportErrorBody? {
+        try? JSONDecoder().decode(NotifySupportErrorBody.self, from: data)
+    }
+}
+#endif

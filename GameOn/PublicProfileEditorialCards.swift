@@ -1620,3 +1620,106 @@ struct FanProfileUserReportSheet: View {
         }
     }
 }
+
+struct VenueReportSheet: View {
+    let venueId: UUID
+    let onDismiss: () -> Void
+    let onSubmitted: () -> Void
+
+    @State private var reportCategory: ModerationReportCategory?
+    @State private var reportDetails = ""
+    @State private var isSubmitting = false
+    @State private var errorText: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Category", selection: $reportCategory) {
+                        Text("Select category").tag(Optional<ModerationReportCategory>.none)
+                        ForEach(ModerationReportCategory.allCases) { category in
+                            Text(category.displayTitle).tag(Optional(category))
+                        }
+                    }
+                    .disabled(isSubmitting)
+                } footer: {
+                    if reportCategory == nil {
+                        Text("Choose a category to submit this report.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section {
+                    TextField("Details (optional)", text: $reportDetails, axis: .vertical)
+                        .lineLimit(3...6)
+                        .disabled(isSubmitting)
+                }
+
+                if isSubmitting {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                            Text("Submitting…")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if let errorText, !errorText.isEmpty {
+                    Section {
+                        Text(errorText)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("Report Venue")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { onDismiss() }
+                        .disabled(isSubmitting)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Submit") {
+                        Task { await submitReport() }
+                    }
+                    .disabled(isSubmitting || reportCategory == nil)
+                }
+            }
+            .interactiveDismissDisabled(isSubmitting)
+        }
+    }
+
+    private func submitReport() async {
+        guard let category = reportCategory else {
+            await MainActor.run { errorText = "Please choose a category." }
+            return
+        }
+
+        await MainActor.run {
+            isSubmitting = true
+            errorText = nil
+        }
+
+        let moderation = ModerationService()
+        let trimmedDetails = reportDetails.trimmingCharacters(in: .whitespacesAndNewlines)
+        let detailsOpt = trimmedDetails.isEmpty ? nil : trimmedDetails
+
+        do {
+            try await moderation.reportVenue(venueId: venueId, category: category, details: detailsOpt)
+            await MainActor.run {
+                isSubmitting = false
+                onSubmitted()
+            }
+        } catch {
+            ModerationService.logReportSubmitFailure(error, context: "report_venue")
+            await MainActor.run {
+                isSubmitting = false
+                errorText = ModerationService.userFacingReportSubmitError(error)
+            }
+        }
+    }
+}

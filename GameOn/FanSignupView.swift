@@ -39,6 +39,7 @@ struct FanSignupView: View {
 
     @ObservedObject var viewModel: MapViewModel
     var prefilledEmail: String = ""
+    @Binding var termsAccepted: Bool
     var onSwitchToSignIn: () -> Void
     var onDismissAfterSuccess: () -> Void
 
@@ -59,8 +60,6 @@ struct FanSignupView: View {
     @State private var showNationalTeamPicker = false
     @State private var selectedAvatarItem: PhotosPickerItem?
     @State private var pendingAvatarData: Data?
-    @State private var policiesAccepted = false
-    @State private var fanSignupLegalDocument: SettingsLegalDocumentKind?
 
     @State private var currentStep: SignupStep = .profile
     @State private var isSubmitting = false
@@ -96,8 +95,15 @@ struct FanSignupView: View {
                     VStack(spacing: 24) {
                         onboardingTopBar
 
+                        FanGeoAuthTermsAcceptanceView(isAccepted: $termsAccepted)
+
                         if currentStep == .profile {
-                            FanGeoAppleSignInButton(viewModel: viewModel, accountMode: .fan, entryPoint: .fanSignup)
+                            FanGeoAppleSignInButton(
+                                viewModel: viewModel,
+                                accountMode: .fan,
+                                entryPoint: .fanSignup,
+                                isEnabled: termsAccepted
+                            )
                                 .padding(.top, 2)
                         }
 
@@ -143,13 +149,8 @@ struct FanSignupView: View {
         .fanGeoScreenBackground()
         .onAppear {
             print("[SignupUX] render mode=create")
-            if isApplePendingProfile {
-                email = viewModel.applePendingFanSignupEmail
-                password = ""
-                confirmPassword = ""
-                return
-            }
-            if email.isEmpty, !prefilledEmail.isEmpty {
+            applyApplePendingSignupState()
+            if !isApplePendingProfile, email.isEmpty, !prefilledEmail.isEmpty {
                 email = prefilledEmail
             }
         }
@@ -193,24 +194,16 @@ struct FanSignupView: View {
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
         }
-        .sheet(item: $fanSignupLegalDocument) { document in
-            SettingsLegalDocumentSheet(document: document)
-        }
         .onChange(of: viewModel.isLoggedIn) { wasLoggedIn, isLoggedIn in
             if !wasLoggedIn && isLoggedIn && !profileRetryMode && errorMessage.isEmpty {
                 onDismissAfterSuccess()
             }
         }
-        .onChange(of: viewModel.applePendingFanSignupEmail) { _, newEmail in
-            let normalized = OwnerBusinessEmail.normalized(newEmail)
-            if !normalized.isEmpty {
-                email = normalized
-                password = ""
-                confirmPassword = ""
-                errorMessage = ""
-                emailError = ""
-                passwordError = ""
-            }
+        .onChange(of: viewModel.applePendingFanSignupEmail) { _, _ in
+            applyApplePendingSignupState()
+        }
+        .onChange(of: viewModel.applePendingFanSignupDisplayName) { _, _ in
+            applyApplePendingSignupState()
         }
         .onDisappear {
             viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "sheetClosed")
@@ -318,7 +311,9 @@ struct FanSignupView: View {
             .padding(.top, 6)
 
             VStack(spacing: 13) {
-                if !isApplePendingProfile {
+                if isApplePendingProfile {
+                    appleSignedInBanner
+                } else {
                     onboardingField(systemImage: "envelope", placeholder: "you@email.com", text: $email)
                         .keyboardType(.emailAddress)
                         .textInputAutocapitalization(.never)
@@ -336,31 +331,19 @@ struct FanSignupView: View {
                         isVisible: $showConfirmPassword
                     )
                     if !passwordError.isEmpty { fieldError(passwordError) }
-                } else {
-                    HStack(spacing: 10) {
-                        Image(systemName: "apple.logo")
-                            .font(.body.weight(.bold))
-                        Text(email.isEmpty ? "Apple email verified" : email)
-                            .font(FGTypography.body.weight(.semibold))
-                            .lineLimit(1)
-                        Spacer(minLength: 0)
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(FGColor.accentGreen)
-                    }
-                    .padding()
-                    .background(FGAdaptiveSurface.controlFill)
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }
 
-                onboardingField(systemImage: "person", placeholder: "Display name", text: $displayNameDraft)
-                    .textInputAutocapitalization(.words)
-                    .autocorrectionDisabled()
-                    .onChange(of: displayNameDraft) { _, newValue in
-                        if newValue.count > Self.displayNameMaxLength {
-                            displayNameDraft = String(newValue.prefix(Self.displayNameMaxLength))
+                if !usesAppleProvidedDisplayName {
+                    onboardingField(systemImage: "person", placeholder: "Display name", text: $displayNameDraft)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                        .onChange(of: displayNameDraft) { _, newValue in
+                            if newValue.count > Self.displayNameMaxLength {
+                                displayNameDraft = String(newValue.prefix(Self.displayNameMaxLength))
+                            }
                         }
-                    }
-                if !displayNameError.isEmpty { fieldError(displayNameError) }
+                    if !displayNameError.isEmpty { fieldError(displayNameError) }
+                }
 
                 VStack(alignment: .leading, spacing: 7) {
                     HStack(spacing: 8) {
@@ -488,8 +471,6 @@ struct FanSignupView: View {
                     .font(FGTypography.metadata.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
-
-            policiesSection
         }
         .fanGeoGlassCard()
     }
@@ -514,7 +495,7 @@ struct FanSignupView: View {
                 .shadow(color: FGColor.accentBlue.opacity(0.28), radius: 12, y: 6)
             }
             .buttonStyle(.plain)
-            .disabled(isSubmitting || (currentStep == .bio && !canSubmit))
+            .disabled(isSubmitting || (currentStep == .profile && !termsAccepted) || (currentStep == .bio && !canSubmit))
 
             if currentStep == .teams || currentStep == .country {
                 Button("Skip for now") {
@@ -753,7 +734,7 @@ struct FanSignupView: View {
             passwordError = "Passwords do not match."
             return false
         }
-        if !displayNameError.isEmpty {
+        if !displayNameError.isEmpty, !usesAppleProvidedDisplayName {
             return false
         }
         if let issue = FanGeoHandleRules.validate(handleDraft) {
@@ -787,6 +768,11 @@ struct FanSignupView: View {
             handleIsConfirmedAvailable = true
         }
 
+        if !termsAccepted {
+            errorMessage = "Accept the Terms of Use and Community Guidelines to continue."
+            return false
+        }
+
         return true
     }
 
@@ -794,20 +780,22 @@ struct FanSignupView: View {
         VStack(alignment: .leading, spacing: FGSpacing.md) {
             avatarPickerRow
 
-            labeledField(title: "Email", required: true) {
-                TextField("you@email.com", text: $email)
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.emailAddress)
-                    .autocorrectionDisabled()
-                    .font(FGTypography.body)
-                    .fanGeoInputFieldStyle()
-                    .disabled(profileRetryMode || isApplePendingProfile)
-            }
-            if !emailError.isEmpty {
-                fieldError(emailError)
-            }
+            if isApplePendingProfile {
+                appleSignedInBanner
+            } else {
+                labeledField(title: "Email", required: true) {
+                    TextField("you@email.com", text: $email)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.emailAddress)
+                        .autocorrectionDisabled()
+                        .font(FGTypography.body)
+                        .fanGeoInputFieldStyle()
+                        .disabled(profileRetryMode)
+                }
+                if !emailError.isEmpty {
+                    fieldError(emailError)
+                }
 
-            if !isApplePendingProfile {
                 labeledField(title: "Password", required: true) {
                     VStack(spacing: 10) {
                         passwordEntryField(
@@ -829,20 +817,22 @@ struct FanSignupView: View {
                 }
             }
 
-            labeledField(title: "Display name", required: true) {
-                TextField("Your name", text: $displayNameDraft)
-                    .textInputAutocapitalization(.words)
-                    .autocorrectionDisabled()
-                    .font(FGTypography.body)
-                    .fanGeoInputFieldStyle()
-                    .onChange(of: displayNameDraft) { _, newValue in
-                        if newValue.count > Self.displayNameMaxLength {
-                            displayNameDraft = String(newValue.prefix(Self.displayNameMaxLength))
+            if !usesAppleProvidedDisplayName {
+                labeledField(title: "Display name", required: true) {
+                    TextField("Your name", text: $displayNameDraft)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                        .font(FGTypography.body)
+                        .fanGeoInputFieldStyle()
+                        .onChange(of: displayNameDraft) { _, newValue in
+                            if newValue.count > Self.displayNameMaxLength {
+                                displayNameDraft = String(newValue.prefix(Self.displayNameMaxLength))
+                            }
                         }
-                    }
-            }
-            if !displayNameError.isEmpty {
-                fieldError(displayNameError)
+                }
+                if !displayNameError.isEmpty {
+                    fieldError(displayNameError)
+                }
             }
 
             labeledField(title: "@handle", required: true) {
@@ -884,10 +874,6 @@ struct FanSignupView: View {
             }
 
             favoriteTeamsRow
-
-            if !profileRetryMode {
-                policiesSection
-            }
         }
         .fanGeoGlassCard()
     }
@@ -1004,43 +990,6 @@ struct FanSignupView: View {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private var policiesSection: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Button {
-                policiesAccepted.toggle()
-            } label: {
-                Image(systemName: policiesAccepted ? "checkmark.square.fill" : "square")
-                    .font(.title3)
-                    .foregroundStyle(policiesAccepted ? FGColor.accentBlue : FGColor.mutedText(colorScheme))
-            }
-            .buttonStyle(.plain)
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 0) {
-                    Text("I agree to the ")
-                    Button { fanSignupLegalDocument = .termsOfService } label: {
-                        Text("Terms of Service").underline()
-                    }
-                    .buttonStyle(.plain)
-                    Text(", ")
-                    Button { fanSignupLegalDocument = .privacyPolicy } label: {
-                        Text("Privacy Policy").underline()
-                    }
-                    .buttonStyle(.plain)
-                    Text(", and ")
-                    Button { fanSignupLegalDocument = .communityGuidelines } label: {
-                        Text("Community Guidelines").underline()
-                    }
-                    .buttonStyle(.plain)
-                    Text(".")
-                }
-                .font(.footnote)
-                .foregroundStyle(FGColor.primaryText(colorScheme))
-                .tint(FGColor.accentBlue)
-            }
-        }
-    }
-
     private var submitButton: some View {
         FGPrimaryButton(
             title: submitButtonTitle,
@@ -1068,27 +1017,75 @@ struct FanSignupView: View {
 
     private var canSubmit: Bool {
         if profileRetryMode {
-            return profileFieldsValid && policiesAccepted
+            return profileFieldsValid && termsAccepted
         }
         if isApplePendingProfile {
             return profileFieldsValid
                 && !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && policiesAccepted
+                && termsAccepted
         }
         return profileFieldsValid
             && !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !password.isEmpty
             && !confirmPassword.isEmpty
             && password == confirmPassword
-            && policiesAccepted
+            && termsAccepted
     }
 
     private var isApplePendingProfile: Bool {
         !OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail).isEmpty
     }
 
+    private var appleProvidedDisplayName: String {
+        viewModel.applePendingFanSignupDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var usesAppleProvidedDisplayName: Bool {
+        isApplePendingProfile && !appleProvidedDisplayName.isEmpty
+    }
+
+    private var effectiveDisplayNameForSignup: String {
+        let draft = displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !draft.isEmpty { return draft }
+        if usesAppleProvidedDisplayName { return appleProvidedDisplayName }
+        return ""
+    }
+
+    private var appleSignedInBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "apple.logo")
+                .font(.body.weight(.bold))
+            Text("Signed in with Apple")
+                .font(FGTypography.body.weight(.semibold))
+            Spacer(minLength: 0)
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(FGColor.accentGreen)
+        }
+        .padding()
+        .background(FGAdaptiveSurface.controlFill)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    @MainActor
+    private func applyApplePendingSignupState() {
+        guard isApplePendingProfile else { return }
+        let normalizedEmail = OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail)
+        if !normalizedEmail.isEmpty {
+            email = normalizedEmail
+        }
+        password = ""
+        confirmPassword = ""
+        errorMessage = ""
+        emailError = ""
+        passwordError = ""
+        if usesAppleProvidedDisplayName {
+            displayNameDraft = appleProvidedDisplayName
+            displayNameError = ""
+        }
+    }
+
     private var profileFieldsValid: Bool {
-        let trimmedName = displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = effectiveDisplayNameForSignup
         return !trimmedName.isEmpty
             && trimmedName.count <= Self.displayNameMaxLength
             && FanGeoHandleRules.validate(handleDraft) == nil
@@ -1124,6 +1121,10 @@ struct FanSignupView: View {
 
     @MainActor
     private func refreshDisplayNameValidation(markTouched: Bool) {
+        if usesAppleProvidedDisplayName {
+            displayNameError = ""
+            return
+        }
         let trimmed = displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             if markTouched || !displayNameError.isEmpty {
@@ -1211,9 +1212,15 @@ struct FanSignupView: View {
             return false
         }
 
-        if !displayNameError.isEmpty {
+        if !displayNameError.isEmpty, !usesAppleProvidedDisplayName {
             print("[SignupUX] submitFailed step=validation error=displayName")
             print("[EmailConfirmDebug] formValidationFailed reason=display_name_invalid")
+            return false
+        }
+
+        if effectiveDisplayNameForSignup.isEmpty {
+            print("[SignupUX] submitFailed step=validation error=displayName")
+            print("[EmailConfirmDebug] formValidationFailed reason=display_name_required")
             return false
         }
 
@@ -1225,8 +1232,8 @@ struct FanSignupView: View {
             return false
         }
 
-        if !profileRetryMode, !policiesAccepted {
-            errorMessage = "Accept the Terms of Service, Privacy Policy, and Community Guidelines to continue."
+        if !profileRetryMode, !termsAccepted {
+            errorMessage = "Accept the Terms of Use and Community Guidelines to continue."
             print("[SignupUX] submitFailed step=validation error=policies")
             print("[EmailConfirmDebug] formValidationFailed reason=policies_required")
             return false
@@ -1238,7 +1245,7 @@ struct FanSignupView: View {
     private func buildProfileInput() -> FanSignupProfileInput {
         let bioTrimmed = bioDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         return FanSignupProfileInput(
-            displayName: displayNameDraft.trimmingCharacters(in: .whitespacesAndNewlines),
+            displayName: effectiveDisplayNameForSignup,
             handle: handleDraft,
             bio: bioTrimmed.isEmpty ? MapViewModel.defaultFanSignupBio : bioTrimmed,
             avatarData: pendingAvatarData,
@@ -1280,7 +1287,7 @@ struct FanSignupView: View {
             print("[FanSignupDebug] submitApplePendingProfile=true email=\(email)")
             let outcome = await viewModel.completeAppleFanSignupProfile(
                 profile: profile,
-                recordFanGuidelinesAcceptance: policiesAccepted
+                recordFanGuidelinesAcceptance: termsAccepted
             )
             if outcome.succeeded {
                 errorMessage = ""
@@ -1299,7 +1306,7 @@ struct FanSignupView: View {
             email: email,
             password: password,
             profile: profile,
-            recordFanGuidelinesAcceptance: policiesAccepted
+            recordFanGuidelinesAcceptance: termsAccepted
         )
 
         if outcome.succeeded, !outcome.authSucceeded {

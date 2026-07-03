@@ -6,6 +6,8 @@ struct VenueDetailView: View {
     @State private var showClaimConfirmation = false
     @State private var claimActionError: String?
     @State private var predictionClosedMessage: String?
+    @State private var showReportVenueSheet = false
+    @State private var venueReportBanner: String?
     @State private var contentRevealPhase = 1
     @State private var predictionSheet: VenueDetailPredictionSheetContext?
     @State private var selectedGameDetailID: String?
@@ -61,6 +63,8 @@ struct VenueDetailView: View {
     var showsHomeCrowdControls: Bool = false
     var isHomeCrowdVenue: Bool = false
     var onToggleHomeCrowd: (() async -> Void)? = nil
+    /// Signed-in fans can report abusive or misleading venue listings.
+    var showsVenueReportAction: Bool = false
 
     @State private var isHomeCrowdActionInFlight = false
 
@@ -268,6 +272,9 @@ struct VenueDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: FGSpacing.lg) {
+                if let venueReportBanner, !venueReportBanner.isEmpty {
+                    venueReportBannerView(venueReportBanner)
+                }
                 venueHeroSection
                 insideVenueSection
                     .progressiveAppear(isVisible: contentRevealPhase >= 2)
@@ -361,6 +368,37 @@ struct VenueDetailView: View {
         } message: {
             Text(predictionClosedMessage ?? "")
         }
+        .sheet(isPresented: $showReportVenueSheet) {
+            VenueReportSheet(
+                venueId: bar.id,
+                onDismiss: { showReportVenueSheet = false },
+                onSubmitted: {
+                    showReportVenueSheet = false
+                    venueReportBanner = "Report submitted. FanGeo moderation will review it."
+                }
+            )
+        }
+    }
+
+    private func venueReportBannerView(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 13, weight: .semibold))
+            Text(text)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .multilineTextAlignment(.leading)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(FGColor.accentGreen)
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
+                .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.14 : 0.10))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
+                .strokeBorder(FGColor.accentGreen.opacity(0.28), lineWidth: 1)
+        }
     }
 
     @MainActor
@@ -437,6 +475,30 @@ struct VenueDetailView: View {
                     .buttonStyle(.plain)
                     .opacity(showsFanOnlyActionButtons ? 1 : 0.5)
                     .progressiveAppear(isVisible: contentRevealPhase >= 2, yOffset: 4)
+
+                    if showsVenueReportAction {
+                        Menu {
+                            Button {
+                                showReportVenueSheet = true
+                            } label: {
+                                Label("Report Venue", systemImage: "flag.fill")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(FGColor.primaryText(colorScheme))
+                                .frame(width: 44, height: 44)
+                                .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.94))
+                                .clipShape(Circle())
+                                .overlay {
+                                    Circle()
+                                        .strokeBorder(FGColor.divider(colorScheme).opacity(0.72), lineWidth: 1)
+                                }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Venue options")
+                        .progressiveAppear(isVisible: contentRevealPhase >= 2, yOffset: 4)
+                    }
                 }
             }
         }

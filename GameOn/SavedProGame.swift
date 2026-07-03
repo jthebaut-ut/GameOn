@@ -1703,12 +1703,26 @@ extension MapViewModel {
             homeTeam: game.homeTeam,
             awayTeam: game.awayTeam
         )
-        let scorerName = ProGameNotificationFormatting.validGoalScorerName(
-            context.scorerName,
-            scoringTeam: scoringTeam
+        let resolution = LiveScoringEventResolver.resolve(
+            sportType: game.liveSportVisualType,
+            timelineEvents: game.timelineEvents ?? []
         )
+        let latestScoringEvent = resolution.latestEvent
+        let teamNames = [game.homeTeam, game.awayTeam]
+        let scorerName =
+            ProGameNotificationFormatting.validGoalScorerName(
+                context.scorerName,
+                scoringTeam: scoringTeam,
+                otherTeams: teamNames
+            )
+            ?? ProGameNotificationFormatting.validGoalScorerName(
+                latestScoringEvent?.scorer,
+                scoringTeam: scoringTeam,
+                otherTeams: teamNames
+            )
+        let minuteCandidate = context.minuteText ?? latestScoringEvent?.gameClock
         return ProGameNotificationFormatting.goalNotificationBody(
-            minuteText: context.minuteText,
+            minuteText: minuteCandidate,
             scorerName: scorerName,
             homeTeam: game.homeTeam,
             homeScore: game.scoreHome,

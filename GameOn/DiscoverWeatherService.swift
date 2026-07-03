@@ -9,22 +9,34 @@ struct DiscoverWeather: Equatable {
     let symbolName: String
 }
 
-/// Lightweight cached weather for the Discover map pill (WeatherKit → Open-Meteo fallback).
+enum DiscoverWeatherDataSource: Equatable {
+    case weatherKit
+    case openMeteo
+}
+
+struct DiscoverWeatherSnapshot: Equatable {
+    let weather: DiscoverWeather
+    let source: DiscoverWeatherDataSource
+}
+
+/// Lightweight cached weather for the Discover map pill (Open-Meteo; WeatherKit optional via flag).
 @MainActor
 final class DiscoverWeatherService {
     static let shared = DiscoverWeatherService()
 
+    /// Re-enable when Apple-side WeatherKit JWT auth is resolved.
+    private let useWeatherKit = false
+
     private struct CacheEntry {
         let coordinate: CLLocationCoordinate2D
-        let weather: DiscoverWeather
+        let snapshot: DiscoverWeatherSnapshot
         let fetchedAt: Date
-        let sourceLabel: String
         let locationLabel: String
     }
 
     private var cache: CacheEntry?
     private var inFlightCoordinate: CLLocationCoordinate2D?
-    private var inFlightTask: Task<DiscoverWeather?, Never>?
+    private var inFlightTask: Task<DiscoverWeatherSnapshot?, Never>?
 
     /// 20 minutes — within the requested 15–30 minute window.
     private let cacheTTL: TimeInterval = 20 * 60
@@ -37,19 +49,19 @@ final class DiscoverWeatherService {
         for coordinate: CLLocationCoordinate2D,
         force: Bool = false,
         requestedBasis: String = "unknown"
-    ) async -> DiscoverWeather? {
+    ) async -> DiscoverWeatherSnapshot? {
         let rounded = Self.roundedCoordinate(coordinate)
 
         if !force, let cached = cache, !shouldRefresh(for: rounded, entry: cached) {
             logDebug(
                 requestedBasis: requestedBasis,
-                source: cached.sourceLabel,
+                source: Self.sourceLabel(for: cached.snapshot.source),
                 location: cached.locationLabel,
-                temp: cached.weather.temperature,
+                temp: cached.snapshot.weather.temperature,
                 cacheHit: true,
                 finalBasis: requestedBasis
             )
-            return cached.weather
+            return cached.snapshot
         }
 
         if let inFlightCoordinate,
@@ -58,7 +70,7 @@ final class DiscoverWeatherService {
             return await inFlightTask.value
         }
 
-        let task = Task { @MainActor () -> DiscoverWeather? in
+        let task = Task { @MainActor () -> DiscoverWeatherSnapshot? in
             await fetchAndCache(for: rounded, requestedBasis: requestedBasis)
         }
         inFlightCoordinate = rounded
@@ -69,24 +81,30 @@ final class DiscoverWeatherService {
         return result
     }
 
-    private func fetchAndCache(for coordinate: CLLocationCoordinate2D, requestedBasis: String) async -> DiscoverWeather? {
+    private func fetchAndCache(for coordinate: CLLocationCoordinate2D, requestedBasis: String) async -> DiscoverWeatherSnapshot? {
         let locationLabel = Self.coordinateLabel(coordinate)
 
-        if let kit = await fetchWeatherKit(coordinate: coordinate) {
-            storeCache(coordinate: coordinate, weather: kit, source: "weatherkit", location: locationLabel)
-            logDebug(
-                requestedBasis: requestedBasis,
-                source: "weatherkit",
-                location: locationLabel,
-                temp: kit.temperature,
-                cacheHit: false,
-                finalBasis: requestedBasis
-            )
-            return kit
+        if useWeatherKit {
+            #if canImport(WeatherKit)
+            if let kit = await fetchWeatherKit(coordinate: coordinate) {
+                let snapshot = DiscoverWeatherSnapshot(weather: kit, source: .weatherKit)
+                storeCache(coordinate: coordinate, snapshot: snapshot, location: locationLabel)
+                logDebug(
+                    requestedBasis: requestedBasis,
+                    source: "weatherkit",
+                    location: locationLabel,
+                    temp: kit.temperature,
+                    cacheHit: false,
+                    finalBasis: requestedBasis
+                )
+                return snapshot
+            }
+            #endif
         }
 
         if let meteo = await fetchOpenMeteo(coordinate: coordinate) {
-            storeCache(coordinate: coordinate, weather: meteo, source: "open-meteo", location: locationLabel)
+            let snapshot = DiscoverWeatherSnapshot(weather: meteo, source: .openMeteo)
+            storeCache(coordinate: coordinate, snapshot: snapshot, location: locationLabel)
             logDebug(
                 requestedBasis: requestedBasis,
                 source: "open-meteo",
@@ -95,7 +113,7 @@ final class DiscoverWeatherService {
                 cacheHit: false,
                 finalBasis: requestedBasis
             )
-            return meteo
+            return snapshot
         }
 
         logDebug(
@@ -106,7 +124,7 @@ final class DiscoverWeatherService {
             cacheHit: false,
             finalBasis: requestedBasis
         )
-        return cache?.weather
+        return cache?.snapshot
     }
 
     private func shouldRefresh(for coordinate: CLLocationCoordinate2D, entry: CacheEntry) -> Bool {
@@ -120,23 +138,31 @@ final class DiscoverWeatherService {
 
     private func storeCache(
         coordinate: CLLocationCoordinate2D,
-        weather: DiscoverWeather,
-        source: String,
+        snapshot: DiscoverWeatherSnapshot,
         location: String
     ) {
         cache = CacheEntry(
             coordinate: coordinate,
-            weather: weather,
+            snapshot: snapshot,
             fetchedAt: Date(),
-            sourceLabel: source,
             locationLabel: location
         )
     }
 
+    private static func sourceLabel(for source: DiscoverWeatherDataSource) -> String {
+        switch source {
+        case .weatherKit:
+            return "weatherkit"
+        case .openMeteo:
+            return "open-meteo"
+        }
+    }
+
     #if canImport(WeatherKit)
     private func fetchWeatherKit(coordinate: CLLocationCoordinate2D) async -> DiscoverWeather? {
+        let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+
         do {
-            let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
             let weather = try await WeatherService.shared.weather(for: location)
             let current = weather.currentWeather
             let fahrenheit = Int(current.temperature.converted(to: .fahrenheit).value.rounded())
@@ -144,14 +170,10 @@ final class DiscoverWeatherService {
             return DiscoverWeather(temperature: fahrenheit, symbolName: symbol)
         } catch {
 #if DEBUG
-            print("[DiscoverWeatherDebug] weatherkitError=\(error.localizedDescription)")
+            print("[DiscoverWeatherDebug] weatherKitError=\(error.localizedDescription)")
 #endif
             return nil
         }
-    }
-    #else
-    private func fetchWeatherKit(coordinate: CLLocationCoordinate2D) async -> DiscoverWeather? {
-        nil
     }
     #endif
 

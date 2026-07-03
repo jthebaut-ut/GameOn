@@ -124,6 +124,8 @@ struct ProfileIdentityCard: View {
     @AppStorage("profileSponsoredPlacement.lastVenueId") private var lastSponsoredProfileVenueIDRaw = ""
     @AppStorage("profileSponsoredPlacement.lastPlacementId") private var lastSponsoredProfilePlacementIDRaw = ""
     @AppStorage("profileSponsoredPlacement.repeatCount") private var sponsoredProfileVenueRepeatCount = 0
+    @State private var profileBelowFoldSectionsReady = false
+    @State private var lastIncomingPokesFingerprint = ""
 
     private static let bioCharacterLimit = 160
     private static let incomingPokesHighlightsLimit = 50
@@ -397,7 +399,7 @@ struct ProfileIdentityCard: View {
                     heroBlock
                 }
 
-                if canShowOwnerPokesHighlights {
+                if profileBelowFoldSectionsReady, canShowOwnerPokesHighlights {
                     profileSectionContainer(.utility) {
                         pokesHighlightsSection
                     }
@@ -415,13 +417,13 @@ struct ProfileIdentityCard: View {
                     openToPreviewSection
                 }
 
-                if canShowSuggestedFans {
+                if profileBelowFoldSectionsReady, canShowSuggestedFans {
                     profileSectionContainer(.secondary, accent: [FGColor.accentBlue, Self.profileTealAccent]) {
                         suggestedFansSection
                     }
                 }
 
-                if let slot = sponsoredProfileSlotContent {
+                if profileBelowFoldSectionsReady, let slot = sponsoredProfileSlotContent {
                     profileSectionContainer(.secondary, accent: [FGColor.accentGreen]) {
                         sponsoredProfileSlotView(slot)
                             .id(slot.stableIdentity)
@@ -434,9 +436,11 @@ struct ProfileIdentityCard: View {
             .background(cardShellBackground)
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
             .overlay(cardBorder)
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.07), radius: 22, y: 12)
-            .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.035 : 0.055), radius: 18, y: 3)
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.06), radius: 14, y: 8)
             .onAppear {
+#if DEBUG
+                print("[SettingsPerf] profileIdentityCard appear isAccountTabActive=\(isAccountTabActive)")
+#endif
                 print("[SponsoredPlacementDebug] profileIdentityCardAppeared=true isAccountTabActive=\(isAccountTabActive)")
 #if DEBUG
                 print("[FanUpdatesStoreMigrationDebug] ProfileIdentityReadsStore=true")
@@ -449,12 +453,17 @@ struct ProfileIdentityCard: View {
                 DebugLogGate.debug("[PokesConsolidation] propsUIRemoved")
                 DebugLogGate.debug("[PokesConsolidation] primarySocialSurface=pokes")
                 FanReputationEngine.log(reputation)
-                refreshSponsoredProfilePlacement(reason: "profileAppear")
+                scheduleProfileBelowFoldSectionsIfNeeded()
             }
             .onChange(of: viewModel.currentUserBio) { _, newValue in
 #if DEBUG
                 print("[ProfileBioDebug] identityCardDisplayedBio=\(newValue.trimmingCharacters(in: .whitespacesAndNewlines))")
 #endif
+            }
+            .onChange(of: isAccountTabActive) { _, isActive in
+                if isActive {
+                    scheduleProfileBelowFoldSectionsIfNeeded()
+                }
             }
             .sheet(isPresented: $showHandleSetup) {
                 FanGeoIdentitySetupView(viewModel: viewModel, mode: .handleOnly)
@@ -1205,6 +1214,19 @@ struct ProfileIdentityCard: View {
         await loadIncomingPokes(ignoreCache: forceRefresh, reason: reason)
     }
 
+    @MainActor
+    private func scheduleProfileBelowFoldSectionsIfNeeded() {
+        guard isAccountTabActive, !profileBelowFoldSectionsReady else { return }
+        Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled, isAccountTabActive else { return }
+            profileBelowFoldSectionsReady = true
+#if DEBUG
+            print("[SettingsPerf] profileBelowFoldSections rendered")
+#endif
+        }
+    }
+
     /// Clears tab/avatar/card unseen state after the Pokes card has loaded on Account (not on tab select alone).
     private func acknowledgePokesCardAfterSuccessfulLoad() {
         guard isAccountTabActive, viewModel.hasUnseenPokes else { return }
@@ -1244,13 +1266,23 @@ struct ProfileIdentityCard: View {
 
         do {
             let items = try await profilePokesService.fetchMyIncomingPokes(limit: Self.incomingPokesHighlightsLimit)
+            let fingerprint = items.map(\.id.uuidString).joined(separator: "|")
 
             await MainActor.run {
+                if fingerprint == lastIncomingPokesFingerprint,
+                   incomingPokeTotalCount == items.count {
+                    isLoadingIncomingPokes = false
+                    acknowledgePokesCardAfterSuccessfulLoad()
+                    return
+                }
+                lastIncomingPokesFingerprint = fingerprint
                 incomingPokes = items
                 incomingPokeTotalCount = items.count
                 incomingPokesMessage = nil
                 isLoadingIncomingPokes = false
-                ProfilePhase1PersonalizationCache.incomingPokesLoadedAtByAuthId[authId] = Date()
+                if let authId = viewModel.currentUserAuthId {
+                    ProfilePhase1PersonalizationCache.incomingPokesLoadedAtByAuthId[authId] = Date()
+                }
                 viewModel.applyIncomingPokesFetch(items)
                 acknowledgePokesCardAfterSuccessfulLoad()
             }

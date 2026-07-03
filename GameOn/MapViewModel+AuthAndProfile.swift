@@ -884,6 +884,9 @@ extension MapViewModel {
         passwordResetUpdateMessage = ""
         passwordResetUpdateError = ""
         applePendingFanSignupEmail = ""
+        applePendingFanSignupDisplayName = ""
+        applePendingBusinessSignupEmail = ""
+        applePendingBusinessSignupDisplayName = ""
         appleAuthFanMessage = ""
         appleAuthFanMessageIsError = false
         appleAuthBusinessMessage = ""

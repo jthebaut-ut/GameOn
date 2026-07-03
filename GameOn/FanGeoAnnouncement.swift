@@ -220,6 +220,19 @@ struct FanGeoAnnouncement: Identifiable, Equatable, Sendable {
         return nil
     }
 
+    static func debugDateString(_ date: Date?) -> String {
+        guard let date else { return "nil" }
+        return debugDateFormatter.string(from: date)
+    }
+
+    private static let debugDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+        return formatter
+    }()
+
 #if DEBUG
     static func logDiscoverAnnouncementEvaluation(
         row: FanGeoAnnouncement,
@@ -254,19 +267,6 @@ struct FanGeoAnnouncement: Identifiable, Equatable, Sendable {
             "sponsored=\(row.isSponsoredDiscoverPromotion)"
         )
     }
-
-    static func debugDateString(_ date: Date?) -> String {
-        guard let date else { return "nil" }
-        return debugDateFormatter.string(from: date)
-    }
-
-    private static let debugDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
-        return formatter
-    }()
 #endif
 }
 
@@ -484,11 +484,16 @@ enum FanGeoAnnouncementGeoMatcher {
     }
 }
 
-// MARK: - Dismiss persistence (24 hours)
+// MARK: - Persistent announcement dismissal (until dismiss_version changes)
 
+/// Tracks per-device Discover banner dismissals in UserDefaults.
+/// Dismissed announcements remain hidden until the announcement's dismiss_version changes
+/// (for example, when the admin uses Push Again).
 enum FanGeoAnnouncementDismissStore {
+    /// Legacy key prefix retained for backward compatibility: `fangeo.announcement.dismissed.until.{id}.v{version}`.
     private static let keyPrefix = "fangeo.announcement.dismissed.until."
-    private static let dismissDuration: TimeInterval = 24 * 60 * 60
+    /// Permanent sentinel stored for each dismissed `(id, dismiss_version)` pair.
+    private static let dismissedSentinel: Double = 1.0
 
     static func dismissStorageKey(for announcement: FanGeoAnnouncement) -> String {
         storageKey(for: announcement.id, dismissVersion: announcement.dismissVersion)
@@ -499,21 +504,21 @@ enum FanGeoAnnouncementDismissStore {
     }
 
     static func isDismissed(id: UUID, dismissVersion: Int, now: Date = Date()) -> Bool {
-        let until = UserDefaults.standard.double(forKey: storageKey(for: id, dismissVersion: dismissVersion))
-        guard until > 0 else { return false }
-        return now.timeIntervalSince1970 < until
+        // Any stored value for this id/version means the user dismissed it; no time-based expiry.
+        UserDefaults.standard.double(forKey: storageKey(for: id, dismissVersion: dismissVersion)) > 0
     }
 
     static func dismiss(_ announcement: FanGeoAnnouncement, now: Date = Date()) {
-        dismiss(id: announcement.id, dismissVersion: announcement.dismissVersion, now: now)
+        dismiss(id: announcement.id, dismissVersion: announcement.dismissVersion)
     }
 
-    static func dismiss(id: UUID, dismissVersion: Int, now: Date = Date()) {
-        let until = now.timeIntervalSince1970 + dismissDuration
-        UserDefaults.standard.set(until, forKey: storageKey(for: id, dismissVersion: dismissVersion))
+    static func dismiss(id: UUID, dismissVersion: Int) {
+        // Persists until dismiss_version changes; a new version uses a separate UserDefaults key.
+        UserDefaults.standard.set(dismissedSentinel, forKey: storageKey(for: id, dismissVersion: dismissVersion))
     }
 
     private static func storageKey(for id: UUID, dismissVersion: Int) -> String {
+        // Key shape: fangeo.announcement.dismissed.until.{id}.v{version}
         let version = max(1, dismissVersion)
         return keyPrefix + id.uuidString.lowercased() + ".v\(version)"
     }

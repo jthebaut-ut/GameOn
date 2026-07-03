@@ -21,17 +21,20 @@ enum BusinessCreationFormValidation {
         phoneLocal: String,
         description: String,
         proofNote: String,
-        coverPhotoData: Data?
+        coverPhotoData: Data?,
+        skipEmailPasswordAuthFields: Bool = false
     ) -> String? {
         guard isRegisterMode else { return nil }
 
-        let email = OwnerBusinessEmail.normalized(venueOwnerEmail)
-        guard email.contains("@") else {
-            return email.isEmpty ? "Business email missing" : "Enter a valid business email"
-        }
+        if !skipEmailPasswordAuthFields {
+            let email = OwnerBusinessEmail.normalized(venueOwnerEmail)
+            guard email.contains("@") else {
+                return email.isEmpty ? "Business email missing" : "Enter a valid business email"
+            }
 
-        if venuePassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return "Password missing"
+            if venuePassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "Password missing"
+            }
         }
 
         let biz = businessName.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -32,6 +32,7 @@ enum AppleAuthAccountMode: String {
 enum AppleAuthEntryPoint: String {
     case signIn
     case fanSignup
+    case businessSignup
 }
 
 /// Central `@MainActor` observable object: map camera and selection, venue and schedule data, Supabase auth, venue-owner tools, favorites, and social (interests, comments, vibes).
@@ -221,6 +222,9 @@ final class MapViewModel: ObservableObject {
     @Published var appleAuthBusinessMessage = ""
     @Published var appleAuthBusinessMessageIsError = false
     @Published var applePendingFanSignupEmail = ""
+    @Published var applePendingFanSignupDisplayName = ""
+    @Published var applePendingBusinessSignupEmail = ""
+    @Published var applePendingBusinessSignupDisplayName = ""
     var appleAuthFanMessageAutoClearTask: Task<Void, Never>?
     var appleAuthBusinessMessageAutoClearTask: Task<Void, Never>?
     /// Set after a fan/user password-reset email is requested (`MapViewModel+AuthAndProfile`).
@@ -719,6 +723,7 @@ final class MapViewModel: ObservableObject {
     @Published var requestedMainTabRaw: String?
     /// Pro game reminder notification tap → Going tab / Pro Games / match detail.
     @Published var pendingProGameNotificationDeepLink: ProGameNotificationDeepLinkRequest?
+    @Published var pendingSupportReplyNotificationDeepLink: SupportReplyNotificationDeepLinkRequest?
     /// Eligible Discover banner announcements for carousel presentation (sorted).
     @Published var discoverBannerAnnouncements: [FanGeoAnnouncement] = []
     /// Resolved promoted venues for sponsored announcement cards (outside current map bounds).
@@ -1108,4 +1113,8 @@ final class MapViewModel: ObservableObject {
     var venueGameCalendarDotDatesCache: [String: (dates: Set<Date>, fetchedAt: Date)] = [:]
     var pickupGameCalendarDotDatesCache: [String: (dates: Set<Date>, fetchedAt: Date)] = [:]
     var proGameCalendarDotDatesCache: [String: (dates: Set<Date>, fetchedAt: Date)] = [:]
+    /// Last Discover map bounds bucket used for venue calendar dots (see ``discoverBoundsBucketString()``).
+    var lastVenueCalendarDotBoundsBucket: String?
+    /// Debounced refresh of Discover venue calendar dots after map viewport / bar set changes.
+    var discoverVenueCalendarDotPreloadTask: Task<Void, Never>?
 }

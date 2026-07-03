@@ -294,6 +294,93 @@ nonisolated enum VenueGameExpiration {
     }
 }
 
+// Completed games stay visible in Going for 48 hours, then move out of the active Going view.
+nonisolated enum GoingTabCompletedGameVisibility {
+    static let postCompletionVisibilityHours = 48
+    private static let postCompletionVisibilityInterval: TimeInterval = TimeInterval(48 * 60 * 60)
+
+    static func isVisibleInGoingTab(completedAt: Date?, isCompleted: Bool, now: Date = Date()) -> Bool {
+        guard isCompleted else { return true }
+        guard let completedAt else { return true }
+        return now < completedAt.addingTimeInterval(postCompletionVisibilityInterval)
+    }
+
+    static func isProGameVisibleInGoingTab(_ game: SavedProGame, now: Date = Date()) -> Bool {
+        guard game.isFinal else { return true }
+        return isVisibleInGoingTab(
+            completedAt: inferredProGameCompletedAt(game),
+            isCompleted: true,
+            now: now
+        )
+    }
+
+    static func isVenueGameVisibleInGoingTab(row: VenueEventRow, now: Date = Date()) -> Bool {
+        guard VenueGameExpiration.isWatchingCompleted(row: row, now: now) else { return true }
+        return isVisibleInGoingTab(
+            completedAt: VenueGameExpiration.purgeAfterDate(for: row, now: now),
+            isCompleted: true,
+            now: now
+        )
+    }
+
+    static func isPickupGameCompleted(_ row: PickupGameRow, now: Date = Date()) -> Bool {
+        let status = row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if status == "removed" { return true }
+        if let end = PickupGameModels.endDate(for: row), now >= end { return true }
+        return false
+    }
+
+    static func isPickupGameVisibleInGoingTab(row: PickupGameRow, now: Date = Date()) -> Bool {
+        guard isPickupGameCompleted(row, now: now) else { return true }
+        return isVisibleInGoingTab(
+            completedAt: inferredPickupGameCompletedAt(row, now: now),
+            isCompleted: true,
+            now: now
+        )
+    }
+
+    private static func inferredProGameCompletedAt(_ game: SavedProGame) -> Date? {
+        guard game.isFinal else { return nil }
+        if let minute = game.minute, minute > 0 {
+            return game.startTime.addingTimeInterval(TimeInterval(minute * 60))
+        }
+        return game.startTime.addingTimeInterval(typicalProMatchDuration(for: game.liveSportVisualType))
+    }
+
+    private static func inferredPickupGameCompletedAt(_ row: PickupGameRow, now: Date) -> Date? {
+        let status = row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if status == "removed" {
+            if let updated = row.updated_at.flatMap({ PickupGameModels.parseSupabaseTimestamptz($0) }) {
+                return updated
+            }
+            if let removeAfter = row.remove_after_at.flatMap({ PickupGameModels.parseSupabaseTimestamptz($0) }) {
+                return removeAfter
+            }
+        }
+        if let end = PickupGameModels.endDate(for: row), now >= end {
+            return end
+        }
+        return nil
+    }
+
+    private static func typicalProMatchDuration(for sport: LiveSportVisualType) -> TimeInterval {
+        switch sport {
+        case .soccer:
+            return 105 * 60
+        case .hockey:
+            return 3 * 3600
+        case .basketball:
+            return 2.5 * 3600
+        case .baseball:
+            return 3.5 * 3600
+        case .nfl:
+            return 3.5 * 3600
+        default:
+            return 2 * 3600
+        }
+    }
+}
+
 /// Row from `public.businesses` (multi-venue owner Phase B1).
 struct BusinessRow: Decodable, Equatable, Identifiable {
     let id: UUID

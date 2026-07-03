@@ -54,6 +54,7 @@ struct ProGameScoreboardStyle: Equatable {
     var teamNameSpacing: CGFloat = 4
     var teamScoreGap: CGFloat = 10
     var sectionSpacing: CGFloat = 6
+    var showsTeamEmblems: Bool = true
 }
 
 enum ProGameScoreboardStatusHeader: Equatable {
@@ -135,7 +136,9 @@ struct ProGameScoreboardView: View {
 
     private func teamSideCluster(identity: ProGameTeamScoreIdentity) -> some View {
         HStack(spacing: style.teamNameSpacing) {
-            inlineTeamEmblem(identity, size: style.emblemSize)
+            if style.showsTeamEmblems {
+                inlineTeamEmblem(identity, size: style.emblemSize)
+            }
 
             Text(identity.displayName)
                 .font(style.teamNameFont)

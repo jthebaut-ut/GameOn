@@ -89,6 +89,11 @@ enum SettingsLegalDocumentKind: String, Identifiable, Hashable {
                 .init(heading: "Overview", body: """
                 These Terms of Service govern your use of FanGeo. By using the app, creating an account, posting content, sending messages, submitting reports, claiming a venue, or managing a business listing, you agree to follow these terms.
                 """),
+                .init(heading: "Community Standards and Acceptable Use", body: """
+                FanGeo has zero tolerance for objectionable content or abusive users. Users may not post, upload, send, or share content that includes harassment, hate speech, threats, bullying, sexual exploitation, illegal content, spam, impersonation, abusive behavior, or other objectionable material.
+
+                Users may report objectionable content or abusive users in the app. FanGeo may remove content, restrict access, suspend accounts, or permanently terminate accounts that violate these Terms or Community Guidelines.
+                """),
                 .init(heading: "Acceptable use", body: """
                 Use FanGeo only for lawful, personal, and legitimate business-listing purposes. Do not misuse the service, spam, scrape, crawl, harvest data, manipulate attendance or ratings, interfere with app security, bypass access controls, or attempt to access accounts, messages, reports, admin tools, venue tools, or data you are not authorized to use.
                 """),
@@ -253,6 +258,76 @@ struct SettingsLegalDocumentSheet: View {
             return document.title
         default:
             return document.title
+        }
+    }
+}
+
+// MARK: - Auth terms acceptance (App Review / UGC compliance)
+
+struct FanGeoAuthTermsAcceptanceView: View {
+    @Binding var isAccepted: Bool
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @State private var presentedDocument: SettingsLegalDocumentKind?
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Button {
+                isAccepted.toggle()
+            } label: {
+                Image(systemName: isAccepted ? "checkmark.square.fill" : "square")
+                    .font(.title2)
+                    .foregroundStyle(isAccepted ? FGColor.accentBlue : FGColor.mutedText(colorScheme))
+                    .frame(width: 28, height: 28, alignment: .top)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Accept Terms of Use and Community Guidelines")
+            .accessibilityAddTraits(isAccepted ? .isSelected : [])
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("By creating an account or signing in, you agree to the FanGeo Terms of Use and Community Guidelines.")
+                    .font(.footnote)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 18) {
+                    Button {
+                        presentedDocument = .termsOfService
+                    } label: {
+                        Text("Terms of Use")
+                            .font(.footnote.weight(.semibold))
+                            .underline()
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        presentedDocument = .communityGuidelines
+                    } label: {
+                        Text(L10n.t("community_guidelines", languageCode: appLanguageRaw))
+                            .font(.footnote.weight(.semibold))
+                            .underline()
+                    }
+                    .buttonStyle(.plain)
+                }
+                .foregroundStyle(FGColor.accentBlue)
+
+                Text("FanGeo has zero tolerance for harassment, hate speech, threats, illegal content, abusive behavior, or other objectionable content. Accounts violating these rules may be suspended or permanently removed.")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(FGSpacing.md)
+        .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.76 : 0.97))
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
+                .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .sheet(item: $presentedDocument) { document in
+            SettingsLegalDocumentSheet(document: document)
         }
     }
 }

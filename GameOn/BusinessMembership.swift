@@ -128,15 +128,16 @@ struct BusinessVenueGamePostingStatus: Equatable {
     }
     var isBusinessProPromo: Bool {
         guard computedIsPro else { return false }
-        let source = normalizedEntitlementSource
-        if source == "subscription_pro" || source == "pro_paid" { return false }
-        if source == "free_user_promo" || source == "global_business_pro" || source == "admin_pro_promo" { return true }
-        return source.isEmpty && planType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "pro_promo"
+        return !isBusinessSubscriptionPro
     }
     var isBusinessSubscriptionPro: Bool {
         guard computedIsPro else { return false }
         let source = normalizedEntitlementSource
-        return source == "subscription_pro" || source == "pro_paid" || !isBusinessProPromo
+        let plan = planType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return source == "subscription_pro"
+            || source == "pro_paid"
+            || plan == "subscription_pro"
+            || plan == "pro_paid"
     }
 
     /// Paid/subscription Pro that grants business FanGeo+ (excludes launch promo / `pro_promo`).
@@ -153,15 +154,33 @@ struct BusinessVenueGamePostingStatus: Equatable {
         let source = status.normalizedEntitlementSource
         return source == "pro_paid" || source == "subscription_pro"
     }
+    static let launchPromoComplimentaryAccessSubtitle = "Launch Promotion (Complimentary Access)"
+
+    /// Set to `true` only after StoreKit-verified Apple IAP Business Pro subscriptions ship.
+    static let useAppleSubscriptionPlanDisplay = false
+
     var businessPlanDisplayTitle: String {
-        if isBusinessProPromo { return "Free User Promotion" }
-        if isBusinessSubscriptionPro { return "Business Pro Active" }
-        return "Business Regular"
+        guard computedIsPro else { return "Business Regular" }
+        if Self.useAppleSubscriptionPlanDisplay, isBusinessSubscriptionPro {
+            return "Business Pro Active"
+        }
+        return "Business Pro"
     }
+
     var businessPlanDisplaySubtitle: String {
-        if isBusinessProPromo { return "Promotion access" }
-        if isBusinessSubscriptionPro { return "Launch Promotion" }
-        return normalizedPlanStatusForDisplay
+        guard computedIsPro else { return normalizedPlanStatusForDisplay }
+        if Self.useAppleSubscriptionPlanDisplay, isBusinessSubscriptionPro {
+            var parts = ["Apple Subscription"]
+            if let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) {
+                parts.append("Expires \(formatted)")
+            }
+            return parts.joined(separator: " • ")
+        }
+        var parts = [Self.launchPromoComplimentaryAccessSubtitle]
+        if let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) {
+            parts.append("Expires \(formatted)")
+        }
+        return parts.joined(separator: " • ")
     }
     var businessProPromoIncludedThroughText: String? {
         guard isBusinessProPromo else { return nil }
@@ -332,11 +351,11 @@ struct BusinessVenueGamePostingStatus: Equatable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
         let isPromo = normalizedBusinessProActive
-            && (
-                entitlementSource == "free_user_promo"
-                || entitlementSource == "global_business_pro"
-                || entitlementSource == "admin_pro_promo"
-                || (entitlementSource.isEmpty && planType == "pro_promo")
+            && !(
+                entitlementSource == "subscription_pro"
+                || entitlementSource == "pro_paid"
+                || planType == "subscription_pro"
+                || planType == "pro_paid"
             )
         let venueCount = activeVenueCount ?? entitlement.venues_used
         let legacyHostedGameCount = entitlement.hosted_games_this_month

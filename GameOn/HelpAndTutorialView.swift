@@ -174,8 +174,8 @@ struct HelpAndTutorialView: View {
                     onContactSupport()
                 } label: {
                     helpRow(
-                        title: "Contact Support",
-                        subtitle: "Questions, feedback, or technical issues.",
+                        title: "Support Center",
+                        subtitle: "Tickets, reports, and help.",
                         systemImage: "envelope.fill",
                         tint: FGColor.accentBlue
                     )
@@ -185,7 +185,7 @@ struct HelpAndTutorialView: View {
             .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
             .listRowBackground(Color.clear)
         } header: {
-            helpSectionHeader("✉️ Contact Support")
+            helpSectionHeader("✉️ Support Center")
         }
     }
 

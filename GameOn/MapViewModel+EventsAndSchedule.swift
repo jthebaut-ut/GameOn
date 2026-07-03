@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 
 extension MapViewModel {
@@ -227,7 +228,8 @@ extension MapViewModel {
         let m = cal.component(.month, from: selectedDay)
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let pd = pickupDiscoverCalendarDayPublicFingerprint(selectedDay: selectedDay, searchQuery: q, filter: filter)
-        return "\(y)-\(m)|\(Int(day.timeIntervalSince1970))|\(selectedSport)|\(calendarUsesVisibleMapRegionOnly)|\(scheduleDataGeneration)|ctf:\(filter.rawValue)|q:\(q)|pd:\(pd)"
+        let viewportScope = filter == .venueGames ? calendarTabMapViewportScopeFingerprint() : 0
+        return "\(y)-\(m)|\(Int(day.timeIntervalSince1970))|\(selectedSport)|\(calendarUsesVisibleMapRegionOnly)|\(scheduleDataGeneration)|ctf:\(filter.rawValue)|q:\(q)|pd:\(pd)|vps:\(viewportScope)"
     }
 
     /// Fingerprint for **public** pickup rows shown on Calendar (Discover map list only; ignores personal join-request caches).
@@ -403,17 +405,70 @@ extension MapViewModel {
         return f
     }()
 
+    /// Schedule > Venues: map-viewport scope only (``mapVisibleBars`` or ``bars``), mirroring Discover calendar dots.
+    private func calendarTabMapViewportVenueScope() -> (ids: Set<UUID>, loweredNames: Set<String>) {
+        let basis = mapVisibleBars.isEmpty ? bars : mapVisibleBars
+        guard !basis.isEmpty else { return ([], []) }
+        var ids = Set<UUID>()
+        var loweredNames = Set<String>()
+        ids.reserveCapacity(basis.count)
+        loweredNames.reserveCapacity(basis.count)
+        for bar in basis {
+            ids.insert(bar.id)
+            let name = bar.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty {
+                loweredNames.insert(name.lowercased())
+            }
+        }
+        return (ids, loweredNames)
+    }
+
+    private func calendarTabMapViewportScopeFingerprint() -> Int {
+        let scope = calendarTabMapViewportVenueScope()
+        var hasher = Hasher()
+        hasher.combine(scope.ids.count)
+        hasher.combine(scope.loweredNames.count)
+        for id in scope.ids.sorted(by: { $0.uuidString < $1.uuidString }) {
+            hasher.combine(id)
+        }
+        for name in scope.loweredNames.sorted() {
+            hasher.combine(name)
+        }
+        hasher.combine(mapVisibleBars.count)
+        hasher.combine(bars.count)
+        return hasher.finalize()
+    }
+
+    private func calendarTabVenueEventIsInMapViewport(_ event: SportsEvent) -> Bool {
+        guard event.league == "Venue Event" else { return false }
+        let scope = calendarTabMapViewportVenueScope()
+        guard !scope.ids.isEmpty || !scope.loweredNames.isEmpty else { return false }
+
+        if let row = matchingCalendarVenueEventRow(for: event) {
+            if let venueID = row.venue_id, scope.ids.contains(venueID) {
+                return true
+            }
+            if let venueName = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !venueName.isEmpty,
+               scope.loweredNames.contains(venueName.lowercased()) {
+                return true
+            }
+            return false
+        }
+
+        if let bar = barVenueForCalendarVenueEvent(event) {
+            return scope.ids.contains(bar.id) || scope.loweredNames.contains(bar.name.lowercased())
+        }
+        return false
+    }
+
     private func calendarTabVenueSportsEvents(for selectedDate: Date, searchQuery: String) -> [SportsEvent] {
         let cal = Calendar.current
-        let regionTitles = calendarUsesVisibleMapRegionOnly ? venueGameTitleAllowlistForCalendarDotsWhenRegionOnly() : nil
         let base = events.filter { event in
             guard cal.isDate(event.date, inSameDayAs: selectedDate) else { return false }
             guard event.league == "Venue Event" else { return false }
             guard selectedSport == "All" || event.sport == selectedSport else { return false }
-            if calendarUsesVisibleMapRegionOnly, let titles = regionTitles {
-                return titles.contains(event.title)
-            }
-            return true
+            return calendarTabVenueEventIsInMapViewport(event)
         }
         return base.filter { calendarTabLocalQueryMatchesEvent($0, query: searchQuery) }
     }
@@ -868,19 +923,26 @@ extension MapViewModel {
         return []
     }
 
-    /// Calendar tab: resolve a ``BarVenue`` for a merged venue event (`SportsEvent` league `Venue Event`).
-    func barVenueForCalendarVenueEvent(_ event: SportsEvent) -> BarVenue? {
+    /// Calendar tab: venue event row matching a merged ``SportsEvent`` (`league` `Venue Event`).
+    func matchingCalendarVenueEventRow(for event: SportsEvent) -> VenueEventRow? {
         guard event.league == "Venue Event" else { return nil }
         let ymd = discoverPreviewSQLDayString(for: event.date)
         let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
         let sport = event.sport.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if let row = venueEventRows.first(where: { ev in
+        return venueEventRows.first(where: { ev in
             guard ev.event_title?.trimmingCharacters(in: .whitespacesAndNewlines) == title else { return false }
             guard ev.event_date?.trimmingCharacters(in: .whitespacesAndNewlines) == ymd else { return false }
             let rs = ev.sport?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return rs.isEmpty || rs == sport
-        }) {
+        })
+    }
+
+    /// Calendar tab: resolve a ``BarVenue`` for a merged venue event (`SportsEvent` league `Venue Event`).
+    func barVenueForCalendarVenueEvent(_ event: SportsEvent) -> BarVenue? {
+        guard event.league == "Venue Event" else { return nil }
+        let title = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let row = matchingCalendarVenueEventRow(for: event) {
             if let vid = row.venue_id, let b = bars.first(where: { $0.id == vid }) {
                 return b
             }
@@ -893,5 +955,35 @@ extension MapViewModel {
         return bars.first { bar in
             bar.games.contains(where: { $0.caseInsensitiveCompare(title) == .orderedSame })
         }
+    }
+
+    /// Calendar tab → Discover: bar from cache or a minimal snapshot for ``consumeFollowingVenueNavigationIfPending``.
+    func snapshotBarVenueForCalendarVenueEventFocus(_ event: SportsEvent) -> BarVenue? {
+        if let bar = barVenueForCalendarVenueEvent(event) {
+            return bar
+        }
+        guard let row = matchingCalendarVenueEventRow(for: event),
+              let venueId = row.venue_id else {
+            return nil
+        }
+        let venueName = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let sport = row.sport?.trimmingCharacters(in: .whitespacesAndNewlines) ?? event.sport
+        let eventTitle = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return BarVenue(
+            id: venueId,
+            name: venueName.isEmpty ? "Venue" : venueName,
+            address: "",
+            phone: "",
+            primarySport: sport,
+            distance: "",
+            rating: 0,
+            tags: [],
+            games: eventTitle.isEmpty ? [] : [eventTitle],
+            coordinate: CLLocationCoordinate2D(latitude: 0, longitude: 0),
+            goingCounts: [:],
+            ownerEmail: row.owner_email,
+            adminStatus: row.admin_status,
+            venueOwnerEmailRaw: row.owner_email
+        )
     }
 }
