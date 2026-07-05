@@ -2188,23 +2188,26 @@ struct DiscoverScreen: View {
         }
         .onChange(of: discoverAnnotationInvalidationToken) { _, _ in
             guard isDiscoverTabSelected else {
-#if DEBUG
-                print("[DiscoverPerf] inactive skipped heavy map work reason=annotationInvalidation")
-#endif
+                DebugLogGate.discoverTabPerfVerbose(
+                    "[DiscoverPerf] inactive skipped heavy map work reason=annotationInvalidation"
+                )
                 return
             }
             rebuildDiscoverAnnotationCache(reason: "annotationInvalidation")
         }
         .onChange(of: isDiscoverTabSelected) { _, visible in
-            guard visible else { return }
+            if !visible {
+                viewModel.noteDiscoverTabBecameHidden()
+                return
+            }
             TabPerf.selectedTab("discover")
             AppPerfDebug.screenLoadStart(tab: "discover", source: "tabVisible")
             presentStartupGuideIfNeeded()
             Task { @MainActor in
                 await viewModel.refreshDiscoverBannerAnnouncementForDiscoverTabVisible()
-#if DEBUG
-                print("[DiscoverPerf] announcement refresh source=DiscoverScreen reason=tabVisible")
-#endif
+                DebugLogGate.discoverTabPerfVerbose(
+                    "[DiscoverPerf] announcement refresh source=DiscoverScreen reason=tabVisible"
+                )
                 if await viewModel.consumePendingDiscoverFocusVenue(source: "discoverTabVisible") {
                     showVenueDetails = true
                 }
@@ -2303,9 +2306,9 @@ struct DiscoverScreen: View {
         Task {
             if isDiscoverTabSelected {
                 await viewModel.refreshDiscoverBannerAnnouncementForDiscoverTabVisible()
-#if DEBUG
-                print("[DiscoverPerf] announcement refresh source=DiscoverScreen reason=appear")
-#endif
+                DebugLogGate.discoverTabPerfVerbose(
+                    "[DiscoverPerf] announcement refresh source=DiscoverScreen reason=appear"
+                )
             }
             await viewModel.ensureBusinessOwnerSessionFlagsIfPossible(context: "discover_on_appear")
             viewModel.logBusinessOwnerSessionFlags(context: "discover_on_appear")
@@ -2782,14 +2785,14 @@ struct DiscoverScreen: View {
         regionOverride: MKCoordinateRegion? = nil
     ) async {
         guard isDiscoverTabSelected else {
-#if DEBUG
-            print("[DiscoverPerf] inactive skipped heavy map work reason=ensureDiscoverDatasetConsistency trigger=\(trigger)")
-#endif
+            DebugLogGate.discoverTabPerfVerbose(
+                "[DiscoverPerf] inactive skipped heavy map work reason=ensureDiscoverDatasetConsistency trigger=\(trigger)"
+            )
             return
         }
-#if DEBUG
-        print("[DiscoverPerf] active running consistency check trigger=\(trigger)")
-#endif
+        DebugLogGate.discoverTabPerfVerbose(
+            "[DiscoverPerf] active running consistency check trigger=\(trigger)"
+        )
         if isPassiveDiscoverTabConsistencyTrigger(trigger),
            !forceCurrentModeReload,
            let last = lastDiscoverTabConsistencyAt,
@@ -3593,9 +3596,9 @@ struct DiscoverScreen: View {
 
     private func rebuildDiscoverAnnotationCache(reason: String) {
         guard isDiscoverTabSelected else {
-#if DEBUG
-            print("[DiscoverPerf] inactive skipped heavy map work reason=rebuildDiscoverAnnotationCache trigger=\(reason)")
-#endif
+            DebugLogGate.discoverTabPerfVerbose(
+                "[DiscoverPerf] inactive skipped heavy map work reason=rebuildDiscoverAnnotationCache trigger=\(reason)"
+            )
             return
         }
         let key = discoverAnnotationCacheKey()

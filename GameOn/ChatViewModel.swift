@@ -73,6 +73,8 @@ final class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
     /// Shown when swipe-delete (inbox clear) fails; kept separate from ``errorMessage`` so friend-request errors don’t clash.
     @Published var inboxDeleteError: String?
+    /// Shown when Friends directory unfriend fails; kept separate from ``errorMessage``.
+    @Published var unfriendError: String?
     @Published private(set) var requiresSignIn: Bool = false
     @Published var isLoading: Bool = false
 
@@ -106,6 +108,9 @@ final class ChatViewModel: ObservableObject {
     private var startupLightweightPrefetchTask: Task<StartupChatPrefetchResult, Never>?
     private var lastStartupLightweightPrefetchAt: Date?
     private let startupLightweightPrefetchTTL: TimeInterval = 90
+    private var lastChatTabIntentPreloadAt: Date?
+    private var lastChatTabSurfaceRefreshAt: Date?
+    private static let chatTabRefreshCoalesceInterval: TimeInterval = 25
 
     private var chatTabVisibleForDirectReadState = false
     private var privateChatUnlockedForDirectReadState = false
@@ -153,6 +158,8 @@ final class ChatViewModel: ObservableObject {
     private var chatPresenceListenTask: Task<Void, Never>?
     private var chatPresenceTrackedUserIds: Set<UUID> = []
     private var chatPresenceExpiryTask: Task<Void, Never>?
+    /// Peers hidden from Recent Chats via swipe delete (persisted per auth user; restored on new inbound DM).
+    private var hiddenInboxPeerUserIds: Set<UUID> = []
 
     /// Supabase Realtime `IN` filters should stay small; above this we omit the client filter and rely on RLS.
     private let kMaxConversationIdsForInboxRealtimeClientFilter = 48
@@ -230,6 +237,7 @@ final class ChatViewModel: ObservableObject {
 
     private func noteAuthenticatedChatSession(userId: UUID, source: String) {
         currentUserAuthId = userId
+        hiddenInboxPeerUserIds = DmInboxHiddenConversationsStore.hiddenPeerUserIds(authId: userId)
         requiresSignIn = false
 #if DEBUG
         let email = mapViewModel?.authenticatedSocialEmailForUI ?? ""
@@ -270,6 +278,7 @@ final class ChatViewModel: ObservableObject {
         lastInboxLoadAt = nil
         friendshipChipByOtherUserId = [:]
         currentUserAuthId = nil
+        hiddenInboxPeerUserIds = []
         hidesFloatingTabBarForDirectChat = false
         blockedUserIds = []
         usersWhoBlockedMeIds = []
@@ -1123,17 +1132,25 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// Zeros this peer’s row in the local inbox immediately after opening a thread / mark-read so the tab badge drops before summaries refetch.
-    func markDirectInboxReadLocally(peerUserId: UUID, conversationId: UUID? = nil) {
+    func markDirectInboxReadLocally(
+        peerUserId: UUID,
+        conversationId: UUID? = nil,
+        scheduleBadgeRecalculation: Bool = true
+    ) {
 #if DEBUG
         print("[BadgeSyncDebug] marked read conversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
 #endif
         guard let idx = friends.firstIndex(where: { $0.id == peerUserId }) else {
-            requestBadgeRecalculation(reason: "marked_read_missing_row")
+            if scheduleBadgeRecalculation {
+                requestBadgeRecalculation(reason: "marked_read_missing_row", includeInboxSummaries: true)
+            }
             return
         }
         let old = friends[idx]
         guard old.unreadCount > 0 else {
-            requestBadgeRecalculation(reason: "marked_read_no_local_unread")
+            if scheduleBadgeRecalculation {
+                requestBadgeRecalculation(reason: "marked_read_no_local_unread", includeInboxSummaries: true)
+            }
             return
         }
 #if DEBUG
@@ -1160,12 +1177,62 @@ final class ChatViewModel: ObservableObject {
         print("[UnreadBadgeDebug] totalBadge=\(totalUnread)")
 #endif
         Task { await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "local_mark_read") }
-        requestBadgeRecalculation(reason: "marked_read")
+        if scheduleBadgeRecalculation {
+            requestBadgeRecalculation(reason: "marked_read", includeInboxSummaries: true)
+        }
+    }
+
+    /// Persists read cursor, clears local inbox unread, and reconciles tab/list badges.
+    @discardableResult
+    func markDirectThreadRead(
+        conversationId: UUID,
+        peerUserId: UUID,
+        reason: String,
+        requireActiveVisibleThread: Bool = true
+    ) async -> Bool {
+#if DEBUG
+        print("[DMUnread] opening thread reason=\(reason) conversationId=\(conversationId.uuidString.lowercased())")
+#endif
+        if requireActiveVisibleThread {
+            guard canMarkActiveDirectThreadRead(conversationId: conversationId, reason: reason) else {
+                return false
+            }
+        }
+        guard let me = try? await directChatService.currentUserId() else { return false }
+        do {
+            try await directChatService.markConversationRead(
+                conversationId: conversationId,
+                userId: me,
+                lastReadAt: Date()
+            )
+#if DEBUG
+            print("[DMUnread] mark read success conversationId=\(conversationId.uuidString.lowercased()) reason=\(reason)")
+#endif
+        } catch {
+#if DEBUG
+            print(
+                "[DMUnread] mark read error conversationId=\(conversationId.uuidString.lowercased()) " +
+                "reason=\(reason) error=\(error.localizedDescription)"
+            )
+#endif
+            return false
+        }
+        markDirectInboxReadLocally(
+            peerUserId: peerUserId,
+            conversationId: conversationId,
+            scheduleBadgeRecalculation: false
+        )
+        requestBadgeRecalculation(reason: "thread_mark_read_\(reason)", includeInboxSummaries: true)
+#if DEBUG
+        print("[DMUnread] unread counts refreshed reason=\(reason)")
+#endif
+        return true
     }
 
     /// Applies a lightweight inbox row update for an incoming peer DM (1:1). Returns false if a full inbox reconcile should run.
     private func applyRealtimeIncomingPeerMessage(_ row: DirectMessageRow) async -> Bool {
         let peerId = row.sender_id
+        revealInboxConversationIfHidden(peerUserId: peerId, reason: "incoming_peer_dm")
         let viewing = isUserViewingThisDmThread(conversationId: row.conversation_id, peerSenderId: peerId)
         let badgeBefore = unreadDirectMessageCount
 #if DEBUG
@@ -1404,6 +1471,40 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
+    /// Lightweight tab-intent preload: unread DM badge + pending request counts only (no inbox body reload).
+    func prefetchTabIntentChatBadgeData() async {
+        guard (try? await directChatService.currentUserId()) != nil else {
+            clearForSignOut()
+            return
+        }
+        await refreshUnreadDirectMessageCount()
+        await refreshFriendRequestListsOnly()
+        noteChatTabIntentPreloadCompleted()
+    }
+
+    func shouldSkipChatTabIntentPreload() -> Bool {
+        guard let last = lastChatTabIntentPreloadAt else { return false }
+        return Date().timeIntervalSince(last) < Self.chatTabRefreshCoalesceInterval
+    }
+
+    func shouldSkipChatTabSurfaceRefresh() -> Bool {
+        let recentIntent = lastChatTabIntentPreloadAt.map {
+            Date().timeIntervalSince($0) < Self.chatTabRefreshCoalesceInterval
+        } ?? false
+        let recentSurface = lastChatTabSurfaceRefreshAt.map {
+            Date().timeIntervalSince($0) < Self.chatTabRefreshCoalesceInterval
+        } ?? false
+        return recentIntent || recentSurface
+    }
+
+    func noteChatTabIntentPreloadCompleted() {
+        lastChatTabIntentPreloadAt = Date()
+    }
+
+    func noteChatTabSurfaceRefreshCompleted() {
+        lastChatTabSurfaceRefreshAt = Date()
+    }
+
     /// Refreshes friend request rows + chip map + pending badge without reloading DM inbox.
     func refreshFriendRequestListsOnly() async {
         let startedAt = Date()
@@ -1609,6 +1710,7 @@ final class ChatViewModel: ObservableObject {
             // Hide users blocked in either direction.
             var visible = displays.filter { !isEitherDirectionBlocked(with: $0.id) }
             visible = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: visible)
+            visible = applyHiddenInboxPeerFilter(visible)
             friends = visible
             syncChatPresenceRealtimeIfNeeded(reason: "inboxSummariesLoaded")
 #if DEBUG
@@ -1652,23 +1754,37 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Swipe-delete from inbox: calls the same `clear_direct_conversation` RPC as in-thread “Clear chat history”.
-    /// Does not remove the friendship; only clears/hides the thread per server rules.
+    /// Swipe-delete from inbox: hides the thread for this user and best-effort clears server history when RPC exists.
+    /// Does not remove the friendship; only clears/hides the thread per server rules when available.
     func clearInboxConversation(withFriendUserId friendUserId: UUID) async {
-        let snapshot = friends
+#if DEBUG
+        print("[DMDelete] delete tapped friendUserId=\(friendUserId.uuidString.lowercased())")
+#endif
         inboxDeleteError = nil
+        hideInboxConversationLocally(peerUserId: friendUserId)
+#if DEBUG
+        print("[DMDelete] local remove friendUserId=\(friendUserId.uuidString.lowercased())")
+#endif
+
         do {
             let cid = try await directChatService.startDirectConversation(friendUserId: friendUserId)
             try await directChatService.clearDirectConversation(conversationId: cid)
-            friends.removeAll { $0.id == friendUserId }
-            let totalUnread = friends.reduce(0) { $0 + $1.unreadCount }
-            await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "clear_inbox_conversation")
-            await refreshInboxSummaries()
+#if DEBUG
+            print("[DMDelete] server hide success conversationId=\(cid.uuidString.lowercased())")
+#endif
         } catch {
-            friends = snapshot
-            if ignoreCancellationIfNeeded(error, context: "inbox_delete") { return }
-            inboxDeleteError = error.localizedDescription
+#if DEBUG
+            print(
+                "[DMDelete] server hide error friendUserId=\(friendUserId.uuidString.lowercased()) " +
+                "error=\(error.localizedDescription)"
+            )
+#endif
         }
+
+        await refreshInboxSummaries()
+#if DEBUG
+        print("[DMDelete] inbox refreshed friendUserId=\(friendUserId.uuidString.lowercased())")
+#endif
     }
 
     func previewForLoadedDmParticipant(userId: UUID) -> UserPreview? {
@@ -1821,6 +1937,7 @@ final class ChatViewModel: ObservableObject {
                 )
             }
             friendDisplays = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: friendDisplays)
+            friendDisplays = applyHiddenInboxPeerFilter(friendDisplays)
             friends = friendDisplays
             syncChatPresenceRealtimeIfNeeded(reason: "fullRefreshLoaded")
 #if DEBUG
@@ -2030,6 +2147,33 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// Removes an accepted friendship from the Friends directory (`remove_friend` only — DM history is preserved).
+    func unfriend(_ item: FriendDisplay) async {
+        unfriendError = nil
+        let snapshotFriends = friends
+        let snapshotChips = friendshipChipByOtherUserId
+
+        friends.removeAll { $0.id == item.id }
+        var chips = friendshipChipByOtherUserId
+        chips.removeValue(forKey: item.id)
+        friendshipChipByOtherUserId = chips
+
+        do {
+            try await service.removeFriend(friendUserId: item.id)
+            await refreshInboxSummaries()
+            await refreshFriendRequestListsOnly()
+        } catch {
+            if ignoreCancellationIfNeeded(error, context: "unfriend") {
+                friends = snapshotFriends
+                friendshipChipByOtherUserId = snapshotChips
+                return
+            }
+            friends = snapshotFriends
+            friendshipChipByOtherUserId = snapshotChips
+            unfriendError = error.localizedDescription
+        }
+    }
+
     func sendFriendRequest(to addresseeId: UUID) async {
         if isEitherDirectionBlocked(with: addresseeId) {
             errorMessage = "You can’t send a friend request to this user."
@@ -2137,6 +2281,37 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// Accepted friends without a DM thread yet still appear in the Friends directory (presentation only; inbox RPC unchanged).
+    private func applyHiddenInboxPeerFilter(_ displays: [FriendDisplay]) -> [FriendDisplay] {
+        guard !hiddenInboxPeerUserIds.isEmpty else { return displays }
+        return displays.filter { display in
+            guard display.isConversationBacked else { return true }
+            return !hiddenInboxPeerUserIds.contains(display.id)
+        }
+    }
+
+    @MainActor
+    private func hideInboxConversationLocally(peerUserId: UUID) {
+        if let authId = currentUserAuthId {
+            DmInboxHiddenConversationsStore.hide(peerUserId: peerUserId, authId: authId)
+            hiddenInboxPeerUserIds.insert(peerUserId)
+        }
+        friends.removeAll { $0.id == peerUserId && $0.isConversationBacked }
+        let totalUnread = friends.reduce(0) { $0 + $1.unreadCount }
+        Task { await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "clear_inbox_conversation_local") }
+    }
+
+    @MainActor
+    private func revealInboxConversationIfHidden(peerUserId: UUID, reason: String) {
+        guard hiddenInboxPeerUserIds.contains(peerUserId) else { return }
+        hiddenInboxPeerUserIds.remove(peerUserId)
+        if let authId = currentUserAuthId {
+            DmInboxHiddenConversationsStore.unhide(peerUserId: peerUserId, authId: authId)
+        }
+#if DEBUG
+        print("[DMDelete] revealed friendUserId=\(peerUserId.uuidString.lowercased()) reason=\(reason)")
+#endif
+    }
+
     private func mergeAcceptedFriendsMissingFromInbox(
         me: UUID,
         inboxDisplays: [FriendDisplay]

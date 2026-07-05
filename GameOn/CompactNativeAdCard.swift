@@ -42,6 +42,15 @@ struct CompactNativeAdCard: View {
 
     @State private var adLoaded = false
     @State private var adFailed = false
+    @Environment(\.hostTabAdInteractionEnabled) private var hostTabAdInteractionEnabled
+
+    private var allowsAdHitTesting: Bool {
+        AdHitTestSafety.allowsInteraction(
+            adLoaded: adLoaded,
+            hostTabRaw: hostTabRaw,
+            hostTabAdInteractionEnabled: hostTabAdInteractionEnabled
+        )
+    }
 
     var body: some View {
         if !FanGeoAdPolicy.shouldMountAdViews() {
@@ -63,6 +72,7 @@ struct CompactNativeAdCard: View {
                     slotIndex: slotIndex,
                     layoutWidth: layoutWidth,
                     prefersLightChrome: prefersLightChrome,
+                    allowsInteraction: allowsAdHitTesting,
                     onAdLoaded: {
                         if animatesLoadState {
                             withAnimation(.easeOut(duration: 0.2)) {
@@ -100,8 +110,9 @@ struct CompactNativeAdCard: View {
                 .frame(height: adLoaded ? CompactNativeAdLayout.preferredHeight : 0)
                 .background(Color.clear)
                 .opacity(adLoaded ? 1 : 0)
-                .allowsHitTesting(adLoaded)
+                .allowsHitTesting(allowsAdHitTesting)
                 .clipped()
+                .contentShape(Rectangle())
                 .onAppear {
                     logNativeAdDebug("mounted=true collapsed=\(!adLoaded) unitID=\(adUnitID) layoutWidth=\(String(format: "%.1f", Double(layoutWidth)))")
                     AdDebugDiagnostics.logEvent(
@@ -141,6 +152,7 @@ private struct CompactNativeAdRepresentable: UIViewRepresentable {
     let slotIndex: Int
     let layoutWidth: CGFloat
     let prefersLightChrome: Bool
+    let allowsInteraction: Bool
     let onAdLoaded: () -> Void
     let onAdFailed: (Error) -> Void
 
@@ -174,6 +186,11 @@ private struct CompactNativeAdRepresentable: UIViewRepresentable {
             slotIndex: slotIndex,
             layoutWidth: layoutWidth
         )
+        AdHitTestSafety.syncUIViewInteraction(
+            view,
+            enabled: allowsInteraction,
+            placement: placement
+        )
         return view
     }
 
@@ -197,6 +214,11 @@ private struct CompactNativeAdRepresentable: UIViewRepresentable {
             adUnitID: adUnitID,
             slotIndex: slotIndex,
             layoutWidth: layoutWidth
+        )
+        AdHitTestSafety.syncUIViewInteraction(
+            uiView,
+            enabled: allowsInteraction,
+            placement: placement
         )
     }
 
@@ -458,6 +480,7 @@ private final class CompactNativeAdHostView: NativeAdView {
     func populate(with nativeAd: NativeAd) {
         isHidden = false
         alpha = 1
+        isUserInteractionEnabled = false
         headlineLabel.text = nativeAd.headline
         bodyLabel.text = nativeAd.body
 
@@ -488,6 +511,7 @@ private final class CompactNativeAdHostView: NativeAdView {
         self.nativeAd = nil
         isHidden = true
         alpha = 0
+        isUserInteractionEnabled = false
         headlineLabel.text = nil
         bodyLabel.text = nil
         advertiserLabel.text = nil
@@ -502,9 +526,9 @@ private final class CompactNativeAdHostView: NativeAdView {
         backgroundColor = .clear
         isHidden = true
         alpha = 0
-        clipsToBounds = false
+        clipsToBounds = true
         layer.cornerRadius = 0
-        layer.masksToBounds = false
+        layer.masksToBounds = true
 
         chromeBackgroundView.backgroundColor = .clear
         chromeBackgroundView.translatesAutoresizingMaskIntoConstraints = false

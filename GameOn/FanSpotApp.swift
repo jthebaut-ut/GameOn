@@ -97,45 +97,164 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         await MainActor.run {
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             SupportReplyNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanGeoAnnouncementNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }
     }
 }
 #endif
 
+private enum FanGeoLaunchConsentGate {
+    static let fallbackSeconds: TimeInterval = 1.5
+}
+
 private struct FanGeoAdConsentPrePromptHost<Content: View>: View {
     let content: Content
     @State private var showsPreConsentPrompt = false
-    @State private var shouldContinueConsentFlowAfterDismissal = false
+    @State private var isPreparingPrivacySettings = false
+    @State private var revealsMainExperience = GoogleMobileAdsBootstrap.hasFinishedConsentFlow
+        || GoogleMobileAdsBootstrap.canRevealMainExperienceWhileConsentFinishes
 
     init(@ViewBuilder content: () -> Content) {
         self.content = content()
     }
 
     var body: some View {
-        content
-            .sheet(
-                isPresented: $showsPreConsentPrompt,
-                onDismiss: {
-                    guard shouldContinueConsentFlowAfterDismissal else { return }
-                    shouldContinueConsentFlowAfterDismissal = false
-                    GoogleMobileAdsBootstrap.acknowledgePreConsentPromptAndContinue()
-                }
-            ) {
-                FanGeoAdConsentPrePromptView {
-                    shouldContinueConsentFlowAfterDismissal = true
-                    showsPreConsentPrompt = false
-                }
-                .interactiveDismissDisabled()
-                .presentationDetents([.medium])
-                .presentationDragIndicator(.hidden)
+        ZStack {
+            content
+                .opacity(revealsMainExperience ? 1 : 0)
+                .allowsHitTesting(revealsMainExperience)
+                .accessibilityHidden(!revealsMainExperience)
+
+            if !revealsMainExperience {
+                FanGeoSplashView()
+                    .zIndex(1)
+                    .transition(.opacity)
             }
-            .onAppear {
-                showsPreConsentPrompt = GoogleMobileAdsBootstrap.shouldPresentPreConsentPrompt
+        }
+        .sheet(isPresented: $showsPreConsentPrompt) {
+            FanGeoAdConsentPrePromptView(
+                isPreparingPrivacySettings: isPreparingPrivacySettings,
+                onContinue: handlePreConsentContinue
+            )
+            .interactiveDismissDisabled()
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.hidden)
+        }
+        .task {
+            await waitForAppBootstrapReady()
+            handleAppBootstrapReady()
+        }
+        .onAppear {
+            GoogleMobileAdsBootstrap.runWhenConsentFlowFinished {
+                Task { @MainActor in
+                    revealMainExperienceIfNeeded(reason: "consentCompleteCallback")
+                }
             }
+        }
+    }
+
+    private func handlePreConsentContinue() {
+        guard !isPreparingPrivacySettings else { return }
+        isPreparingPrivacySettings = true
+        logLaunchConsentGate(state: "waiting", showing: "splash", reason: "preConsentContinue")
+        Task {
+            let delayNs = UInt64.random(in: 250_000_000...400_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
+            GoogleMobileAdsBootstrap.acknowledgePreConsentPromptAndContinue()
+            await waitForConsentFlowCompletion()
+            isPreparingPrivacySettings = false
+            showsPreConsentPrompt = false
+            revealMainExperienceIfNeeded(reason: "firstLaunchConsentComplete")
+        }
+    }
+
+    private func handleAppBootstrapReady() {
+        if GoogleMobileAdsBootstrap.shouldPresentPreConsentPrompt {
+            logLaunchConsentGate(state: "waiting", showing: "splash", reason: "preConsentPrompt")
+            showsPreConsentPrompt = true
+            return
+        }
+
+        if revealMainExperienceIfNeeded(reason: "bootstrapReadyImmediate") {
+            return
+        }
+
+        logLaunchConsentGate(state: "waiting", showing: "splash", reason: "consentPending")
+        Task {
+            await waitForConsentFlowCompletionWithFallback()
+        }
+    }
+
+    @discardableResult
+    private func revealMainExperienceIfNeeded(reason: String) -> Bool {
+        guard !revealsMainExperience else { return true }
+        guard shouldRevealMainExperienceNow else { return false }
+        revealsMainExperience = true
+        logLaunchConsentGate(state: "ready", showing: "app", reason: reason)
+        return true
+    }
+
+    private var shouldRevealMainExperienceNow: Bool {
+        GoogleMobileAdsBootstrap.hasFinishedConsentFlow
+            || GoogleMobileAdsBootstrap.canRevealMainExperienceWhileConsentFinishes
+    }
+
+    private func waitForAppBootstrapReady() async {
+        guard !LaunchBootstrapState.didBecomeAppReady else { return }
+        while !LaunchBootstrapState.didBecomeAppReady {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled else { return }
+        }
+    }
+
+    private func waitForConsentFlowCompletion() async {
+        if GoogleMobileAdsBootstrap.hasFinishedConsentFlow { return }
+        await withCheckedContinuation { continuation in
+            GoogleMobileAdsBootstrap.runWhenConsentFlowFinished {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func waitForConsentFlowCompletionWithFallback() async {
+        if revealMainExperienceIfNeeded(reason: "consentAlreadyComplete") {
+            return
+        }
+
+        let finishedInTime = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await waitForConsentFlowCompletion()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(FanGeoLaunchConsentGate.fallbackSeconds * 1_000_000_000)
+                )
+                return false
+            }
+            let first = await group.next() ?? true
+            group.cancelAll()
+            return first
+        }
+
+        if revealMainExperienceIfNeeded(reason: finishedInTime ? "consentComplete" : "callbackDelayed") {
+            return
+        }
+
+        if GoogleMobileAdsBootstrap.hasAcknowledgedPreConsentPrompt {
+            revealsMainExperience = true
+            print("[LaunchConsentGate] fallbackReveal=true reason=callbackDelayed")
+            logLaunchConsentGate(state: "ready", showing: "app", reason: "callbackDelayed")
+        }
+    }
+
+    private func logLaunchConsentGate(state: String, showing: String, reason: String) {
+        print("[LaunchConsentGate] state=\(state) showing=\(showing) reason=\(reason)")
     }
 }
 
 private struct FanGeoAdConsentPrePromptView: View {
+    let isPreparingPrivacySettings: Bool
     let onContinue: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -152,6 +271,19 @@ private struct FanGeoAdConsentPrePromptView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if isPreparingPrivacySettings {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.regular)
+                    Text("Preparing privacy settings…")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+            }
+
             Button(action: onContinue) {
                 Text("Continue")
                     .font(.headline.weight(.bold))
@@ -162,6 +294,8 @@ private struct FanGeoAdConsentPrePromptView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             }
             .buttonStyle(.plain)
+            .disabled(isPreparingPrivacySettings)
+            .opacity(isPreparingPrivacySettings ? 0.55 : 1)
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)

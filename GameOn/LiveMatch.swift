@@ -2505,53 +2505,22 @@ private extension KeyedDecodingContainer where K == LiveTimelineEvent.CodingKeys
 }
 
 nonisolated enum LiveMatchFilters {
-    static func isFifaWorldCupMatch(_ match: LiveMatch) -> Bool {
-        guard isSoccer(match) else { return false }
-
-        let searchableText = [
-            match.league,
-            match.sourceLeagueName,
-            match.leagueAlternate,
-            match.eventName,
-            "\(match.awayTeam) \(match.homeTeam)"
-        ]
-            .compactMap { $0 }
-            .map(normalizedSearchText)
-            .joined(separator: " ")
-
-        let nonFifaWorldCupMarkers = [
-            "fiba",
-            "basketball world cup",
-            "cricket world cup",
-            "icc world cup",
-            "t20 world cup",
-            "rugby world cup",
-            "hockey world cup",
-            "american football",
-            "nfl",
-            "gridiron",
-            "us football"
-        ]
-        if nonFifaWorldCupMarkers.contains(where: { searchableText.contains($0) }) {
-            return false
-        }
-
-        if searchableText.contains("fifa") && searchableText.contains("world cup") {
+    static func isFifaWorldCupMatch(
+        _ match: LiveMatch,
+        linkedSavedProGame: SavedProGame? = nil
+    ) -> Bool {
+        if let linkedSavedProGame, savedProGameIndicatesWorldCup(linkedSavedProGame) {
             return true
         }
-        if searchableText.contains("club world cup") {
+        if let slug = match.featuredEventSlug, featuredSlugIndicatesWorldCup(slug) {
             return true
         }
-        if searchableText.contains("world cup qualifier") || searchableText.contains("world cup qualification") {
+        let text = lightweightWorldCupSearchText(for: match)
+        guard !text.isEmpty, !isExcludedNonFifaWorldCup(text) else { return false }
+        if text.contains("world cup") {
             return true
         }
-        if searchableText.contains("men s world cup") || searchableText.contains("mens world cup") {
-            return true
-        }
-        if searchableText.contains("women s world cup") || searchableText.contains("womens world cup") {
-            return true
-        }
-        return false
+        return text.contains("fifa") && text.contains("wc")
     }
 
     static func matchesLeagueCountry(_ match: LiveMatch, selectedCountries: Set<String>) -> Bool {
@@ -2560,14 +2529,18 @@ nonisolated enum LiveMatchFilters {
         return selectedCountries.contains(country)
     }
 
-    static func matchesFeaturedEvent(_ match: LiveMatch, featuredEvent: FeaturedEvent) -> Bool {
+    static func matchesFeaturedEvent(
+        _ match: LiveMatch,
+        featuredEvent: FeaturedEvent,
+        linkedSavedProGame: SavedProGame? = nil
+    ) -> Bool {
         if let featuredEventSlug = match.featuredEventSlug,
-           normalizedSearchText(featuredEventSlug) == normalizedSearchText(featuredEvent.slug) {
+           featuredEventSlugsMatch(matchSlug: featuredEventSlug, eventSlug: featuredEvent.slug) {
             return true
         }
 
         if featuredEvent.isFifaWorldCupDefinition {
-            return isFifaWorldCupMatch(match)
+            return isFifaWorldCupMatch(match, linkedSavedProGame: linkedSavedProGame)
         }
 
         if let sport = featuredEvent.sport?.trimmingCharacters(in: .whitespacesAndNewlines), !sport.isEmpty {
@@ -2610,12 +2583,70 @@ nonisolated enum LiveMatchFilters {
             match.sourceLeagueName,
             match.leagueAlternate,
             match.eventName,
+            match.featuredEventSlug,
             match.awayTeam,
             match.homeTeam
         ]
             .compactMap { $0 }
             .map(normalizedSearchText)
             .joined(separator: " ")
+    }
+
+    private static func featuredEventSlugsMatch(matchSlug: String, eventSlug: String) -> Bool {
+        let matchNormalized = normalizedSearchText(matchSlug)
+        let eventNormalized = normalizedSearchText(eventSlug)
+        guard !matchNormalized.isEmpty, !eventNormalized.isEmpty else { return false }
+        if matchNormalized == eventNormalized { return true }
+        if matchNormalized.contains(eventNormalized) || eventNormalized.contains(matchNormalized) { return true }
+        let matchIsWorldCup = matchNormalized.contains("world") && matchNormalized.contains("cup")
+        let eventIsWorldCup = eventNormalized.contains("world") && eventNormalized.contains("cup")
+        return matchIsWorldCup && eventIsWorldCup
+    }
+
+    private static func featuredSlugIndicatesWorldCup(_ slug: String) -> Bool {
+        let normalized = normalizedSearchText(slug)
+        guard !normalized.isEmpty else { return false }
+        return normalized.contains("world cup")
+            || (normalized.contains("fifa") && normalized.contains("wc"))
+            || (normalized.contains("world") && normalized.contains("cup"))
+    }
+
+    private static func savedProGameIndicatesWorldCup(_ game: SavedProGame) -> Bool {
+        let haystack = normalizedSearchText(
+            [game.league, game.sport, game.featuredEventSlug]
+                .compactMap { $0 }
+                .joined(separator: " ")
+        )
+        guard !haystack.isEmpty else { return false }
+        if haystack.contains("world cup") {
+            return true
+        }
+        return haystack.contains("fifa") && (haystack.contains("wc") || haystack.contains("world cup"))
+    }
+
+    private static func lightweightWorldCupSearchText(for match: LiveMatch) -> String {
+        normalizedSearchText(
+            [match.league, match.sourceLeagueName, match.leagueAlternate, match.eventName]
+                .compactMap { $0 }
+                .joined(separator: " ")
+        )
+    }
+
+    private static func isExcludedNonFifaWorldCup(_ searchableText: String) -> Bool {
+        let nonFifaWorldCupMarkers = [
+            "fiba",
+            "basketball world cup",
+            "cricket world cup",
+            "icc world cup",
+            "t20 world cup",
+            "rugby world cup",
+            "hockey world cup",
+            "american football",
+            "nfl",
+            "gridiron",
+            "us football"
+        ]
+        return nonFifaWorldCupMarkers.contains(where: { searchableText.contains($0) })
     }
 
     private static func matchesSport(_ match: LiveMatch, sport: String) -> Bool {

@@ -457,3 +457,8 @@ entrypoint = "./functions/cleanup-expired-game-social/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/notify-support-reply/index.ts"
+
+[functions.notify-fangeo-announcement]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/notify-fangeo-announcement/index.ts"

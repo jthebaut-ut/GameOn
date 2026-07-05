@@ -53,6 +53,8 @@ struct LiveScreen: View {
     @State private var liveUpcomingFeedRowsExpanded = false
     @State private var liveActivationRefreshTask: Task<Void, Never>?
     @State private var liveFeedMemoCache = LiveFeedMemoCache<LiveFeedComputedData, LiveFeedCacheKey>()
+    @State private var liveTabMatchesMemoCache = LiveFeedMemoCache<LiveTabMatchesSnapshot, LiveTabMatchesCacheKey>()
+    @State private var liveFeedNativeAdLayoutWidth: CGFloat = 320
 
     private static let liveGameFeedInitialRowCap = 12
 
@@ -156,6 +158,24 @@ struct LiveScreen: View {
         let crowdBuilding: [LiveCrowdMomentum]
     }
 
+    private struct LiveTabMatchesSnapshot {
+        let todayBase: [LiveMatch]
+        let displayed: [LiveMatch]
+        let liveNow: [LiveMatch]
+        let todayUpcoming: [LiveMatch]
+        let sportFilterOptions: [LiveSportVisualType]
+    }
+
+    private struct LiveTabMatchesCacheKey: Equatable {
+        let calendarDayStart: TimeInterval
+        let liveMatchesFingerprint: Int
+        let savedProGamesFingerprint: Int
+        let featuredEventSlug: String?
+        let sportFilter: String?
+        let liveLeagueCountryFilterRaw: String
+        let timeZoneIdentifier: String
+    }
+
     init(
         viewModel: MapViewModel,
         chatViewModel: ChatViewModel,
@@ -182,37 +202,114 @@ struct LiveScreen: View {
         viewModel.canUseFanSocialFeatures
     }
 
+    private var liveUserCalendar: Calendar {
+        var calendar = Calendar.current
+        if let timeZone = TimeZone(identifier: viewModel.selectedTimeZone.identifier) {
+            calendar.timeZone = timeZone
+        }
+        return calendar
+    }
+
     private var liveCalendarToday: Date {
-        Calendar.current.startOfDay(for: Date())
+        liveUserCalendar.startOfDay(for: Date())
     }
 
     private func liveTodayMatchesBase(calendarDay: Date) -> [LiveMatch] {
         viewModel.liveTabTodayMatchesDisplayed(
             searchQuery: "",
             sportFilter: nil,
-            calendarDay: calendarDay
+            calendarDay: calendarDay,
+            calendar: liveUserCalendar
         )
     }
 
-    private func liveDisplayedMatches(from todayBase: [LiveMatch]) -> [LiveMatch] {
-        let matches: [LiveMatch]
+    private func resolvedLiveTabMatchesSnapshot(calendarDay: Date) -> LiveTabMatchesSnapshot {
+        let cacheKey = makeLiveTabMatchesCacheKey(calendarDay: calendarDay)
+        return liveTabMatchesMemoCache.resolve(key: cacheKey) {
+            buildLiveTabMatchesSnapshot(calendarDay: calendarDay)
+        }
+    }
+
+    private func makeLiveTabMatchesCacheKey(calendarDay: Date) -> LiveTabMatchesCacheKey {
+        let dayStart = liveUserCalendar.startOfDay(for: calendarDay)
+        var liveMatchesHasher = Hasher()
+        for match in viewModel.liveMatches {
+            liveMatchesHasher.combine(match.id)
+            liveMatchesHasher.combine(match.matchStatus)
+            liveMatchesHasher.combine(match.startTime.timeIntervalSince1970)
+        }
+        var savedHasher = Hasher()
+        savedHasher.combine(viewModel.savedProGames.count)
+        for game in viewModel.savedProGames {
+            savedHasher.combine(game.stableKey)
+            savedHasher.combine(game.featuredEventSlug)
+            savedHasher.combine(game.league)
+        }
+        return LiveTabMatchesCacheKey(
+            calendarDayStart: dayStart.timeIntervalSince1970,
+            liveMatchesFingerprint: liveMatchesHasher.finalize(),
+            savedProGamesFingerprint: savedHasher.finalize(),
+            featuredEventSlug: liveFeaturedEventFilterSlug,
+            sportFilter: liveGamesSportFilter?.rawValue,
+            liveLeagueCountryFilterRaw: liveLeagueCountryFilterRaw,
+            timeZoneIdentifier: viewModel.selectedTimeZone.identifier
+        )
+    }
+
+    private func buildLiveTabMatchesSnapshot(calendarDay: Date) -> LiveTabMatchesSnapshot {
+        if viewModel.isLoadingLiveMatches && viewModel.liveMatches.isEmpty {
+            return LiveTabMatchesSnapshot(
+                todayBase: [],
+                displayed: [],
+                liveNow: [],
+                todayUpcoming: [],
+                sportFilterOptions: []
+            )
+        }
+
+        let todayBase = liveTodayMatchesBase(calendarDay: calendarDay)
+        let savedProGamesByKey = Dictionary(
+            uniqueKeysWithValues: viewModel.savedProGames.map { ($0.stableKey, $0) }
+        )
+        if selectedLiveFeaturedEvent?.isFifaWorldCupDefinition == true {
+            logLiveFIFADiagnostic(todayBase: todayBase, savedProGamesByKey: savedProGamesByKey)
+        }
+        let sportFiltered: [LiveMatch]
         if selectedLiveFeaturedEvent == nil, let liveGamesSportFilter {
-            matches = todayBase.filter { $0.liveSportVisualType == liveGamesSportFilter }
+            sportFiltered = todayBase.filter { $0.liveSportVisualType == liveGamesSportFilter }
         } else {
-            matches = todayBase
+            sportFiltered = todayBase
         }
-        let featuredFiltered: [LiveMatch]
+
+        let displayed: [LiveMatch]
         if let selectedLiveFeaturedEvent {
-            featuredFiltered = matches.filter {
-                LiveMatchFilters.matchesFeaturedEvent($0, featuredEvent: selectedLiveFeaturedEvent)
+            displayed = sportFiltered.filter { match in
+                let linked = savedProGamesByKey[SavedProGame.stableKey(for: match)]
+                    ?? savedProGamesByKey[match.id]
+                return LiveMatchFilters.matchesFeaturedEvent(
+                    match,
+                    featuredEvent: selectedLiveFeaturedEvent,
+                    linkedSavedProGame: linked
+                )
             }
+            logLiveFeaturedFilterSummary(
+                todayBase: todayBase,
+                afterFeaturedFilter: displayed
+            )
         } else {
-            featuredFiltered = matches
+            displayed = liveMatchesFilteredBySelectedCountries(sportFiltered)
         }
-        if selectedLiveFeaturedEvent != nil {
-            return featuredFiltered
-        }
-        return liveMatchesFilteredBySelectedCountries(featuredFiltered)
+
+        let liveNow = liveNowMatches(from: displayed)
+        let todayUpcoming = liveTodayUpcomingMatches(from: displayed, calendarDay: calendarDay)
+        let sportFilterOptions = liveGamesSportFilterOptions(from: todayBase)
+        return LiveTabMatchesSnapshot(
+            todayBase: todayBase,
+            displayed: displayed,
+            liveNow: liveNow,
+            todayUpcoming: todayUpcoming,
+            sportFilterOptions: sportFilterOptions
+        )
     }
 
     private func liveNowMatches(from displayed: [LiveMatch]) -> [LiveMatch] {
@@ -220,7 +317,7 @@ struct LiveScreen: View {
     }
 
     private func liveTodayUpcomingMatches(from displayed: [LiveMatch], calendarDay: Date) -> [LiveMatch] {
-        let cal = Calendar.current
+        let cal = liveUserCalendar
         return displayed
             .filter { $0.matchStatus == .scheduled || $0.matchStatus == .fullTime }
             .filter { cal.isDate($0.startTime, inSameDayAs: calendarDay) }
@@ -232,20 +329,8 @@ struct LiveScreen: View {
         return LiveSportVisualType.allCases.filter { present.contains($0) }
     }
 
-    private var displayedLiveMatches: [LiveMatch] {
-        liveDisplayedMatches(from: liveTodayMatchesBase(calendarDay: liveCalendarToday))
-    }
-
-    private var displayedLiveNowMatches: [LiveMatch] {
-        liveNowMatches(from: displayedLiveMatches)
-    }
-
-    private var displayedTodayUpcomingMatches: [LiveMatch] {
-        liveTodayUpcomingMatches(from: displayedLiveMatches, calendarDay: liveCalendarToday)
-    }
-
     private var liveGamesSportFilterOptions: [LiveSportVisualType] {
-        liveGamesSportFilterOptions(from: liveTodayMatchesBase(calendarDay: liveCalendarToday))
+        resolvedLiveTabMatchesSnapshot(calendarDay: liveCalendarToday).sportFilterOptions
     }
 
     private func todayUpcomingLiveMatchSort(_ lhs: LiveMatch, _ rhs: LiveMatch) -> Bool {
@@ -280,7 +365,13 @@ struct LiveScreen: View {
             }
         }
         return liveFeaturedEvents.first {
-            LiveMatchFilters.matchesFeaturedEvent(match, featuredEvent: $0)
+            LiveMatchFilters.matchesFeaturedEvent(
+                match,
+                featuredEvent: $0,
+                linkedSavedProGame: viewModel.savedProGames.first {
+                    $0.stableKey == SavedProGame.stableKey(for: match) || $0.id == match.id
+                }
+            )
         }
     }
 
@@ -577,11 +668,12 @@ struct LiveScreen: View {
     private var liveFeedLayer: some View {
         let showPersonalLiveSections = canShowPersonalLiveSections
         let calendarDay = liveCalendarToday
-        let todayMatchesBase = liveTodayMatchesBase(calendarDay: calendarDay)
-        let liveTabMatches = liveDisplayedMatches(from: todayMatchesBase)
-        let liveNowMatches = liveNowMatches(from: liveTabMatches)
-        let todayUpcomingMatches = liveTodayUpcomingMatches(from: liveTabMatches, calendarDay: calendarDay)
-        let sportFilterChipOptions = liveGamesSportFilterOptions(from: todayMatchesBase)
+        let tabMatches = resolvedLiveTabMatchesSnapshot(calendarDay: calendarDay)
+        let todayMatchesBase = tabMatches.todayBase
+        let liveTabMatches = tabMatches.displayed
+        let liveNowMatches = tabMatches.liveNow
+        let todayUpcomingMatches = tabMatches.todayUpcoming
+        let sportFilterChipOptions = tabMatches.sportFilterOptions
         let feedComputed = resolvedLiveFeedComputedData(calendarDay: calendarDay, matchCandidates: todayMatchesBase)
         let showVenuesAndPickupToday = !isBusinessLiveAudienceUser
         let venuesAndPickupToday = showVenuesAndPickupToday ? feedComputed.venuesAndPickupToday : []
@@ -608,6 +700,11 @@ struct LiveScreen: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(alignment: .leading, spacing: 22) {
                         liveHeroHeader
+
+                        if viewModel.sportsDataUpdateIndicatorVisible {
+                            SportsDataUpdateIndicator()
+                                .padding(.horizontal)
+                        }
 
                         liveSummaryChips(
                             liveNowCount: liveSummaryLiveNowCount(
@@ -655,6 +752,17 @@ struct LiveScreen: View {
                             .id(LiveScrollSection.crowdBuilding.rawValue)
                     }
                     .padding(.horizontal, 20)
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear
+                                .onAppear {
+                                    updateLiveFeedNativeAdLayoutWidth(geometry.size.width)
+                                }
+                                .onChange(of: geometry.size.width) { _, width in
+                                    updateLiveFeedNativeAdLayoutWidth(width)
+                                }
+                        }
+                    }
                     .padding(.top, 76)
                     .padding(.bottom, 112)
                 }
@@ -1029,23 +1137,12 @@ struct LiveScreen: View {
         allLiveGames: [LiveMatch],
         sportFilterOptions: [LiveSportVisualType]
     ) -> some View {
-        let worldCupMatches = allLiveGames.filter(LiveMatchFilters.isFifaWorldCupMatch)
         let liveFeedRows = LiveFeedAdPlacement.listItems(for: liveNowMatches)
         let upcomingFeedRows = LiveFeedAdPlacement.listItems(for: todayUpcomingMatches)
-        let _: Void = logLiveWorldCupFilterDebug(
-            selected: selectedLiveFeaturedEvent?.isFifaWorldCupDefinition == true,
-            totalLiveGames: allLiveGames.count,
-            matchedWorldCupGames: worldCupMatches
-        )
-        let _: Void = logLiveFeaturedEventDebug(
-            selectedFeaturedEvent: selectedLiveFeaturedEvent,
-            allMatches: allLiveGames,
-            returnedMatches: matches,
-            liveNowCount: liveNowMatches.count,
-            todayUpcomingMatches: todayUpcomingMatches
-        )
-        let _: Void = logLiveNowSectionDebug(liveNowExpanded: liveNowExpanded, liveNowCount: liveNowMatches.count)
-        let _: Void = LiveFeedAdPlacement.logPlan(matchCount: liveNowMatches.count)
+        if LiveRenderDiagnostics.enabled {
+            let _: Void = logLiveNowSectionDebug(liveNowExpanded: liveNowExpanded, liveNowCount: liveNowMatches.count)
+            let _: Void = LiveFeedAdPlacement.logPlan(matchCount: liveNowMatches.count)
+        }
 
         return liveCollapsiblePanelSection(
             kind: .liveGames,
@@ -1177,14 +1274,16 @@ struct LiveScreen: View {
             liveNowExpanded.toggle()
         }
 #if DEBUG
-        print("[LiveTabDebug] liveNowExpanded=\(liveNowExpanded)")
-        print("[LiveTabDebug] liveNowCount=\(displayedLiveNowMatches.count)")
+        if LiveRenderDiagnostics.enabled {
+            print("[LiveTabDebug] liveNowExpanded=\(liveNowExpanded)")
+            print("[LiveTabDebug] liveNowCount=\(resolvedLiveTabMatchesSnapshot(calendarDay: liveCalendarToday).liveNow.count)")
+        }
 #endif
     }
 
     private var liveGamesEmptyStateMessage: String {
-        if selectedLiveFeaturedEvent != nil {
-            return "No matches found for this featured event."
+        if let selectedLiveFeaturedEvent {
+            return "No \(selectedLiveFeaturedEvent.emptyStateTitle) matches scheduled for today."
         }
         if liveLeagueCountryFilterIsActive {
             return "No live games for selected countries right now"
@@ -1314,152 +1413,81 @@ struct LiveScreen: View {
         FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
     }
 
-    private func normalizedWorldCupFilterText(_ raw: String) -> String {
-        raw
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-            .replacingOccurrences(of: "&", with: " and ")
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-
-    private func isLikelyNationalTeamName(_ rawTeam: String) -> Bool {
-        if CountryFlagHelper.isCountry(rawTeam) {
-            return true
-        }
-
-        var name = normalizedWorldCupFilterText(rawTeam)
-        let suffixes = [
-            " national team",
-            " men",
-            " women",
-            " u23",
-            " u21",
-            " u20",
-            " u19",
-            " u18",
-            " u17"
-        ]
-        for suffix in suffixes where name.hasSuffix(suffix) {
-            name = String(name.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return Self.worldCupFilterNationalTeamNames.contains(name)
-    }
-
-    private static let worldCupFilterNationalTeamNames: Set<String> = {
-        var names = Set<String>()
-        for region in Locale.Region.isoRegions {
-            let code = region.identifier
-            let locale = Locale(identifier: "en_US")
-            if let country = locale.localizedString(forRegionCode: code) {
-                names.insert(
-                    country
-                        .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-                        .lowercased()
-                )
-            }
-        }
-        names.formUnion([
-            "usa",
-            "us",
-            "united states",
-            "england",
-            "scotland",
-            "wales",
-            "northern ireland",
-            "republic of ireland",
-            "south korea",
-            "north korea",
-            "ivory coast",
-            "cote d ivoire",
-            "czech republic",
-            "czechia",
-            "iran",
-            "russia",
-            "turkiye",
-            "turkey"
-        ])
-        return names
-    }()
-
-    private func logLiveWorldCupFilterDebug(
-        selected: Bool,
-        totalLiveGames: Int,
-        matchedWorldCupGames: [LiveMatch]
+    private func logLiveFeaturedFilterSummary(
+        todayBase: [LiveMatch],
+        afterFeaturedFilter: [LiveMatch]
     ) {
 #if DEBUG
-        print("[LiveWorldCupFilterDebug] selected=\(selected)")
-        print("[LiveWorldCupFilterDebug] totalLiveGames=\(totalLiveGames)")
-        print("[LiveWorldCupFilterDebug] matchedWorldCupGames=\(matchedWorldCupGames.count)")
-        guard selected else { return }
-        for match in matchedWorldCupGames.prefix(12) {
-            print("[LiveWorldCupFilterDebug] league=\(match.league)")
-            print("[LiveWorldCupFilterDebug] title=\(match.awayTeam) at \(match.homeTeam)")
-        }
+        guard selectedLiveFeaturedEvent != nil else { return }
+        print("[LiveFeaturedFilter] rawCount=\(viewModel.liveMatches.count)")
+        print("[LiveFeaturedFilter] afterDateFilter=\(todayBase.count)")
+        print("[LiveFeaturedFilter] afterFeaturedFilter=\(afterFeaturedFilter.count)")
 #endif
     }
 
-    private func logLiveFeaturedEventDebug(
-        selectedFeaturedEvent: FeaturedEvent?,
-        allMatches: [LiveMatch],
-        returnedMatches: [LiveMatch],
-        liveNowCount: Int,
-        todayUpcomingMatches: [LiveMatch]
-    ) {
 #if DEBUG
-        let cal = Calendar.current
-        let windowStart = cal.startOfDay(for: liveCalendarToday)
-        let windowEnd = cal.date(byAdding: .day, value: 1, to: windowStart)
-            ?? windowStart.addingTimeInterval(24 * 60 * 60)
-        let formatter = Self.liveFeaturedEventDebugDateFormatter
-        let selectedKey = liveFeaturedEventDebugSelectedKey(selectedFeaturedEvent)
-        let todayAllMatches = allMatches.filter { cal.isDate($0.startTime, inSameDayAs: windowStart) }
-        let scheduledCount = todayUpcomingMatches.filter { $0.matchStatus == .scheduled }.count
-        let finalCount = todayUpcomingMatches.filter { $0.matchStatus == .fullTime }.count
-        print("[LiveFeaturedEventDebug] provider=\(LiveSportsService.providerDescription)")
-        print("[LiveFeaturedEventDebug] selectedChipKey=\(selectedKey)")
-        print("[LiveFeaturedEventDebug] localTimeZone=\(cal.timeZone.identifier)")
-        print("[LiveFeaturedEventDebug] dateWindowStart=\(formatter.string(from: windowStart))")
-        print("[LiveFeaturedEventDebug] dateWindowEnd=\(formatter.string(from: windowEnd))")
-        print("[LiveFeaturedEventDebug] candidateCount=\(allMatches.count)")
-        print("[LiveFeaturedEventDebug] returnedCount=\(returnedMatches.count)")
-        print("[LiveFeaturedEventDebug] totalTodayMatches=\(todayAllMatches.count)")
-        print("[LiveFeaturedEventDebug] liveNowCount=\(liveNowCount)")
-        print("[LiveFeaturedEventDebug] scheduledCount=\(scheduledCount)")
-        print("[LiveFeaturedEventDebug] finalCount=\(finalCount)")
-        print("[LiveFeaturedEventDebug] todayUpcomingCount=\(todayUpcomingMatches.count)")
-        for match in returnedMatches.prefix(8) {
-            print("[LiveFeaturedEventDebug] match=\(match.awayTeam) at \(match.homeTeam) league=\(match.league) status=\(match.matchStatus.rawValue) start=\(formatter.string(from: match.startTime)) featuredEventSlug=\(match.featuredEventSlug ?? "nil")")
-        }
-#endif
-    }
-
-    private func liveFeaturedEventDebugSelectedKey(_ selectedFeaturedEvent: FeaturedEvent?) -> String {
-        if let selectedFeaturedEvent {
-            return [
-                "featured_slug=\(selectedFeaturedEvent.slug)",
-                "title=\(selectedFeaturedEvent.title)",
-                "shortTitle=\(selectedFeaturedEvent.shortTitle ?? "nil")"
-            ].joined(separator: " ")
-        }
-        if let liveGamesSportFilter {
-            return "sport=\(liveGamesSportFilter.rawValue)"
-        }
-        if liveLeagueCountryFilterIsActive {
-            return "countries=\(selectedLiveLeagueCountries.sorted().joined(separator: ","))"
-        }
-        return "all"
-    }
-
-    private static let liveFeaturedEventDebugDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss ZZZZ"
+    private static let liveFIFADiagnosticDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
+
+    private func logLiveFIFADiagnostic(
+        todayBase: [LiveMatch],
+        savedProGamesByKey: [String: SavedProGame]
+    ) {
+        let formatter = Self.liveFIFADiagnosticDateFormatter
+        for match in todayBase.prefix(30) {
+            print(
+                "[LiveFIFADiagnostic] " +
+                "id=\(match.id) " +
+                "homeTeam=\(match.homeTeam) " +
+                "awayTeam=\(match.awayTeam) " +
+                "league=\(match.league) " +
+                "sourceLeagueName=\(match.sourceLeagueName ?? "nil") " +
+                "leagueAlternate=\(match.leagueAlternate ?? "nil") " +
+                "eventName=\(match.eventName ?? "nil") " +
+                "featuredEventSlug=\(match.featuredEventSlug ?? "nil") " +
+                "sport=\(match.sport) " +
+                "status=\(match.matchStatus.rawValue) " +
+                "startTime=\(formatter.string(from: match.startTime))"
+            )
+        }
+
+        let explicitWorldCupMatches = todayBase.filter {
+            LiveMatchFilters.isFifaWorldCupMatch($0, linkedSavedProGame: nil)
+        }.count
+
+        let savedProGameLinkedMatches = todayBase.filter { match in
+            guard let linked = savedProGamesByKey[SavedProGame.stableKey(for: match)]
+                ?? savedProGamesByKey[match.id] else {
+                return false
+            }
+            return diagnosticSavedProGameHasWorldCupMetadata(linked)
+        }.count
+
+        print("[LiveFIFADiagnostic] todayCount=\(todayBase.count)")
+        print("[LiveFIFADiagnostic] explicitWorldCupMatches=\(explicitWorldCupMatches)")
+        print("[LiveFIFADiagnostic] savedProGameLinkedMatches=\(savedProGameLinkedMatches)")
+    }
+
+    private func diagnosticSavedProGameHasWorldCupMetadata(_ game: SavedProGame) -> Bool {
+        let haystack = [
+            game.league,
+            game.sport,
+            game.featuredEventSlug
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        guard !haystack.isEmpty else { return false }
+        if haystack.contains("world cup") {
+            return true
+        }
+        return haystack.contains("fifa") && haystack.contains("wc")
+    }
+#endif
 
     private func logLiveNowSectionDebug(liveNowExpanded: Bool, liveNowCount: Int) {
 #if DEBUG
@@ -2140,18 +2168,23 @@ struct LiveScreen: View {
     }
 
     private func liveFeedNativeAdCard(slotIndex: Int) -> some View {
-        GeometryReader { geometry in
-            CompactNativeAdCard(
-                placement: "live.feed",
-                hostTabRaw: "live",
-                slotIndex: slotIndex,
-                layoutWidth: max(280, geometry.size.width),
-                prefersLightChrome: false,
-                animatesLoadState: true
-            )
-        }
+        CompactNativeAdCard(
+            placement: "live.feed",
+            hostTabRaw: "live",
+            slotIndex: slotIndex,
+            layoutWidth: liveFeedNativeAdLayoutWidth,
+            prefersLightChrome: false,
+            animatesLoadState: true
+        )
+        .frame(maxWidth: .infinity)
         .frame(height: CompactNativeAdLayout.preferredHeight)
         .clipped()
+        .contentShape(Rectangle())
+    }
+
+    private func updateLiveFeedNativeAdLayoutWidth(_ width: CGFloat) {
+        guard width > 0, abs(liveFeedNativeAdLayoutWidth - width) > 0.5 else { return }
+        liveFeedNativeAdLayoutWidth = max(280, width)
     }
 
     @ViewBuilder

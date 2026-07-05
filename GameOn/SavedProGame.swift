@@ -625,6 +625,7 @@ extension MapViewModel {
         persistSavedProGames()
         Task { [weak self] in
             guard let self else { return }
+            await GameReminderNotificationService.shared.cancelFavoriteTeamProGamePreKickoffReminder(identifier: snapshot.stableKey)
             await self.scheduleProGameReminderIfPossible(snapshot)
             await self.syncSavedProGameToAppleCalendar(
                 snapshot,
@@ -646,8 +647,9 @@ extension MapViewModel {
         }
     }
 
-    func unsaveProGame(id: String) {
+    func unsaveProGame(id: String, onRemoteDeleteFailed: ((Error) -> Void)? = nil) {
         let savedGame = savedProGames.first { $0.stableKey == id || $0.id == id }
+        let restoreSnapshot = savedGame
         let remoteLiveMatchId = savedGame?.id ?? id
         let reminderIdentifier = savedGame?.stableKey ?? id
         savedProGames.removeAll { $0.stableKey == id || $0.id == id }
@@ -666,6 +668,7 @@ extension MapViewModel {
                 forceBypassFreshness: true
             )
             await self.deleteProGamePredictionsForUnsave(proGameId: reminderIdentifier)
+            await self.reconcileFavoriteTeamProGameReminders(reason: "unsavedProGame")
         }
 
         guard let userID = currentUserAuthId, isAuthenticatedForSocialFeatures else { return }
@@ -674,6 +677,12 @@ extension MapViewModel {
             do {
                 try await self.deleteSavedProGameFromSupabase(liveMatchId: remoteLiveMatchId, userID: userID)
             } catch {
+                await MainActor.run {
+                    if let restoreSnapshot {
+                        self.reinsertSavedProGameIfMissing(restoreSnapshot)
+                    }
+                    onRemoteDeleteFailed?(error)
+                }
 #if DEBUG
                 print("[SavedProGames] deleteRemoteFailed id=\(remoteLiveMatchId) error=\(error.localizedDescription)")
 #endif
@@ -681,8 +690,15 @@ extension MapViewModel {
         }
     }
 
-    func removeSavedProGame(id: String) {
-        unsaveProGame(id: id)
+    private func reinsertSavedProGameIfMissing(_ snapshot: SavedProGame) {
+        guard !savedProGames.contains(where: { $0.stableKey == snapshot.stableKey }) else { return }
+        savedProGames.append(snapshot)
+        savedProGames.sort(by: SavedProGame.displaySort)
+        persistSavedProGames()
+    }
+
+    func removeSavedProGame(id: String, onRemoteDeleteFailed: ((Error) -> Void)? = nil) {
+        unsaveProGame(id: id, onRemoteDeleteFailed: onRemoteDeleteFailed)
     }
 
     func currentSavedProGameSnapshot(_ saved: SavedProGame) -> SavedProGame {
@@ -1181,14 +1197,24 @@ extension MapViewModel {
         forceRefresh: Bool = false
     ) async {
         guard enabled else {
+            let previous = favoriteTeamProGames
             favoriteTeamProGames = []
+            await reconcileFavoriteTeamProGameReminders(
+                reason: "autoFollowDisabled",
+                previousGames: previous
+            )
             return
         }
 
         let favoriteTeams = FavoriteTeamsStore
             .resolvedTeams(from: favoriteTeamIDsRaw)
         guard !favoriteTeams.isEmpty else {
+            let previous = favoriteTeamProGames
             favoriteTeamProGames = []
+            await reconcileFavoriteTeamProGameReminders(
+                reason: "noFavoriteTeams",
+                previousGames: previous
+            )
             return
         }
 
@@ -1252,6 +1278,10 @@ extension MapViewModel {
             )
             await syncFavoriteTeamProGameSubscriptions(autoFollowMatches, reason: "favoriteTeamAutoFollowFetch")
             mergeFavoriteTeamWindowMatchesIntoLiveMatches(matches)
+            await reconcileFavoriteTeamProGameReminders(
+                reason: "favoriteTeamAutoFollowFetch",
+                previousGames: previous
+            )
             lastFavoriteTeamProGamesRefreshAt = Date()
             lastFavoriteTeamProGamesRefreshKey = refreshKey
         } catch {
@@ -1267,6 +1297,10 @@ extension MapViewModel {
                 reason: "favoriteTeamAutoFollowFallback"
             )
             await syncFavoriteTeamProGameSubscriptions(autoFollowMatches, reason: "favoriteTeamAutoFollowFallback")
+            await reconcileFavoriteTeamProGameReminders(
+                reason: "favoriteTeamAutoFollowFallback",
+                previousGames: previous
+            )
         }
     }
 

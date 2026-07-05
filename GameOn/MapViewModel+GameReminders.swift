@@ -2,6 +2,11 @@ import Foundation
 import UserNotifications
 
 extension MapViewModel {
+    private static var proGameReminderVerboseLogging = false
+    private static let proGameReminderBatchDeferDelayNs: UInt64 = 1_500_000_000
+    private static let proGameReminderPreferenceBatchDeferDelayNs: UInt64 = 500_000_000
+    private static let proGameReminderBatchCoalesceInterval: TimeInterval = 45
+
     private var gameReminderService: GameReminderNotificationService {
         GameReminderNotificationService.shared
     }
@@ -41,6 +46,15 @@ extension MapViewModel {
         await syncProGameFinalScorePreferenceToBackend(reason: "proGameGameReminderTimingChanged")
     }
 
+    func setFavoriteTeamProGameReminderTiming(_ timing: ProGameReminderTiming) async {
+        guard favoriteTeamProGameReminderTiming != timing else { return }
+
+        await gameReminderService.cancelAllFavoriteTeamProGamePreKickoffReminders()
+        guard await notificationSettingsStore.setFavoriteTeamProGameReminderTiming(timing) else { return }
+
+        await reconcileFavoriteTeamProGameReminders(reason: "favoriteTeamGameReminderTimingChanged")
+    }
+
     func gameReminderPreferenceDidChange() async {
         print("[NotificationSettingsDebug] save reminderPreference notifyBeforeGame=\(notifyBeforeGame) proGameKickoffAlertEnabled=\(proGameKickoffAlertEnabled) proGameReminderTiming=\(proGameReminderTiming.rawValue) reminderMinutesBefore=\(reminderMinutesBefore) repeatGameReminder=\(repeatGameReminder) repeatEveryMinutes=\(repeatEveryMinutes)")
         print("[NotificationDebug] reminderPreference=\(reminderMinutesBefore)")
@@ -53,8 +67,13 @@ extension MapViewModel {
         print("[NotificationSettingsDebug] save proGameKickoffAlertEnabled=\(proGameKickoffAlertEnabled) proGameReminderTiming=\(proGameReminderTiming.rawValue)")
         await cancelAllProGameKickoffAlerts()
         await cancelAllProGamePreKickoffReminders()
-        await rescheduleAvailableProGameKickoffAlerts(reason: "preferenceChanged")
-        await rescheduleAvailableProGamePreKickoffReminders(reason: "preferenceChanged")
+        proGameReminderLastScheduledFingerprintByGame.removeAll()
+        proGameReminderLastBatchFingerprint = ""
+        scheduleDeferredSavedProGameReminderReconcile(
+            reason: "preferenceChanged",
+            force: true,
+            delayNanoseconds: Self.proGameReminderPreferenceBatchDeferDelayNs
+        )
     }
 
     func scheduleGameReminderIfPossible(venueEventID: UUID) async {
@@ -95,27 +114,7 @@ extension MapViewModel {
     }
 
     func scheduleProGameNotificationsIfPossible(_ savedGame: SavedProGame) async {
-        guard savedProGames.contains(where: { $0.stableKey == savedGame.stableKey }) else { return }
-        guard let event = proGameReminderNotificationEvent(for: savedGame) else {
-            await cancelProGameNotificationSchedules(savedGameIdentifier: savedGame.stableKey)
-            return
-        }
-
-        if proGameKickoffAlertEnabled {
-            await gameReminderService.scheduleProGameKickoffAlert(for: event)
-        } else {
-            await gameReminderService.cancelProGameKickoffAlert(identifier: savedGame.stableKey)
-        }
-
-        if proGameGameReminderEnabled, let reminderMinutesBefore = proGameReminderTiming.reminderMinutesBefore {
-            await gameReminderService.scheduleProGamePreKickoffReminder(
-                for: event,
-                userPreference: proGameReminderTiming.rawValue,
-                reminderMinutesBefore: reminderMinutesBefore
-            )
-        } else {
-            await gameReminderService.cancelProGamePreKickoffReminder(identifier: savedGame.stableKey)
-        }
+        _ = await refreshSavedProGameReminderSchedulesIfNeeded(savedGame, force: true)
     }
 
     func scheduleProGameReminderIfPossible(_ savedGame: SavedProGame) async {
@@ -143,8 +142,137 @@ extension MapViewModel {
     }
 
     func reconcileSavedProGameReminders(reason: String) async {
-        await rescheduleAvailableProGameKickoffAlerts(reason: reason)
-        await rescheduleAvailableProGamePreKickoffReminders(reason: reason)
+        scheduleDeferredSavedProGameReminderReconcile(reason: reason)
+    }
+
+    func scheduleDeferredSavedProGameReminderReconcile(
+        reason: String,
+        force: Bool = false,
+        delayNanoseconds: UInt64 = 1_500_000_000
+    ) {
+        proGameReminderPendingReconcileReason = reason
+        proGameReminderDeferredReconcileTask?.cancel()
+        proGameReminderDeferredReconcileTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            await self.performSavedProGameReminderBatchReconcile(
+                reason: self.proGameReminderPendingReconcileReason ?? reason,
+                force: force
+            )
+            self.proGameReminderDeferredReconcileTask = nil
+        }
+    }
+
+    private func performSavedProGameReminderBatchReconcile(reason: String, force: Bool) async {
+        let startedAt = Date()
+        let games = savedProGames
+        let batchFingerprint = proGameReminderBatchFingerprint(for: games)
+
+        if !force,
+           let lastBatchAt = proGameReminderLastBatchAt,
+           Date().timeIntervalSince(lastBatchAt) < Self.proGameReminderBatchCoalesceInterval,
+           batchFingerprint == proGameReminderLastBatchFingerprint {
+            let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+            print("[ProGameReminderPerf] batch games=\(games.count) skipped=\(games.count) scheduled=0 durationMs=\(ms) reason=coalescedUnchanged")
+            return
+        }
+
+        guard await gameReminderService.beginBatchScheduling() else {
+            gameReminderService.endBatchScheduling()
+            let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+            print("[ProGameReminderPerf] batch games=\(games.count) skipped=\(games.count) scheduled=0 durationMs=\(ms) reason=permissionDenied")
+            return
+        }
+        defer { gameReminderService.endBatchScheduling() }
+
+        let currentKeys = Set(games.map(\.stableKey))
+        for (gameKey, _) in proGameReminderLastScheduledFingerprintByGame where !currentKeys.contains(gameKey) {
+            await cancelProGameNotificationSchedules(savedGameIdentifier: gameKey)
+            proGameReminderLastScheduledFingerprintByGame.removeValue(forKey: gameKey)
+        }
+
+        var skipped = 0
+        var scheduled = 0
+        for savedGame in games {
+            if await refreshSavedProGameReminderSchedulesIfNeeded(savedGame, force: force) {
+                scheduled += 1
+            } else {
+                skipped += 1
+            }
+        }
+
+        proGameReminderLastBatchFingerprint = batchFingerprint
+        proGameReminderLastBatchAt = Date()
+        let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+        print("[ProGameReminderPerf] batch games=\(games.count) skipped=\(skipped) scheduled=\(scheduled) durationMs=\(ms) reason=\(reason)")
+    }
+
+    private func proGameReminderGlobalSettingsFingerprint() -> String {
+        [
+            proGameKickoffAlertEnabled ? "kickoffOn" : "kickoffOff",
+            proGameGameReminderEnabled ? "reminderOn" : "reminderOff",
+            proGameReminderTiming.rawValue,
+            proGameReminderTiming.reminderMinutesBefore.map(String.init) ?? "nil"
+        ].joined(separator: "|")
+    }
+
+    private func proGameReminderScheduleFingerprint(for savedGame: SavedProGame) -> String {
+        [
+            savedGame.stableKey,
+            String(Int(savedGame.startTime.timeIntervalSince1970)),
+            proGameReminderGlobalSettingsFingerprint()
+        ].joined(separator: "|")
+    }
+
+    private func proGameReminderBatchFingerprint(for games: [SavedProGame]) -> String {
+        [
+            proGameReminderGlobalSettingsFingerprint(),
+            games.map { proGameReminderScheduleFingerprint(for: $0) }.sorted().joined(separator: ";")
+        ].joined(separator: "||")
+    }
+
+    @discardableResult
+    private func refreshSavedProGameReminderSchedulesIfNeeded(
+        _ savedGame: SavedProGame,
+        force: Bool
+    ) async -> Bool {
+        let fingerprint = proGameReminderScheduleFingerprint(for: savedGame)
+        if !force, proGameReminderLastScheduledFingerprintByGame[savedGame.stableKey] == fingerprint {
+            return false
+        }
+
+        guard savedProGames.contains(where: { $0.stableKey == savedGame.stableKey }) else {
+            await cancelProGameNotificationSchedules(savedGameIdentifier: savedGame.stableKey)
+            proGameReminderLastScheduledFingerprintByGame.removeValue(forKey: savedGame.stableKey)
+            return true
+        }
+
+        guard let event = proGameReminderNotificationEvent(for: savedGame) else {
+            await cancelProGameNotificationSchedules(savedGameIdentifier: savedGame.stableKey)
+            proGameReminderLastScheduledFingerprintByGame[savedGame.stableKey] = fingerprint
+            return true
+        }
+
+        if proGameKickoffAlertEnabled {
+            await gameReminderService.scheduleProGameKickoffAlert(for: event)
+        } else {
+            await gameReminderService.cancelProGameKickoffAlert(identifier: savedGame.stableKey)
+        }
+
+        if proGameGameReminderEnabled, let reminderMinutesBefore = proGameReminderTiming.reminderMinutesBefore {
+            await gameReminderService.scheduleProGamePreKickoffReminder(
+                for: event,
+                userPreference: proGameReminderTiming.rawValue,
+                reminderMinutesBefore: reminderMinutesBefore
+            )
+        } else {
+            await gameReminderService.cancelProGamePreKickoffReminder(identifier: savedGame.stableKey)
+        }
+
+        proGameReminderLastScheduledFingerprintByGame[savedGame.stableKey] = fingerprint
+        return true
     }
 
     private func rescheduleAvailableGameReminders(reason: String) async {
@@ -156,53 +284,11 @@ extension MapViewModel {
     }
 
     private func rescheduleAvailableProGameKickoffAlerts(reason: String) async {
-        guard proGameKickoffAlertEnabled else { return }
-        for savedGame in savedProGames {
-            print("[ProGameKickoffAlertDebug] rescheduleAlert id=\(savedGame.stableKey) reason=\(reason)")
-            await scheduleProGameKickoffAlertIfPossible(savedGame)
-        }
+        await performSavedProGameReminderBatchReconcile(reason: reason, force: true)
     }
 
     private func rescheduleAvailableProGamePreKickoffReminders(reason: String) async {
-        guard proGameGameReminderEnabled else { return }
-        for savedGame in savedProGames {
-            print("[ProGameReminderDebug] rescheduleReminder id=\(savedGame.stableKey) reason=\(reason)")
-            await scheduleProGamePreKickoffReminderIfPossible(savedGame)
-        }
-    }
-
-    private func scheduleProGameKickoffAlertIfPossible(_ savedGame: SavedProGame) async {
-        guard proGameKickoffAlertEnabled else {
-            await gameReminderService.cancelProGameKickoffAlert(identifier: savedGame.stableKey)
-            return
-        }
-        guard savedProGames.contains(where: { $0.stableKey == savedGame.stableKey }) else { return }
-        guard let event = proGameReminderNotificationEvent(for: savedGame) else {
-            await gameReminderService.cancelProGameKickoffAlert(identifier: savedGame.stableKey)
-            return
-        }
-        await gameReminderService.scheduleProGameKickoffAlert(for: event)
-    }
-
-    private func scheduleProGamePreKickoffReminderIfPossible(_ savedGame: SavedProGame) async {
-        guard proGameGameReminderEnabled else {
-            await gameReminderService.cancelProGamePreKickoffReminder(identifier: savedGame.stableKey)
-            return
-        }
-        guard savedProGames.contains(where: { $0.stableKey == savedGame.stableKey }) else { return }
-        guard let reminderMinutesBefore = proGameReminderTiming.reminderMinutesBefore else {
-            await gameReminderService.cancelProGamePreKickoffReminder(identifier: savedGame.stableKey)
-            return
-        }
-        guard let event = proGameReminderNotificationEvent(for: savedGame) else {
-            await gameReminderService.cancelProGamePreKickoffReminder(identifier: savedGame.stableKey)
-            return
-        }
-        await gameReminderService.scheduleProGamePreKickoffReminder(
-            for: event,
-            userPreference: proGameReminderTiming.rawValue,
-            reminderMinutesBefore: reminderMinutesBefore
-        )
+        await performSavedProGameReminderBatchReconcile(reason: reason, force: true)
     }
 
     private func availableGoingVenueEventIDs() -> [UUID] {
@@ -328,5 +414,80 @@ extension MapViewModel {
         let plain = ISO8601DateFormatter()
         plain.formatOptions = [.withInternetDateTime]
         return plain.date(from: raw)
+    }
+
+    func reconcileFavoriteTeamProGameReminders(
+        reason: String,
+        previousGames: [FavoriteTeamProGame] = []
+    ) async {
+        let currentKeys = Set(favoriteTeamProGames.map(\.game.stableKey))
+
+        for item in previousGames where !currentKeys.contains(item.game.stableKey) {
+            await gameReminderService.cancelFavoriteTeamProGamePreKickoffReminder(identifier: item.game.stableKey)
+#if DEBUG
+            print("[FavoriteTeamReminder] skipped reason=removedFromFavoriteTeamWindow game=\(item.game.stableKey)")
+#endif
+        }
+
+        for item in favoriteTeamProGames {
+            await refreshFavoriteTeamProGamePreKickoffReminder(item, reason: reason)
+        }
+    }
+
+    private func refreshFavoriteTeamProGamePreKickoffReminder(
+        _ item: FavoriteTeamProGame,
+        reason: String
+    ) async {
+        let game = item.game
+        let gameId = game.stableKey
+
+        if let skipReason = await favoriteTeamPreKickoffReminderSkipReason(for: item) {
+#if DEBUG
+            print("[FavoriteTeamReminder] skipped reason=\(skipReason) game=\(gameId) trigger=\(reason)")
+#endif
+            await gameReminderService.cancelFavoriteTeamProGamePreKickoffReminder(identifier: gameId)
+            return
+        }
+
+#if DEBUG
+        print("[FavoriteTeamReminder] eligible game=\(gameId) trigger=\(reason)")
+#endif
+
+        guard let event = proGameReminderNotificationEvent(for: game) else {
+#if DEBUG
+            print("[FavoriteTeamReminder] skipped reason=kickoffInPast game=\(gameId) trigger=\(reason)")
+#endif
+            await gameReminderService.cancelFavoriteTeamProGamePreKickoffReminder(identifier: gameId)
+            return
+        }
+
+        guard let reminderMinutesBefore = favoriteTeamProGameReminderTiming.reminderMinutesBefore else { return }
+
+        await gameReminderService.scheduleFavoriteTeamProGamePreKickoffReminder(
+            for: event,
+            userPreference: favoriteTeamProGameReminderTiming.rawValue,
+            reminderMinutesBefore: reminderMinutesBefore
+        )
+#if DEBUG
+        print("[FavoriteTeamReminder] scheduled game=\(gameId) trigger=\(reason)")
+#endif
+    }
+
+    private func favoriteTeamPreKickoffReminderSkipReason(
+        for item: FavoriteTeamProGame
+    ) async -> String? {
+        guard favoriteTeamProGameReminderEnabled else {
+            return "teamMatchReminderNever"
+        }
+        guard await gameReminderService.canScheduleNotifications() else {
+            return "permissionDenied"
+        }
+        if savedProGames.contains(where: { $0.stableKey == item.game.stableKey }) {
+            return "savedGameOwnsReminder"
+        }
+        guard item.game.startTime > Date() else {
+            return "notUpcoming"
+        }
+        return nil
     }
 }

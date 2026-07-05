@@ -71,6 +71,7 @@ final class GameReminderNotificationService {
     private let center: UNUserNotificationCenter
     private let identifierPrefix = "fangeo.gameReminder."
     private let proGameIdentifierPrefix = "fangeo.proGameReminder."
+    private let favoriteTeamProGameReminderPrefix = "fangeo.favoriteTeamProGameReminder."
     private let proGameKickoffAlertPrefix = "fangeo.proGameKickoffAlert."
     private let proGameFinalIdentifierPrefix = "fangeo.proGameFinal."
     private let proGameHalftimeIdentifierPrefix = "fangeo.proGameHalftime."
@@ -79,8 +80,35 @@ final class GameReminderNotificationService {
     private let proGameScoreCorrectionIdentifierPrefix = "fangeo.proGameScoreCorrection."
     private let proGameCardNotificationIdentifierPrefix = "fangeo.proGameCard."
 
+    private var batchSchedulingAuthorizationAllowed: Bool?
+    private var suppressVerboseProGameSchedulingLogs = false
+
     private init(center: UNUserNotificationCenter = .current()) {
         self.center = center
+    }
+
+    func beginBatchScheduling() async -> Bool {
+        suppressVerboseProGameSchedulingLogs = true
+        let allowed = await requestAuthorizationIfNeeded()
+        batchSchedulingAuthorizationAllowed = allowed
+        return allowed
+    }
+
+    func endBatchScheduling() {
+        batchSchedulingAuthorizationAllowed = nil
+        suppressVerboseProGameSchedulingLogs = false
+    }
+
+    private func authorizationForScheduling() async -> Bool {
+        if let allowed = batchSchedulingAuthorizationAllowed {
+            return allowed
+        }
+        return await requestAuthorizationIfNeeded()
+    }
+
+    private func logProGameScheduling(_ message: @autoclosure () -> String) {
+        guard !suppressVerboseProGameSchedulingLogs else { return }
+        print(message())
     }
 
     func authorizationStatus() async -> UNAuthorizationStatus {
@@ -203,18 +231,18 @@ final class GameReminderNotificationService {
             awayTeam: event.awayTeam,
             homeTeam: event.homeTeam
         )
-        print("[ProGameKickoffAlertDebug] gameId=\(event.identifier)")
-        print("[ProGameKickoffAlertDebug] gameStart=\(Self.debugDateString(event.startDate))")
-        print("[ProGameKickoffAlertDebug] title=\"\(matchupTitle)\"")
+        logProGameScheduling("[ProGameKickoffAlertDebug] gameId=\(event.identifier)")
+        logProGameScheduling("[ProGameKickoffAlertDebug] gameStart=\(Self.debugDateString(event.startDate))")
+        logProGameScheduling("[ProGameKickoffAlertDebug] title=\"\(matchupTitle)\"")
 
-        guard await requestAuthorizationIfNeeded() else {
-            print("[ProGameKickoffAlertDebug] notificationCreated=false reason=permissionDenied")
+        guard await authorizationForScheduling() else {
+            logProGameScheduling("[ProGameKickoffAlertDebug] notificationCreated=false reason=permissionDenied")
             return
         }
 
         let now = Date()
         guard event.startDate > now else {
-            print("[ProGameKickoffAlertDebug] notificationCreated=false reason=kickoffInPast")
+            logProGameScheduling("[ProGameKickoffAlertDebug] notificationCreated=false reason=kickoffInPast")
             return
         }
 
@@ -243,11 +271,11 @@ final class GameReminderNotificationService {
             try await center.add(request)
             let pending = await center.pendingNotificationRequests()
             let isPending = pending.contains { $0.identifier == scheduledIdentifier }
-            print("[ProGameKickoffAlertDebug] scheduledTime=\(Self.debugDateString(event.startDate))")
-            print("[ProGameKickoffAlertDebug] scheduledIdentifier=\(scheduledIdentifier)")
-            print("[ProGameKickoffAlertDebug] notificationCreated=\(isPending)")
+            logProGameScheduling("[ProGameKickoffAlertDebug] scheduledTime=\(Self.debugDateString(event.startDate))")
+            logProGameScheduling("[ProGameKickoffAlertDebug] scheduledIdentifier=\(scheduledIdentifier)")
+            logProGameScheduling("[ProGameKickoffAlertDebug] notificationCreated=\(isPending)")
         } catch {
-            print("[ProGameKickoffAlertDebug] notificationCreated=false error=\(error.localizedDescription)")
+            logProGameScheduling("[ProGameKickoffAlertDebug] notificationCreated=false error=\(error.localizedDescription)")
         }
     }
 
@@ -255,6 +283,43 @@ final class GameReminderNotificationService {
         for event: ProGameReminderNotificationEvent,
         userPreference: String,
         reminderMinutesBefore: Int,
+        repeatUntilStart: Bool = false,
+        repeatEveryMinutes: Int = 30
+    ) async {
+        await scheduleProGamePreKickoffReminder(
+            for: event,
+            userPreference: userPreference,
+            reminderMinutesBefore: reminderMinutesBefore,
+            identifierPrefix: proGameIdentifierPrefix,
+            debugLabel: "ProGameReminderDebug",
+            cancelBeforeSchedule: cancelProGamePreKickoffReminder,
+            repeatUntilStart: repeatUntilStart,
+            repeatEveryMinutes: repeatEveryMinutes
+        )
+    }
+
+    func scheduleFavoriteTeamProGamePreKickoffReminder(
+        for event: ProGameReminderNotificationEvent,
+        userPreference: String,
+        reminderMinutesBefore: Int
+    ) async {
+        await scheduleProGamePreKickoffReminder(
+            for: event,
+            userPreference: userPreference,
+            reminderMinutesBefore: reminderMinutesBefore,
+            identifierPrefix: favoriteTeamProGameReminderPrefix,
+            debugLabel: "FavoriteTeamReminder",
+            cancelBeforeSchedule: cancelFavoriteTeamProGamePreKickoffReminder
+        )
+    }
+
+    private func scheduleProGamePreKickoffReminder(
+        for event: ProGameReminderNotificationEvent,
+        userPreference: String,
+        reminderMinutesBefore: Int,
+        identifierPrefix: String,
+        debugLabel: String,
+        cancelBeforeSchedule: (String) async -> Void,
         repeatUntilStart: Bool = false,
         repeatEveryMinutes: Int = 30
     ) async {
@@ -267,25 +332,27 @@ final class GameReminderNotificationService {
             awayTeam: event.awayTeam,
             homeTeam: event.homeTeam
         )
-        print("[ProGameReminderDebug] userPreference=\(userPreference)")
-        print("[ProGameReminderDebug] gameId=\(event.identifier)")
-        print("[ProGameReminderDebug] gameStart=\(Self.debugDateString(event.startDate))")
-        print("[ProGameReminderDebug] title=\"\(matchupTitle)\"")
+        logProGameScheduling("[\(debugLabel)] userPreference=\(userPreference)")
+        logProGameScheduling("[\(debugLabel)] gameId=\(event.identifier)")
+        logProGameScheduling("[\(debugLabel)] gameStart=\(Self.debugDateString(event.startDate))")
+        logProGameScheduling("[\(debugLabel)] title=\"\(matchupTitle)\"")
 
         let permissionBefore = await authorizationStatus()
-        print("[ProGameReminderDebug] permissionStatus=\(Self.authorizationStatusDescription(permissionBefore))")
-        guard await requestAuthorizationIfNeeded() else {
-            let permissionAfter = await authorizationStatus()
-            print("[ProGameReminderDebug] notificationCreated=false")
-            print("[ProGameReminderDebug] schedulingSuccess=false")
-            print("[ProGameReminderDebug] schedulingFailure=permissionDenied")
-            print("[ProGameReminderDebug] permissionStatus=\(Self.authorizationStatusDescription(permissionAfter))")
+        logProGameScheduling("[\(debugLabel)] permissionStatus=\(Self.authorizationStatusDescription(permissionBefore))")
+        guard await authorizationForScheduling() else {
+            if !suppressVerboseProGameSchedulingLogs {
+                let permissionAfter = await authorizationStatus()
+                print("[\(debugLabel)] notificationCreated=false")
+                print("[\(debugLabel)] schedulingSuccess=false")
+                print("[\(debugLabel)] schedulingFailure=permissionDenied")
+                print("[\(debugLabel)] permissionStatus=\(Self.authorizationStatusDescription(permissionAfter))")
+            }
             return
         }
 
         let fireDate = event.startDate.addingTimeInterval(TimeInterval(-reminderMinutesBefore * 60))
 
-        await cancelProGamePreKickoffReminder(identifier: event.identifier)
+        await cancelBeforeSchedule(event.identifier)
 
         let fireDates = proGamePreKickoffReminderFireDates(
             preferredFireDate: fireDate,
@@ -293,10 +360,10 @@ final class GameReminderNotificationService {
         )
 
         guard !fireDates.isEmpty else {
-            print("[ProGameReminderDebug] scheduledTime=none")
-            print("[ProGameReminderDebug] notificationCreated=false")
-            print("[ProGameReminderDebug] schedulingSuccess=false")
-            print("[ProGameReminderDebug] schedulingFailure=noFutureFireDate")
+            logProGameScheduling("[\(debugLabel)] scheduledTime=none")
+            logProGameScheduling("[\(debugLabel)] notificationCreated=false")
+            logProGameScheduling("[\(debugLabel)] schedulingSuccess=false")
+            logProGameScheduling("[\(debugLabel)] schedulingFailure=noFutureFireDate")
             return
         }
 
@@ -314,7 +381,11 @@ final class GameReminderNotificationService {
                 from: scheduledDate
             )
             let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
-            let scheduledIdentifier = proGameReminderIdentifier(for: event.identifier, repeatIndex: index)
+            let scheduledIdentifier = proGameReminderIdentifier(
+                for: event.identifier,
+                repeatIndex: index,
+                prefix: identifierPrefix
+            )
             let request = UNNotificationRequest(
                 identifier: scheduledIdentifier,
                 content: content,
@@ -325,28 +396,44 @@ final class GameReminderNotificationService {
                 try await center.add(request)
                 let pending = await center.pendingNotificationRequests()
                 let isPending = pending.contains { $0.identifier == scheduledIdentifier }
-                print("[ProGameReminderDebug] scheduledTime=\(Self.debugDateString(scheduledDate))")
-                print("[ProGameReminderDebug] scheduledIdentifier=\(scheduledIdentifier)")
-                print("[ProGameReminderDebug] notificationCreated=\(isPending)")
-                print("[ProGameReminderDebug] schedulingSuccess=\(isPending)")
+                logProGameScheduling("[\(debugLabel)] scheduledTime=\(Self.debugDateString(scheduledDate))")
+                logProGameScheduling("[\(debugLabel)] scheduledIdentifier=\(scheduledIdentifier)")
+                logProGameScheduling("[\(debugLabel)] notificationCreated=\(isPending)")
+                logProGameScheduling("[\(debugLabel)] schedulingSuccess=\(isPending)")
             } catch {
-                print("[ProGameReminderDebug] scheduledTime=\(Self.debugDateString(scheduledDate))")
-                print("[ProGameReminderDebug] scheduledIdentifier=\(scheduledIdentifier)")
-                print("[ProGameReminderDebug] notificationCreated=false")
-                print("[ProGameReminderDebug] schedulingSuccess=false")
-                print("[ProGameReminderDebug] schedulingFailure=\(error.localizedDescription)")
+                logProGameScheduling("[\(debugLabel)] scheduledTime=\(Self.debugDateString(scheduledDate))")
+                logProGameScheduling("[\(debugLabel)] scheduledIdentifier=\(scheduledIdentifier)")
+                logProGameScheduling("[\(debugLabel)] notificationCreated=false")
+                logProGameScheduling("[\(debugLabel)] schedulingSuccess=false")
+                logProGameScheduling("[\(debugLabel)] schedulingFailure=\(error.localizedDescription)")
             }
         }
     }
 
     func cancelProGamePreKickoffReminder(identifier: String) async {
-        print("[ProGameReminderDebug] cancelReminder gameId=\(identifier)")
-        let baseIdentifier = proGameReminderIdentifier(for: identifier)
+        await cancelProGamePreKickoffReminder(identifier: identifier, prefix: proGameIdentifierPrefix, debugLabel: "ProGameReminderDebug")
+    }
+
+    func cancelFavoriteTeamProGamePreKickoffReminder(identifier: String) async {
+        await cancelProGamePreKickoffReminder(identifier: identifier, prefix: favoriteTeamProGameReminderPrefix, debugLabel: "FavoriteTeamReminder")
+    }
+
+    private func cancelProGamePreKickoffReminder(identifier: String, prefix: String, debugLabel: String) async {
+        print("[\(debugLabel)] cancelReminder gameId=\(identifier)")
+        let baseIdentifier = proGameReminderIdentifier(for: identifier, prefix: prefix)
         let identifiers = await center.pendingNotificationRequests()
             .map(\.identifier)
             .filter { $0 == baseIdentifier || $0.hasPrefix("\(baseIdentifier).") }
         center.removePendingNotificationRequests(withIdentifiers: identifiers.isEmpty ? [baseIdentifier] : identifiers)
-        print("[ProGameReminderDebug] canceledIdentifiers=\((identifiers.isEmpty ? [baseIdentifier] : identifiers).joined(separator: ","))")
+        print("[\(debugLabel)] canceledIdentifiers=\((identifiers.isEmpty ? [baseIdentifier] : identifiers).joined(separator: ","))")
+    }
+
+    func cancelAllFavoriteTeamProGamePreKickoffReminders() async {
+        let requests = await center.pendingNotificationRequests()
+        let identifiers = requests
+            .map(\.identifier)
+            .filter { $0.hasPrefix(favoriteTeamProGameReminderPrefix) }
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
     }
 
     func cancelProGameKickoffAlert(identifier: String) async {
@@ -621,11 +708,19 @@ final class GameReminderNotificationService {
     }
 
     private func proGameReminderIdentifier(for identifier: String) -> String {
-        "\(proGameIdentifierPrefix)\(identifier)"
+        proGameReminderIdentifier(for: identifier, prefix: proGameIdentifierPrefix)
     }
 
     private func proGameReminderIdentifier(for identifier: String, repeatIndex: Int) -> String {
-        let base = proGameReminderIdentifier(for: identifier)
+        proGameReminderIdentifier(for: identifier, repeatIndex: repeatIndex, prefix: proGameIdentifierPrefix)
+    }
+
+    private func proGameReminderIdentifier(for identifier: String, prefix: String) -> String {
+        "\(prefix)\(identifier)"
+    }
+
+    private func proGameReminderIdentifier(for identifier: String, repeatIndex: Int, prefix: String) -> String {
+        let base = proGameReminderIdentifier(for: identifier, prefix: prefix)
         return repeatIndex == 0 ? base : "\(base).repeat\(repeatIndex)"
     }
 

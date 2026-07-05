@@ -20,7 +20,7 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             if shouldShowSplash {
-                FanGeoSplashView()
+                FanGeoSplashView(statusMessage: bootstrapCoordinator.splashStatusMessage)
                     .zIndex(1)
             } else if let ban = viewModel.activeAccountBan {
                 AccountSuspensionGateView(viewModel: viewModel, ban: ban, kind: .user)
@@ -51,6 +51,7 @@ struct ContentView: View {
             FanGeoAnalyticsService.recordAppOpen()
             ProGameNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             SupportReplyNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            FanGeoAnnouncementNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             #if DEBUG
             print("[LaunchPathDebug] ContentViewMounted=true")
             print("[LaunchPathDebug] isBootstrapping=\(bootstrapCoordinator.isBootstrapping)")

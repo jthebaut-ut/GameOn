@@ -17,6 +17,8 @@
 	<string>ca-app-pub-9637364906993742~5547329973</string>
 	<key>GADNativeAdValidatorEnabled</key>
 	<false/>
+	<key>NSUserTrackingUsageDescription</key>
+	<string>FanGeo uses your permission to show more relevant ads and help keep sports discovery, pickup games, and fan features free.</string>
 	<key>SKAdNetworkItems</key>
 	<array>
 		<dict>

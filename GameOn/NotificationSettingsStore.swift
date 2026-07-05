@@ -5,13 +5,19 @@ nonisolated enum ProGameNotificationPreferenceKeys {
     static let finalScoreAlerts = "proGameFinalScoreNotifications"
     static let favoriteTeamAlerts = "favoriteTeamProGameAlertsEnabled"
     static let reminderTiming = "proGameReminderTiming"
+    static let favoriteTeamReminderTiming = "favoriteTeamProGameReminderTiming"
     static let kickoffAlert = "proGameKickoffAlertEnabled"
+}
+
+nonisolated enum FanGeoNotificationPreferenceKeys {
+    static let announcementNotifications = "fanGeoAnnouncementNotificationsEnabled"
 }
 
 nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
     case never
     case oneDay
     case oneHour
+    case twoHours
     case thirtyMinutes
     case tenMinutes
 
@@ -25,6 +31,8 @@ nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
             return "1 Day Before"
         case .oneHour:
             return "1 Hour Before"
+        case .twoHours:
+            return "2 Hours Before"
         case .thirtyMinutes:
             return "30 Minutes Before"
         case .tenMinutes:
@@ -44,6 +52,8 @@ nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
             return 24 * 60
         case .oneHour:
             return 60
+        case .twoHours:
+            return 120
         case .thirtyMinutes:
             return 30
         case .tenMinutes:
@@ -61,6 +71,8 @@ nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
             return .oneDay
         case 60:
             return .oneHour
+        case 120:
+            return .twoHours
         case 30:
             return .thirtyMinutes
         case 10:
@@ -70,9 +82,24 @@ nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Timing choices for saved Pro Game pre-kickoff reminders (Settings → Match Reminder).
+    static var savedGamePickerOptions: [ProGameReminderTiming] {
+        [.never, .oneDay, .oneHour, .thirtyMinutes, .tenMinutes]
+    }
+
     /// Timing choices for optional pre-kickoff game reminders.
     static var pickerOptions: [ProGameReminderTiming] {
-        allCases
+        savedGamePickerOptions
+    }
+
+    /// Timing choices for favorite-team pre-kickoff reminders (Settings → Team Match Reminder).
+    static var favoriteTeamPickerOptions: [ProGameReminderTiming] {
+        [.never, .thirtyMinutes, .oneHour, .twoHours]
+    }
+
+    static func resolvedFavoriteTeam(rawValue: String) -> ProGameReminderTiming {
+        let timing = ProGameReminderTiming(rawValue: rawValue) ?? .oneHour
+        return favoriteTeamPickerOptions.contains(timing) ? timing : .oneHour
     }
 }
 
@@ -199,6 +226,11 @@ final class NotificationSettingsStore: ObservableObject {
         willSet { objectWillChange.send() }
     }
 
+    @AppStorage(ProGameNotificationPreferenceKeys.favoriteTeamReminderTiming)
+    private var favoriteTeamProGameReminderTimingRaw: String = ProGameReminderTiming.oneHour.rawValue {
+        willSet { objectWillChange.send() }
+    }
+
     @AppStorage(ProGameNotificationPreferenceKeys.kickoffAlert)
     var proGameKickoffAlertEnabled: Bool = true {
         willSet { objectWillChange.send() }
@@ -213,6 +245,15 @@ final class NotificationSettingsStore: ObservableObject {
         proGameReminderTiming.schedulesKickoffReminder
     }
 
+    var favoriteTeamProGameReminderTiming: ProGameReminderTiming {
+        get { ProGameReminderTiming.resolvedFavoriteTeam(rawValue: favoriteTeamProGameReminderTimingRaw) }
+        set { favoriteTeamProGameReminderTimingRaw = newValue.rawValue }
+    }
+
+    var favoriteTeamProGameReminderEnabled: Bool {
+        favoriteTeamProGameReminderTiming.schedulesKickoffReminder
+    }
+
     @AppStorage(ProGameNotificationPreferenceKeys.finalScoreAlerts)
     var proGameFinalScoreNotifications: Bool = true {
         willSet { objectWillChange.send() }
@@ -220,6 +261,11 @@ final class NotificationSettingsStore: ObservableObject {
 
     @AppStorage(ProGameNotificationPreferenceKeys.favoriteTeamAlerts)
     var favoriteTeamProGameAlertsEnabled: Bool = false {
+        willSet { objectWillChange.send() }
+    }
+
+    @AppStorage(FanGeoNotificationPreferenceKeys.announcementNotifications)
+    var fanGeoAnnouncementNotificationsEnabled: Bool = true {
         willSet { objectWillChange.send() }
     }
 
@@ -236,6 +282,7 @@ final class NotificationSettingsStore: ObservableObject {
 
     init() {
         migrateProGameReminderTimingIfNeeded()
+        migrateFavoriteTeamProGameReminderTimingIfNeeded()
         migrateProGameKickoffAlertSplitIfNeeded()
         print("[NotificationSettingsStoreDebug] initialized")
     }
@@ -272,6 +319,20 @@ final class NotificationSettingsStore: ObservableObject {
                 proGameReminderTimingRaw = ProGameReminderTiming.never.rawValue
                 proGameKickoffAlertEnabled = true
             }
+        }
+
+        UserDefaults.standard.set(true, forKey: migrationKey)
+    }
+
+    private func migrateFavoriteTeamProGameReminderTimingIfNeeded() {
+        let migrationKey = "favoriteTeamProGameReminderTimingMigrated.v1"
+        guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+
+        if UserDefaults.standard.string(forKey: ProGameNotificationPreferenceKeys.favoriteTeamReminderTiming) == nil {
+            let savedTiming = proGameReminderTiming
+            favoriteTeamProGameReminderTimingRaw = ProGameReminderTiming
+                .favoriteTeamPickerOptions
+                .contains(savedTiming) ? savedTiming.rawValue : ProGameReminderTiming.oneHour.rawValue
         }
 
         UserDefaults.standard.set(true, forKey: migrationKey)
@@ -320,6 +381,7 @@ final class NotificationSettingsStore: ObservableObject {
             await gameReminderService.cancelAllGameReminders()
             await gameReminderService.cancelAllProGameKickoffAlerts()
             await gameReminderService.cancelAllProGamePreKickoffReminders()
+            await gameReminderService.cancelAllFavoriteTeamProGamePreKickoffReminders()
             notificationPermissionMessage = "Notifications are off for FanGeo. Turn them on in iOS Settings to receive game reminders."
         case .authorized, .provisional, .ephemeral:
             notificationPermissionMessage = ""
@@ -413,6 +475,25 @@ final class NotificationSettingsStore: ObservableObject {
         proGameReminderTiming = timing
         if timing == .never {
             await gameReminderService.cancelAllProGamePreKickoffReminders()
+        }
+        return true
+    }
+
+    func setFavoriteTeamProGameReminderTiming(_ timing: ProGameReminderTiming) async -> Bool {
+        print("[NotificationSettingsDebug] save favoriteTeamProGameReminderTiming requested=\(timing.rawValue)")
+        if timing.schedulesKickoffReminder {
+            let granted = await gameReminderService.requestAuthorizationIfNeeded()
+            guard granted else {
+                notificationPermissionMessage = "Notifications are off for FanGeo. Turn them on in iOS Settings to receive game reminders."
+                print("[NotificationSettingsDebug] save favoriteTeamProGameReminderTiming deniedBySystem")
+                return false
+            }
+            notificationPermissionMessage = ""
+        }
+
+        favoriteTeamProGameReminderTiming = timing
+        if timing == .never {
+            await gameReminderService.cancelAllFavoriteTeamProGamePreKickoffReminders()
         }
         return true
     }

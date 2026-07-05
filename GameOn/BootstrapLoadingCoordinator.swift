@@ -7,8 +7,10 @@ final class BootstrapLoadingCoordinator: ObservableObject {
     @Published private(set) var isBootstrapping = true
     @Published private(set) var bootstrapError: String?
     @Published private(set) var shouldUseMainTabFallbackBootstrap = false
+    @Published private(set) var splashStatusMessage = FanGeoSplashBootstrapStage.preparing.message
 
     private var didStart = false
+    private static let didExplicitlyLogoutDefaultsKey = "didExplicitlyLogout"
     private let minimumVisibleSeconds: TimeInterval = FanGeoSplashAnimation.minimumVisibleDuration
     private let maximumWaitSeconds: TimeInterval = 3.8
 
@@ -19,11 +21,16 @@ final class BootstrapLoadingCoordinator: ObservableObject {
         guard !didStart else { return }
         didStart = true
 
+        setSplashStage(.preparing)
+
         let startedAt = Date()
         let bootstrapTask = Task {
             await Self.performCriticalBootstrap(
                 viewModel: viewModel,
-                chatViewModel: chatViewModel
+                chatViewModel: chatViewModel,
+                onStage: { [weak self] stage in
+                    self?.setSplashStage(stage)
+                }
             )
         }
 
@@ -70,23 +77,44 @@ final class BootstrapLoadingCoordinator: ObservableObject {
     /// Critical launch path only — must stay fast enough for splash dismiss.
     static func performCriticalBootstrap(
         viewModel: MapViewModel,
-        chatViewModel: ChatViewModel
+        chatViewModel: ChatViewModel,
+        onStage: (@MainActor (FanGeoSplashBootstrapStage) -> Void)? = nil
     ) async {
         let criticalStart = Date()
         print("[LaunchPerf] criticalStart")
 
+        await MainActor.run {
+            onStage?(.preparing)
+        }
         await viewModel.renderCachedDiscoverCore()
 
+        await MainActor.run {
+            onStage?(.findingNearbyVenues)
+        }
         await viewModel.prepareInitialDiscoverRegionAndPreload()
 
+        if shouldShowLoadingFavoritesSplashStage {
+            await MainActor.run {
+                onStage?(.loadingFavorites)
+            }
+        }
         await viewModel.bootstrapAuthSessionOnly()
 
-        if LaunchBootstrapState.markLaunchDiscoverCoreRefreshStarted() {
+        let shouldRefreshDiscoverCore = await MainActor.run {
+            LaunchBootstrapState.markLaunchDiscoverCoreRefreshStarted()
+        }
+        if shouldRefreshDiscoverCore {
+            await MainActor.run {
+                onStage?(.checkingLiveGames)
+            }
             await viewModel.refreshDiscoverCoreInBackground()
         } else {
             print("[LaunchPerf] duplicateSkipped reason=launchDiscoverCoreRefresh")
         }
 
+        await MainActor.run {
+            onStage?(.almostReady)
+        }
         let shouldLoadChatBadge = await MainActor.run {
             viewModel.isAuthenticatedForSocialFeatures
         }
@@ -104,6 +132,14 @@ final class BootstrapLoadingCoordinator: ObservableObject {
         print("[LaunchPerf] criticalEnd ms=\(criticalMs)")
     }
 
+    private static var shouldShowLoadingFavoritesSplashStage: Bool {
+        !UserDefaults.standard.bool(forKey: didExplicitlyLogoutDefaultsKey)
+    }
+
+    private func setSplashStage(_ stage: FanGeoSplashBootstrapStage) {
+        splashStatusMessage = stage.message
+    }
+
     private func scheduleWarmPreload(
         viewModel: MapViewModel,
         chatViewModel: ChatViewModel
@@ -114,6 +150,10 @@ final class BootstrapLoadingCoordinator: ObservableObject {
                 viewModel: viewModel,
                 chatViewModel: chatViewModel,
                 accountTabVisible: false
+            )
+            UserPreferencesWarmCacheCoordinator.shared.beginIfNeeded(
+                viewModel: viewModel,
+                delayMs: 1_400
             )
         }
     }

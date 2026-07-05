@@ -2,8 +2,12 @@ import SwiftUI
 
 /// Full-screen static splash shown immediately after the static `LaunchScreen` storyboard.
 struct FanGeoSplashView: View {
-    private static let statusMessage = "Loading your fan experience…"
+    let statusMessage: String
     @State private var contentOpacity = 0.0
+
+    init(statusMessage: String = FanGeoSplashBootstrapStage.preparing.message) {
+        self.statusMessage = statusMessage
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -23,7 +27,7 @@ struct FanGeoSplashView: View {
                         .offset(y: -54)
                         .accessibilityLabel("FanGeo")
 
-                    FanGeoLoadingStatusText(text: Self.statusMessage)
+                    FanGeoCrossfadeLoadingStatusText(text: statusMessage)
                         .padding(.horizontal, 24)
                         .frame(height: 56)
                         .offset(y: -54 + (imageWidth / 2) + 46)
@@ -40,7 +44,7 @@ struct FanGeoSplashView: View {
             #if DEBUG
             print("[FanGeoLoadingDebug] splashDisplayed")
             print("[FanGeoLoadingDebug] stableImageLayout=true")
-            print("[FanGeoLoadingDebug] loadingStatus=\(Self.statusMessage)")
+            print("[FanGeoLoadingDebug] loadingStatus=\(statusMessage)")
             print("[FanGeoLoadingBrandingDebug] premiumSplashLoaded=true")
             print("[FanGeoLoadingBrandingDebug] launchAndSwiftUIMatch=true")
             print("[LaunchScreenDebug] launchBackgroundApplied=true")
@@ -50,7 +54,7 @@ struct FanGeoSplashView: View {
     }
 }
 
-private struct FanGeoLoadingStatusText: View {
+private struct FanGeoCrossfadeLoadingStatusText: View {
     let text: String
 
     var body: some View {
@@ -61,6 +65,12 @@ private struct FanGeoLoadingStatusText: View {
             .lineLimit(1)
             .minimumScaleFactor(0.82)
             .frame(maxWidth: .infinity)
+            .multilineTextAlignment(.center)
+            .contentTransition(.opacity)
+            .animation(
+                .easeInOut(duration: FanGeoSplashAnimation.statusCrossfadeDuration),
+                value: text
+            )
             .accessibilityLabel(text)
     }
 }

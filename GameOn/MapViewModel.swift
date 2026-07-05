@@ -490,6 +490,20 @@ final class MapViewModel: ObservableObject {
         get { notificationSettingsStore.proGameReminderTiming }
         set { notificationSettingsStore.proGameReminderTiming = newValue }
     }
+
+    var favoriteTeamProGameReminderTiming: ProGameReminderTiming {
+        get { notificationSettingsStore.favoriteTeamProGameReminderTiming }
+        set { notificationSettingsStore.favoriteTeamProGameReminderTiming = newValue }
+    }
+
+    var favoriteTeamProGameReminderEnabled: Bool {
+        notificationSettingsStore.favoriteTeamProGameReminderEnabled
+    }
+
+    var fanGeoAnnouncementNotificationsEnabled: Bool {
+        get { notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled }
+        set { notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled = newValue }
+    }
     
     @Published var events: [SportsEvent] = SampleData.events
     @Published var isLoadingEvents: Bool = false
@@ -508,6 +522,7 @@ final class MapViewModel: ObservableObject {
     var lastBusinessFavoriteTeamProGamesRefreshAt: Date?
     var lastBusinessFavoriteTeamProGamesRefreshKey: String?
     @Published var isLoadingLiveMatches: Bool = false
+    @Published var sportsDataUpdateIndicatorVisible = false
     @Published var liveMatchesLoadError: String?
     /// DEBUG-only hint when Live Games is empty (provider/cache diagnostics).
     @Published var liveMatchesEmptyDebugHint: String?
@@ -576,6 +591,23 @@ final class MapViewModel: ObservableObject {
     var discoverMapRenderSnapshotGeneration: UInt64 = 0
     /// Bottom-tab Calendar selected (updated by ``MainTabView``); gates calendar-only preload/enrichment while tab is preserved off-screen.
     var isCalendarTabSelected = false
+    var isLiveTabSelected = false
+    var scheduleTabInteractionProtected = false
+    var liveSportsDataRefreshDepth = 0
+    var pendingDeferredLiveMatches: [LiveMatch]?
+    var deferredLiveMatchesApplyTask: Task<Void, Never>?
+    var sportsDataUpdateIndicatorShowTask: Task<Void, Never>?
+    var sportsDataUpdateIndicatorMaxVisibleHideTask: Task<Void, Never>?
+    var pendingCalendarTabEventsListCacheInvalidation = false
+    var userPreferencesWarmCacheTask: Task<Void, Never>?
+    var lastUserPreferencesWarmCacheAt: Date?
+    var lastUserPreferencesWarmCacheUserId: UUID?
+    var lastProGameNotificationPreferencesLoadAt: Date?
+
+    @MainActor
+    var isLiveMatchesNetworkRefreshInFlight: Bool {
+        liveMatchesRefreshTask != nil
+    }
     /// When true, ``scheduleDiscoverMapRenderSnapshotRebuild(reason:)`` is a no-op until a single ``flushDiscoverMapRenderSnapshotRebuild(reason:)``.
     var suppressDiscoverSnapshotRebuilds = false
     /// Currently running detached Discover map snapshot build; cancelled when a newer rebuild supersedes it.
@@ -904,6 +936,10 @@ final class MapViewModel: ObservableObject {
     /// Debounces Discover-tab-visible network refreshes (Push Again / dismiss_version checks).
     var lastDiscoverTabVisibleAnnouncementRefreshAt: Date?
     var cachedDiscoverBannerCandidates: [FanGeoAnnouncement] = []
+    /// Push-open focus: when set, Discover carousel shows only this announcement (if eligible).
+    var focusedDiscoverAnnouncementId: UUID?
+    /// True after the focused announcement has been shown in the Discover carousel.
+    var focusedDiscoverAnnouncementDisplayed = false
     /// Set when the app leaves the foreground; cleared after a forced announcement refresh.
     var announcementsAppWasBackgrounded = false
 
@@ -1099,6 +1135,11 @@ final class MapViewModel: ObservableObject {
     var lastAppleCalendarPickupSyncKey: String?
     var appleCalendarGlobalSyncTask: Task<Void, Never>?
     var deferredProGamesCalendarReconcileTask: Task<Void, Never>?
+    var proGameReminderDeferredReconcileTask: Task<Void, Never>?
+    var proGameReminderPendingReconcileReason: String?
+    var proGameReminderLastBatchFingerprint: String = ""
+    var proGameReminderLastScheduledFingerprintByGame: [String: String] = [:]
+    var proGameReminderLastBatchAt: Date?
     var lastAppleCalendarGlobalSyncAt: Date?
     var lastAppleCalendarGlobalSyncKey: String?
 

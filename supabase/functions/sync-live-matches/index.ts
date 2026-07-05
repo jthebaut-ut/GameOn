@@ -5,6 +5,20 @@
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 import { followedCatalogTeamIdsForMatch } from "./favorite-team-live-matcher.ts"
+import {
+  applyFifaWorldCupTagging,
+  defaultFifaWorldCupProviderConfigs,
+  fetchTodayFifaWorldCupExternalIds,
+  FIFA_WORLD_CUP_LEAGUE_ID,
+  FIFA_WORLD_CUP_LEAGUE_ALTERNATE,
+  isFifaWorldCupFeaturedSlug,
+  mergeFeaturedMetadataOntoLiveMatch,
+  resolveFifaWorldCupFeaturedSlug,
+  resolveFeaturedEventStorageSlug,
+  resolveSportsDBLeagueLabel,
+  FIFA_WORLD_CUP_LEAGUE_LABEL,
+  FORCE_FIFA_WORLD_CUP_FEATURED_SLUG,
+} from "./fifa-world-cup-tagging.ts"
 
 const THESPORTSDB_V2_BASE = "https://www.thesportsdb.com/api/v2/json"
 const THE_SPORTSDB_V1_FREE_API_KEY = "123"
@@ -177,6 +191,27 @@ type FeaturedPreloadOptions = {
   forceFeaturedPreload: boolean
 }
 
+type ForceFeaturedSyncEventResult = {
+  fetched: number
+  nextFetched: number
+  normalized: number
+  seasonFetched: number
+  skippedReason: string | null
+  slug: string
+  title: string
+  todayFetched: number
+  upserted: number
+}
+
+type ForceFeaturedSyncCounts = {
+  events: ForceFeaturedSyncEventResult[]
+  fetched: number
+  normalized: number
+  processed: number
+  skipped: number
+  upserted: number
+}
+
 type ScheduledLeagueConfig = {
   id: string
   sport: string
@@ -215,6 +250,12 @@ const corsHeaders = {
 const FEATURED_PRELOAD_LOOKAHEAD_DAYS = 180
 const FEATURED_PRELOAD_COOLDOWN_MS = 6 * 60 * 60 * 1000
 const FEATURED_EVENTSDAY_FALLBACK_MAX_DAYS = 45
+const FEATURED_PRELOAD_SYNC_KINDS = [
+  "featured_event_fixture",
+  "featured_event_next_fixture",
+  "featured_event_day_fixture",
+  "force_featured_events_refresh",
+] as const
 const HEAVY_ENRICHMENT_LOOKAHEAD_MS = 48 * 60 * 60 * 1000
 const LIVE_TIMELINE_ACTIVE_FOLLOWER_CACHE_TTL_MS = 60 * 1000
 const LIVE_TIMELINE_DEFAULT_CACHE_TTL_MS = 3 * 60 * 1000
@@ -224,6 +265,369 @@ const MAX_TIMELINE_LOOKUP_KEYS = 800
 const TIMELINE_LOOKUP_BATCH_SIZE = 200
 
 let lastFeaturedPreloadAttemptAt = 0
+
+function forceFeaturedSyncLog(message: string): void {
+  console.log(`[ForceFeaturedSync] ${message}`)
+}
+
+function isForceFeaturedSyncCandidate(
+  event: Record<string, unknown>,
+  leagueId: string,
+): boolean {
+  return String(event?.idLeague ?? "").trim() === leagueId
+}
+
+function isForceFeaturedSyncWindowMatch(
+  match: LiveMatchUpsert,
+  startOfTodayMs: number,
+  eventStart: Date,
+  eventEnd: Date,
+): boolean {
+  if (match.match_status === "LIVE" || match.match_status === "HT") {
+    return true
+  }
+
+  const startMs = new Date(match.start_time).getTime()
+  if (!Number.isFinite(startMs) || startMs < startOfTodayMs) {
+    return false
+  }
+
+  return startMs >= eventStart.getTime() && startMs <= eventEnd.getTime()
+}
+
+function resolveForceFeaturedSyncSlug(featuredEvent: FeaturedEventRow): string {
+  return resolveFeaturedEventStorageSlug(featuredEvent.slug)
+}
+
+function normalizeFeaturedEventFixtureForPreload(
+  featuredEvent: FeaturedEventRow,
+  event: Record<string, any>,
+  config: FeaturedEventProviderConfig,
+): LiveMatchUpsert | null {
+  const sport = config.sport ?? featuredEvent.sport ?? "Sports"
+  const leagueFallback = config.league ?? String(event?.strLeague ?? config.leagueId)
+  const fallback: ScheduledLeagueConfig = {
+    id: config.leagueId,
+    sport,
+    league: leagueFallback,
+  }
+
+  if (isFifaWorldCupFeaturedSlug(featuredEvent.slug)) {
+    return normalizeSportsDBFeaturedFixture(event, fallback)
+  }
+
+  return normalizeSportsDBScheduledFixture(event, fallback)
+}
+
+function buildFeaturedPreloadMatch(
+  featuredEvent: FeaturedEventRow,
+  event: Record<string, unknown>,
+  normalized: LiveMatchUpsert,
+  syncKind: string,
+): LiveMatchUpsert {
+  const featuredSlug = resolveFeaturedEventStorageSlug(featuredEvent.slug)
+
+  return {
+    ...normalized,
+    league: isFifaWorldCupFeaturedSlug(featuredEvent.slug)
+      ? FIFA_WORLD_CUP_LEAGUE_LABEL
+      : normalized.league,
+    featured_event_slug: featuredSlug,
+    payload: {
+      ...(event && typeof event === "object" ? event : {}),
+      fangeo_sync_kind: syncKind,
+      fangeo_featured_event_slug: featuredSlug,
+      ...(isFifaWorldCupFeaturedSlug(featuredEvent.slug)
+        ? {
+          idLeague: FIFA_WORLD_CUP_LEAGUE_ID,
+          strLeague: FIFA_WORLD_CUP_LEAGUE_LABEL,
+          strLeagueAlternate: FIFA_WORLD_CUP_LEAGUE_ALTERNATE,
+        }
+        : {}),
+    },
+  }
+}
+
+function resolveForceFeaturedSyncLeagueLabel(
+  featuredEvent: FeaturedEventRow,
+  providerConfig: FeaturedEventProviderConfig,
+  event: Record<string, unknown>,
+): string {
+  if (isFifaWorldCupFeaturedSlug(featuredEvent.slug)) {
+    return FIFA_WORLD_CUP_LEAGUE_LABEL
+  }
+
+  return providerConfig.league ?? resolveSportsDBLeagueLabel(event, featuredEvent.title)
+}
+
+async function fetchForceFeaturedEventProviderEvents(
+  apiKey: string,
+  featuredEvent: FeaturedEventRow,
+  providerConfig: FeaturedEventProviderConfig,
+): Promise<{ eventById: Map<string, Record<string, unknown>>; nextFetched: number; seasonFetched: number; todayFetched: number }> {
+  const eventById = new Map<string, Record<string, unknown>>()
+  const sport = providerConfig.sport ?? featuredEvent.sport ?? "Soccer"
+  const leagueId = providerConfig.leagueId
+
+  const seasonEvents = await fetchTheSportsDBSeasonEvents(apiKey, leagueId, providerConfig.season)
+  for (const event of seasonEvents) {
+    if (!isForceFeaturedSyncCandidate(event, leagueId)) continue
+    const externalId = String(event?.idEvent ?? "").trim()
+    if (externalId) eventById.set(externalId, event)
+  }
+
+  const today = new Date().toISOString().slice(0, 10)
+  const todayEvents = await fetchTheSportsDBEventsDay(apiKey, today, sport)
+  for (const event of todayEvents) {
+    if (!isForceFeaturedSyncCandidate(event, leagueId)) continue
+    const externalId = String(event?.idEvent ?? "").trim()
+    if (externalId) eventById.set(externalId, event)
+  }
+
+  const nextEvents = await fetchTheSportsDBEventsNextLeague(apiKey, leagueId)
+  for (const event of nextEvents) {
+    if (!isForceFeaturedSyncCandidate(event, leagueId)) continue
+    const externalId = String(event?.idEvent ?? "").trim()
+    if (externalId) eventById.set(externalId, event)
+  }
+
+  return {
+    eventById,
+    seasonFetched: seasonEvents.length,
+    todayFetched: todayEvents.length,
+    nextFetched: nextEvents.length,
+  }
+}
+
+async function collectForceFeaturedEventMatches(
+  featuredEvent: FeaturedEventRow,
+  apiKey: string,
+  startOfTodayMs: number,
+): Promise<ForceFeaturedSyncEventResult & { matches: LiveMatchUpsert[] }> {
+  const eventResult: ForceFeaturedSyncEventResult & { matches: LiveMatchUpsert[] } = {
+    slug: featuredEvent.slug,
+    title: featuredEvent.title,
+    seasonFetched: 0,
+    todayFetched: 0,
+    nextFetched: 0,
+    fetched: 0,
+    normalized: 0,
+    upserted: 0,
+    skippedReason: null,
+    matches: [],
+  }
+
+  const providerConfigs = configuredFeaturedEventProviderConfigs(featuredEvent)
+  if (providerConfigs.length === 0) {
+    eventResult.skippedReason = "no_provider_mapping"
+    forceFeaturedSyncLog(
+      `slug=${featuredEvent.slug} title=${featuredEvent.title} skippedReason=no_provider_mapping`,
+    )
+    return eventResult
+  }
+
+  const eventStart = parseDateOnly(featuredEvent.start_date)
+  const eventEnd = endOfDateOnly(featuredEvent.end_date)
+  if (!eventStart || !eventEnd) {
+    eventResult.skippedReason = "invalid_date_window"
+    forceFeaturedSyncLog(
+      `slug=${featuredEvent.slug} title=${featuredEvent.title} skippedReason=invalid_date_window`,
+    )
+    return eventResult
+  }
+
+  const featuredSlug = resolveForceFeaturedSyncSlug(featuredEvent)
+  const eventById = new Map<string, Record<string, unknown>>()
+
+  for (const providerConfig of providerConfigs) {
+    const fetched = await fetchForceFeaturedEventProviderEvents(apiKey, featuredEvent, providerConfig)
+    eventResult.seasonFetched += fetched.seasonFetched
+    eventResult.todayFetched += fetched.todayFetched
+    eventResult.nextFetched += fetched.nextFetched
+
+    for (const [externalId, event] of fetched.eventById.entries()) {
+      eventById.set(externalId, event)
+    }
+  }
+
+  eventResult.fetched = eventById.size
+
+  const fallbackSport = providerConfigs[0]?.sport ?? featuredEvent.sport ?? "Soccer"
+  for (const event of eventById.values()) {
+    const providerConfig = providerConfigs.find((config) =>
+      isForceFeaturedSyncCandidate(event, config.leagueId)
+    ) ?? providerConfigs[0]
+
+    const fallbackLeague: ScheduledLeagueConfig = {
+      id: providerConfig.leagueId,
+      sport: fallbackSport,
+      league: resolveForceFeaturedSyncLeagueLabel(featuredEvent, providerConfig, event),
+    }
+
+    const normalized = normalizeSportsDBFeaturedFixture(event, fallbackLeague)
+    if (!normalized) continue
+    if (!isForceFeaturedSyncWindowMatch(normalized, startOfTodayMs, eventStart, eventEnd)) continue
+    if (!featuredEventMatchesFixture(featuredEvent, normalized)) continue
+
+    const leagueLabel = resolveForceFeaturedSyncLeagueLabel(featuredEvent, providerConfig, event)
+    eventResult.matches.push({
+      ...normalized,
+      league: leagueLabel,
+      featured_event_slug: featuredSlug,
+      payload: {
+        ...event,
+        idLeague: providerConfig.leagueId,
+        strLeague: leagueLabel,
+        ...(isFifaWorldCupFeaturedSlug(featuredEvent.slug)
+          ? { strLeagueAlternate: FIFA_WORLD_CUP_LEAGUE_ALTERNATE }
+          : {}),
+        fangeo_sync_kind: "force_featured_events_refresh",
+        fangeo_featured_event_slug: featuredSlug,
+      },
+    })
+    eventResult.normalized += 1
+  }
+
+  forceFeaturedSyncLog(
+    `slug=${featuredEvent.slug} title=${featuredEvent.title} fetched=${eventResult.fetched} normalized=${eventResult.normalized}`,
+  )
+
+  if (eventResult.normalized === 0 && !eventResult.skippedReason) {
+    eventResult.skippedReason = "no_matching_fixtures"
+    forceFeaturedSyncLog(
+      `slug=${featuredEvent.slug} title=${featuredEvent.title} skippedReason=no_matching_fixtures`,
+    )
+  }
+
+  return eventResult
+}
+
+async function runForceFeaturedEventsRefresh(
+  supabase: ReturnType<typeof createClient>,
+): Promise<ForceFeaturedSyncCounts> {
+  forceFeaturedSyncLog("started")
+
+  const apiKey = Deno.env.get("THESPORTSDB_API_KEY") ?? THE_SPORTSDB_V1_FREE_API_KEY
+  const counts: ForceFeaturedSyncCounts = {
+    processed: 0,
+    skipped: 0,
+    fetched: 0,
+    normalized: 0,
+    upserted: 0,
+    events: [],
+  }
+
+  const featuredEvents = await fetchActiveUpcomingFeaturedEvents(supabase, {
+    featuredEventsChecked: 0,
+    featuredFixturesFetched: 0,
+    featuredFixturesNormalized: 0,
+    featuredFixturesMatched: 0,
+    featuredEventsDayDatesScanned: 0,
+    featuredEventsDayFetched: 0,
+    featuredEventsDayMatched: 0,
+    featuredEventsNextFetched: 0,
+    featuredEventsNextMatched: 0,
+    featuredFixturesUpserted: 0,
+    featuredPreloadSkippedReason: null,
+    forceFeaturedPreload: false,
+    apiCalls: 0,
+    errors: 0,
+  })
+
+  const featuredSyncSlugByEventSlug = new Map(
+    featuredEvents.map((featuredEvent) => [
+      featuredEvent.slug,
+      resolveForceFeaturedSyncSlug(featuredEvent),
+    ]),
+  )
+
+  const startOfToday = new Date()
+  startOfToday.setUTCHours(0, 0, 0, 0)
+  const startOfTodayMs = startOfToday.getTime()
+
+  const allMatches: LiveMatchUpsert[] = []
+  for (const featuredEvent of featuredEvents) {
+    const eventResult = await collectForceFeaturedEventMatches(featuredEvent, apiKey, startOfTodayMs)
+    counts.events.push({
+      slug: eventResult.slug,
+      title: eventResult.title,
+      seasonFetched: eventResult.seasonFetched,
+      todayFetched: eventResult.todayFetched,
+      nextFetched: eventResult.nextFetched,
+      fetched: eventResult.fetched,
+      normalized: eventResult.normalized,
+      upserted: 0,
+      skippedReason: eventResult.skippedReason,
+    })
+
+    if (eventResult.skippedReason === "no_provider_mapping" || eventResult.skippedReason === "invalid_date_window") {
+      counts.skipped += 1
+      continue
+    }
+
+    counts.processed += 1
+    counts.fetched += eventResult.fetched
+    counts.normalized += eventResult.normalized
+    allMatches.push(...eventResult.matches)
+  }
+
+  const deduped = dedupeLiveMatchUpserts(allMatches)
+  omitEmptyTimelineFieldsForUpsert(deduped)
+
+  if (deduped.length > 0) {
+    const { error } = await supabase
+      .from("live_matches")
+      .upsert(deduped, { onConflict: "id" })
+
+    if (error) {
+      throw new Error(error.message)
+    }
+  }
+
+  counts.upserted = deduped.length
+
+  for (const event of counts.events) {
+    const featuredSyncSlug = featuredSyncSlugByEventSlug.get(event.slug) ?? event.slug
+    event.upserted = deduped.filter((match) => match.featured_event_slug === featuredSyncSlug).length
+    if (!event.skippedReason || event.skippedReason === "no_matching_fixtures") {
+      forceFeaturedSyncLog(
+        `slug=${event.slug} title=${event.title} upserted=${event.upserted}`,
+      )
+    }
+  }
+
+  forceFeaturedSyncLog(`fetched=${counts.fetched} normalized=${counts.normalized} upserted=${counts.upserted}`)
+  return counts
+}
+
+async function fetchTheSportsDBEventsDay(
+  apiKey: string,
+  date: string,
+  sport: string,
+): Promise<Record<string, unknown>[]> {
+  const url = `https://www.thesportsdb.com/api/v1/json/${apiKey}/eventsday.php?d=${encodeURIComponent(date)}&s=${encodeURIComponent(sport)}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error(`eventsday HTTP ${response.status}`)
+  }
+
+  const data = await response.json()
+  return Array.isArray(data?.events) ? data.events : []
+}
+
+async function fetchTheSportsDBEventsNextLeague(
+  apiKey: string,
+  leagueId: string,
+): Promise<Record<string, unknown>[]> {
+  const url = `https://www.thesportsdb.com/api/v1/json/${apiKey}/eventsnextleague.php?id=${encodeURIComponent(leagueId)}`
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error(`eventsnextleague HTTP ${response.status}`)
+  }
+
+  const data = await response.json()
+  return Array.isArray(data?.events) ? data.events : []
+}
 
 serve(async (req) => {
   if (req.method === "OPTIONS") {
@@ -243,6 +647,25 @@ serve(async (req) => {
     })
 
     const forceFeaturedPreload = requestBody?.forceFeaturedPreload === true
+    const forceFeaturedEventsRefresh = requestBody?.forceFeaturedEventsRefresh === true
+      || requestBody?.forceFeaturedSync === true
+      || requestBody?.forceFifaWorldCupRefresh === true
+
+    if (forceFeaturedEventsRefresh) {
+      try {
+        const forceFeaturedSyncCounts = await runForceFeaturedEventsRefresh(supabase)
+        return json({
+          success: true,
+          forceFeaturedEventsRefresh: true,
+          forceFeaturedSync: true,
+          forceFeaturedSyncCounts,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        forceFeaturedSyncLog(`error=${message}`)
+        return json({ success: false, error: message, forceFeaturedEventsRefresh: true }, 500)
+      }
+    }
 
     const debugTimelineEventId = cleanString(requestBody?.debugTimelineEventId)
     if (debugTimelineEventId) {
@@ -367,7 +790,9 @@ serve(async (req) => {
     completedLog(`completedRowsFetched=${completedCounts.fetched}`)
     counts.pruned = await pruneStaleMatches(supabase, matchWindow)
     const protectedMatchIds = await fetchProtectedMatchIds(supabase, matchWindow)
-    const featuredMatches = await fetchFeaturedEventFixtureMatches(supabase, featuredCounts, {
+    const featuredEvents = await fetchActiveUpcomingFeaturedEvents(supabase, featuredCounts)
+    const fifaWorldCupFeaturedSlug = resolveFifaWorldCupFeaturedSlug(featuredEvents)
+    const featuredMatches = await fetchFeaturedEventFixtureMatches(supabase, featuredCounts, featuredEvents, {
       forceFeaturedPreload,
     })
     const featuredUpsertIds = new Set(featuredMatches.map((match) => match.id))
@@ -378,6 +803,11 @@ serve(async (req) => {
       [...featuredMatches, ...scheduledOnlyMatches],
       protectedMatchIds,
       scheduledCounts,
+    )
+    applyFifaWorldCupTagging(
+      matchesToUpsert,
+      fifaWorldCupFeaturedSlug,
+      await fetchTodayFifaWorldCupExternalIds(Deno.env.get("THESPORTSDB_API_KEY") ?? "123"),
     )
     await enrichMatchesWithTVBroadcasts(supabase, matchesToUpsert, counts)
     await enrichMatchesWithTimelineEvents(supabase, matchesToUpsert, counts)
@@ -398,7 +828,7 @@ serve(async (req) => {
         scheduledUpsertIds.has(match.id) && match.match_status === "SCHEDULED"
       ).length
       featuredCounts.featuredFixturesUpserted = matchesToUpsert.filter((match) =>
-        featuredUpsertIds.has(match.id) && match.match_status === "SCHEDULED"
+        cleanString(match.featured_event_slug) && featuredUpsertIds.has(match.id)
       ).length
       completedCounts.upserted = matchesToUpsert.filter((match) =>
         completedUpsertIds.has(match.id) && match.match_status === "FT"
@@ -520,6 +950,7 @@ async function fetchScheduledFixtureMatches(
 async function fetchFeaturedEventFixtureMatches(
   supabase: ReturnType<typeof createClient>,
   counts: FeaturedPreloadCounts,
+  featuredEvents: FeaturedEventRow[],
   options: FeaturedPreloadOptions = { forceFeaturedPreload: false },
 ): Promise<LiveMatchUpsert[]> {
   counts.forceFeaturedPreload = options.forceFeaturedPreload
@@ -528,7 +959,8 @@ async function fetchFeaturedEventFixtureMatches(
   if (options.forceFeaturedPreload) {
     featuredLog("forceFeaturedPreload=true")
   } else if (now - lastFeaturedPreloadAttemptAt < FEATURED_PRELOAD_COOLDOWN_MS) {
-    counts.featuredPreloadSkippedReason = "cooldown"
+    counts.featuredPreloadSkippedReason = "cooldown_in_memory"
+    featuredLog(`preload_skipped reason=cooldown_in_memory`)
     return []
   }
   lastFeaturedPreloadAttemptAt = now
@@ -537,16 +969,19 @@ async function fetchFeaturedEventFixtureMatches(
     const lastPersistedPreloadAt = await fetchLastFeaturedPreloadUpdatedAt(supabase)
     if (lastPersistedPreloadAt && now - lastPersistedPreloadAt.getTime() < FEATURED_PRELOAD_COOLDOWN_MS) {
       counts.featuredPreloadSkippedReason = "cooldown"
+      featuredLog(`preload_skipped reason=cooldown lastPreloadAt=${lastPersistedPreloadAt.toISOString()}`)
       return []
     }
   }
 
-  const featuredEvents = await fetchActiveUpcomingFeaturedEvents(supabase, counts)
   counts.featuredEventsChecked = featuredEvents.length
   if (featuredEvents.length === 0) {
     counts.featuredPreloadSkippedReason = "no_active_upcoming_featured_events"
+    featuredLog("preload_skipped reason=no_active_upcoming_featured_events")
     return []
   }
+
+  featuredLog(`preload_started events=${featuredEvents.length}`)
 
   const apiKey = Deno.env.get("THESPORTSDB_API_KEY") ?? "123"
   const allMatches: LiveMatchUpsert[] = []
@@ -591,11 +1026,7 @@ async function fetchFeaturedEventFixtureMatches(
         counts.featuredFixturesFetched += events.length
 
         for (const event of events) {
-          const normalized = normalizeSportsDBScheduledFixture(event, {
-            id: config.leagueId,
-            sport: config.sport ?? featuredEvent.sport ?? "Sports",
-            league: config.league ?? String(event?.strLeague ?? config.leagueId),
-          })
+          const normalized = normalizeFeaturedEventFixtureForPreload(featuredEvent, event, config)
           if (!normalized) continue
           counts.featuredFixturesNormalized += 1
 
@@ -607,15 +1038,12 @@ async function fetchFeaturedEventFixtureMatches(
             continue
           }
 
-          eventMatches.push({
-            ...normalized,
-            featured_event_slug: featuredEvent.slug,
-            payload: {
-              ...(event && typeof event === "object" ? event : {}),
-              fangeo_sync_kind: "featured_event_fixture",
-              fangeo_featured_event_slug: featuredEvent.slug,
-            },
-          })
+          eventMatches.push(buildFeaturedPreloadMatch(
+            featuredEvent,
+            event,
+            normalized,
+            "featured_event_fixture",
+          ))
           counts.featuredFixturesMatched += 1
         }
       } catch (error) {
@@ -650,6 +1078,10 @@ async function fetchFeaturedEventFixtureMatches(
   if (allMatches.length === 0 && missingMappings.length > 0) {
     counts.featuredPreloadSkippedReason = `missing_provider_mapping:${missingMappings.join(",")}`
   }
+
+  featuredLog(
+    `preload_complete matched=${counts.featuredFixturesMatched} normalized=${counts.featuredFixturesNormalized} rows=${allMatches.length}`,
+  )
 
   return dedupeFeaturedMatches(allMatches)
 }
@@ -687,8 +1119,6 @@ async function fetchFeaturedEventEventsNextLeagueMatches(
   featuredLog(`slug=${featuredEvent.slug} eventsnextleague leagueId=${providerConfig.leagueId}`)
   counts.apiCalls += 1
 
-  const sport = providerConfig.sport ?? featuredEvent.sport ?? "Soccer"
-  const leagueFallback = providerConfig.league ?? String(providerConfig.leagueId)
   const seenIds = new Set(existingMatches.map((match) => match.id))
   const nextMatches: LiveMatchUpsert[] = []
 
@@ -701,11 +1131,7 @@ async function fetchFeaturedEventEventsNextLeagueMatches(
     counts.featuredEventsNextFetched += events.length
 
     for (const event of events) {
-      const normalized = normalizeSportsDBScheduledFixture(event, {
-        id: providerConfig.leagueId,
-        sport,
-        league: leagueFallback,
-      })
+      const normalized = normalizeFeaturedEventFixtureForPreload(featuredEvent, event, providerConfig)
       if (!normalized) continue
       if (seenIds.has(normalized.id)) continue
 
@@ -715,15 +1141,12 @@ async function fetchFeaturedEventEventsNextLeagueMatches(
       }
       if (!featuredEventMatchesFixture(featuredEvent, normalized)) continue
 
-      nextMatches.push({
-        ...normalized,
-        featured_event_slug: featuredEvent.slug,
-        payload: {
-          ...(event && typeof event === "object" ? event : {}),
-          fangeo_sync_kind: "featured_event_next_fixture",
-          fangeo_featured_event_slug: featuredEvent.slug,
-        },
-      })
+      nextMatches.push(buildFeaturedPreloadMatch(
+        featuredEvent,
+        event,
+        normalized,
+        "featured_event_next_fixture",
+      ))
       seenIds.add(normalized.id)
       counts.featuredEventsNextMatched += 1
     }
@@ -801,11 +1224,7 @@ async function fetchFeaturedEventEventsDayFallback(
           if (eventLeagueId && eventLeagueId !== providerConfig.leagueId) continue
         }
 
-        const normalized = normalizeSportsDBScheduledFixture(event, {
-          id: providerConfig.leagueId,
-          sport,
-          league: leagueFallback,
-        })
+        const normalized = normalizeFeaturedEventFixtureForPreload(featuredEvent, event, providerConfig)
         if (!normalized) continue
         if (seenIds.has(normalized.id)) continue
 
@@ -815,15 +1234,12 @@ async function fetchFeaturedEventEventsDayFallback(
         }
         if (!featuredEventMatchesFixture(featuredEvent, normalized)) continue
 
-        fallbackMatches.push({
-          ...normalized,
-          featured_event_slug: featuredEvent.slug,
-          payload: {
-            ...(event && typeof event === "object" ? event : {}),
-            fangeo_sync_kind: "featured_event_day_fixture",
-            fangeo_featured_event_slug: featuredEvent.slug,
-          },
-        })
+        fallbackMatches.push(buildFeaturedPreloadMatch(
+          featuredEvent,
+          event,
+          normalized,
+          "featured_event_day_fixture",
+        ))
         seenIds.add(normalized.id)
         counts.featuredEventsDayMatched += 1
       }
@@ -840,10 +1256,15 @@ async function fetchFeaturedEventEventsDayFallback(
 async function fetchLastFeaturedPreloadUpdatedAt(
   supabase: ReturnType<typeof createClient>,
 ): Promise<Date | null> {
+  const syncKindFilter = FEATURED_PRELOAD_SYNC_KINDS
+    .map((kind) => `payload->>fangeo_sync_kind.eq.${kind}`)
+    .join(",")
+
   const { data, error } = await supabase
     .from("live_matches")
     .select("updated_at")
     .not("featured_event_slug", "is", null)
+    .or(syncKindFilter)
     .order("updated_at", { ascending: false })
     .limit(1)
     .maybeSingle()
@@ -904,9 +1325,16 @@ function normalizeFeaturedEventRow(row: any): FeaturedEventRow | null {
 
 function configuredFeaturedEventProviderConfigs(featuredEvent: FeaturedEventRow): FeaturedEventProviderConfig[] {
   const envSuffix = normalizedEnvKey(featuredEvent.slug)
-  const leagueIds = envList(`THESPORTSDB_FEATURED_EVENT_LEAGUE_IDS_${envSuffix}`, [])
-  const seasons = envList(`THESPORTSDB_FEATURED_EVENT_SEASONS_${envSuffix}`, [])
-  if (leagueIds.length === 0 || seasons.length === 0) return []
+  let leagueIds = envList(`THESPORTSDB_FEATURED_EVENT_LEAGUE_IDS_${envSuffix}`, [])
+  let seasons = envList(`THESPORTSDB_FEATURED_EVENT_SEASONS_${envSuffix}`, [])
+
+  if (leagueIds.length === 0 || seasons.length === 0) {
+    const defaults = defaultFifaWorldCupProviderConfigs(featuredEvent)
+    if (defaults) {
+      return defaults
+    }
+    return []
+  }
 
   const sport = cleanString(Deno.env.get(`THESPORTSDB_FEATURED_EVENT_SPORT_${envSuffix}`)) ?? featuredEvent.sport
   const league = cleanString(Deno.env.get(`THESPORTSDB_FEATURED_EVENT_LEAGUE_NAME_${envSuffix}`))
@@ -920,6 +1348,11 @@ function configuredFeaturedEventProviderConfigs(featuredEvent: FeaturedEventRow)
 }
 
 function featuredEventMatchesFixture(featuredEvent: FeaturedEventRow, match: LiveMatchUpsert): boolean {
+  if (isFifaWorldCupFeaturedSlug(featuredEvent.slug)) {
+    const idLeague = payloadString(match.payload, "idLeague")
+    if (idLeague === FIFA_WORLD_CUP_LEAGUE_ID) return true
+  }
+
   if (featuredEvent.sport && !sportMatchesFeaturedEvent(match.sport, featuredEvent.sport)) {
     return false
   }
@@ -1192,9 +1625,11 @@ function dedupeLiveMatchUpserts(matches: LiveMatchUpsert[]): LiveMatchUpsert[] {
 }
 
 function liveMatchUpsertPriority(match: LiveMatchUpsert): number {
-  if (match.match_status === "FT") return 4
-  if (match.match_status === "LIVE" || match.match_status === "HT") return 3
-  return 1
+  let priority = 1
+  if (match.match_status === "FT") priority = 4
+  else if (match.match_status === "LIVE" || match.match_status === "HT") priority = 3
+  if (cleanString(match.featured_event_slug)) priority += 0.25
+  return priority
 }
 
 
@@ -1258,7 +1693,7 @@ function normalizeSportsDBV2Livescore(event: Record<string, unknown>): LiveMatch
     score_away: numberOrZero(event?.intAwayScore),
     match_status: normalizeSportsDBStatus(rawStatus),
     minute,
-    league: String(event?.strLeague ?? "Sports"),
+    league: resolveSportsDBLeagueLabel(event),
     start_time: timestamp,
     payload: event,
     tv_broadcasts: null,
@@ -1328,7 +1763,7 @@ function normalizeSportsDBEvent(event: Record<string, any>, fallbackLeague: stri
     score_away: numberOrZero(event?.intAwayScore),
     match_status: normalizeSportsDBStatus(rawStatus),
     minute,
-    league: String(event?.strLeague ?? fallbackLeague),
+    league: resolveSportsDBLeagueLabel(event, fallbackLeague),
     start_time: timestamp,
     payload: event,
     tv_broadcasts: null,
@@ -1353,7 +1788,7 @@ function normalizeSportsDBScheduledFixture(
   return {
     ...normalized,
     sport: String(event?.strSport ?? "").trim() ? normalizeSportsDBSport(event?.strSport) : fallback.sport,
-    league: String(event?.strLeague ?? fallback.league),
+    league: resolveSportsDBLeagueLabel(event, fallback.league),
     score_home: 0,
     score_away: 0,
     match_status: "SCHEDULED",
@@ -1361,6 +1796,24 @@ function normalizeSportsDBScheduledFixture(
     payload: {
       ...event,
       fangeo_sync_kind: "scheduled_fixture",
+    },
+  }
+}
+
+function normalizeSportsDBFeaturedFixture(
+  event: Record<string, any>,
+  fallback: ScheduledLeagueConfig,
+): LiveMatchUpsert | null {
+  const normalized = normalizeSportsDBEvent(event, fallback.league)
+  if (!normalized) return null
+
+  return {
+    ...normalized,
+    sport: String(event?.strSport ?? "").trim() ? normalizeSportsDBSport(event?.strSport) : fallback.sport,
+    league: resolveSportsDBLeagueLabel(event, fallback.league),
+    payload: {
+      ...event,
+      fangeo_sync_kind: "featured_event_fixture",
     },
   }
 }
@@ -1426,16 +1879,22 @@ function mergeLiveAndScheduledMatches(
   protectedMatchIds: Set<string>,
   counts: ScheduledFixturesCounts,
 ): LiveMatchUpsert[] {
-  const mergedIds = new Set(liveMatches.map((match) => match.id))
+  const liveById = new Map(liveMatches.map((match) => [match.id, match]))
   const merged = [...liveMatches]
 
   for (const match of scheduledMatches) {
-    if (mergedIds.has(match.id) || protectedMatchIds.has(match.id)) {
+    const existingLive = liveById.get(match.id)
+    if (existingLive) {
+      mergeFeaturedMetadataOntoLiveMatch(existingLive, match)
+      counts.protectedExisting += 1
+      continue
+    }
+    if (protectedMatchIds.has(match.id)) {
       counts.protectedExisting += 1
       continue
     }
     merged.push(match)
-    mergedIds.add(match.id)
+    liveById.set(match.id, match)
   }
 
   return merged

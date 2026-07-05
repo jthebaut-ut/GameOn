@@ -871,19 +871,14 @@ private final class DirectChatPresenter: ObservableObject {
 
     /// Upserts read cursor with `Date()` so `last_read_at` is never behind DB `created_at` microsecond precision.
     @discardableResult
-    func flushMarkReadNow(reason: String) async -> Bool {
-        guard loadError == nil, let cid = conversationId, let me = currentUserId else { return false }
-        guard chatViewModel?.canMarkActiveDirectThreadRead(conversationId: cid, reason: reason) == true else { return false }
-        do {
-            try await service.markConversationRead(
-                conversationId: cid,
-                userId: me,
-                lastReadAt: Date()
-            )
-            return true
-        } catch {
-            return false
-        }
+    func flushMarkReadNow(reason: String, requireActiveVisibleThread: Bool = true) async -> Bool {
+        guard loadError == nil, let cid = conversationId, currentUserId != nil else { return false }
+        return await chatViewModel?.markDirectThreadRead(
+            conversationId: cid,
+            peerUserId: friend.id,
+            reason: reason,
+            requireActiveVisibleThread: requireActiveVisibleThread
+        ) ?? false
     }
 
     private func subscribeThreadChannelWithTimeout(_ channel: RealtimeChannelV2, timeoutNs: UInt64 = 15_000_000_000) async throws {
@@ -1280,13 +1275,7 @@ private final class DirectChatPresenter: ObservableObject {
         }
 
         let merged = await refreshMessagesForCurrentThread(reason: "manual_refresh")
-        if await flushMarkReadNow(reason: "manual_refresh") {
-            chatViewModel?.markDirectInboxReadLocally(
-                peerUserId: friend.id,
-                conversationId: cid
-            )
-            chatViewModel?.requestBadgeRecalculation(reason: "manual_refresh_mark_read")
-        }
+        _ = await flushMarkReadNow(reason: "manual_refresh")
 #if DEBUG
         print("[DMManualRefreshDebug] merged count=\(merged)")
 #endif
@@ -1501,9 +1490,7 @@ private final class DirectChatPresenter: ObservableObject {
         if !isOwnSender {
             Task { [weak self] in
                 guard let self else { return }
-                if await self.flushMarkReadNow(reason: "thread_realtime_peer_message") {
-                    self.chatViewModel?.notifyIncomingDmHandledInActiveThread()
-                }
+                _ = await self.flushMarkReadNow(reason: "thread_realtime_peer_message")
             }
         }
         DMRealtimeDiagnostics.debug("insertMatchedThread=true messageId=\(rowIdLow) ignoredReason=none")
@@ -2055,32 +2042,14 @@ struct DirectChatView: View {
                     presenter.conversationId,
                     reason: "thread_task_loaded"
                 )
-                if chatViewModel.canMarkActiveDirectThreadRead(
-                    conversationId: presenter.conversationId,
-                    reason: "thread_open_local"
-                ) {
-                    chatViewModel.markDirectInboxReadLocally(
+                if let conversationId = presenter.conversationId {
+                    await chatViewModel.markDirectThreadRead(
+                        conversationId: conversationId,
                         peerUserId: presenter.friend.id,
-                        conversationId: presenter.conversationId
+                        reason: "thread_open"
                     )
                 }
-                await withTaskGroup(of: Void.self) { group in
-                    group.addTask {
-                        await presenter.ensureRealtimeSubscriptionIfReady(reason: "thread_task_loaded")
-                    }
-                    group.addTask {
-                        do {
-                            try await Task.sleep(nanoseconds: 90_000_000)
-                            if await presenter.flushMarkReadNow(reason: "thread_open") {
-                                await chatViewModel.requestBadgeRecalculation(reason: "thread_open_mark_read")
-                            }
-                            while !Task.isCancelled {
-                                try await Task.sleep(nanoseconds: 60_000_000_000)
-                            }
-                        } catch is CancellationError {
-                        } catch {}
-                    }
-                }
+                await presenter.ensureRealtimeSubscriptionIfReady(reason: "thread_task_loaded")
             } else {
                 await chatViewModel.refreshInboxSummariesIfNeeded()
             }
@@ -2097,6 +2066,13 @@ struct DirectChatView: View {
             )
             Task {
                 await presenter.ensureRealtimeSubscriptionIfReady(reason: "direct_chat_appear")
+                if let conversationId = presenter.conversationId {
+                    await chatViewModel.markDirectThreadRead(
+                        conversationId: conversationId,
+                        peerUserId: presenter.friend.id,
+                        reason: "direct_chat_appear"
+                    )
+                }
             }
         }
         .onChange(of: presenter.conversationId) { _, cid in
@@ -2110,14 +2086,12 @@ struct DirectChatView: View {
                 guard chatViewModel.setActiveVisibleConversationIdIfAllowed(
                     presenter.conversationId,
                     reason: "became_visible"
-                ) else { return }
-                if await presenter.flushMarkReadNow(reason: "became_visible") {
-                    chatViewModel.markDirectInboxReadLocally(
-                        peerUserId: presenter.friend.id,
-                        conversationId: presenter.conversationId
-                    )
-                    chatViewModel.requestBadgeRecalculation(reason: "became_visible_mark_read")
-                }
+                ), let conversationId = presenter.conversationId else { return }
+                await chatViewModel.markDirectThreadRead(
+                    conversationId: conversationId,
+                    peerUserId: presenter.friend.id,
+                    reason: "became_visible"
+                )
             }
         }
         .onDisappear {
@@ -2126,16 +2100,19 @@ struct DirectChatView: View {
             DMRealtimeDiagnostics.debug("scenePhase=directChatDisappear")
             DMRealtimeDiagnostics.debug("activeConversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") scenePhase=directChatDisappear")
             stopDirectChatPresenceRefreshLoop()
-            chatViewModel.clearActiveVisibleConversationId(reason: "direct_chat_disappear")
+            let conversationId = presenter.conversationId
+            let peerUserId = presenter.friend.id
             Task {
-                await presenter.stopDirectMessageRealtime()
-                if await presenter.flushMarkReadNow(reason: "thread_disappear") {
-                    chatViewModel.markDirectInboxReadLocally(
-                        peerUserId: presenter.friend.id,
-                        conversationId: presenter.conversationId
+                if let conversationId {
+                    await chatViewModel.markDirectThreadRead(
+                        conversationId: conversationId,
+                        peerUserId: peerUserId,
+                        reason: "thread_disappear",
+                        requireActiveVisibleThread: false
                     )
-                    chatViewModel.requestBadgeRecalculation(reason: "thread_disappear_mark_read")
                 }
+                await presenter.stopDirectMessageRealtime()
+                chatViewModel.clearActiveVisibleConversationId(reason: "direct_chat_disappear")
             }
         }
         .onChange(of: scenePhase) { _, phase in

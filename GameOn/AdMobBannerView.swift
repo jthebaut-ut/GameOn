@@ -2,6 +2,9 @@ import Foundation
 import GoogleMobileAds
 import UIKit
 import UserMessagingPlatform
+#if canImport(AppTrackingTransparency)
+import AppTrackingTransparency
+#endif
 
 // Verbose ad diagnostics are limited to developer/internal builds; App Store users should not see ad debug logs.
 enum AdDiagnostics {
@@ -197,9 +200,15 @@ enum GoogleMobileAdsBootstrap {
     private static var didStartMobileAds = false
     private static var isWaitingForPreConsentPrompt = false
     private static var pendingReadyHandlers: [() -> Void] = []
+    private static var pendingConsentFlowFinishedHandlers: [() -> Void] = []
 
     static var canRequestAds: Bool {
         didFinishConsentFlow && adsCanBeRequested
+    }
+
+    /// UI gate: true once FanGeo pre-consent (if any), UMP, and ATT steps have completed.
+    static var hasFinishedConsentFlow: Bool {
+        didFinishConsentFlow
     }
 
     static var privacyOptionsRequired: Bool {
@@ -210,12 +219,33 @@ enum GoogleMobileAdsBootstrap {
         isWaitingForPreConsentPrompt && !FanGeoAdConsentPrePromptStore.hasAcknowledged
     }
 
+    static var hasAcknowledgedPreConsentPrompt: Bool {
+        FanGeoAdConsentPrePromptStore.hasAcknowledged
+    }
+
+    /// UI-only: returning users with no interactive ATT/UMP steps left can enter the app while consent refresh finishes.
+    static var canRevealMainExperienceWhileConsentFinishes: Bool {
+        guard hasAcknowledgedPreConsentPrompt else { return false }
+        guard !isWaitingForPreConsentPrompt else { return false }
+        if #available(iOS 14, *) {
+            guard ATTrackingManager.trackingAuthorizationStatus != .notDetermined else { return false }
+        }
+        switch ConsentInformation.shared.consentStatus {
+        case .required, .unknown:
+            return false
+        case .notRequired, .obtained:
+            return true
+        @unknown default:
+            return false
+        }
+    }
+
     static func startIfNeeded() {
         guard !didStart else { return }
         didStart = true
         FanGeoAdPolicy.logStartupDiagnostics()
         guard !FanGeoAdPolicy.shouldSkipAdNetworkBootstrap else {
-            didFinishConsentFlow = true
+            markConsentFlowFinished()
             AdDebugDiagnostics.logConsent("adsBootstrapSkipped=true reason=screenshotMode")
             return
         }
@@ -252,6 +282,14 @@ enum GoogleMobileAdsBootstrap {
         pendingReadyHandlers.append(handler)
     }
 
+    static func runWhenConsentFlowFinished(_ handler: @escaping () -> Void) {
+        if didFinishConsentFlow {
+            handler()
+            return
+        }
+        pendingConsentFlowFinishedHandlers.append(handler)
+    }
+
     static func presentPrivacyOptionsIfRequired() async {
         guard privacyOptionsRequired,
               let root = await waitForRootViewController(timeoutSeconds: 3) else { return }
@@ -261,9 +299,11 @@ enum GoogleMobileAdsBootstrap {
     private static func resolveConsentAndStartAdsIfAllowed() async {
         await updateUMPConsentInformation()
         await loadAndPresentUMPFormIfNeeded()
+        await requestAppTrackingAuthorizationIfNeeded()
 
         adsCanBeRequested = ConsentInformation.shared.canRequestAds
-        didFinishConsentFlow = true
+        markConsentFlowFinished()
+        applyTrackingAuthorizationToAdRequestConfiguration()
         AdDebugDiagnostics.logConsent("canRequestAds=\(adsCanBeRequested)")
 
         if adsCanBeRequested {
@@ -273,6 +313,54 @@ enum GoogleMobileAdsBootstrap {
         let handlers = pendingReadyHandlers
         pendingReadyHandlers.removeAll()
         handlers.forEach { $0() }
+    }
+
+    private static func markConsentFlowFinished() {
+        guard !didFinishConsentFlow else { return }
+        didFinishConsentFlow = true
+        let handlers = pendingConsentFlowFinishedHandlers
+        pendingConsentFlowFinishedHandlers.removeAll()
+        handlers.forEach { $0() }
+    }
+
+    /// Requests Apple ATT only after FanGeo pre-consent + UMP, and only when status is `.notDetermined`.
+    private static func requestAppTrackingAuthorizationIfNeeded() async {
+        guard #available(iOS 14, *) else { return }
+        let statusBefore = ATTrackingManager.trackingAuthorizationStatus
+        logATTConsentDebug("statusBefore=\(attAuthorizationStatusLabel(statusBefore))")
+        guard statusBefore == .notDetermined else { return }
+        logATTConsentDebug("requestPresented=true")
+        let statusAfter = await ATTrackingManager.requestTrackingAuthorization()
+        logATTConsentDebug("statusAfter=\(attAuthorizationStatusLabel(statusAfter))")
+    }
+
+    /// Mobile Ads respects ATT automatically; log final status for diagnostics after consent flow completes.
+    private static func applyTrackingAuthorizationToAdRequestConfiguration() {
+        guard #available(iOS 14, *) else { return }
+        let status = ATTrackingManager.trackingAuthorizationStatus
+        AdDebugDiagnostics.logConsent("attStatus=\(attAuthorizationStatusLabel(status))")
+    }
+
+    @available(iOS 14, *)
+    private static func attAuthorizationStatusLabel(_ status: ATTrackingManager.AuthorizationStatus) -> String {
+        switch status {
+        case .notDetermined:
+            return "notDetermined"
+        case .restricted:
+            return "restricted"
+        case .denied:
+            return "denied"
+        case .authorized:
+            return "authorized"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private static func logATTConsentDebug(_ message: String) {
+#if DEBUG
+        print("[ATTConsentDebug] \(message)")
+#endif
     }
 
     private static func updateUMPConsentInformation() async {

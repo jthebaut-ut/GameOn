@@ -25,7 +25,8 @@ extension MapViewModel {
             pro_game_reminder_notifications_enabled: notificationSettingsStore.proGameKickoffAlertEnabled,
             pro_game_reminder_timing: notificationSettingsStore.proGameReminderTiming.rawValue,
             pro_game_final_score_alerts_enabled: notificationSettingsStore.proGameFinalScoreNotifications,
-            favorite_team_pro_game_alerts_enabled: notificationSettingsStore.favoriteTeamProGameAlertsEnabled
+            favorite_team_pro_game_alerts_enabled: notificationSettingsStore.favoriteTeamProGameAlertsEnabled,
+            fan_geo_announcement_notifications_enabled: notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled
         )
 
         do {
@@ -45,10 +46,17 @@ extension MapViewModel {
 
     func loadProGameNotificationPreferencesFromBackend(reason: String) async {
         guard let userID = currentUserAuthId, isAuthenticatedForSocialFeatures else { return }
+        if let lastProGameNotificationPreferencesLoadAt,
+           Date().timeIntervalSince(lastProGameNotificationPreferencesLoadAt) < 60 {
+            DebugLogGate.goingTabPerfVerbose(
+                "[GoingProPerf] teamAlertsSkipped reason=ttlFresh"
+            )
+            return
+        }
         do {
             let rows: [ProGameNotificationPreferenceRow] = try await supabase
                 .from("user_notification_preferences")
-                .select("pro_game_reminder_notifications_enabled,pro_game_reminder_timing,pro_game_final_score_alerts_enabled,favorite_team_pro_game_alerts_enabled")
+                .select("pro_game_reminder_notifications_enabled,pro_game_reminder_timing,pro_game_final_score_alerts_enabled,favorite_team_pro_game_alerts_enabled,fan_geo_announcement_notifications_enabled")
                 .eq("user_id", value: userID.uuidString.lowercased())
                 .limit(1)
                 .execute()
@@ -56,10 +64,12 @@ extension MapViewModel {
 
             if let row = rows.first {
                 applyProGameNotificationPreferences(from: row, reason: reason)
+                lastProGameNotificationPreferencesLoadAt = Date()
                 return
             }
 
             await syncProGameFinalScorePreferenceToBackend(reason: "preferencesSeed")
+            lastProGameNotificationPreferencesLoadAt = Date()
 #if DEBUG
             print("[RemoteNotificationDebug] proGamePreferenceLoaded=seeded reason=\(reason)")
 #endif
@@ -96,6 +106,9 @@ extension MapViewModel {
         if let teamAlerts = row.favorite_team_pro_game_alerts_enabled {
             notificationSettingsStore.favoriteTeamProGameAlertsEnabled = teamAlerts
         }
+        if let announcementAlerts = row.fan_geo_announcement_notifications_enabled {
+            notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled = announcementAlerts
+        }
 
         objectWillChange.send()
         Task { [weak self] in
@@ -103,7 +116,7 @@ extension MapViewModel {
             await self.proGameReminderPreferenceDidChange()
         }
 #if DEBUG
-        print("[RemoteNotificationDebug] proGamePreferenceLoaded kickoffAlert=\(notificationSettingsStore.proGameKickoffAlertEnabled) gameReminder=\(notificationSettingsStore.proGameReminderTiming.rawValue) final=\(notificationSettingsStore.proGameFinalScoreNotifications) teamAlerts=\(notificationSettingsStore.favoriteTeamProGameAlertsEnabled) reason=\(reason)")
+        print("[RemoteNotificationDebug] proGamePreferenceLoaded kickoffAlert=\(notificationSettingsStore.proGameKickoffAlertEnabled) gameReminder=\(notificationSettingsStore.proGameReminderTiming.rawValue) final=\(notificationSettingsStore.proGameFinalScoreNotifications) teamAlerts=\(notificationSettingsStore.favoriteTeamProGameAlertsEnabled) announcementAlerts=\(notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled) reason=\(reason)")
 #endif
     }
 
@@ -189,6 +202,7 @@ extension MapViewModel {
         if !enabled {
             await disableFavoriteTeamAutoDefaultSubscriptions(userID: userID, reason: reason)
         }
+        await reconcileFavoriteTeamProGameReminders(reason: reason)
     }
 
     func favoriteTeamProGameAlertOverride(for game: SavedProGame) -> FavoriteTeamProGameAlertOverride {
@@ -231,6 +245,7 @@ extension MapViewModel {
         Task { [weak self] in
             guard let self else { return }
             await self.syncFavoriteTeamProGameAlertOverride(override, for: item, reason: reason)
+            await self.reconcileFavoriteTeamProGameReminders(reason: "favoriteTeamAlertOverride:\(reason)")
         }
     }
 
@@ -421,6 +436,7 @@ private struct ProGameNotificationPreferenceUpsertRow: Encodable {
     let pro_game_reminder_timing: String
     let pro_game_final_score_alerts_enabled: Bool
     let favorite_team_pro_game_alerts_enabled: Bool
+    let fan_geo_announcement_notifications_enabled: Bool
 }
 
 private struct ProGameNotificationPreferenceRow: Decodable {
@@ -428,6 +444,7 @@ private struct ProGameNotificationPreferenceRow: Decodable {
     let pro_game_reminder_timing: String?
     let pro_game_final_score_alerts_enabled: Bool?
     let favorite_team_pro_game_alerts_enabled: Bool?
+    let fan_geo_announcement_notifications_enabled: Bool?
 }
 
 private struct SavedProGameScoreAlertPatch: Encodable {

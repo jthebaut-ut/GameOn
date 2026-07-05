@@ -1028,6 +1028,12 @@ private enum LiveSportsServiceError: LocalizedError {
     }
 }
 
+#if DEBUG
+private nonisolated enum LiveRowDecodeDebug {
+    static let enabled = false
+}
+#endif
+
 private nonisolated struct LiveMatchRow: Decodable {
     let id: String?
     let source: String?
@@ -1122,20 +1128,22 @@ private nonisolated struct LiveMatchRow: Decodable {
         let payloadSport = Self.firstString(in: payload, keys: ["strSport", "sport"])
         let normalizedStatus = MatchStatus.normalized(from: match_status)
 #if DEBUG
-        print("[LiveSportNormalization] id=\(id) raw=\(rawSport ?? "nil") normalized=\(normalizedSport)")
-        print("[LiveSportDetected] id=\(id) sportType=\(visualType.rawValue) label=\(normalizedSport)")
-        print("[ProGameFinalDebug] rawProviderStatus=\(match_status ?? "nil")")
-        print("[ProGameFinalDebug] normalizedStatus=\(normalizedStatus.rawValue)")
-        print("[ProGameFinalDebug] isFinal=\(normalizedStatus == .fullTime)")
-        print("[LiveVenueDebug] provider=\(payloadProviderDebugDescription)")
-        print("[LiveVenueDebug] title=\(title)")
-        print("[LiveVenueDebug] decodedVenue=\(decodedVenue ?? "nil")")
-        print("[LiveVenueDebug] decodedCity=\(decodedCity ?? "nil")")
-        print("[LiveVenueDebug] normalizedVenue=\(decodedVenue ?? "nil")")
-        print("[LiveVenueDebug] normalizedCity=\(decodedCity ?? "nil")")
-        print("[LiveVenueDebug] latitude=\(venueLatitude.map(String.init(describing:)) ?? "nil")")
-        print("[LiveVenueDebug] longitude=\(venueLongitude.map(String.init(describing:)) ?? "nil")")
-        print("[LiveVenueDebug] rawVenuePayload=\(rawVenuePayloadDebugDescription)")
+        if LiveRowDecodeDebug.enabled {
+            print("[LiveSportNormalization] id=\(id) raw=\(rawSport ?? "nil") normalized=\(normalizedSport)")
+            print("[LiveSportDetected] id=\(id) sportType=\(visualType.rawValue) label=\(normalizedSport)")
+            print("[ProGameFinalDebug] rawProviderStatus=\(match_status ?? "nil")")
+            print("[ProGameFinalDebug] normalizedStatus=\(normalizedStatus.rawValue)")
+            print("[ProGameFinalDebug] isFinal=\(normalizedStatus == .fullTime)")
+            print("[LiveVenueDebug] provider=\(payloadProviderDebugDescription)")
+            print("[LiveVenueDebug] title=\(title)")
+            print("[LiveVenueDebug] decodedVenue=\(decodedVenue ?? "nil")")
+            print("[LiveVenueDebug] decodedCity=\(decodedCity ?? "nil")")
+            print("[LiveVenueDebug] normalizedVenue=\(decodedVenue ?? "nil")")
+            print("[LiveVenueDebug] normalizedCity=\(decodedCity ?? "nil")")
+            print("[LiveVenueDebug] latitude=\(venueLatitude.map(String.init(describing:)) ?? "nil")")
+            print("[LiveVenueDebug] longitude=\(venueLongitude.map(String.init(describing:)) ?? "nil")")
+            print("[LiveVenueDebug] rawVenuePayload=\(rawVenuePayloadDebugDescription)")
+        }
 #endif
         let providerClockText = Self.firstString(
             in: payload,

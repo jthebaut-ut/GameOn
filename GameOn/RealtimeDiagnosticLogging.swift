@@ -9,6 +9,15 @@ nonisolated enum DebugLogGate {
     /// When true, enables hot-path perf/image tracing in Release builds (off by default).
     static let releaseHotPathPerfLogging = false
 
+    /// Multi-line tab switch / preload / deferred-refresh tracing.
+    static var verboseTabSwitchPerfLogging = false
+
+    /// Going tab render/rebuild tracing beyond one-line ``goingTabPerfSummary`` logs.
+    static var verboseGoingTabPerfLogging = false
+
+    /// Discover tab-visible consistency / annotation tracing.
+    static var verboseDiscoverTabPerfLogging = false
+
     static var hotPathPerfLoggingEnabled: Bool {
 #if DEBUG
         return true
@@ -37,6 +46,44 @@ nonisolated enum DebugLogGate {
     static func noisy(_ log: @autoclosure () -> String) {
 #if DEBUG
         guard noisyRealtimeInvestigationLogs else { return }
+        print(log())
+#endif
+    }
+
+    /// One-line tab switch summary (DEBUG only).
+    static func tabSwitchPerfSummary(_ log: @autoclosure () -> String) {
+#if DEBUG
+        print(log())
+#endif
+    }
+
+    /// Verbose tab switch / preload / deferred refresh lines (DEBUG only).
+    static func tabSwitchPerfVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard verboseTabSwitchPerfLogging else { return }
+        print(log())
+#endif
+    }
+
+    /// One-line Going tab perf summary (DEBUG only).
+    static func goingTabPerfSummary(_ log: @autoclosure () -> String) {
+#if DEBUG
+        print(log())
+#endif
+    }
+
+    /// Verbose Going tab render/rebuild tracing (DEBUG only).
+    static func goingTabPerfVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard verboseGoingTabPerfLogging else { return }
+        print(log())
+#endif
+    }
+
+    /// Discover tab-visible perf tracing (DEBUG only).
+    static func discoverTabPerfVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard verboseDiscoverTabPerfLogging else { return }
         print(log())
 #endif
     }
@@ -139,46 +186,39 @@ enum AppPerfDebug {
 /// Main-tab switch tracing (`[TabPerf]`); DEBUG unless ``DebugLogGate/releaseHotPathPerfLogging``.
 enum TabPerf {
     static func selectedTab(_ tab: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[TabPerf] selectedTab=\(tab)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabPerf] selectedTab=\(tab)")
     }
 
     static func tabSwitchStarted(from: String? = nil, to: String? = nil) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         if let from, let to {
-            print("[TabPerf] tabSwitchStarted from=\(from) to=\(to)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPerf] tabSwitchStarted from=\(from) to=\(to)")
         } else {
-            print("[TabPerf] tabSwitchStarted")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPerf] tabSwitchStarted")
         }
     }
 
     static func tabSwitchRendered(tab: String, durationMs: Int? = nil) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         if let durationMs {
-            print("[TabPerf] tabSwitchRendered tab=\(tab) durationMs=\(durationMs)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPerf] tabSwitchRendered tab=\(tab) durationMs=\(durationMs)")
         } else {
-            print("[TabPerf] tabSwitchRendered tab=\(tab)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPerf] tabSwitchRendered tab=\(tab)")
         }
     }
 
     static func refreshSkipped(name: String, reason: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[TabPerf] refreshSkipped reason=\(reason) name=\(name)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabPerf] refreshSkipped reason=\(reason) name=\(name)")
     }
 
     static func refreshStarted(name: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[TabPerf] refreshStarted name=\(name)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabPerf] refreshStarted name=\(name)")
     }
 
     static func refreshFinished(name: String, durationMs: Int) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[TabPerf] refreshFinished name=\(name) durationMs=\(durationMs)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabPerf] refreshFinished name=\(name) durationMs=\(durationMs)")
     }
 
     static func duplicateRefreshCoalesced(name: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[TabPerf] duplicateRefreshCoalesced name=\(name)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabPerf] duplicateRefreshCoalesced name=\(name)")
     }
 }
 
@@ -237,9 +277,8 @@ nonisolated enum PerformanceLog {
 /// Going tab first-paint and background refresh tracing (`[GoingPerfDebug]`).
 nonisolated enum GoingPerfDebug {
     static func screenAppear(source: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] screenAppear=\(Date().timeIntervalSince1970)")
-        print("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] screenAppear=\(Date().timeIntervalSince1970)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 
     static func firstPaint(
@@ -249,38 +288,33 @@ nonisolated enum GoingPerfDebug {
         favoriteTeamGamesCount: Int,
         source: String
     ) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] firstPaintMs=\(ms)")
-        print("[GoingPerfDebug] usedCachedData=\(usedCachedData)")
-        print("[GoingPerfDebug] savedGamesCount=\(savedGamesCount)")
-        print("[GoingPerfDebug] favoriteTeamGamesCount=\(favoriteTeamGamesCount)")
-        print("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] firstPaintMs=\(ms)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] usedCachedData=\(usedCachedData)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] savedGamesCount=\(savedGamesCount)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] favoriteTeamGamesCount=\(favoriteTeamGamesCount)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 
     static func refreshStarted(source: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] refreshStarted=\(Date().timeIntervalSince1970)")
-        print("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] refreshStarted=\(Date().timeIntervalSince1970)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 
     static func refreshFinished(source: String, durationMs: Int) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] refreshFinished=\(Date().timeIntervalSince1970)")
-        print("[GoingPerfDebug] refreshDurationMs=\(durationMs)")
-        print("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] refreshFinished=\(Date().timeIntervalSince1970)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] refreshDurationMs=\(durationMs)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 
     static func duplicateRefreshSkipped(source: String, reason: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] duplicateRefreshSkipped=true")
-        print("[GoingPerfDebug] source=\(source)")
-        print("[GoingPerfDebug] reason=\(reason)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] duplicateRefreshSkipped=true")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] reason=\(reason)")
     }
 
     static func deferredWork(_ work: String, source: String) {
-        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
-        print("[GoingPerfDebug] deferredWork=\(work)")
-        print("[GoingPerfDebug] source=\(source)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] deferredWork=\(work)")
+        DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 }
 

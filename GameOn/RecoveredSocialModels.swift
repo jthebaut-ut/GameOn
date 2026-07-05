@@ -582,6 +582,16 @@ final class FriendshipService {
             .execute()
     }
 
+    /// Ends an accepted friendship without clearing DM history (`remove_friend` RPC).
+    func removeFriend(friendUserId: UUID) async throws {
+        struct Params: Encodable {
+            let p_friend_user_id: UUID
+        }
+        try await client
+            .rpc("remove_friend", params: Params(p_friend_user_id: friendUserId))
+            .execute()
+    }
+
     func clearFriendRequestView(requestId: UUID) async throws {
         struct Params: Encodable {
             let p_id: UUID

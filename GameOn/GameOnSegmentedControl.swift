@@ -35,6 +35,7 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
     let tabs: [GameOnSegmentedTab<Selection>]
     @Binding var selection: Selection
     var accent: Color = FGColor.accentGreen
+    var animatesSelectionChanges: Bool = true
     var fillsWidth = true
 
     @Environment(\.colorScheme) private var colorScheme
@@ -63,8 +64,16 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
         let tint = tab.tint ?? accent
 
         return Button {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
-                selection = tab.id
+            if animatesSelectionChanges {
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                    selection = tab.id
+                }
+            } else {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    selection = tab.id
+                }
             }
         } label: {
             VStack(spacing: 5) {

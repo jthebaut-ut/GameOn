@@ -74,7 +74,11 @@ extension MapViewModel {
     @MainActor
     func dismissDiscoverBannerAnnouncement(_ announcement: FanGeoAnnouncement) {
         FanGeoAnnouncementDismissStore.dismiss(announcement)
-        applyDiscoverBannerSelectionFromCache()
+        if focusedDiscoverAnnouncementId == announcement.id {
+            clearFocusedDiscoverAnnouncement(reason: "dismissed")
+        } else {
+            applyDiscoverBannerSelectionFromCache()
+        }
     }
 
     @MainActor
@@ -120,6 +124,14 @@ extension MapViewModel {
 
     @MainActor
     func applyDiscoverBannerSelectionFromCache() {
+        guard fanGeoAnnouncementNotificationsEnabled else {
+            discoverBannerAnnouncements = []
+#if DEBUG
+            print("[AnnouncementDebug] inAppAnnouncementsHidden reason=fanGeoAnnouncementsDisabled")
+#endif
+            return
+        }
+
         let isBusiness = isBusinessAudienceForAnnouncements
         let userLocation = announcementUserLocationForGeoTargeting
         var eligible: [FanGeoAnnouncement] = []
@@ -142,7 +154,49 @@ extension MapViewModel {
             guard reason == nil else { continue }
             eligible.append(candidate)
         }
-        discoverBannerAnnouncements = eligible.sorted(by: FanGeoAnnouncement.discoverCarouselSort)
+        let sortedEligible = eligible.sorted(by: FanGeoAnnouncement.discoverCarouselSort)
+        if let focusedId = focusedDiscoverAnnouncementId {
+            let focusedOnly = sortedEligible.filter { $0.id == focusedId }
+            if !focusedOnly.isEmpty {
+                discoverBannerAnnouncements = focusedOnly
+                focusedDiscoverAnnouncementDisplayed = true
+#if DEBUG
+                print(
+                    "[AnnouncementDebug] focusedSelection announcementId=\(focusedId.uuidString.lowercased()) " +
+                    "visibleCount=\(focusedOnly.count) displayed=\(focusedDiscoverAnnouncementDisplayed)"
+                )
+#endif
+            } else if cachedDiscoverBannerCandidates.contains(where: { $0.id == focusedId }) {
+                clearFocusedDiscoverAnnouncement(reason: "focusedNotEligible")
+            } else {
+                discoverBannerAnnouncements = []
+#if DEBUG
+                print(
+                    "[AnnouncementDebug] focusedSelection announcementId=\(focusedId.uuidString.lowercased()) " +
+                    "visibleCount=0 awaitingFetch=true"
+                )
+#endif
+            }
+        } else {
+            discoverBannerAnnouncements = sortedEligible
+        }
+    }
+
+    @MainActor
+    func noteDiscoverTabBecameHidden() {
+        guard focusedDiscoverAnnouncementDisplayed else { return }
+        clearFocusedDiscoverAnnouncement(reason: "discoverTabHidden")
+    }
+
+    @MainActor
+    private func clearFocusedDiscoverAnnouncement(reason: String) {
+        guard focusedDiscoverAnnouncementId != nil else { return }
+        focusedDiscoverAnnouncementId = nil
+        focusedDiscoverAnnouncementDisplayed = false
+        applyDiscoverBannerSelectionFromCache()
+#if DEBUG
+        print("[AnnouncementDebug] clearedFocusedAnnouncement reason=\(reason)")
+#endif
     }
 
     var announcementUserLocationForGeoTargeting: FanGeoAnnouncementUserLocation {

@@ -40,7 +40,15 @@ type CardTimelineEntry = {
   minuteText: string
   playerName: string | null
   teamName: string | null
+  providerTimestamp: string | null
 }
+
+/** Age (minutes) at or below this is a normal live card push. */
+const CARD_FRESH_MAX_AGE_MINUTES = 8
+/** Age (minutes) above fresh and at or below this is sent as an "earlier match event". */
+const CARD_DELAYED_MAX_AGE_MINUTES = 20
+
+type CardPushMode = "fresh" | "delayed" | "stale"
 
 type SavedProGameRow = {
   id: string
@@ -104,6 +112,9 @@ type LiveMatchRow = {
   match_status: string
   league: string
   start_time: string
+  minute: number | null
+  updated_at: string | null
+  timeline_updated_at: string | null
   timeline_events: TimelineEventRow[] | null
 }
 
@@ -123,6 +134,19 @@ type TimelineEventRow = {
   strComment: string | null
   dateEvent: string | null
   strSeason: string | null
+  eventTimestamp: string | null
+}
+
+type CardPushStaleness = {
+  mode: CardPushMode
+  stale: boolean
+  cardMinute: number | null
+  currentMinute: number | null
+  ageEstimateMinutes: number | null
+  providerTimestamp: string | null
+  observedAt: string
+  delaySec: number | null
+  reason: string
 }
 
 type PushTokenRow = {
@@ -202,6 +226,7 @@ type WorkerCounts = {
   cardPushSkippedDuplicate: number
   cardPushSkippedPreferenceOff: number
   cardPushSkippedNoToken: number
+  cardPushSkippedStale: number
   cardPushError: number
   notificationsSent: number
   skippedNoLiveMatch: number
@@ -256,6 +281,7 @@ serve(async (req) => {
     cardPushSkippedDuplicate: 0,
     cardPushSkippedPreferenceOff: 0,
     cardPushSkippedNoToken: 0,
+    cardPushSkippedStale: 0,
     cardPushError: 0,
     notificationsSent: 0,
     skippedNoLiveMatch: 0,
@@ -384,6 +410,7 @@ serve(async (req) => {
     console.log(`[ProScorePushWorker] cardPushSkippedDuplicate=${counts.cardPushSkippedDuplicate}`)
     console.log(`[ProScorePushWorker] cardPushSkippedPreferenceOff=${counts.cardPushSkippedPreferenceOff}`)
     console.log(`[ProScorePushWorker] cardPushSkippedNoToken=${counts.cardPushSkippedNoToken}`)
+    console.log(`[ProScorePushWorker] cardPushSkippedStale=${counts.cardPushSkippedStale}`)
     console.log(`[ProScorePushWorker] cardPushError=${counts.cardPushError}`)
     console.log(`[ProScorePushWorker] games checked=${counts.gamesChecked}`)
     console.log(`[ProScorePushWorker] live games checked=${counts.liveGamesChecked}`)
@@ -486,7 +513,7 @@ async function loadLiveMatches(
 ): Promise<LiveMatchRow[]> {
   const { data, error } = await supabase
     .from("live_matches")
-    .select("id,source,external_id,sport,home_team,away_team,score_home,score_away,match_status,league,start_time,timeline_events")
+    .select("id,source,external_id,sport,home_team,away_team,score_home,score_away,match_status,league,start_time,minute,updated_at,timeline_updated_at,timeline_events")
     .gte("start_time", windowStart)
     .lte("start_time", windowEnd)
     .limit(2000)
@@ -764,6 +791,7 @@ async function maybeSendCardUpdates(
     `[ProScorePushWorker] cardPushEligibleUsers=1 gameId=${game.liveMatchId} userId=${game.userId} cards=${cards.length}`,
   )
 
+  const timelineEvents = normalizeTimelineEventsForWorker(liveWithTimeline.timeline_events)
   for (const card of cards) {
     const duplicate = await deliveryDedupeExists(
       supabase,
@@ -780,10 +808,31 @@ async function maybeSendCardUpdates(
       continue
     }
 
-    const alert = cardNotificationContent(game, card)
+    const staleness = evaluateCardPushStaleness(card, liveWithTimeline, timelineEvents)
+    logCardPushTiming(card, staleness)
+    if (staleness.mode === "stale") {
+      counts.cardPushSkippedStale += 1
+      // Record as delivered so late-arriving historical cards are not retried.
+      try {
+        await insertDeliveryDedupe(
+          supabase,
+          game,
+          card.notificationType,
+          card.stableEventKey,
+        )
+      } catch (error) {
+        console.warn(
+          `[ProScorePushWorker] cardPushStaleDedupeFailed gameId=${game.liveMatchId} ` +
+            `eventKey=${card.stableEventKey} error=${errorMessage(error)}`,
+        )
+      }
+      continue
+    }
+
+    const alert = cardNotificationContent(game, card, staleness.mode)
     console.log(
       `[ProScorePushWorker] cardPushAttempt gameId=${game.liveMatchId} userId=${game.userId} ` +
-        `type=${card.notificationType} eventKey=${card.stableEventKey} title=${alert.title}`,
+        `type=${card.notificationType} mode=${staleness.mode} eventKey=${card.stableEventKey} title=${alert.title}`,
     )
 
     let sent = 0
@@ -873,6 +922,7 @@ function parseCardTimelineEvents(
     const minuteText = cardMinuteTextForTimelineEvent(event)
     const playerName = cleanTimelineText(event.strPlayer)
     const teamName = cardTeamNameForTimelineEvent(event, live.home_team, live.away_team)
+    const providerTimestamp = timelineEventProviderTimestamp(event)
     const stableEventKey = stableCardEventKey(
       game.liveMatchId,
       minuteText,
@@ -890,10 +940,199 @@ function parseCardTimelineEvents(
       minuteText,
       playerName,
       teamName,
+      providerTimestamp,
     })
   }
 
   return entries
+}
+
+function timelineEventProviderTimestamp(event: TimelineEventRow): string | null {
+  const candidates = [
+    event.eventTimestamp,
+    event.dateEvent,
+  ]
+  for (const candidate of candidates) {
+    const parsed = parseProviderTimestamp(candidate)
+    if (parsed) return parsed.toISOString()
+  }
+  return null
+}
+
+function parseProviderTimestamp(raw: string | null | undefined): Date | null {
+  const trimmed = (raw ?? "").trim()
+  if (!trimmed) return null
+  // Date-only values (YYYY-MM-DD) are match-day labels, not event times.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null
+  const parsed = new Date(trimmed)
+  if (Number.isNaN(parsed.getTime())) return null
+  // Reject timestamps more than a day in the future or older than a week.
+  const now = Date.now()
+  const ageMs = now - parsed.getTime()
+  if (ageMs < -24 * 60 * 60 * 1000 || ageMs > 7 * 24 * 60 * 60 * 1000) return null
+  return parsed
+}
+
+function parseCardMinuteNumber(minuteText: string | null | undefined): number | null {
+  const formatted = cardMinuteFromRawText(minuteText)
+  if (!formatted || formatted === "?") return null
+  const match = formatted.match(/^(\d+)(?:\+(\d+))?/)
+  if (!match) return null
+  const base = Number.parseInt(match[1] ?? "", 10)
+  const extra = Number.parseInt(match[2] ?? "0", 10)
+  if (!Number.isFinite(base) || base < 0) return null
+  const total = base + (Number.isFinite(extra) && extra > 0 ? extra : 0)
+  return total
+}
+
+function currentMatchMinuteForCardPush(
+  live: LiveMatchRow,
+  timelineEvents: TimelineEventRow[],
+): number | null {
+  if (typeof live.minute === "number" && Number.isFinite(live.minute) && live.minute >= 0) {
+    return live.minute
+  }
+
+  let maxTimelineMinute: number | null = null
+  for (const event of timelineEvents) {
+    const minute = parseCardMinuteNumber(cardMinuteTextForTimelineEvent(event))
+    if (minute === null) continue
+    if (maxTimelineMinute === null || minute > maxTimelineMinute) {
+      maxTimelineMinute = minute
+    }
+  }
+  if (maxTimelineMinute !== null) return maxTimelineMinute
+
+  const status = normalizeStatus(live.match_status)
+  if (status === "HT") return 45
+  if (status === "FT") return 90
+
+  const startMs = Date.parse(live.start_time)
+  if (!Number.isFinite(startMs)) return null
+  const elapsedMinutes = Math.floor((Date.now() - startMs) / 60_000)
+  if (elapsedMinutes < 0) return null
+  // Cap wall-clock estimate so pre-match / long delays do not invent huge clocks.
+  return Math.min(elapsedMinutes, 130)
+}
+
+function cardPushModeForAgeMinutes(ageEstimateMinutes: number): CardPushMode {
+  if (ageEstimateMinutes <= CARD_FRESH_MAX_AGE_MINUTES) return "fresh"
+  if (ageEstimateMinutes <= CARD_DELAYED_MAX_AGE_MINUTES) return "delayed"
+  return "stale"
+}
+
+function cardPushStalenessResult(
+  mode: CardPushMode,
+  cardMinute: number | null,
+  currentMinute: number | null,
+  ageEstimateMinutes: number | null,
+  providerTimestamp: string | null,
+  observedAt: string,
+  delaySec: number | null,
+  reason: string,
+): CardPushStaleness {
+  return {
+    mode,
+    stale: mode === "stale",
+    cardMinute,
+    currentMinute,
+    ageEstimateMinutes,
+    providerTimestamp,
+    observedAt,
+    delaySec,
+    reason,
+  }
+}
+
+function evaluateCardPushStaleness(
+  card: CardTimelineEntry,
+  live: LiveMatchRow,
+  timelineEvents: TimelineEventRow[],
+): CardPushStaleness {
+  const observedAt = new Date()
+  const observedAtIso = observedAt.toISOString()
+  const cardMinute = parseCardMinuteNumber(card.minuteText)
+  const currentMinute = currentMatchMinuteForCardPush(live, timelineEvents)
+  const providerTimestamp = card.providerTimestamp
+  const providerDate = parseProviderTimestamp(providerTimestamp)
+
+  if (providerDate) {
+    const delaySec = Math.max(0, Math.round((observedAt.getTime() - providerDate.getTime()) / 1000))
+    const ageEstimateMinutes = Math.round(delaySec / 60)
+    const mode = cardPushModeForAgeMinutes(ageEstimateMinutes)
+    return cardPushStalenessResult(
+      mode,
+      cardMinute,
+      currentMinute,
+      ageEstimateMinutes,
+      providerDate.toISOString(),
+      observedAtIso,
+      delaySec,
+      `providerTimestamp:${mode}`,
+    )
+  }
+
+  if (cardMinute !== null && currentMinute !== null) {
+    const ageEstimateMinutes = Math.max(0, currentMinute - cardMinute)
+    const mode = cardPushModeForAgeMinutes(ageEstimateMinutes)
+    return cardPushStalenessResult(
+      mode,
+      cardMinute,
+      currentMinute,
+      ageEstimateMinutes,
+      null,
+      observedAtIso,
+      ageEstimateMinutes * 60,
+      `cardMinuteBehindClock:${mode}`,
+    )
+  }
+
+  // No reliable age signal: allow LIVE/HT as fresh, block FT backlog as stale.
+  const status = normalizeStatus(live.match_status)
+  if (status === "FT") {
+    return cardPushStalenessResult(
+      "stale",
+      cardMinute,
+      currentMinute,
+      null,
+      null,
+      observedAtIso,
+      null,
+      "unknownAgeAtFinal",
+    )
+  }
+
+  return cardPushStalenessResult(
+    "fresh",
+    cardMinute,
+    currentMinute,
+    null,
+    null,
+    observedAtIso,
+    null,
+    "unknownAgeLiveAllow",
+  )
+}
+
+function logCardPushTiming(
+  card: CardTimelineEntry,
+  staleness: CardPushStaleness,
+) {
+  const ageLabel = staleness.ageEstimateMinutes ?? "none"
+  const action = staleness.mode === "stale"
+    ? "skip"
+    : staleness.mode === "delayed"
+    ? "sendEarlier"
+    : "send"
+  console.log(
+    `[CardPushTiming] type=${card.cardKind} age=${ageLabel} mode=${staleness.mode} action=${action}`,
+  )
+  console.log(
+    `[CardPushTiming] providerTimestamp=${staleness.providerTimestamp ?? "none"} ` +
+      `observedAt=${staleness.observedAt} delaySec=${staleness.delaySec ?? "none"} ` +
+      `cardMinute=${staleness.cardMinute ?? card.minuteText ?? "none"} ` +
+      `currentMinute=${staleness.currentMinute ?? "none"} reason=${staleness.reason}`,
+  )
 }
 
 function cardNotificationTypeForKind(
@@ -933,28 +1172,93 @@ function stableCardEventKey(
   ].join("|")
 }
 
+function cardNotificationDisplayMinute(minuteText: string | null | undefined): string | null {
+  const formatted = cardMinuteFromRawText(minuteText)
+  if (!formatted || formatted === "?") return null
+  return normalizedGoalMinute(formatted)
+}
+
 function cardNotificationTitle(
   notificationType: CardTimelineEntry["notificationType"],
+  minuteText: string,
+  mode: CardPushMode = "fresh",
 ): string {
+  if (mode === "delayed") {
+    switch (notificationType) {
+      case "yellow_card":
+        return "🟨 Earlier match event"
+      case "red_card":
+      case "second_yellow_card":
+        return "🟥 Earlier match event"
+    }
+  }
+
+  const minute = cardNotificationDisplayMinute(minuteText)
+  const minuteSuffix = minute ? ` ${minute}` : ""
   switch (notificationType) {
     case "yellow_card":
-      return "🟨 Yellow card"
+      return `🟨 Yellow card${minuteSuffix}`
     case "red_card":
+      return `🟥 Red card${minuteSuffix}`
     case "second_yellow_card":
-      return "🟥 Red card"
+      return `🟥 Second yellow${minuteSuffix}`
   }
 }
 
-function cardEventDisplayTitle(
-  notificationType: CardTimelineEntry["notificationType"],
+function cardNotificationBodyFirstLine(
+  card: CardTimelineEntry,
+  mode: CardPushMode = "fresh",
 ): string {
-  switch (notificationType) {
+  const player = card.playerName?.trim()
+  const minute = cardNotificationDisplayMinute(card.minuteText)
+  const minutePrefix = mode === "delayed" && minute ? `${minute} ` : ""
+
+  switch (card.notificationType) {
     case "yellow_card":
-      return "🟨 Yellow Card"
+      if (player) return `${minutePrefix}${player} received a yellow card.`
+      if (card.teamName?.trim()) {
+        const team = formattedTeamName(card.teamName)
+        return team
+          ? `${minutePrefix}${team} received a yellow card.`
+          : `${minutePrefix}Yellow card.`.trim()
+      }
+      return `${minutePrefix}Yellow card.`.trim()
     case "red_card":
+      if (player) return `${minutePrefix}${player} was sent off.`
+      if (card.teamName?.trim()) {
+        const team = formattedTeamName(card.teamName)
+        return team
+          ? `${minutePrefix}A ${team} player was sent off.`
+          : `${minutePrefix}Red card.`.trim()
+      }
+      return `${minutePrefix}Red card.`.trim()
     case "second_yellow_card":
-      return "🟥 Red Card"
+      if (player) return `${minutePrefix}${player} was sent off after a second yellow.`
+      if (card.teamName?.trim()) {
+        const team = formattedTeamName(card.teamName)
+        return team
+          ? `${minutePrefix}A ${team} player was sent off after a second yellow.`
+          : `${minutePrefix}Second yellow card.`.trim()
+      }
+      return `${minutePrefix}Second yellow card.`.trim()
   }
+}
+
+function cardNotificationContent(
+  game: TrackedGame,
+  card: CardTimelineEntry,
+  mode: CardPushMode = "fresh",
+): PushAlertContent {
+  const title = cardNotificationTitle(card.notificationType, card.minuteText, mode)
+  const firstLine = cardNotificationBodyFirstLine(card, mode)
+  const matchup = matchupNotificationBody(game)
+  const body = matchup ? `${firstLine}\n${matchup}` : firstLine
+  const minuteDisplay = cardNotificationDisplayMinute(card.minuteText) ?? "none"
+  console.log(
+    `[CardPushDebug] type=${card.cardKind} minute=${minuteDisplay} mode=${mode} ` +
+      `player=${card.playerName?.trim() || "none"} match=${matchup || "none"}`,
+  )
+  return { title, body }
 }
 
 function resolvedNotificationTeamName(teamName: string | null | undefined): string | null {
@@ -1060,50 +1364,6 @@ function goalNotificationBody(
   return `${firstLine}\n${secondLine}`
 }
 
-function legacyCardNotificationContent(
-  game: TrackedGame,
-  card: CardTimelineEntry,
-): PushAlertContent {
-  const matchup = matchupNotificationBody(game)
-  const subject = cardNotificationSubject(card, game)
-  const isYellow = card.notificationType === "yellow_card"
-  return {
-    title: cardNotificationTitle(card.notificationType),
-    body: `${subject} received a ${isYellow ? "yellow" : "red"} card in ${matchup}.`,
-  }
-}
-
-function cardNotificationContent(
-  game: TrackedGame,
-  card: CardTimelineEntry,
-): PushAlertContent {
-  const resolvedTeam = resolvedNotificationTeamName(card.teamName)
-  if (!resolvedTeam) {
-    return legacyCardNotificationContent(game, card)
-  }
-
-  const title = playerMatchEventTitle(cardEventDisplayTitle(card.notificationType), resolvedTeam)
-  const player = card.playerName?.trim() ?? ""
-  const matchup = matchupNotificationBody(game)
-
-  if (player) {
-    const body = matchup ? `${player}\n${matchup}` : player
-    return { title, body }
-  }
-
-  if (matchup) {
-    return { title, body: matchup }
-  }
-
-  return legacyCardNotificationContent(game, card)
-}
-
-function cardNotificationSubject(card: CardTimelineEntry, game: TrackedGame): string {
-  if (card.playerName?.trim()) return formattedTeamName(card.playerName)
-  if (card.teamName?.trim()) return formattedTeamName(card.teamName)
-  return `${formattedTeamName(game.awayTeam)} vs ${formattedTeamName(game.homeTeam)}`
-}
-
 function parseCardKindFromTimelineEvent(
   event: TimelineEventRow,
   sportKind: ProScoreSportKind,
@@ -1175,17 +1435,54 @@ function cardSearchableText(event: TimelineEventRow): string {
   )
 }
 
-function cardMinuteTextForTimelineEvent(event: TimelineEventRow): string {
-  const raw = cleanTimelineText(event.intTime)
-  if (raw) {
-    if (raw.includes("+") || raw.includes("'") || raw.includes("’")) {
-      const normalized = raw.replace(/’/g, "'")
-      return normalized.endsWith("'") ? normalized : `${normalized}'`
-    }
-    const minute = Number.parseInt(raw, 10)
-    if (Number.isFinite(minute) && minute >= 0) return `${minute}'`
-    return `${raw}'`
+function cardMinuteFromRawText(raw: string | null | undefined): string | null {
+  const trimmed = (raw ?? "").trim()
+  if (!trimmed) return null
+
+  if (/^\d+\+\d+['']?$/.test(trimmed)) {
+    const normalized = trimmed.replace(/’/g, "'")
+    return normalized.endsWith("'") ? normalized : `${normalized}'`
   }
+  if (trimmed.includes("+") || trimmed.includes("'") || trimmed.includes("’")) {
+    const normalized = trimmed.replace(/’/g, "'")
+    return normalized.endsWith("'") ? normalized : `${normalized}'`
+  }
+  if (trimmed.includes(":") || /\d(?:st|nd|rd|th)\b/i.test(trimmed)) {
+    return trimmed.replace(/’/g, "'")
+  }
+  const minute = Number.parseInt(trimmed, 10)
+  if (Number.isFinite(minute) && minute >= 0) return `${minute}'`
+  if (/^\d/.test(trimmed)) {
+    return trimmed.endsWith("'") || trimmed.endsWith("’")
+      ? trimmed.replace(/’/g, "'")
+      : `${trimmed}'`
+  }
+  return trimmed.replace(/’/g, "'")
+}
+
+function extractMinuteFromTimelineText(text: string): string | null {
+  const stoppage = text.match(/\b(\d+\+\d+)['']?/i)?.[0]
+  if (stoppage) return cardMinuteFromRawText(stoppage)
+  const minuteTick = text.match(/\b(\d{1,3})['']/i)?.[1]
+  if (minuteTick) return `${minuteTick}'`
+  return null
+}
+
+function cardMinuteTextForTimelineEvent(event: TimelineEventRow): string {
+  const fromIntTime = cardMinuteFromRawText(cleanTimelineText(event.intTime))
+  if (fromIntTime) return fromIntTime
+
+  const searchable = [
+    event.strComment,
+    event.strTimelineDetail,
+    event.strTimeline,
+  ]
+    .map((value) => cleanTimelineText(value))
+    .filter(Boolean)
+    .join(" ")
+  const fromText = extractMinuteFromTimelineText(searchable)
+  if (fromText) return fromText
+
   return "?"
 }
 
@@ -1862,6 +2159,15 @@ function normalizeTimelineEventRow(row: unknown): TimelineEventRow {
     strComment: readTimelineField(record, "strComment", "str_comment", "comment"),
     dateEvent: readTimelineField(record, "dateEvent", "date_event", "date"),
     strSeason: readTimelineField(record, "strSeason", "str_season", "season"),
+    eventTimestamp: readTimelineField(
+      record,
+      "eventTimestamp",
+      "event_timestamp",
+      "timestamp",
+      "strTimestamp",
+      "dateEventLocal",
+      "date_event_local",
+    ),
   }
 }
 

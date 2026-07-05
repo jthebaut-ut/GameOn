@@ -3,6 +3,9 @@ import UIKit
 
 /// Diagnostics-only tracing for ``DiscoverMapImageCache`` lookups (does not alter cache behavior).
 nonisolated enum ImageCacheDebug {
+    /// Per-lookup tracing; off by default so tab switches stay quiet (session summaries still log).
+    static var verbosePerImageLogging = false
+
     private static let lock = NSLock()
     private static var memoryHits = 0
     private static var diskHits = 0
@@ -12,6 +15,7 @@ nonisolated enum ImageCacheDebug {
     private static var networkFetchCountsByKey: [String: Int] = [:]
 
     private static func trace(_ message: @autoclosure () -> String) {
+        guard verbosePerImageLogging else { return }
         DebugLogGate.hotPathPerf(message())
     }
 
@@ -330,19 +334,19 @@ nonisolated enum ImageCacheDebug {
 
         let memoryRate = lookups > 0 ? Double(mem) / Double(lookups) : 0
         let diskRate = lookups > 0 ? Double(disk) / Double(lookups) : 0
-        trace("[ImageCacheDebug] sessionSummary reason=\(reason)")
-        trace("[ImageCacheDebug] lookupCount=\(lookups)")
-        trace("[ImageCacheDebug] memoryHitRate=\(String(format: "%.3f", memoryRate))")
-        trace("[ImageCacheDebug] diskHitRate=\(String(format: "%.3f", diskRate))")
-        trace("[ImageCacheDebug] memoryHits=\(mem)")
-        trace("[ImageCacheDebug] diskHits=\(disk)")
-        trace("[ImageCacheDebug] networkFetchCount=\(net)")
-        trace("[ImageCacheDebug] inFlightJoinCount=\(joins)")
-        trace("[ImageCacheDebug] duplicateNetworkFetchCount=\(duplicates)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] sessionSummary reason=\(reason)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] lookupCount=\(lookups)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] memoryHitRate=\(String(format: "%.3f", memoryRate))")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] diskHitRate=\(String(format: "%.3f", diskRate))")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] memoryHits=\(mem)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] diskHits=\(disk)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] networkFetchCount=\(net)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] inFlightJoinCount=\(joins)")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] duplicateNetworkFetchCount=\(duplicates)")
         if !duplicateKeys.isEmpty {
-            trace("[ImageCacheDebug] duplicateNetworkKeys=\(duplicateKeys)")
+            DebugLogGate.hotPathPerf("[ImageCacheDebug] duplicateNetworkKeys=\(duplicateKeys)")
         }
-        trace("[ImageCacheDebug] diskLayerPresent=false")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] diskLayerPresent=false")
     }
 
     static func resetSessionStats(reason: String = "reset") {

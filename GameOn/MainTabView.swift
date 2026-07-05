@@ -42,6 +42,8 @@ struct MainTabView: View {
     private static let chatSocialRealtimeGracePeriodSeconds: TimeInterval = 9
     private static let foregroundDeferredBatchDelayNs: UInt64 = 1_750_000_000
     private static let tabPreloadFreshnessInterval: TimeInterval = 30
+    private static let tabIntentPreloadDeferDelayNs: UInt64 = 90_000_000
+    private static let liveMatchesTabPreloadFreshnessInterval: TimeInterval = 90
     private static let postAuthBadgeRefreshThrottleInterval: TimeInterval = 4
     private static let postAuthBadgeRefreshCoalesceDelayNs: UInt64 = 140_000_000
 
@@ -210,6 +212,7 @@ struct MainTabView: View {
             }
 #endif
             viewModel.isCalendarTabSelected = selectedTab == .calendar
+            viewModel.isLiveTabSelected = selectedTab == .live
             if !Self.hasForcedDiscoverTabThisProcess {
                 Self.hasForcedDiscoverTabThisProcess = true
                 selectTab(.discover, animated: false, reason: "startupForceDiscover")
@@ -271,6 +274,7 @@ struct MainTabView: View {
                 chatSocialRealtimeDeferTask = nil
                 cancelTabPreloadTasks()
                 LaunchWarmPreloadCoordinator.shared.cancel()
+                UserPreferencesWarmCacheCoordinator.shared.cancel()
                 PresenceService.shared.stop(reason: "authUnavailable")
                 chatViewModel.clearForSignOut()
             } else {
@@ -279,6 +283,11 @@ struct MainTabView: View {
                     viewModel: viewModel,
                     chatViewModel: chatViewModel,
                     accountTabVisible: selectedTab == .account,
+                    forceRefresh: true
+                )
+                UserPreferencesWarmCacheCoordinator.shared.beginIfNeeded(
+                    viewModel: viewModel,
+                    delayMs: 900,
                     forceRefresh: true
                 )
                 Task { await viewModel.ensurePickupInviteRealtimeIfNeeded() }
@@ -386,6 +395,7 @@ struct MainTabView: View {
                 ]
             )
             viewModel.isCalendarTabSelected = tab == .calendar
+            viewModel.isLiveTabSelected = tab == .live
             switch tab {
             case .discover:
                 privateChatUnlockedForCurrentSelection = false
@@ -406,7 +416,7 @@ struct MainTabView: View {
                 Task {
                     await Task.yield()
                     await startChatSocialRealtimeIfNeeded(reason: "chatTabSelected")
-                    if !viewModel.didCompleteTabIntentPreloadRecently("chat", within: 10) {
+                    if !viewModel.didCompleteTabIntentPreloadRecently("chat", within: 25) {
                         chatViewModel.requestBadgeRecalculation(reason: "chat_tab_selected", includeInboxSummaries: true)
                     } else {
                         AppPerfDebug.refreshSkipped(tab: "chat", source: "badgeRecalculation", reason: "tabPreloadRecent")
@@ -522,13 +532,17 @@ struct MainTabView: View {
             "tab switch",
             "from=\(tabSwitchFromTab?.rawValue ?? "unknown") to=\(tab.rawValue) reason=\(reason)"
         )
-        print("[TabSwitchPerf] begin from=\(tabSwitchFromTab?.rawValue ?? "unknown") to=\(tab.rawValue) cached=\(tabSwitchCachedData ?? false) reason=\(reason)")
+        DebugLogGate.tabSwitchPerfVerbose(
+            "[TabSwitchPerf] begin from=\(tabSwitchFromTab?.rawValue ?? "unknown") to=\(tab.rawValue) cached=\(tabSwitchCachedData ?? false) reason=\(reason)"
+        )
 #if DEBUG
-        print("[UISmoothnessDebug] tabTransition=\(tabSwitchFromTab?.rawValue ?? "unknown")->\(tab.rawValue)")
-        print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
-        print("[TabPerfDebug] tabSwitchStart=\(tabSwitchStartAt?.timeIntervalSince1970 ?? 0)")
-        print("[TabPerfDebug] usedCachedData=\(tabSwitchCachedData ?? false)")
-        print("[TabPerfDebug] reason=\(reason)")
+        if DebugLogGate.verboseTabSwitchPerfLogging {
+            print("[UISmoothnessDebug] tabTransition=\(tabSwitchFromTab?.rawValue ?? "unknown")->\(tab.rawValue)")
+            print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
+            print("[TabPerfDebug] tabSwitchStart=\(tabSwitchStartAt?.timeIntervalSince1970 ?? 0)")
+            print("[TabPerfDebug] usedCachedData=\(tabSwitchCachedData ?? false)")
+            print("[TabPerfDebug] reason=\(reason)")
+        }
 #endif
     }
 
@@ -538,28 +552,32 @@ struct MainTabView: View {
         TabPerf.tabSwitchRendered(tab: tab.rawValue, durationMs: ms)
         AppPerfDebug.tabSwitchEnd(tab: tab.rawValue, durationMs: ms, cacheHit: usedCachedData, source: "firstPaint")
         UIPerformanceDiagnostics.log("tabSwitch from=\(from) to=\(tab.rawValue) ms=\(ms) cached=\(usedCachedData)")
-        print("[TabSwitchPerf] firstContentVisible from=\(from) to=\(tab.rawValue) durationMs=\(ms) cached=\(usedCachedData)")
+        DebugLogGate.tabSwitchPerfSummary(
+            "[TabSwitchPerf] firstContentVisible from=\(from) to=\(tab.rawValue) durationMs=\(ms) cached=\(usedCachedData)"
+        )
         switch tab {
         case .chat:
             UIPerformanceDiagnostics.signpost("DM inbox open", "ms=\(ms)")
-            print("[TabPreloadDebug] tab=chat readyMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=chat readyMs=\(ms)")
         case .account:
             UIPerformanceDiagnostics.signpost("Profile tab open", "ms=\(ms)")
-            print("[TabPreloadDebug] tab=account readyMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=account readyMs=\(ms)")
             ImageCacheDebug.printSessionSummary(reason: "tabVisible:account")
         case .following:
-            print("[TabPreloadDebug] tab=following readyMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=following readyMs=\(ms)")
         case .discover:
-            print("[TabPreloadDebug] tab=discover readyMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=discover readyMs=\(ms)")
             ImageCacheDebug.printSessionSummary(reason: "tabVisible:discover")
         default:
             break
         }
 #if DEBUG
-        print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
-        print("[TabPerfDebug] firstContentVisibleMs=\(ms)")
-        print("[TabPerfDebug] firstPaintMs=\(ms) tab=\(tab.rawValue)")
-        print("[TabPerfDebug] usedCachedData=\(usedCachedData)")
+        if DebugLogGate.verboseTabSwitchPerfLogging {
+            print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
+            print("[TabPerfDebug] firstContentVisibleMs=\(ms)")
+            print("[TabPerfDebug] firstPaintMs=\(ms) tab=\(tab.rawValue)")
+            print("[TabPerfDebug] usedCachedData=\(usedCachedData)")
+        }
 #endif
         tabSwitchStartAt = nil
         tabSwitchCachedData = nil
@@ -572,43 +590,58 @@ struct MainTabView: View {
            Date().timeIntervalSince(last) < Self.tabPreloadFreshnessInterval,
            warmAtStart {
             TabPerf.refreshSkipped(name: "tabIntentPreload:\(tab.rawValue)", reason: "freshCache")
-            print("[TabSwitchPerf] preloadSkipped tab=\(tab.rawValue) reason=fresh cached=true")
+            DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadSkipped tab=\(tab.rawValue) reason=fresh cached=true")
 #if DEBUG
-            print("[TabPreloadDebug] tab=\(tab.rawValue)")
-            print("[TabPreloadDebug] warm=true")
-            print("[TabPreloadDebug] skippedReason=fresh")
+            if DebugLogGate.verboseTabSwitchPerfLogging {
+                print("[TabPreloadDebug] tab=\(tab.rawValue)")
+                print("[TabPreloadDebug] warm=true")
+                print("[TabPreloadDebug] skippedReason=fresh")
+            }
 #endif
             return
         }
         if tabPreloadTasks[tab] != nil {
             TabPerf.duplicateRefreshCoalesced(name: "tabIntentPreload:\(tab.rawValue)")
-            print("[TabSwitchPerf] preloadSkipped tab=\(tab.rawValue) reason=inFlight cached=\(warmAtStart)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadSkipped tab=\(tab.rawValue) reason=inFlight cached=\(warmAtStart)")
 #if DEBUG
-            print("[TabPreloadDebug] tab=\(tab.rawValue)")
-            print("[TabPreloadDebug] warm=\(warmAtStart)")
-            print("[TabPreloadDebug] skippedReason=inFlight")
+            if DebugLogGate.verboseTabSwitchPerfLogging {
+                print("[TabPreloadDebug] tab=\(tab.rawValue)")
+                print("[TabPreloadDebug] warm=\(warmAtStart)")
+                print("[TabPreloadDebug] skippedReason=inFlight")
+            }
 #endif
             return
         }
 
         let startedAt = Date()
         TabPerf.refreshStarted(name: "tabIntentPreload:\(tab.rawValue)")
-        print("[TabSwitchPerf] preloadStarted tab=\(tab.rawValue) cached=\(warmAtStart) reason=\(reason)")
+        DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadStarted tab=\(tab.rawValue) cached=\(warmAtStart) reason=\(reason)")
 #if DEBUG
-        print("[TabPreloadDebug] tab=\(tab.rawValue)")
-        print("[TabPreloadDebug] warm=\(warmAtStart)")
-        print("[TabPreloadDebug] reason=\(reason)")
+        if DebugLogGate.verboseTabSwitchPerfLogging {
+            print("[TabPreloadDebug] tab=\(tab.rawValue)")
+            print("[TabPreloadDebug] warm=\(warmAtStart)")
+            print("[TabPreloadDebug] reason=\(reason)")
+            print("[TabPreloadDebug] skippedReason=deferred")
+        }
 #endif
+        DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=\(tab.rawValue) reason=\(reason) scheduled")
         let task = Task { @MainActor in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: Self.tabIntentPreloadDeferDelayNs)
+            guard !Task.isCancelled else { return }
+            DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=\(tab.rawValue) reason=\(reason) started")
             await runTabIntentPreload(tab: tab, reason: reason)
             let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
             lastTabPreloadAt[tab] = Date()
             tabPreloadTasks[tab] = nil
             TabPerf.refreshFinished(name: "tabIntentPreload:\(tab.rawValue)", durationMs: ms)
-            print("[TabSwitchPerf] preloadFinished tab=\(tab.rawValue) durationMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadFinished tab=\(tab.rawValue) durationMs=\(ms)")
+            DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=\(tab.rawValue) reason=\(reason) finished")
 #if DEBUG
-            print("[TabPreloadDebug] tab=\(tab.rawValue)")
-            print("[TabPreloadDebug] durationMs=\(ms)")
+            if DebugLogGate.verboseTabSwitchPerfLogging {
+                print("[TabPreloadDebug] tab=\(tab.rawValue)")
+                print("[TabPreloadDebug] durationMs=\(ms)")
+            }
 #endif
         }
         tabPreloadTasks[tab] = task
@@ -634,30 +667,77 @@ struct MainTabView: View {
         switch tab {
         case .chat:
             guard viewModel.isAuthenticatedForSocialFeatures else { return }
-            _ = await chatViewModel.prefetchLightweightStartupChatData()
-            await chatViewModel.refreshFriendRequestListsOnly()
-        case .following:
-            guard viewModel.isAuthenticatedForSocialFeatures, viewModel.canUseFollowingTab else { return }
-            await viewModel.refreshFollowingTabDataGloballyUnlessFresh()
-            if viewModel.canFanUsePickupGamesUI {
-                await viewModel.loadMyPickupGameJoinRequestsForFollowing(reason: "tabPreload")
-                await viewModel.loadMyPickupGamesForSettings()
-                await viewModel.loadIncomingPickupGameInvites()
+            if chatViewModel.shouldSkipChatTabIntentPreload() {
+                TabPerf.refreshSkipped(name: "tabIntentPreload:chat", reason: "freshCache")
+                DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadSkipped tab=chat reason=fresh cached=true")
+#if DEBUG
+                if DebugLogGate.verboseTabSwitchPerfLogging {
+                    print("[TabPreloadDebug] tab=chat")
+                    print("[TabPreloadDebug] skippedReason=fresh")
+                }
+#endif
+                return
             }
+            await chatViewModel.prefetchTabIntentChatBadgeData()
+        case .following:
+            // Going paints from cached cards; full refresh is deferred in FollowingScreen.
+            TabPerf.refreshSkipped(name: "tabIntentPreload:following", reason: "deferredToScreen")
+#if DEBUG
+            if DebugLogGate.verboseTabSwitchPerfLogging {
+                print("[TabPreloadDebug] tab=following")
+                print("[TabPreloadDebug] skippedReason=deferred")
+            }
+#endif
+            return
         case .account:
             guard viewModel.isAuthenticatedForSocialFeatures else { return }
+            if tabHasCachedData(.account) {
+                TabPerf.refreshSkipped(name: "tabIntentPreload:account", reason: "cachedIdentity")
+#if DEBUG
+                if DebugLogGate.verboseTabSwitchPerfLogging {
+                    print("[TabPreloadDebug] tab=account")
+                    print("[TabPreloadDebug] skippedReason=fresh")
+                }
+#endif
+                if viewModel.canReceiveProfilePokes {
+                    await viewModel.refreshUnseenPokesBadgeIfNeeded()
+                }
+                return
+            }
             await viewModel.prefetchLightweightUserDataForStartup()
             if viewModel.canReceiveProfilePokes {
                 await viewModel.refreshUnseenPokesBadgeIfNeeded()
             }
         case .discover:
-            guard viewModel.bars.isEmpty else { return }
+            guard viewModel.bars.isEmpty else {
+                TabPerf.refreshSkipped(name: "tabIntentPreload:discover", reason: "cachedVenues")
+#if DEBUG
+                if DebugLogGate.verboseTabSwitchPerfLogging {
+                    print("[TabPreloadDebug] tab=discover")
+                    print("[TabPreloadDebug] skippedReason=fresh")
+                }
+#endif
+                return
+            }
             await viewModel.refreshDiscoverCoreInBackground()
         case .calendar:
             if viewModel.canFanUsePickupGamesUI {
                 await viewModel.refreshCalendarTabPickupSources(reason: "tabPreload")
             }
         case .live:
+            if viewModel.liveMatchesAreFreshForTabPreload(
+                within: Self.liveMatchesTabPreloadFreshnessInterval
+            ) {
+                TabPerf.refreshSkipped(name: "tabIntentPreload:live", reason: "freshCache")
+                DebugLogGate.tabSwitchPerfVerbose("[TabSwitchPerf] preloadSkipped tab=live reason=fresh cached=true")
+#if DEBUG
+                if DebugLogGate.verboseTabSwitchPerfLogging {
+                    print("[TabPreloadDebug] tab=live")
+                    print("[TabPreloadDebug] skippedReason=fresh")
+                }
+#endif
+                return
+            }
             await viewModel.refreshLiveMatchesForLiveTabActivation(forceRefresh: false)
         }
     }
@@ -1108,6 +1188,7 @@ struct MainTabView: View {
     ) -> some View {
         let isSelected = selectedTab == tab
         content()
+            .environment(\.hostTabAdInteractionEnabled, isSelected)
             .opacity(isSelected ? 1 : 0)
             .allowsHitTesting(isSelected)
             .accessibilityHidden(!isSelected)

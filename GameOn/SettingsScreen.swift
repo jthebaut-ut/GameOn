@@ -25,9 +25,15 @@ enum SettingsScrollBottomLayout {
 }
 
 enum SettingsPremiumChrome {
-    static let cardRadius: CGFloat = 20
-    static let rowIconSize: CGFloat = 34
-    static let rowMinHeight: CGFloat = 58
+    static let cardRadius: CGFloat = 24
+    static let rowIconSize: CGFloat = 36
+    static let rowMinHeight: CGFloat = 60
+    static let privacyPermissionsIconSize: CGFloat = 40
+    static let privacyPermissionsRowMinHeight: CGFloat = 72
+    static let profileSectionListSpacing: CGFloat = 16
+    static let accountDestructiveTopSpacing: CGFloat = 22
+    static let scrollCardShadowRadius: CGFloat = 6
+    static let scrollCardShadowYOffset: CGFloat = 3
 
     static func cardFill(_ scheme: ColorScheme) -> Color {
         scheme == .dark
@@ -154,7 +160,7 @@ private enum ProfileSettingsRoute: Hashable {
     case venueResetPassword
 }
 
-private enum SettingsAboutFanGeoMetadata {
+enum SettingsAboutFanGeoMetadata {
     static let supportEmail = "support@fangeosports.com"
 
     static var version: String {
@@ -230,6 +236,7 @@ struct SettingsScreen: View {
     @State private var settingsActiveVenueSelectionCacheKey = ""
     @State private var settingsBusinessProfileLastPassiveRefreshAt: Date?
     @State private var settingsBusinessProfileHydrationInFlight = false
+    @State private var profileSettingsPrivacyRefreshToken = 0
     /// Holds Add-location draft fields across ``MapViewModel`` publishes (e.g. after photo upload) so the sheet does not reset.
     @StateObject private var addLocationSheetFormState = AddLocationSheetFormState()
     /// Which pending claim row is running ``performPendingClaimRefresh(claimId:)`` (nil = idle).
@@ -827,8 +834,12 @@ struct SettingsScreen: View {
                 }
             }
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { oldPhase, phase in
             guard phase == .active, isAccountTabSelected else { return }
+            if showProfileSettingsSheet, oldPhase != .active {
+                syncFanGeoPlusDisplayFromEntitlements()
+                Task { await refreshFanGeoPlusEntitlementFromSettings() }
+            }
             Task {
                 await refreshSettingsBusinessProfile(trigger: "foreground", refreshBusinessData: true, debounce: true)
             }
@@ -884,6 +895,9 @@ struct SettingsScreen: View {
         .onChange(of: showProfileSettingsSheet) { _, isPresented in
             if isPresented {
                 profileSettingsLogoutError = nil
+                profileSettingsPrivacyRefreshToken += 1
+                syncFanGeoPlusDisplayFromEntitlements()
+                Task { await refreshFanGeoPlusEntitlementFromSettings() }
             } else {
                 profileSettingsPath = NavigationPath()
             }
@@ -1070,6 +1084,7 @@ struct SettingsScreen: View {
     private var profileSettingsSheet: some View {
         NavigationStack(path: $profileSettingsPath) {
             List {
+                ProfileSettingsPrivacyPermissionsSection(refreshToken: profileSettingsPrivacyRefreshToken)
                 profileSettingsPrivacySection()
                 profileSettingsNotificationsSection()
                 if !settingsFanGeoPlusUsesBusinessDisplay {
@@ -1080,13 +1095,15 @@ struct SettingsScreen: View {
                 profileSettingsHelpSafetySection()
                 profileSettingsLegalSection()
                 profileSettingsAccountSection()
-                profileSettingsAboutSection()
+                ProfileSettingsAboutSection()
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 Color.clear.frame(height: SettingsScrollBottomLayout.sheetScrollComfortInset)
             }
             .listStyle(.plain)
-            .listSectionSpacing(10)
+            .listRowSeparator(.hidden)
+            .listSectionSeparator(.hidden)
+            .listSectionSpacing(SettingsPremiumChrome.profileSectionListSpacing)
             .scrollContentBackground(.hidden)
             .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
             .navigationTitle(L10n.t("settings", languageCode: appLanguageRaw))
@@ -1807,7 +1824,7 @@ struct SettingsScreen: View {
                         .buttonStyle(.plain)
                     }
                 }
-                .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 6, trailing: 16))
+                .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 0, trailing: 16))
                 .listRowBackground(Color.clear)
 
                 settingsSectionCard {
@@ -1833,6 +1850,7 @@ struct SettingsScreen: View {
                                 title: isProfileLogoutInProgress ? "Logging out..." : "Logout",
                                 subtitle: isProfileLogoutInProgress ? "Signing out securely." : nil,
                                 systemImage: "rectangle.portrait.and.arrow.right",
+                                tint: FGColor.dangerRed.opacity(0.82),
                                 showsChevron: false
                             ) {
                                 if isProfileLogoutInProgress {
@@ -1883,6 +1901,7 @@ struct SettingsScreen: View {
                                 title: isProfileLogoutInProgress ? "Logging out..." : "Logout",
                                 subtitle: isProfileLogoutInProgress ? "Signing out securely." : "Sign out of this business account.",
                                 systemImage: "rectangle.portrait.and.arrow.right",
+                                tint: FGColor.dangerRed.opacity(0.82),
                                 showsChevron: false
                             ) {
                                 if isProfileLogoutInProgress {
@@ -1910,7 +1929,14 @@ struct SettingsScreen: View {
                         .disabled(isProfileLogoutInProgress)
                     }
                 }
-                .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 12, trailing: 16))
+                .listRowInsets(
+                    EdgeInsets(
+                        top: SettingsPremiumChrome.accountDestructiveTopSpacing,
+                        leading: 16,
+                        bottom: 14,
+                        trailing: 16
+                    )
+                )
                 .listRowBackground(Color.clear)
             } header: {
                 settingsSectionHeader("Account")
@@ -2014,50 +2040,115 @@ struct SettingsScreen: View {
     private func profileSettingsNotificationsSection() -> some View {
         Section {
             settingsSectionCard {
-                if viewModel.isAuthenticatedForSocialFeatures {
-                    Button {
-                        profileSettingsPath.append(ProfileSettingsRoute.notifications)
-                    } label: {
-                        settingsRow(
-                            title: L10n.t("notifications", languageCode: appLanguageRaw),
-                            subtitle: notificationSettingsStore.notifyBeforeGame ? "On" : "Off",
-                            systemImage: "bell.badge",
-                            showsChevron: true
-                        )
+                Group {
+                    if viewModel.isAuthenticatedForSocialFeatures {
+                        Button {
+                            profileSettingsPath.append(ProfileSettingsRoute.notifications)
+                        } label: {
+                            fanGeoAlertsSettingsSummaryRow
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Button {
+                            presentGuestFanAuthFromProfileSettings()
+                        } label: {
+                            fanGeoAlertsSettingsSummaryRow
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                } else {
-                    Button {
-                        presentGuestFanAuthFromProfileSettings()
-                    } label: {
-                        settingsRow(
-                            title: L10n.t("notifications", languageCode: appLanguageRaw),
-                            subtitle: "Sign in to manage notifications.",
-                            systemImage: "bell.badge",
-                            showsChevron: true
-                        )
-                    }
-                    .buttonStyle(.plain)
                 }
             }
             .opacity(viewModel.isAuthenticatedForSocialFeatures ? 1 : 0.48)
-            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
+            .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 14, trailing: 16))
             .listRowBackground(Color.clear)
         } header: {
-            settingsSectionHeader(L10n.t("notifications", languageCode: appLanguageRaw))
+            settingsSectionHeader("FanGeo Alerts")
         }
+    }
+
+    private var fanGeoAlertsSettingsSummaryRow: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: FGSpacing.md) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                        .fill(SettingsPremiumChrome.iconSurface(colorScheme))
+                    Image(systemName: "bell.badge.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(FGColor.dangerRed.opacity(0.88))
+                }
+                .frame(width: SettingsPremiumChrome.rowIconSize, height: SettingsPremiumChrome.rowIconSize)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("FanGeo Alerts")
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    Text(
+                        viewModel.isAuthenticatedForSocialFeatures
+                            ? "Choose what FanGeo alerts, reminders, and calendar sync you want to manage."
+                            : "Sign in to manage FanGeo alerts."
+                    )
+                    .font(.system(size: 12.5, weight: .regular, design: .rounded))
+                    .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                    .padding(.top, 4)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(minimum: 0, maximum: .infinity), spacing: 10, alignment: .leading),
+                        GridItem(.flexible(minimum: 0, maximum: .infinity), spacing: 10, alignment: .leading)
+                    ],
+                    alignment: .leading,
+                    spacing: 10
+                ) {
+                    fanGeoAlertsManageBullet("Live Game Alerts", systemImage: "sportscourt.fill", tint: FGColor.dangerRed.opacity(0.88))
+                    fanGeoAlertsManageBullet("Friend Activity", systemImage: "person.2.fill", tint: Color(red: 0.58, green: 0.36, blue: 0.86))
+                    fanGeoAlertsManageBullet("Favorite Team Alerts", systemImage: "star.fill", tint: SettingsPremiumChrome.proGold(colorScheme))
+                    fanGeoAlertsManageBullet("Venue Activity", systemImage: "mappin.and.ellipse", tint: FGColor.accentBlue)
+                    fanGeoAlertsManageBullet("Pickup Invites", systemImage: "figure.run", tint: FGColor.accentGreen)
+                    fanGeoAlertsManageBullet("Apple Calendar Sync", systemImage: "calendar.badge.checkmark", tint: FGColor.accentBlue)
+                }
+            }
+            .padding(.leading, SettingsPremiumChrome.rowIconSize + FGSpacing.md)
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    private func fanGeoAlertsManageBullet(_ title: String, systemImage: String, tint: Color) -> some View {
+        HStack(alignment: .center, spacing: 6) {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(tint)
+                .frame(width: 14, alignment: .center)
+            Text(title)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                .lineLimit(2)
+                .minimumScaleFactor(0.85)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func profileSettingsFanGeoPlusSection() -> some View {
         Section {
             settingsSectionCard {
-                fanGeoPlusSettingsRow
+                fanGeoPlusComingSoonCard
             }
-            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
+            .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 14, trailing: 16))
             .listRowBackground(Color.clear)
-            .onAppear {
-                syncFanGeoPlusDisplayFromEntitlements()
-            }
         } header: {
             settingsSectionHeader("FanGeo+")
         }
@@ -2068,11 +2159,7 @@ struct SettingsScreen: View {
         if settingsFanGeoPlusUsesBusinessDisplay {
             settingsRowDivider()
 
-            fanGeoPlusSettingsRow
-                .onAppear {
-                    syncFanGeoPlusDisplayFromEntitlements()
-                    logBusinessFanGeoPlusSettingsRender()
-                }
+            fanGeoPlusComingSoonCard
 
             settingsRowDivider()
         }
@@ -2165,6 +2252,84 @@ struct SettingsScreen: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private var fanGeoPlusComingSoonCard: some View {
+        let isActive = fanGeoPlusEntitlementIsActive
+
+        return HStack(alignment: .center, spacing: FGSpacing.md) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(SettingsPremiumChrome.iconSurface(colorScheme))
+                Image(systemName: "crown.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(SettingsPremiumChrome.proGold(colorScheme))
+            }
+            .frame(width: SettingsPremiumChrome.rowIconSize, height: SettingsPremiumChrome.rowIconSize)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("FanGeo+")
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    .lineLimit(1)
+                Text(isActive ? "Ad-free experience enabled." : "Ad-free experience.")
+                    .font(.system(size: 12.5, weight: .regular, design: .rounded))
+                    .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            fanGeoPlusSettingsSummaryBadge(isActive: isActive)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 12)
+        .frame(minHeight: SettingsPremiumChrome.rowMinHeight, alignment: .center)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            isActive
+                ? "FanGeo plus, ad-free experience enabled, active"
+                : "FanGeo plus, ad-free experience, coming soon"
+        )
+    }
+
+    private func fanGeoPlusSettingsSummaryBadge(isActive: Bool) -> some View {
+        Group {
+            if isActive {
+                Text("Active")
+                    .font(.system(size: 10, weight: .heavy, design: .rounded))
+                    .tracking(0.35)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(FGColor.accentGreen, in: Capsule(style: .continuous))
+            } else {
+                Text("Coming Soon")
+                    .font(.system(size: 10, weight: .heavy, design: .rounded))
+                    .tracking(0.35)
+                    .foregroundStyle(SettingsPremiumChrome.proBadgeText(colorScheme))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(
+                        LinearGradient(
+                            colors: [
+                                SettingsPremiumChrome.proGold(colorScheme),
+                                SettingsPremiumChrome.proGoldDeep(colorScheme)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        in: Capsule(style: .continuous)
+                    )
+            }
+        }
+        .accessibilityLabel(isActive ? "FanGeo+ Active" : "FanGeo+ Coming Soon")
     }
 
     private var fanGeoPlusSettingsRow: some View {
@@ -2537,7 +2702,7 @@ struct SettingsScreen: View {
                 }
                 .buttonStyle(.plain)
             }
-            .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
+            .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 16, trailing: 16))
             .listRowBackground(Color.clear)
         } header: {
             settingsSectionHeader("Help & Safety")
@@ -2601,38 +2766,6 @@ struct SettingsScreen: View {
         }
     }
 
-    private func profileSettingsAboutSection() -> some View {
-        Section {
-            settingsSectionCard {
-                VStack(spacing: 8) {
-                    Text("FanGeo")
-                        .font(.system(size: 17, weight: .bold, design: .rounded))
-                        .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
-
-                    Text("Version \(SettingsAboutFanGeoMetadata.version) (Build \(SettingsAboutFanGeoMetadata.build))")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
-
-                    Text("© 2026 FanGeo Sports")
-                        .font(.system(size: 12, weight: .regular, design: .rounded))
-                        .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
-
-                    Text(SettingsAboutFanGeoMetadata.supportEmail)
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
-                }
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, FGSpacing.md)
-                .padding(.vertical, 18)
-            }
-            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 12, trailing: 16))
-            .listRowBackground(Color.clear)
-        } header: {
-            settingsSectionHeader("About FanGeo")
-        }
-    }
-
     @ViewBuilder
     private func settingsSectionHeader(_ title: String) -> some View {
         Text(title.uppercased())
@@ -2640,8 +2773,8 @@ struct SettingsScreen: View {
             .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme).opacity(0.72))
             .tracking(0.8)
             .textCase(nil)
-            .padding(.top, 10)
-            .padding(.bottom, 4)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
     }
 
     @ViewBuilder
@@ -2758,7 +2891,12 @@ struct SettingsScreen: View {
                 RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
                     .strokeBorder(SettingsPremiumChrome.cardStroke(colorScheme), lineWidth: 0.75)
             }
-            .shadow(color: .black.opacity(colorScheme == .dark ? 0.14 : 0.06), radius: 8, y: 4)
+            .compositingGroup()
+            .shadow(
+                color: .black.opacity(colorScheme == .dark ? 0.12 : 0.05),
+                radius: SettingsPremiumChrome.scrollCardShadowRadius,
+                y: SettingsPremiumChrome.scrollCardShadowYOffset
+            )
         }
     }
 
@@ -4759,6 +4897,364 @@ private struct SettingsVenueOwnerDeletionSheet: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+}
+
+// MARK: - Profile settings isolated sections
+
+private struct ProfileSettingsSectionHeader: View {
+    let title: String
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Text(title.uppercased())
+            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme).opacity(0.72))
+            .tracking(0.8)
+            .textCase(nil)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+    }
+}
+
+private struct ProfileSettingsSectionCard<Content: View>: View {
+    let content: Content
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            content
+        }
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                    .fill(SettingsPremiumChrome.cardFill(colorScheme))
+                RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                SettingsPremiumChrome.cardHighlight(colorScheme),
+                                Color.clear
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                .strokeBorder(SettingsPremiumChrome.cardStroke(colorScheme), lineWidth: 0.75)
+        }
+        .compositingGroup()
+        .shadow(
+            color: .black.opacity(colorScheme == .dark ? 0.12 : 0.05),
+            radius: SettingsPremiumChrome.scrollCardShadowRadius,
+            y: SettingsPremiumChrome.scrollCardShadowYOffset
+        )
+    }
+}
+
+struct ProfileSettingsPrivacyPermissionsSection: View {
+    let refreshToken: Int
+
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var snapshot = FanGeoPrivacyPermissionsSnapshot.placeholder
+    @State private var refreshTask: Task<Void, Never>?
+
+    var body: some View {
+        Section {
+            ProfileSettingsSectionCard {
+                Button {
+                    openFanGeoPrivacySettings()
+                } label: {
+                    privacyPermissionsSettingsRow(
+                        title: "Location",
+                        subtitle: "Used for nearby venues, pickup games, and local recommendations.",
+                        systemImage: "location.fill",
+                        tint: FGColor.accentBlue
+                    ) {
+                        privacyPermissionsStatusBadge(snapshot.locationStatusLabel)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(snapshot.locationSettingsActionTitle)
+
+                privacyPermissionsRowDivider()
+
+                Button {
+                    openFanGeoPrivacySettings()
+                } label: {
+                    privacyPermissionsSettingsRow(
+                        title: "Notifications",
+                        subtitle: "Used for live game alerts, pickup invitations, team alerts, and friend activity.",
+                        systemImage: "bell.badge.fill",
+                        tint: FGColor.accentGreen
+                    ) {
+                        privacyPermissionsStatusBadge(snapshot.notificationStatusLabel)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Open iPhone Settings")
+
+                privacyPermissionsRowDivider()
+
+                Button {
+                    handlePersonalizedAdsPrivacyPermissionsAction()
+                } label: {
+                    privacyPermissionsSettingsRow(
+                        title: "Personalized Ads",
+                        subtitle: "Advertising helps keep FanGeo free. You can choose personalized or limited ads where available.",
+                        systemImage: "hand.raised.fill",
+                        tint: Color(red: 0.92, green: 0.58, blue: 0.18)
+                    ) {
+                        privacyPermissionsStatusBadge(
+                            snapshot.personalizedAdsStatusLabel,
+                            accent: .personalizedAds
+                        )
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(
+                    snapshot.personalizedAdsPrefersSystemSettings
+                        ? "Manage in iPhone Settings"
+                        : (snapshot.personalizedAdsUsesUMPPrivacyOptions
+                            ? "Manage Choices"
+                            : "Manage in iPhone Settings")
+                )
+            }
+            .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 14, trailing: 16))
+            .listRowBackground(Color.clear)
+        } header: {
+            ProfileSettingsSectionHeader(title: "Privacy & Permissions")
+        }
+        .task(id: refreshToken) {
+            await refreshSnapshotIfNeeded()
+        }
+        .onChange(of: scenePhase) { oldPhase, newPhase in
+            guard oldPhase != .active, newPhase == .active else { return }
+            scheduleRefresh()
+        }
+        .onDisappear {
+            refreshTask?.cancel()
+            refreshTask = nil
+        }
+    }
+
+    private enum PrivacyPermissionsBadgeAccent {
+        case standard
+        case personalizedAds
+    }
+
+    private func scheduleRefresh() {
+        refreshTask?.cancel()
+        refreshTask = Task {
+            await refreshSnapshotIfNeeded()
+        }
+    }
+
+    @MainActor
+    private func refreshSnapshotIfNeeded() async {
+        guard !Task.isCancelled else { return }
+        snapshot = await FanGeoPrivacyPermissionsStatusReader.currentSnapshot()
+    }
+
+    private func openFanGeoPrivacySettings() {
+#if canImport(UIKit)
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+#endif
+    }
+
+    private func handlePersonalizedAdsPrivacyPermissionsAction() {
+        if snapshot.personalizedAdsPrefersSystemSettings {
+            openFanGeoPrivacySettings()
+            return
+        }
+        if snapshot.personalizedAdsUsesUMPPrivacyOptions {
+            Task {
+                await GoogleMobileAdsBootstrap.presentPrivacyOptionsIfRequired()
+            }
+            return
+        }
+        openFanGeoPrivacySettings()
+    }
+
+    @ViewBuilder
+    private func privacyPermissionsSettingsRow<Trailing: View>(
+        title: String,
+        subtitle: String,
+        systemImage: String,
+        tint: Color,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(alignment: .center, spacing: FGSpacing.md + 2) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .fill(SettingsPremiumChrome.iconSurface(colorScheme))
+                Image(systemName: systemImage)
+                    .font(.system(size: 17, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(tint)
+            }
+            .frame(
+                width: SettingsPremiumChrome.privacyPermissionsIconSize,
+                height: SettingsPremiumChrome.privacyPermissionsIconSize
+            )
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    .lineLimit(2)
+                Text(subtitle)
+                    .font(.system(size: 12.5, weight: .regular, design: .rounded))
+                    .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 0)
+
+            trailing()
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                .frame(width: 14, height: 14, alignment: .center)
+        }
+        .padding(.horizontal, FGSpacing.md + 2)
+        .padding(.vertical, 14)
+        .frame(minHeight: SettingsPremiumChrome.privacyPermissionsRowMinHeight, alignment: .center)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private func privacyPermissionsRowDivider() -> some View {
+        Divider()
+            .overlay(SettingsPremiumChrome.divider(colorScheme))
+            .opacity(0.42)
+            .padding(.leading, 68)
+            .padding(.trailing, FGSpacing.md)
+            .padding(.vertical, 2)
+    }
+
+    private func privacyPermissionsStatusBadge(
+        _ label: String,
+        accent: PrivacyPermissionsBadgeAccent = .standard
+    ) -> some View {
+        Text(label)
+            .font(.system(size: 11, weight: .bold, design: .rounded))
+            .foregroundStyle(privacyPermissionsBadgeForeground(label, accent: accent))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(privacyPermissionsBadgeBackground(label, accent: accent))
+            )
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+            .animation(nil, value: label)
+    }
+
+    private func privacyPermissionsBadgeForeground(_ label: String, accent: PrivacyPermissionsBadgeAccent) -> Color {
+        if accent == .personalizedAds, label == "On" {
+            return Color(red: 0.92, green: 0.58, blue: 0.18)
+        }
+        switch label {
+        case "On", "While Using App", "Always Allowed":
+            return FGColor.accentGreen
+        case "Off", "Limited Ads", "Restricted":
+            return FGColor.dangerRed.opacity(0.88)
+        default:
+            return FGColor.mutedText(colorScheme)
+        }
+    }
+
+    private func privacyPermissionsBadgeBackground(_ label: String, accent: PrivacyPermissionsBadgeAccent) -> Color {
+        privacyPermissionsBadgeForeground(label, accent: accent).opacity(colorScheme == .dark ? 0.18 : 0.12)
+    }
+}
+
+struct ProfileSettingsAboutSection: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Section {
+            ProfileSettingsSectionCard {
+                VStack(spacing: 14) {
+                    Image("FanGeoPremiumLoadingLogo")
+                        .resizable()
+                        .interpolation(.medium)
+                        .antialiased(true)
+                        .scaledToFit()
+                        .frame(width: 76, height: 76)
+                        .accessibilityLabel("FanGeo")
+
+                    VStack(spacing: 4) {
+                        Text("Version \(SettingsAboutFanGeoMetadata.version)")
+                            .font(.system(size: 13, weight: .medium, design: .rounded))
+                            .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                        Text("Build \(SettingsAboutFanGeoMetadata.build)")
+                            .font(.system(size: 12, weight: .regular, design: .rounded))
+                            .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                    }
+
+                    VStack(spacing: 4) {
+                        Text("Support")
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                            .textCase(.uppercase)
+                            .tracking(0.6)
+                        Text(SettingsAboutFanGeoMetadata.supportEmail)
+                            .font(.system(size: 13, weight: .medium, design: .rounded))
+                            .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                    }
+
+                    Button {
+                        openFanGeoWebsite()
+                    } label: {
+                        VStack(spacing: 4) {
+                            Text("Website")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                                .textCase(.uppercase)
+                                .tracking(0.6)
+                            Text("www.fangeosports.com")
+                                .font(.system(size: 13, weight: .medium, design: .rounded))
+                                .foregroundStyle(FGColor.accentBlue)
+                        }
+                    }
+                    .buttonStyle(.plain)
+
+                    Text("© 2026 FanGeo Sports")
+                        .font(.system(size: 12, weight: .regular, design: .rounded))
+                        .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                        .padding(.top, 4)
+                }
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, FGSpacing.lg)
+                .padding(.vertical, 28)
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 14, trailing: 16))
+            .listRowBackground(Color.clear)
+        } header: {
+            ProfileSettingsSectionHeader(title: "About FanGeo")
+        }
+    }
+
+    private func openFanGeoWebsite() {
+#if canImport(UIKit)
+        guard let url = URL(string: "https://www.fangeosports.com/") else { return }
+        UIApplication.shared.open(url)
+#endif
     }
 }
 
@@ -7388,15 +7884,15 @@ private struct SettingsGameNotificationsCard: View {
                 tint: FGColor.accentGreen
             ) {
                 notificationToggle(
-                    title: "Game reminders",
-                    subtitle: "Kickoff reminders for venue games you mark Going.",
+                    title: "Venue Game Reminders",
+                    subtitle: "FanGeo reminds you before venue games you're attending.",
                     isOn: gameNotificationsEnabledBinding
                 )
                 .disabled(isFanOnlyNotificationsLockedForBusiness)
 
                 notificationToggle(
                     title: "Favorite team nearby",
-                    subtitle: "A nearby venue is showing one of your teams.",
+                    subtitle: "FanGeo notifies you when a nearby venue is showing one of your teams.",
                     isOn: loggingBinding(
                         key: "venueFavoriteTeamNearbyNotifications",
                         title: "Favorite team nearby",
@@ -7422,11 +7918,11 @@ private struct SettingsGameNotificationsCard: View {
                 tint: FGColor.accentBlue
             ) {
                 notificationToggle(
-                    title: "Pickup game reminders",
-                    subtitle: "Reminders before pickup games you host or join.",
+                    title: "Pickup Game Reminders",
+                    subtitle: "FanGeo reminds you before pickup games you host or join.",
                     isOn: loggingBinding(
                         key: "pickupGameReminderNotifications",
-                        title: "Pickup game reminders",
+                        title: "Pickup Game Reminders",
                         value: $pickupGameReminderNotifications,
                         fanGated: true
                     )
@@ -7434,8 +7930,8 @@ private struct SettingsGameNotificationsCard: View {
                 .disabled(isFanOnlyNotificationsLockedForBusiness)
 
                 notificationToggle(
-                    title: "Pickup game updates",
-                    subtitle: "Join requests, player activity, and game changes.",
+                    title: "Pickup Game Updates",
+                    subtitle: "FanGeo notifies you about join requests, player activity, and game changes.",
                     isOn: pickupGameUpdatesBinding
                 )
                 .disabled(isFanOnlyNotificationsLockedForBusiness)
@@ -7451,19 +7947,12 @@ private struct SettingsGameNotificationsCard: View {
                 systemImage: "heart.text.square.fill",
                 tint: FGColor.accentYellow
             ) {
-                proGameReminderSettingsSection
-
-                Divider()
-                    .padding(.leading, FGSpacing.md)
-
-                notificationToggle(
-                    title: "Final score alerts",
-                    subtitle: "One alert when a saved Pro Game goes final.",
-                    isOn: proGameFinalScoreAlertsBinding
-                )
+                proGameNotificationsSettingsSection
             }
 
-            calendarSyncSettingsSection
+            fanGeoAnnouncementNotificationsSection
+
+            calendarIntegrationModule
         }
         .tint(FGColor.accentGreen)
         .task {
@@ -7493,10 +7982,56 @@ private struct SettingsGameNotificationsCard: View {
 
     private var notificationIntro: some View {
         VStack(alignment: .leading, spacing: FGSpacing.xs) {
-            Text("Stay close to the action")
+            Text("FanGeo Notifications")
                 .font(FGTypography.sectionTitle)
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-            Text("Important game and pickup updates stay on by default. Social nudges are optional so FanGeo does not over-notify you.")
+            Text("Receive FanGeo notifications for games, teams, venues, and activity—even when the app is closed (if notifications are enabled on your device).")
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, FGSpacing.xs)
+    }
+
+    private var fanGeoAnnouncementNotificationsSection: some View {
+        notificationSection(
+            title: "FanGeo",
+            subtitle: "Important news and updates from FanGeo.",
+            systemImage: "megaphone.fill",
+            tint: FGColor.accentBlue
+        ) {
+            notificationToggle(
+                title: "FanGeo Announcements",
+                subtitle: "Show FanGeo announcements in the app and receive push notifications for important updates, major releases, and special events.",
+                isOn: fanGeoAnnouncementNotificationsBinding
+            )
+        }
+    }
+
+    private var fanGeoAnnouncementNotificationsBinding: Binding<Bool> {
+        Binding(
+            get: { notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled },
+            set: { enabled in
+                print("[NotificationSettingsDebug] save key=\(FanGeoNotificationPreferenceKeys.announcementNotifications) title=\"FanGeo Announcements\" value=\(enabled)")
+                notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled = enabled
+            }
+        )
+    }
+
+    private var calendarIntegrationModule: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.lg) {
+            calendarIntegrationIntro
+            calendarSyncSettingsSection
+        }
+        .padding(.top, 28)
+    }
+
+    private var calendarIntegrationIntro: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.xs) {
+            Text("Apple Calendar Integration")
+                .font(FGTypography.sectionTitle)
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+            Text("Automatically sync your FanGeo games and events with your Apple Calendar. Calendar reminders are managed by Apple Calendar, not FanGeo notifications.")
                 .font(FGTypography.caption)
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .fixedSize(horizontal: false, vertical: true)
@@ -7505,12 +8040,18 @@ private struct SettingsGameNotificationsCard: View {
     }
 
     private var calendarSyncSettingsSection: some View {
-        notificationSection(
-            title: "Apple Calendar Sync",
-            subtitle: "Keep FanGeo and Apple Calendar aligned.",
-            systemImage: "calendar.badge.checkmark",
-            tint: FGColor.accentGreen
-        ) {
+        FGCard {
+            HStack(alignment: .top, spacing: FGSpacing.md) {
+                Image(systemName: "calendar.badge.checkmark")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(FGColor.accentGreen)
+                    .frame(width: 28, height: 28)
+                    .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: FGRadius.small, style: .continuous))
+
+                Spacer(minLength: 0)
+            }
+
             VStack(alignment: .leading, spacing: 12) {
                 notificationToggle(
                     title: "Sync to Apple Calendar",
@@ -7684,6 +8225,12 @@ private struct SettingsGameNotificationsCard: View {
                 .padding(.bottom, 10)
             }
             .padding(.top, 10)
+            .background(FGAdaptiveSurface.controlFill)
+            .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
+                    .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+            }
         }
     }
 
@@ -7908,30 +8455,141 @@ private struct SettingsGameNotificationsCard: View {
         }
     }
 
-    private var proGameReminderSettingsSection: some View {
+    private static let proGameLiveMatchCoverageLine =
+        "⚽ Soccer • 🏀 Basketball • 🏈 Football • ⚾ Baseball • 🏒 Hockey"
+
+    private var proGameNotificationsSettingsSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            notificationToggle(
-                title: "Kickoff alert",
-                subtitle: "FanGeo notifies you when a saved Pro Game starts.",
-                isOn: proGameKickoffAlertBinding
-            )
+            VStack(alignment: .leading, spacing: 0) {
+                proGameNotificationGroupHeader("Saved Pro Games", isFirst: true)
+
+                proGameMatchReminderTimingRow(
+                    title: "Pre-Game Reminder",
+                    subtitle: "FanGeo reminds you before your saved game begins.",
+                    selection: proGameGameReminderTimingBinding
+                )
+
+                Divider()
+                    .padding(.leading, FGSpacing.md)
+
+                proGameLiveMatchAlertsToggle
+
+                Divider()
+                    .padding(.leading, FGSpacing.md)
+
+                notificationToggle(
+                    title: "Final Score",
+                    subtitle: "FanGeo sends the final score when your saved game ends.",
+                    isOn: proGameFinalScoreAlertsBinding
+                )
+            }
 
             Divider()
                 .padding(.leading, FGSpacing.md)
+                .padding(.vertical, FGSpacing.xs)
 
-            proGameGameReminderTimingRow(selection: proGameGameReminderTimingBinding)
+            VStack(alignment: .leading, spacing: 0) {
+                proGameNotificationGroupHeader("Favorite Teams")
+
+                proGameMatchReminderTimingRow(
+                    title: "Pre-Game Reminder",
+                    subtitle: "FanGeo reminds you before your favorite team plays.",
+                    selection: favoriteTeamProGameReminderTimingBinding,
+                    options: ProGameReminderTiming.favoriteTeamPickerOptions
+                )
+
+                Divider()
+                    .padding(.leading, FGSpacing.md)
+
+                notificationToggle(
+                    title: "Favorite Team Alerts",
+                    subtitle: "FanGeo sends match start, live score, and final score alerts for your favorite teams—even if you haven't saved the game.",
+                    isOn: favoriteTeamProGameAlertsBinding
+                )
+            }
 
             permissionMessage
                 .padding(.top, 4)
         }
     }
 
+    private func proGameNotificationGroupHeader(_ title: String, isFirst: Bool = false) -> some View {
+        Text(title)
+            .font(FGTypography.caption.weight(.bold))
+            .foregroundStyle(FGColor.mutedText(colorScheme))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, FGSpacing.md)
+            .padding(.top, isFirst ? FGSpacing.sm : FGSpacing.xs)
+            .padding(.bottom, FGSpacing.xs)
+    }
+
+    // TODO(ProGameNotifications): Wire Live Match Alerts to a true master toggle (kickoff + per-game score_alerts)
+    // once backend mapping supports goals, halftime, and cards from Settings.
+    private var proGameLiveMatchAlertsToggle: some View {
+        Toggle(isOn: proGameKickoffAlertBinding) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Live Match Alerts")
+                    .font(FGTypography.body.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                Text("FanGeo sends kickoff, live score, halftime/intermission, and other live match alerts for your saved games.")
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Live coverage:")
+                        .font(FGTypography.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                    Text(Self.proGameLiveMatchCoverageLine)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 1)
+            }
+        }
+        .toggleStyle(.switch)
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 10)
+        .accessibilityLabel("Live Match Alerts")
+        .accessibilityValue(proGameKickoffAlertBinding.wrappedValue ? "On" : "Off")
+        .accessibilityHint(
+            "FanGeo sends kickoff, live score, halftime and intermission, and other live match alerts for your saved games. " +
+            "Live coverage: Soccer, Basketball, Football, Baseball, and Hockey."
+        )
+    }
+
     private var proGameKickoffAlertBinding: Binding<Bool> {
         Binding(
             get: { notificationSettingsStore.proGameKickoffAlertEnabled },
             set: { enabled in
-                print("[NotificationSettingsDebug] save key=proGameKickoffAlertEnabled value=\(enabled)")
+                print("[NotificationSettingsDebug] save key=proGameKickoffAlertEnabled liveMatchAlerts=\(enabled)")
                 Task { await viewModel.setProGameKickoffAlertEnabled(enabled) }
+            }
+        )
+    }
+
+    private var favoriteTeamProGameAlertsBinding: Binding<Bool> {
+        Binding(
+            get: { notificationSettingsStore.favoriteTeamProGameAlertsEnabled },
+            set: { enabled in
+                print("[NotificationSettingsDebug] save key=favoriteTeamProGameAlertsEnabled value=\(enabled)")
+                Task {
+                    await viewModel.setFavoriteTeamProGameAlertsEnabled(
+                        enabled,
+                        games: viewModel.favoriteTeamProGames,
+                        reason: "settingsProTeamAlertsToggle"
+                    )
+                }
+            }
+        )
+    }
+
+    private var favoriteTeamProGameReminderTimingBinding: Binding<ProGameReminderTiming> {
+        Binding(
+            get: { notificationSettingsStore.favoriteTeamProGameReminderTiming },
+            set: { timing in
+                print("[NotificationSettingsDebug] save key=favoriteTeamProGameReminderTiming value=\(timing.rawValue)")
+                Task { await viewModel.setFavoriteTeamProGameReminderTiming(timing) }
             }
         )
     }
@@ -7947,14 +8605,17 @@ private struct SettingsGameNotificationsCard: View {
     }
 
     @ViewBuilder
-    private func proGameGameReminderTimingRow(
-        selection: Binding<ProGameReminderTiming>
+    private func proGameMatchReminderTimingRow(
+        title: String,
+        subtitle: String,
+        selection: Binding<ProGameReminderTiming>,
+        options: [ProGameReminderTiming] = ProGameReminderTiming.pickerOptions
     ) -> some View {
         let timingColor = FGColor.accentYellow
         let chevronColor = FGColor.mutedText(colorScheme)
 
         Menu {
-            ForEach(ProGameReminderTiming.pickerOptions) { timing in
+            ForEach(options) { timing in
                 Button {
                     selection.wrappedValue = timing
                 } label: {
@@ -7967,26 +8628,30 @@ private struct SettingsGameNotificationsCard: View {
             }
         } label: {
             proGameGameReminderTimingRowLabel(
+                title: title,
+                subtitle: subtitle,
                 timingName: selection.wrappedValue.displayName,
                 timingColor: timingColor,
                 chevronColor: chevronColor
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Game reminder \(selection.wrappedValue.displayName)")
+        .accessibilityLabel("\(title) \(selection.wrappedValue.displayName)")
     }
 
     private func proGameGameReminderTimingRowLabel(
+        title: String,
+        subtitle: String,
         timingName: String,
         timingColor: Color,
         chevronColor: Color
     ) -> some View {
         HStack(alignment: .center, spacing: FGSpacing.md) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Game reminder")
+                Text(title)
                     .font(FGTypography.body.weight(.semibold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
-                Text("Optional FanGeo reminder before kickoff.")
+                Text(subtitle)
                     .font(FGTypography.caption)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -8012,7 +8677,7 @@ private struct SettingsGameNotificationsCard: View {
     private var proGameFinalScoreAlertsBinding: Binding<Bool> {
         proGameNotificationPreferenceBinding(
             key: ProGameNotificationPreferenceKeys.finalScoreAlerts,
-            title: "Final score alerts",
+            title: "Final Score",
             get: { notificationSettingsStore.proGameFinalScoreNotifications },
             set: { enabled in
                 Task { await viewModel.setProGameFinalScoreNotificationsEnabled(enabled) }

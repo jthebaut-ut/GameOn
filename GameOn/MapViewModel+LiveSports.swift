@@ -33,6 +33,12 @@ extension MapViewModel {
         await refreshLiveMatchesForCalendar(forceRefresh: forceRefresh)
     }
 
+    /// True when ``liveMatches`` is non-empty and was refreshed recently (tab preload skip).
+    func liveMatchesAreFreshForTabPreload(within interval: TimeInterval = 90) -> Bool {
+        guard !liveMatches.isEmpty, let last = lastLiveMatchesRefreshAt else { return false }
+        return Date().timeIntervalSince(last) < interval
+    }
+
     /// Coalesces duplicate non-force refresh requests from Live tab activation (preload, onAppear, onChange).
     @MainActor
     func refreshLiveMatchesForLiveTabActivation(forceRefresh: Bool = false) async {
@@ -71,10 +77,14 @@ extension MapViewModel {
         liveMatchesRefreshTask = task
         await task.value
         liveMatchesRefreshTask = nil
+        syncSportsDataUpdateIndicatorVisibility(triggerReason: "refreshTaskCompleted")
     }
 
     @MainActor
     private func runLiveMatchesRefresh(forceRefresh: Bool) async {
+        noteLiveSportsDataRefreshStarted(reason: "liveMatches")
+        defer { noteLiveSportsDataRefreshFinished() }
+
         LiveMatchesRefreshState.generation &+= 1
         let refreshGeneration = LiveMatchesRefreshState.generation
 
@@ -146,6 +156,20 @@ extension MapViewModel {
 
     @MainActor
     private func applyLiveMatchesFromLiveRefresh(_ matches: [LiveMatch]) async {
+        if shouldDeferLiveMatchesApplyForScheduleTab() {
+            pendingDeferredLiveMatches = matches
+#if DEBUG
+            print("[LiveSchedulePerf] liveRefreshContinuedOffscreen=true")
+            print("[LiveSchedulePerf] deferredLiveApplyAfterSchedule=true")
+#endif
+            scheduleDeferredLiveMatchesApply(reason: "scheduleTabVisible")
+            return
+        }
+        await applyLiveMatchesFromLiveRefreshNow(matches)
+    }
+
+    @MainActor
+    private func applyLiveMatchesFromLiveRefreshNow(_ matches: [LiveMatch]) async {
         let diagnostics = await LiveSportsService.shared.lastFetchDiagnostics
 #if DEBUG
         print("[LiveRefreshDebug] replace_not_append=true previous_count=\(liveMatches.count) incoming_count=\(matches.count)")
@@ -164,14 +188,139 @@ extension MapViewModel {
             matches: matches,
             diagnostics: diagnostics
         )
-        invalidateCalendarTabEventsListCache()
+        invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded()
 #if DEBUG
         logLiveTabAssignment(matches: matches)
 #endif
     }
 
     @MainActor
+    private func invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded() {
+        if isCalendarTabSelected && !isLiveTabSelected {
+            pendingCalendarTabEventsListCacheInvalidation = true
+            return
+        }
+        invalidateCalendarTabEventsListCache()
+    }
+
+    @MainActor
+    func flushPendingCalendarTabEventsListCacheInvalidationIfNeeded() {
+        guard pendingCalendarTabEventsListCacheInvalidation else { return }
+        pendingCalendarTabEventsListCacheInvalidation = false
+        invalidateCalendarTabEventsListCache()
+    }
+
+    @MainActor
+    private func shouldDeferLiveMatchesApplyForScheduleTab() -> Bool {
+        isCalendarTabSelected && !isLiveTabSelected
+    }
+
+    @MainActor
+    private func scheduleDeferredLiveMatchesApply(reason: String) {
+        deferredLiveMatchesApplyTask?.cancel()
+        deferredLiveMatchesApplyTask = Task { @MainActor [weak self] in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            if self.scheduleTabInteractionProtected {
+                self.scheduleDeferredLiveMatchesApply(reason: "scheduleInteractionProtected")
+                return
+            }
+            guard let pending = self.pendingDeferredLiveMatches else { return }
+            self.pendingDeferredLiveMatches = nil
+#if DEBUG
+            print("[LiveSchedulePerf] deferredLiveApplyAfterSchedule=true reason=\(reason)")
+#endif
+            await self.applyLiveMatchesFromLiveRefreshNow(pending)
+            self.deferredLiveMatchesApplyTask = nil
+        }
+    }
+
+    @MainActor
+    func noteLiveSportsDataRefreshStarted(reason: String) {
+        liveSportsDataRefreshDepth += 1
+        syncSportsDataUpdateIndicatorVisibility(triggerReason: reason)
+    }
+
+    @MainActor
+    func noteLiveSportsDataRefreshFinished() {
+        liveSportsDataRefreshDepth = max(0, liveSportsDataRefreshDepth - 1)
+        syncSportsDataUpdateIndicatorVisibility(triggerReason: "refreshFinished")
+    }
+
+    @MainActor
+    func noteScheduleTabInteractionBegan() {
+        scheduleTabInteractionProtected = true
+    }
+
+    @MainActor
+    func noteScheduleTabInteractionEnded() {
+        scheduleTabInteractionProtected = false
+    }
+
+    @MainActor
+    var liveSportsDataRefreshInFlight: Bool {
+        liveSportsDataRefreshDepth > 0 || liveMatchesRefreshTask != nil
+    }
+
+    @MainActor
+    private var sportsDataUpdateIndicatorSourceInFlight: Bool {
+        liveSportsDataRefreshDepth > 0
+    }
+
+    @MainActor
+    func forceHideSportsDataUpdateIndicator(reason: String) {
+        sportsDataUpdateIndicatorShowTask?.cancel()
+        sportsDataUpdateIndicatorShowTask = nil
+        sportsDataUpdateIndicatorMaxVisibleHideTask?.cancel()
+        sportsDataUpdateIndicatorMaxVisibleHideTask = nil
+        guard sportsDataUpdateIndicatorVisible else { return }
+        sportsDataUpdateIndicatorVisible = false
+        print("[SportsDataUpdateUI] hidden reason=\(reason)")
+    }
+
+    @MainActor
+    func scheduleSportsDataUpdateIndicatorMaxDurationHideIfNeeded(allowFailsafe: Bool) {
+        sportsDataUpdateIndicatorMaxVisibleHideTask?.cancel()
+        sportsDataUpdateIndicatorMaxVisibleHideTask = nil
+        guard allowFailsafe, sportsDataUpdateIndicatorVisible else { return }
+        sportsDataUpdateIndicatorMaxVisibleHideTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 9_000_000_000)
+            guard !Task.isCancelled else { return }
+            guard let self, self.sportsDataUpdateIndicatorVisible else { return }
+            print("[SportsDataUpdateUI] stuckTimeoutHide=true reason=maxDuration")
+            self.forceHideSportsDataUpdateIndicator(reason: "maxDuration")
+        }
+    }
+
+    @MainActor
+    private func syncSportsDataUpdateIndicatorVisibility(triggerReason _: String) {
+        let inFlight = sportsDataUpdateIndicatorSourceInFlight
+        if inFlight {
+            sportsDataUpdateIndicatorShowTask?.cancel()
+            sportsDataUpdateIndicatorShowTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                guard let self, self.sportsDataUpdateIndicatorSourceInFlight else { return }
+                if !self.sportsDataUpdateIndicatorVisible {
+                    self.sportsDataUpdateIndicatorVisible = true
+                    print("[SportsDataUpdateUI] visible=true reason=liveRefreshInFlight")
+                }
+                if self.isLiveTabSelected || !self.isCalendarTabSelected {
+                    self.scheduleSportsDataUpdateIndicatorMaxDurationHideIfNeeded(allowFailsafe: true)
+                }
+            }
+        } else {
+            forceHideSportsDataUpdateIndicator(reason: "workFinished")
+        }
+    }
+
+    @MainActor
     private func runCalendarProGamesRefresh(selectedDate: Date, forceRefresh: Bool) async {
+        noteLiveSportsDataRefreshStarted(reason: "calendarProGames")
+        defer { noteLiveSportsDataRefreshFinished() }
+
         let day = Calendar.current.startOfDay(for: selectedDate)
         let dayKey = String(Int(day.timeIntervalSince1970 / 86_400))
         if !forceRefresh,
@@ -302,15 +451,15 @@ extension MapViewModel {
     func liveTabTodayMatchesDisplayed(
         searchQuery: String,
         sportFilter: LiveSportVisualType? = nil,
-        calendarDay: Date = Calendar.current.startOfDay(for: Date())
+        calendarDay: Date = Calendar.current.startOfDay(for: Date()),
+        calendar: Calendar = .current
     ) -> [LiveMatch] {
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cal = Calendar.current
         return liveMatches
             .filter { match in
                 if match.matchStatus.isHappeningNow { return true }
                 guard match.matchStatus == .scheduled || match.matchStatus == .fullTime else { return false }
-                return cal.isDate(match.startTime, inSameDayAs: calendarDay)
+                return calendar.isDate(match.startTime, inSameDayAs: calendarDay)
             }
             .filter { sportFilter == nil || $0.liveSportVisualType == sportFilter }
             .filter { query.isEmpty || Self.liveMatch($0, matchesSearchQuery: query) }

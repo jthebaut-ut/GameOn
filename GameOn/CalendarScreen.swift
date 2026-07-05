@@ -43,8 +43,38 @@ struct CalendarScreen: View {
     @State private var teamScheduleErrorMessage: String?
     @State private var teamScheduleRecentSearches: [String] = []
     @State private var teamScheduleLookupCache: [String: TeamScheduleCacheEntry] = [:]
+    @State private var calendarProGamesPerf = CalendarProGamesPerfState()
     @FocusState private var isGameSearchFocused: Bool
     @FocusState private var isTeamScheduleSearchFocused: Bool
+
+    private struct CalendarProGamesPerfState {
+        var cachedDisplayedProMatches: [LiveMatch] = []
+        var cachedDisplayedProMatchesKey: String = ""
+        var displayCacheByKey: [String: [LiveMatch]] = [:]
+        var lastNetworkRefreshRequestedAt: Date?
+        var deferredInteractionWorkTask: Task<Void, Never>?
+        var pendingInteractionToken: String = ""
+        var cachedSegmentBadgeCounts: [CalendarTabGameFilter: Int] = [:]
+        var deferredDisplayCachePrewarmTask: Task<Void, Never>?
+        var displayCacheRebuildInFlight = false
+        var networkRefreshInFlight = false
+        var statusIndicatorVisible = false
+        var statusIndicatorShowTask: Task<Void, Never>?
+        var statusIndicatorHideTask: Task<Void, Never>?
+        var sportsDataUpdateGlobalFailsafeTask: Task<Void, Never>?
+        var deferredLiveMatchesScheduleProRebuildTask: Task<Void, Never>?
+        var pendingLiveMatchesScheduleProRebuildToken: String = ""
+        var scheduleLastInteractionAt: Date?
+        static let networkCoalesceInterval: TimeInterval = 25
+        static let deferredNetworkRefreshDelayNs: UInt64 = 200_000_000
+        static let liveMatchesScheduleProRebuildDelayNs: UInt64 = 400_000_000
+        static let liveMatchesScheduleProRebuildInteractionDelayNs: UInt64 = 500_000_000
+        static let scheduleRecentInteractionWindow: TimeInterval = 0.5
+        static let statusIndicatorMinVisibleDelayNs: UInt64 = 300_000_000
+        static let statusIndicatorMaxVisibleDuration: TimeInterval = 9
+        static let displayCacheByKeyLimit = 21
+        static let stripDateCachePrewarmDelayNs: UInt64 = 100_000_000
+    }
 
     private var isBusinessCalendarAccess: Bool {
         viewModel.currentUserIsBusinessAccount || viewModel.isVenueOwnerLoggedIn || viewModel.hasAuthenticatedVenueOwnerSession
@@ -120,12 +150,450 @@ struct CalendarScreen: View {
         if isCalendarSearchModeActive {
             return calendarSearchFilteredProMatches
         }
-        return calendarBaseDisplayedProMatches()
+        return calendarProGamesPerf.cachedDisplayedProMatches
     }
 
-    private func calendarBaseDisplayedProMatches() -> [LiveMatch] {
-        viewModel.calendarProGamesDisplayed(
+    private func calendarProGamesDisplayCacheKey(for date: Date? = nil) -> String {
+        let resolvedDate = date ?? viewModel.calendarTabSelectedDate
+        let dayStart = Int(
+            Calendar.current.startOfDay(for: resolvedDate).timeIntervalSince1970
+        )
+        return [
+            "\(dayStart)",
+            calendarProGamesSportFilter,
+            calendarFeaturedEventFilterSlug ?? "",
+            calendarLeagueCountryFilterRaw,
+            "\(viewModel.liveMatches.count)",
+            "\(viewModel.activeFeaturedEvents.count)"
+        ].joined(separator: "|")
+    }
+
+    private func logScheduleTapPerf(_ message: @autoclosure () -> String) {
+#if DEBUG
+        print(message())
+#endif
+    }
+
+    private func logScheduleTapProtectedIfNeeded() {
+        if viewModel.liveSportsDataRefreshInFlight || viewModel.isLiveMatchesNetworkRefreshInFlight {
+            print("[LiveSchedulePerf] scheduleTapProtected=true")
+        }
+    }
+
+    private func noteScheduleRecentInteraction() {
+        calendarProGamesPerf.scheduleLastInteractionAt = Date()
+    }
+
+    private func calendarInteractionToken() -> String {
+        [
+            calendarProGamesDayKey(for: viewModel.calendarTabSelectedDate),
+            effectiveCalendarGameFilter.rawValue,
+            calendarProGamesSportFilter,
+            calendarFeaturedEventFilterSlug ?? "",
+            calendarLeagueCountryFilterRaw
+        ].joined(separator: "|")
+    }
+
+    private func scheduleCalendarInteractionDeferredWork(
+        reason: String,
+        forceNetworkRefresh: Bool = false,
+        delayNanoseconds: UInt64 = CalendarProGamesPerfState.deferredNetworkRefreshDelayNs
+    ) {
+        let latest = calendarInteractionToken()
+
+        if !calendarProGamesPerf.pendingInteractionToken.isEmpty,
+           calendarProGamesPerf.pendingInteractionToken != latest {
+            calendarProGamesPerf.deferredInteractionWorkTask?.cancel()
+            logScheduleTapPerf("[ScheduleTapPerf] deferredWorkCancelled old=\(calendarProGamesPerf.pendingInteractionToken)")
+        }
+
+        calendarProGamesPerf.pendingInteractionToken = latest
+        noteScheduleRecentInteraction()
+        logScheduleTapPerf("[ScheduleTapPerf] cachePaintScheduled latest=\(latest)")
+
+        calendarProGamesPerf.deferredInteractionWorkTask?.cancel()
+        calendarProGamesPerf.deferredInteractionWorkTask = Task { @MainActor in
+            viewModel.noteScheduleTabInteractionBegan()
+            defer { viewModel.noteScheduleTabInteractionEnded() }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard !Task.isCancelled else {
+                syncCalendarProGamesStatusIndicatorIfIdle(reason: "cancelled")
+                return
+            }
+            guard calendarProGamesPerf.pendingInteractionToken == latest else { return }
+            logScheduleTapPerf("[ScheduleTapPerf] deferredWorkStarted latest=\(latest)")
+            await performCalendarInteractionDeferredWork(
+                reason: reason,
+                forceNetworkRefresh: forceNetworkRefresh
+            )
+            calendarProGamesPerf.deferredInteractionWorkTask = nil
+            if calendarProGamesPerf.pendingInteractionToken == latest {
+                calendarProGamesPerf.pendingInteractionToken = ""
+            }
+        }
+    }
+
+    private func performCalendarInteractionDeferredWork(
+        reason: String,
+        forceNetworkRefresh: Bool
+    ) async {
+        refreshCurrentDayCalendarSearchForLoadedDataChange()
+        guard isCalendarTabSelected else { return }
+        sanitizeBusinessCalendarFilterIfNeeded()
+
+        if reason == "calendar_tab_filter_change" {
+            viewModel.calendarEventsListCache.removeAll()
+            viewModel.loadCalendarTabCalendarDotsAroundMonth(
+                viewModel.calendarTabSelectedDate,
+                reason: reason
+            )
+        }
+
+        if isProGamesSelected {
+            updateCalendarProGamesDisplayCache(reason: reason)
+            if !shouldSkipCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceNetworkRefresh) {
+                await performCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceNetworkRefresh)
+            }
+        }
+
+        if reason == "calendar_selected_date_change" {
+            refreshCalendarPickupSourcesIfNeeded(forceRefresh: true, reason: reason)
+        }
+
+        refreshCalendarSegmentBadgeCounts(reason: reason)
+    }
+
+    private func liveMatchesScheduleProRebuildDelayNanoseconds() -> UInt64 {
+        if viewModel.scheduleTabInteractionProtected {
+            return CalendarProGamesPerfState.liveMatchesScheduleProRebuildInteractionDelayNs
+        }
+        if let lastInteraction = calendarProGamesPerf.scheduleLastInteractionAt,
+           Date().timeIntervalSince(lastInteraction) < CalendarProGamesPerfState.scheduleRecentInteractionWindow {
+            return CalendarProGamesPerfState.liveMatchesScheduleProRebuildInteractionDelayNs
+        }
+        return CalendarProGamesPerfState.liveMatchesScheduleProRebuildDelayNs
+    }
+
+    private func handleLiveMatchesCountChangedWhileScheduleVisible() {
+        guard isCalendarTabSelected else { return }
+        print("[LiveSchedulePerf] liveMatchesChangedWhileScheduleVisible=true")
+
+        let latest = calendarInteractionToken()
+        if !calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken.isEmpty,
+           calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken != latest {
+            calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask?.cancel()
+        }
+        calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken = latest
+
+        let delayNs = liveMatchesScheduleProRebuildDelayNanoseconds()
+        let delayMs = Int(delayNs / 1_000_000)
+        print("[LiveSchedulePerf] scheduleProRebuildDeferred=true delayMs=\(delayMs)")
+
+        calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask?.cancel()
+        calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask = Task { @MainActor in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else {
+                syncCalendarProGamesStatusIndicatorIfIdle(reason: "cancelled")
+                return
+            }
+            guard calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken == latest else { return }
+            guard isCalendarTabSelected else { return }
+            if viewModel.scheduleTabInteractionProtected {
+                handleLiveMatchesCountChangedWhileScheduleVisible()
+                return
+            }
+            await performLiveMatchesChangedScheduleProRebuild(reason: "liveMatchesCountChanged")
+            calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask = nil
+            if calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken == latest {
+                calendarProGamesPerf.pendingLiveMatchesScheduleProRebuildToken = ""
+            }
+        }
+    }
+
+    private func performLiveMatchesChangedScheduleProRebuild(reason: String) async {
+        viewModel.flushPendingCalendarTabEventsListCacheInvalidationIfNeeded()
+        refreshCurrentDayCalendarSearchForLoadedDataChange()
+        guard isCalendarTabSelected else { return }
+
+        if isProGamesSelected {
+            updateCalendarProGamesDisplayCache(reason: reason)
+        }
+        refreshCalendarSegmentBadgeCounts(reason: reason)
+        scheduleCalendarProGamesStripDateCachePrewarm(reason: reason)
+    }
+
+    private func refreshCalendarSegmentBadgeCounts(reason: String) {
+        calendarProGamesPerf.cachedSegmentBadgeCounts = [
+            .venueGames: venueEventsForSelectedDateNoSearch.count,
+            .pickupGames: pickupEventsForSelectedDateNoSearch.count,
+            .proGames: proMatchesForSelectedDateNoSearch.count
+        ]
+#if DEBUG
+        print("[CalendarProGamesPerf] segmentBadgesUpdated reason=\(reason)")
+#endif
+    }
+
+    private func logScheduleTapPerfDisplayedCacheUpdated(count: Int, reason: String) {
+#if DEBUG
+        print("[ScheduleTapPerf] displayedCacheUpdated count=\(count) reason=\(reason)")
+#endif
+    }
+
+    private func storeCalendarProGamesDisplayCacheEntry(key: String, matches: [LiveMatch]) {
+        calendarProGamesPerf.displayCacheByKey[key] = matches
+        if calendarProGamesPerf.displayCacheByKey.count > CalendarProGamesPerfState.displayCacheByKeyLimit {
+            let keepKeys = Set(calendarDateStripDates.map { calendarProGamesDisplayCacheKey(for: $0) })
+                .union([calendarProGamesDisplayCacheKey()])
+            calendarProGamesPerf.displayCacheByKey = calendarProGamesPerf.displayCacheByKey.filter { keepKeys.contains($0.key) }
+        }
+    }
+
+    @discardableResult
+    private func applyCalendarProGamesDisplayCacheIfAvailable(reason: String) -> Bool {
+        guard isProGamesSelected, !isCalendarSearchModeActive else { return false }
+        let key = calendarProGamesDisplayCacheKey()
+        if let cached = calendarProGamesPerf.displayCacheByKey[key] {
+            calendarProGamesPerf.cachedDisplayedProMatchesKey = key
+            calendarProGamesPerf.cachedDisplayedProMatches = cached
+            logScheduleTapPerfDisplayedCacheUpdated(count: cached.count, reason: reason)
+            return true
+        }
+        if calendarProGamesPerf.cachedDisplayedProMatchesKey != key {
+            calendarProGamesPerf.cachedDisplayedProMatchesKey = key
+            calendarProGamesPerf.cachedDisplayedProMatches = []
+        }
+        return false
+    }
+
+    private func updateCalendarProGamesDisplayCache(reason: String) {
+        guard isProGamesSelected, !isCalendarSearchModeActive else { return }
+        let key = calendarProGamesDisplayCacheKey()
+        if calendarProGamesPerf.cachedDisplayedProMatchesKey == key,
+           calendarProGamesPerf.displayCacheByKey[key] != nil {
+            return
+        }
+        calendarProGamesPerf.displayCacheRebuildInFlight = true
+        syncCalendarProGamesStatusIndicator()
+        defer {
+            calendarProGamesPerf.displayCacheRebuildInFlight = false
+            syncCalendarProGamesStatusIndicator()
+        }
+        let matches = calendarBaseDisplayedProMatches()
+        storeCalendarProGamesDisplayCacheEntry(key: key, matches: matches)
+        calendarProGamesPerf.cachedDisplayedProMatchesKey = key
+        calendarProGamesPerf.cachedDisplayedProMatches = matches
+        logScheduleTapPerfDisplayedCacheUpdated(count: matches.count, reason: reason)
+#if DEBUG
+        print("[CalendarProGamesPerf] displayCacheUpdated reason=\(reason) count=\(matches.count)")
+#endif
+    }
+
+    private func scheduleCalendarProGamesStripDateCachePrewarm(reason: String) {
+        guard isProGamesSelected, isCalendarTabSelected else { return }
+        calendarProGamesPerf.deferredDisplayCachePrewarmTask?.cancel()
+        calendarProGamesPerf.deferredDisplayCachePrewarmTask = Task { @MainActor in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: CalendarProGamesPerfState.stripDateCachePrewarmDelayNs)
+            guard !Task.isCancelled else {
+                syncCalendarProGamesStatusIndicatorIfIdle(reason: "cancelled")
+                return
+            }
+            prewarmCalendarProGamesDisplayCacheForStripDates(reason: reason)
+            calendarProGamesPerf.deferredDisplayCachePrewarmTask = nil
+        }
+    }
+
+    private func prewarmCalendarProGamesDisplayCacheForStripDates(reason: String) {
+        guard isProGamesSelected else { return }
+        for date in calendarDateStripDates {
+            let key = calendarProGamesDisplayCacheKey(for: date)
+            guard calendarProGamesPerf.displayCacheByKey[key] == nil else { continue }
+            let matches = calendarBaseDisplayedProMatches(for: date)
+            storeCalendarProGamesDisplayCacheEntry(key: key, matches: matches)
+        }
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "prewarm:\(reason)")
+    }
+
+    private var calendarProGamesBackgroundWorkActive: Bool {
+        calendarProGamesPerf.displayCacheRebuildInFlight || calendarProGamesPerf.networkRefreshInFlight
+    }
+
+    private var shouldShowCalendarProGamesStatusIndicatorSurface: Bool {
+        isCalendarTabSelected && isProGamesSelected && !isCalendarSearchModeActive
+    }
+
+    private var scheduleProHasCachedGamesVisible: Bool {
+        guard isProGamesSelected else { return false }
+        if !displayedProMatches.isEmpty { return true }
+        return calendarProGamesPerf.displayCacheByKey[calendarProGamesDisplayCacheKey()] != nil
+    }
+
+    private var calendarProGamesStatusIndicatorMessage: String {
+        calendarProGamesPerf.networkRefreshInFlight
+            ? "Refreshing schedule…"
+            : "Updating games…"
+    }
+
+    private func hideCalendarProGamesStatusIndicator(reason: String) {
+        calendarProGamesPerf.statusIndicatorShowTask?.cancel()
+        calendarProGamesPerf.statusIndicatorShowTask = nil
+        calendarProGamesPerf.statusIndicatorHideTask?.cancel()
+        calendarProGamesPerf.statusIndicatorHideTask = nil
+        guard calendarProGamesPerf.statusIndicatorVisible else { return }
+        calendarProGamesPerf.statusIndicatorVisible = false
+        print("[SportsDataUpdateUI] hidden reason=\(reason)")
+    }
+
+    private func syncCalendarProGamesStatusIndicatorIfIdle(reason: String) {
+        guard !calendarProGamesBackgroundWorkActive else { return }
+        hideCalendarProGamesStatusIndicator(reason: reason)
+    }
+
+    private func scheduleCalendarProGamesStatusIndicatorFailsafeIfNeeded() {
+        calendarProGamesPerf.statusIndicatorHideTask?.cancel()
+        calendarProGamesPerf.statusIndicatorHideTask = nil
+        guard calendarProGamesPerf.statusIndicatorVisible else { return }
+        guard scheduleProHasCachedGamesVisible else { return }
+
+        calendarProGamesPerf.statusIndicatorHideTask = Task { @MainActor in
+            let delayNs = UInt64(CalendarProGamesPerfState.statusIndicatorMaxVisibleDuration * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
+            guard calendarProGamesPerf.statusIndicatorVisible else { return }
+            print("[SportsDataUpdateUI] stuckTimeoutHide=true reason=maxDuration")
+            hideCalendarProGamesStatusIndicator(reason: "maxDuration")
+        }
+    }
+
+    private func syncCalendarProGamesStatusIndicator() {
+        guard shouldShowCalendarProGamesStatusIndicatorSurface else {
+            hideCalendarProGamesStatusIndicator(reason: "tabHidden")
+            return
+        }
+
+        if calendarProGamesBackgroundWorkActive {
+            calendarProGamesPerf.statusIndicatorShowTask?.cancel()
+            calendarProGamesPerf.statusIndicatorShowTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: CalendarProGamesPerfState.statusIndicatorMinVisibleDelayNs)
+                guard !Task.isCancelled else { return }
+                guard shouldShowCalendarProGamesStatusIndicatorSurface else {
+                    hideCalendarProGamesStatusIndicator(reason: "tabHidden")
+                    return
+                }
+                guard calendarProGamesBackgroundWorkActive else {
+                    hideCalendarProGamesStatusIndicator(reason: "workFinished")
+                    return
+                }
+                calendarProGamesPerf.statusIndicatorVisible = true
+                calendarProGamesPerf.statusIndicatorShowTask = nil
+                scheduleCalendarProGamesStatusIndicatorFailsafeIfNeeded()
+            }
+        } else {
+            hideCalendarProGamesStatusIndicator(reason: "workFinished")
+        }
+    }
+
+    private func handleCalendarProGamesIndicatorSurfaceHidden(reason: String) {
+        calendarProGamesPerf.sportsDataUpdateGlobalFailsafeTask?.cancel()
+        calendarProGamesPerf.sportsDataUpdateGlobalFailsafeTask = nil
+        hideCalendarProGamesStatusIndicator(reason: reason)
+        viewModel.forceHideSportsDataUpdateIndicator(reason: reason)
+    }
+
+    private func handleScheduleSportsDataUpdateIndicatorVisibilityChanged(_ visible: Bool) {
+        calendarProGamesPerf.sportsDataUpdateGlobalFailsafeTask?.cancel()
+        calendarProGamesPerf.sportsDataUpdateGlobalFailsafeTask = nil
+        guard visible, shouldShowCalendarProGamesStatusIndicatorSurface else { return }
+        guard scheduleProHasCachedGamesVisible else { return }
+
+        calendarProGamesPerf.sportsDataUpdateGlobalFailsafeTask = Task { @MainActor in
+            let delayNs = UInt64(CalendarProGamesPerfState.statusIndicatorMaxVisibleDuration * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
+            guard viewModel.sportsDataUpdateIndicatorVisible else { return }
+            print("[SportsDataUpdateUI] stuckTimeoutHide=true reason=maxDuration")
+            viewModel.forceHideSportsDataUpdateIndicator(reason: "maxDuration")
+        }
+    }
+
+    private func calendarProGamesDayKey(for date: Date) -> String {
+        let day = Calendar.current.startOfDay(for: date)
+        return String(Int(day.timeIntervalSince1970 / 86_400))
+    }
+
+    private func shouldSkipCalendarProGamesNetworkRefresh(reason: String, forceRefresh: Bool) -> Bool {
+        if forceRefresh { return false }
+        guard isProGamesSelected else { return true }
+
+        if let lastRequest = calendarProGamesPerf.lastNetworkRefreshRequestedAt,
+           Date().timeIntervalSince(lastRequest) < CalendarProGamesPerfState.networkCoalesceInterval {
+            return true
+        }
+
+        let cal = Calendar.current
+        let day = cal.startOfDay(for: viewModel.calendarTabSelectedDate)
+        let dayKey = calendarProGamesDayKey(for: day)
+
+        if let lastDayRefresh = viewModel.calendarProGamesRefreshAtByDay[dayKey],
+           Date().timeIntervalSince(lastDayRefresh) < 90,
+           !viewModel.liveMatches.contains(where: { match in
+               match.matchStatus.isHappeningNow && cal.isDate(match.startTime, inSameDayAs: day)
+           }) {
+            return true
+        }
+
+        if reason == "calendar_selected_date_change" || reason == "calendar_tab_filter_change" {
+            if viewModel.liveMatchesAreFreshForTabPreload(within: 90), !viewModel.liveMatches.isEmpty {
+                return true
+            }
+        }
+
+        if reason == "calendar_tab_selected" || reason == "calendar_tab_appear" || reason == "calendar_scene_active" {
+            if viewModel.liveMatchesAreFreshForTabPreload(within: 90), !viewModel.liveMatches.isEmpty {
+                return true
+            }
+        }
+
+        if viewModel.liveSportsDataRefreshInFlight || viewModel.isLiveMatchesNetworkRefreshInFlight {
+            return true
+        }
+
+        return false
+    }
+
+    private func scheduleCalendarProGamesDeferredRefresh(reason: String, forceRefresh: Bool = false) {
+        guard isProGamesSelected else { return }
+        scheduleCalendarInteractionDeferredWork(reason: reason, forceNetworkRefresh: forceRefresh)
+    }
+
+    private func performCalendarProGamesNetworkRefresh(reason: String, forceRefresh: Bool) async {
+        if shouldSkipCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceRefresh) {
+            print("[CalendarProGamesPerf] networkRefreshSkipped reason=\(reason) cached=true")
+            return
+        }
+        calendarProGamesPerf.networkRefreshInFlight = true
+        syncCalendarProGamesStatusIndicator()
+        defer {
+            calendarProGamesPerf.networkRefreshInFlight = false
+            syncCalendarProGamesStatusIndicator()
+        }
+        calendarProGamesPerf.lastNetworkRefreshRequestedAt = Date()
+#if DEBUG
+        print("[CalendarProGamesDebug] refreshReason=\(reason)")
+#endif
+        await viewModel.refreshLiveMatchesForCalendar(
             selectedDate: viewModel.calendarTabSelectedDate,
+            forceRefresh: forceRefresh
+        )
+        updateCalendarProGamesDisplayCache(reason: "networkRefreshFinished:\(reason)")
+    }
+
+    private func calendarBaseDisplayedProMatches(for selectedDate: Date? = nil) -> [LiveMatch] {
+        let date = selectedDate ?? viewModel.calendarTabSelectedDate
+        return viewModel.calendarProGamesDisplayed(
+            selectedDate: date,
             searchQuery: "",
             sportFilter: calendarProGamesSportFilter,
             worldCupOnly: false,
@@ -291,7 +759,7 @@ struct CalendarScreen: View {
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
             }
             .onChange(of: viewModel.liveMatches.count) { _, _ in
-                refreshCurrentDayCalendarSearchForLoadedDataChange()
+                handleLiveMatchesCountChangedWhileScheduleVisible()
             }
             .onChange(of: viewModel.pickupGamesForDiscoverMap.count) { _, _ in
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
@@ -303,13 +771,14 @@ struct CalendarScreen: View {
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
             }
             .onChange(of: calendarProGamesSportFilter) { _, _ in
-                refreshCurrentDayCalendarSearchForLoadedDataChange()
+                scheduleCalendarInteractionDeferredWork(reason: "calendarProGamesSportFilterChanged")
             }
             .onChange(of: calendarLeagueCountryFilterRaw) { _, _ in
-                refreshCurrentDayCalendarSearchForLoadedDataChange()
+                applyCalendarProGamesDisplayCacheIfAvailable(reason: "leagueCountryInstant")
+                scheduleCalendarInteractionDeferredWork(reason: "calendarLeagueCountryFilterChanged")
             }
             .onChange(of: calendarFeaturedEventFilterSlug) { _, _ in
-                refreshCurrentDayCalendarSearchForLoadedDataChange()
+                scheduleCalendarInteractionDeferredWork(reason: "calendarFeaturedEventFilterChanged")
             }
     }
 
@@ -326,6 +795,14 @@ struct CalendarScreen: View {
             }
             .onChange(of: isBusinessCalendarAccess) { _, _ in
                 sanitizeBusinessCalendarFilterIfNeeded()
+            }
+            .onChange(of: viewModel.sportsDataUpdateIndicatorVisible) { _, visible in
+                handleScheduleSportsDataUpdateIndicatorVisibilityChanged(visible)
+            }
+            .onChange(of: effectiveCalendarGameFilter) { _, filter in
+                if filter != .proGames {
+                    handleCalendarProGamesIndicatorSurfaceHidden(reason: "tabChanged")
+                }
             }
     }
 
@@ -354,6 +831,13 @@ struct CalendarScreen: View {
             calendarTopControls
             calendarSearchSuggestionsSlot
             eventsHeader
+            if isProGamesSelected, !isCalendarSearchModeActive {
+                if viewModel.sportsDataUpdateIndicatorVisible {
+                    SportsDataUpdateIndicator()
+                        .padding(.horizontal)
+                }
+                calendarProGamesUpdatingStatusBanner
+            }
             if effectiveCalendarGameFilter == .venueGames && !isCalendarSearchModeActive {
                 calendarVenueGamesRegionNotice
             }
@@ -701,7 +1185,8 @@ struct CalendarScreen: View {
                 )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Score updates \(isEnabled ? "on" : "off")")
+        .accessibilityLabel("Live alerts for this game \(isEnabled ? "on" : "off")")
+        .accessibilityHint("Goals, halftime, cards and other live updates.")
     }
 
     private func presentTeamScheduleSheet() {
@@ -876,6 +1361,8 @@ struct CalendarScreen: View {
     private func handleCalendarAppear() {
         sanitizeBusinessCalendarFilterIfNeeded()
         refreshCurrentDayCalendarSearchForLoadedDataChange()
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "appearInstant")
+        scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_appear")
         guard isCalendarTabSelected else {
 #if DEBUG
             print("[PerfPhase1D] deferredCalendarWork reason=calendarScreenOnAppearPickupRefresh")
@@ -884,7 +1371,7 @@ struct CalendarScreen: View {
         }
         Task { @MainActor in
             await Task.yield()
-            refreshCalendarProGamesIfNeeded(reason: "calendar_tab_appear")
+            scheduleCalendarProGamesDeferredRefresh(reason: "calendar_tab_appear")
             guard viewModel.canFanUsePickupGamesUI else { return }
             guard !shouldDeferCalendarPickupRefreshAfterTabPreload() else {
                 AppPerfDebug.refreshSkipped(
@@ -929,24 +1416,27 @@ struct CalendarScreen: View {
     }
 
     private func handleCalendarGameFilterChange() {
-        refreshCurrentDayCalendarSearchForLoadedDataChange()
-        guard isCalendarTabSelected else { return }
-        sanitizeBusinessCalendarFilterIfNeeded()
-        viewModel.calendarEventsListCache.removeAll()
-        viewModel.loadCalendarTabCalendarDotsAroundMonth(
-            viewModel.calendarTabSelectedDate,
-            reason: "calendar_tab_filter_change"
-        )
-        refreshCalendarProGamesIfNeeded(reason: "calendar_tab_filter_change")
+        noteScheduleRecentInteraction()
+        logScheduleTapProtectedIfNeeded()
+        logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=proTab value=\(effectiveCalendarGameFilter.rawValue)")
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "gameFilterInstant")
+        scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_filter_change")
     }
 
     private func handleCalendarTabSelectionChange(active: Bool) {
-        guard active else { return }
+        if !active {
+            calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask?.cancel()
+            calendarProGamesPerf.deferredLiveMatchesScheduleProRebuildTask = nil
+            handleCalendarProGamesIndicatorSurfaceHidden(reason: "tabHidden")
+            return
+        }
         AppPerfDebug.screenLoadStart(tab: "calendar", source: "tabSelected")
         sanitizeBusinessCalendarFilterIfNeeded()
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "tabSelectedInstant")
+        scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_selected")
+        scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_selected")
         Task { @MainActor in
             await Task.yield()
-            refreshCalendarProGamesIfNeeded(reason: "calendar_tab_selected")
             guard shouldDeferCalendarPickupRefreshAfterTabPreload() else {
                 refreshCalendarPickupSourcesIfNeeded(reason: "calendar_tab_selected")
                 return
@@ -968,16 +1458,34 @@ struct CalendarScreen: View {
         guard phase == .active else { return }
         guard isCalendarTabSelected else { return }
         sanitizeBusinessCalendarFilterIfNeeded()
-        refreshCalendarProGamesIfNeeded(reason: "calendar_scene_active")
+        scheduleCalendarProGamesDeferredRefresh(reason: "calendar_scene_active")
         refreshCalendarPickupSourcesIfNeeded(reason: "calendar_scene_active")
     }
 
     private func handleCalendarSelectedDateChange() {
-        refreshCurrentDayCalendarSearchForLoadedDataChange()
-        guard isCalendarTabSelected else { return }
-        sanitizeBusinessCalendarFilterIfNeeded()
-        refreshCalendarProGamesIfNeeded(reason: "calendar_selected_date_change")
-        refreshCalendarPickupSourcesIfNeeded(forceRefresh: true, reason: "calendar_selected_date_change")
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "selectedDateInstant")
+        scheduleCalendarInteractionDeferredWork(reason: "calendar_selected_date_change")
+    }
+
+    private func handleCalendarDateStripTap(_ date: Date) {
+        let calendar = Calendar.current
+        if calendar.isDate(date, inSameDayAs: viewModel.calendarTabSelectedDate) {
+            logScheduleTapPerf("[ScheduleTapPerf] tapBlocked reason=alreadySelected")
+            return
+        }
+        let dayKey = calendarProGamesDayKey(for: date)
+        noteScheduleRecentInteraction()
+        logScheduleTapProtectedIfNeeded()
+        logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=date value=\(dayKey)")
+        let started = CFAbsoluteTimeGetCurrent()
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            viewModel.calendarTabSelectedDate = date
+        }
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "dateStripInstant")
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        logScheduleTapPerf("[ScheduleTapPerf] selectedStateUpdatedMs=\(String(format: "%.2f", ms))")
     }
 
     private func refreshCalendarPickupSourcesIfNeeded(forceRefresh: Bool = false, reason: String) {
@@ -1032,7 +1540,8 @@ struct CalendarScreen: View {
                     accessibilityLabel: "Show \(filter.segmentTitle)"
                 )
             },
-            selection: calendarGameFilterBinding
+            selection: calendarGameFilterBinding,
+            animatesSelectionChanges: false
         )
         .padding(.horizontal)
     }
@@ -1049,15 +1558,7 @@ struct CalendarScreen: View {
     }
 
     private func calendarSegmentBadge(for filter: CalendarTabGameFilter) -> String? {
-        let count: Int
-        switch filter {
-        case .venueGames:
-            count = venueEventsForSelectedDateNoSearch.count
-        case .pickupGames:
-            count = pickupEventsForSelectedDateNoSearch.count
-        case .proGames:
-            count = proMatchesForSelectedDateNoSearch.count
-        }
+        guard let count = calendarProGamesPerf.cachedSegmentBadgeCounts[filter] else { return nil }
         return count > 0 ? "\(count)" : nil
     }
 
@@ -1120,6 +1621,7 @@ struct CalendarScreen: View {
             }
             .padding(.horizontal)
         }
+        .scrollClipDisabled(false)
     }
 
     private var calendarDateStripDates: [Date] {
@@ -1141,9 +1643,7 @@ struct CalendarScreen: View {
         let isSelected = calendar.isDate(date, inSameDayAs: viewModel.calendarTabSelectedDate)
         let isToday = calendar.isDateInToday(date)
         return Button {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
-                viewModel.calendarTabSelectedDate = date
-            }
+            handleCalendarDateStripTap(date)
         } label: {
             VStack(spacing: 4) {
                 Text(isToday ? "Today" : calendarDateStripWeekdayFormatter.string(from: date))
@@ -1168,6 +1668,7 @@ struct CalendarScreen: View {
                         lineWidth: 1
                     )
             }
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(calendarDateStripAccessibilityFormatter.string(from: date))
@@ -1212,6 +1713,36 @@ struct CalendarScreen: View {
         .padding(.horizontal)
     }
 
+    @ViewBuilder
+    private var calendarProGamesUpdatingStatusBanner: some View {
+        if calendarProGamesPerf.statusIndicatorVisible {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(calendarProGamesStatusIndicatorMessage)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground))
+            )
+            .overlay {
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+            }
+            .padding(.horizontal)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .allowsHitTesting(false)
+            .transition(.opacity.combined(with: .move(edge: .top)))
+            .animation(.easeInOut(duration: 0.2), value: calendarProGamesPerf.statusIndicatorVisible)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(calendarProGamesStatusIndicatorMessage)
+        }
+    }
+
     private var eventsHeaderTitle: String {
         if isCalendarSearchModeActive {
             return "Search Results"
@@ -1243,17 +1774,6 @@ struct CalendarScreen: View {
             return "Pickup Games"
         case .proGames:
             return "Matches"
-        }
-    }
-
-    private func refreshCalendarProGamesIfNeeded(reason: String) {
-        guard isProGamesSelected else { return }
-#if DEBUG
-        print("[CalendarProGamesDebug] refreshReason=\(reason)")
-#endif
-        Task {
-            await Task.yield()
-            await viewModel.refreshLiveMatchesForCalendar(selectedDate: viewModel.calendarTabSelectedDate, forceRefresh: false)
         }
     }
 
@@ -1675,11 +2195,29 @@ struct CalendarScreen: View {
             isSelected: selectedCalendarFeaturedEvent == nil && DiscoverSportFilterRowLayout.selectionTokensMatch(calendarProGamesSportFilter, selection),
             isCompact: true
         ) {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
-                calendarFeaturedEventFilterSlug = nil
-                calendarProGamesSportFilter = selection
-            }
+            handleProGamesSportChipTap(selection: selection)
         }
+    }
+
+    private func handleProGamesSportChipTap(selection: String) {
+        if selectedCalendarFeaturedEvent == nil,
+           DiscoverSportFilterRowLayout.selectionTokensMatch(calendarProGamesSportFilter, selection) {
+            logScheduleTapPerf("[ScheduleTapPerf] tapBlocked reason=alreadySelected")
+            return
+        }
+        logScheduleTapProtectedIfNeeded()
+        logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=sportChip value=\(selection)")
+        noteScheduleRecentInteraction()
+        let started = CFAbsoluteTimeGetCurrent()
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            calendarFeaturedEventFilterSlug = nil
+            calendarProGamesSportFilter = selection
+        }
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "sportChipInstant")
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        logScheduleTapPerf("[ScheduleTapPerf] selectedStateUpdatedMs=\(String(format: "%.2f", ms))")
     }
 
     private func calendarFeaturedEventChip(_ featuredEvent: FeaturedEvent) -> some View {
@@ -1690,12 +2228,26 @@ struct CalendarScreen: View {
             isCompact: true,
             preferSystemSymbol: false
         ) {
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
-                calendarProGamesSportFilter = "All"
-                updateSelectedCalendarLeagueCountries([])
-                calendarFeaturedEventFilterSlug = selectedCalendarFeaturedEvent?.slug == featuredEvent.slug ? nil : featuredEvent.slug
-            }
+            handleCalendarFeaturedEventChipTap(featuredEvent)
         }
+    }
+
+    private func handleCalendarFeaturedEventChipTap(_ featuredEvent: FeaturedEvent) {
+        let togglingOff = selectedCalendarFeaturedEvent?.slug == featuredEvent.slug
+        logScheduleTapProtectedIfNeeded()
+        logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=featuredChip value=\(togglingOff ? "nil" : featuredEvent.slug)")
+        noteScheduleRecentInteraction()
+        let started = CFAbsoluteTimeGetCurrent()
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            calendarProGamesSportFilter = "All"
+            updateSelectedCalendarLeagueCountries([])
+            calendarFeaturedEventFilterSlug = togglingOff ? nil : featuredEvent.slug
+        }
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "featuredChipInstant")
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        logScheduleTapPerf("[ScheduleTapPerf] selectedStateUpdatedMs=\(String(format: "%.2f", ms))")
     }
 
     private func handleVenueCalendarEventTap(_ event: SportsEvent) {

@@ -6,17 +6,20 @@ import GoogleMobileAds
 
 private struct AdaptiveBannerRepresentable: UIViewRepresentable {
     let placement: String
+    let hostTabRaw: String
     let adUnitID: String
     let adSize: AdSize
     let slotSize: CGSize
     let layoutWidth: CGFloat
     let requestBackoffUntil: Date?
+    let allowsInteraction: Bool
     let onAdLoaded: () -> Void
     let onAdFailed: (Error) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             placement: placement,
+            hostTabRaw: hostTabRaw,
             layoutWidth: layoutWidth,
             requestBackoffUntil: requestBackoffUntil,
             onAdLoaded: onAdLoaded,
@@ -65,7 +68,13 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
             slotSize: slotSize,
             adUnitID: adUnitID,
             requestBackoffUntil: requestBackoffUntil,
-            container: uiView
+            container: uiView,
+            allowsInteraction: allowsInteraction
+        )
+        AdHitTestSafety.syncUIViewInteraction(
+            uiView,
+            enabled: allowsInteraction,
+            placement: placement
         )
     }
 
@@ -97,6 +106,7 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
 
     final class Coordinator: NSObject, BannerViewDelegate {
         let placement: String
+        let hostTabRaw: String
         let layoutWidth: CGFloat
         private weak var banner: BannerView?
         private weak var container: UIView?
@@ -128,12 +138,14 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
 
         init(
             placement: String,
+            hostTabRaw: String,
             layoutWidth: CGFloat,
             requestBackoffUntil: Date?,
             onAdLoaded: @escaping () -> Void,
             onAdFailed: @escaping (Error) -> Void
         ) {
             self.placement = placement
+            self.hostTabRaw = hostTabRaw
             self.layoutWidth = layoutWidth
             self.externalBackoffUntil = requestBackoffUntil
             self.onAdLoaded = onAdLoaded
@@ -166,9 +178,11 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
             slotSize: CGSize,
             adUnitID: String,
             requestBackoffUntil: Date?,
-            container: UIView
+            container: UIView,
+            allowsInteraction: Bool
         ) {
             guard let banner else { return }
+            syncBannerInteraction(enabled: allowsInteraction)
             externalBackoffUntil = requestBackoffUntil
             lastAdUnitID = adUnitID
 
@@ -356,11 +370,12 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
         }
 
         private var isHostTabVisible: Bool {
-            !AdDebugContext.isTabOffscreenPreserved(tabRaw: "discover")
+            !AdDebugContext.isTabOffscreenPreserved(tabRaw: hostTabRaw)
         }
 
         func detach() {
             logDiscoverAdState(phase: "detach", requested: false)
+            syncBannerInteraction(enabled: false)
             banner?.delegate = nil
             banner?.isHidden = true
             banner?.removeFromSuperview()
@@ -416,6 +431,7 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
             nextAllowedRequestAt = nil
             logDiscoverAdState(phase: "loaded", requested: false, loaded: true)
             logDiscoverAdVisibility(phase: "loaded.deferred")
+            syncBannerInteraction(enabled: isHostTabVisible && hasLoaded)
             onAdLoaded()
         }
 
@@ -552,6 +568,12 @@ private struct AdaptiveBannerRepresentable: UIViewRepresentable {
             print("[DiscoverAdDebug] isHidden=\(isHidden)")
             print(String(format: "[DiscoverAdDebug] alpha=%.3f", Double(alpha)))
         }
+
+        func syncBannerInteraction(enabled: Bool) {
+            let effective = enabled && isHostTabVisible && hasLoaded
+            AdHitTestSafety.syncUIViewInteraction(container, enabled: effective, placement: placement)
+            AdHitTestSafety.syncUIViewInteraction(banner, enabled: effective, placement: placement, logFrameWhenEnabled: false)
+        }
     }
 }
 
@@ -582,6 +604,7 @@ enum AdaptiveBannerLayout {
 /// Anchored adaptive AdMob banner sized to the exact parent slot.
 struct AdaptiveBannerView: View {
     let placement: String
+    let hostTabRaw: String
     let adUnitID: String
     /// Final visible width available to the banner after parent screen margins.
     let layoutWidth: CGFloat
@@ -589,8 +612,20 @@ struct AdaptiveBannerView: View {
     var onAdLoaded: () -> Void = {}
     var onAdFailed: (Error) -> Void = { _ in }
 
+    @State private var bannerLoaded = false
+    @Environment(\.hostTabAdInteractionEnabled) private var hostTabAdInteractionEnabled
+
+    private var allowsBannerHitTesting: Bool {
+        AdHitTestSafety.allowsInteraction(
+            adLoaded: bannerLoaded,
+            hostTabRaw: hostTabRaw,
+            hostTabAdInteractionEnabled: hostTabAdInteractionEnabled
+        )
+    }
+
     init(
         placement: String = "discover.bottomStrip",
+        hostTabRaw: String = "discover",
         adUnitID: String,
         layoutWidth: CGFloat,
         requestBackoffUntil: Date? = nil,
@@ -598,6 +633,7 @@ struct AdaptiveBannerView: View {
         onAdFailed: @escaping (Error) -> Void = { _ in }
     ) {
         self.placement = placement
+        self.hostTabRaw = hostTabRaw
         self.adUnitID = adUnitID
         self.layoutWidth = layoutWidth
         self.requestBackoffUntil = requestBackoffUntil
@@ -624,13 +660,21 @@ struct AdaptiveBannerView: View {
         return GeometryReader { geo in
             AdaptiveBannerRepresentable(
                 placement: placement,
+                hostTabRaw: hostTabRaw,
                 adUnitID: adUnitID,
                 adSize: adSize,
                 slotSize: slotSize,
                 layoutWidth: layoutWidth,
                 requestBackoffUntil: requestBackoffUntil,
-                onAdLoaded: onAdLoaded,
-                onAdFailed: onAdFailed
+                allowsInteraction: allowsBannerHitTesting,
+                onAdLoaded: {
+                    bannerLoaded = true
+                    onAdLoaded()
+                },
+                onAdFailed: { error in
+                    bannerLoaded = false
+                    onAdFailed(error)
+                }
             )
             .onAppear {
                 if placement == "discover.bottomStrip" {
@@ -659,6 +703,8 @@ struct AdaptiveBannerView: View {
         }
         .frame(width: slotSize.width, height: slotSize.height)
         .clipped()
+        .contentShape(Rectangle())
+        .allowsHitTesting(allowsBannerHitTesting)
         .accessibilityElement(children: .contain)
     }
 }

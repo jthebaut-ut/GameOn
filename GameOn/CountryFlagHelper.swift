@@ -1,6 +1,9 @@
 import Foundation
 
 nonisolated enum CountryFlagHelper {
+    /// Off by default; enable only when investigating missing calendar flags.
+    static var calendarFlagVerboseLogging = false
+
     private struct NationalTeamFlagEntry {
         let code: String
         let names: [String]
@@ -226,6 +229,9 @@ nonisolated enum CountryFlagHelper {
     }
 
     static func logCalendarFlagDebug(teamName: String, source: String = "AppleCalendar") {
+#if DEBUG
+        guard calendarFlagVerboseLogging else { return }
+#endif
         let trimmed = teamName.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = normalizedTeamName(trimmed)
         let countryCode = countryCode(for: trimmed)
@@ -242,6 +248,9 @@ nonisolated enum CountryFlagHelper {
         finalTitle: String,
         source: String = "AppleCalendar"
     ) {
+#if DEBUG
+        guard CountryFlagHelper.calendarFlagVerboseLogging else { return }
+#endif
         let away = awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let home = homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let awayCode = countryCode(for: away)
