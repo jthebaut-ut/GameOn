@@ -32,11 +32,13 @@ enum AdHitTestSafety {
     ) {
         guard let view else { return }
         view.isUserInteractionEnabled = enabled
+#if DEBUG
         if enabled, logFrameWhenEnabled {
             let frame = view.convert(view.bounds, to: view.window)
             print("[AdHitTestDebug] visibleFrame placement=\(placement) frame=\(frame.debugDescription)")
         } else if !enabled {
             print("[AdHitTestDebug] disabled reason=hiddenOrOffscreen placement=\(placement)")
         }
+#endif
     }
 }

@@ -389,7 +389,7 @@ final class ChatViewModel: ObservableObject {
 #if DEBUG
         RealtimeHealthDiagnostics.log("reconnectDetected=chat_social_foreground_resubscribe")
 #endif
-        print("[PresenceDebug] foregroundReconnect=true")
+        DebugLogGate.debug("[PresenceDebug] foregroundReconnect=true")
         AppPerfDebug.realtimeRestarted(true, source: "foregroundResubscribe")
         await stopInboxRealtimeListener()
         await stopFriendshipsRealtimeListener()
@@ -456,7 +456,7 @@ final class ChatViewModel: ObservableObject {
            chatPresenceListenTask != nil,
            chatPresenceChannel != nil {
             startChatPresenceExpiryTickerIfNeeded()
-            print("[PresenceDebug] subscribeStarted=false reason=alreadyActive onlineUsersCount=\(chatPresenceOnlineCount())")
+            DebugLogGate.debug("[PresenceDebug] subscribeStarted=false reason=alreadyActive onlineUsersCount=\(chatPresenceOnlineCount())")
             return
         }
 
@@ -481,9 +481,9 @@ final class ChatViewModel: ObservableObject {
         let channel = supabase.channel(channelName)
         chatPresenceChannel = channel
         let identity = dmRealtimeIdentitySnapshot()
-        print("[PresenceDebug] subscribeStarted=true reason=\(reason) channelName=\(channelName)")
-        print("[PresenceDebug] userId=\(identity.authUserIdLogValue)")
-        print("[PresenceDebug] businessId=\(identity.businessIdLogValue)")
+        DebugLogGate.debug("[PresenceDebug] subscribeStarted=true reason=\(reason) channelName=\(channelName)")
+        DebugLogGate.debug("[PresenceDebug] userId=\(identity.authUserIdLogValue)")
+        DebugLogGate.debug("[PresenceDebug] businessId=\(identity.businessIdLogValue)")
 
         let streams = Self.chunked(userIds, size: kMaxUserProfileIdsForPresenceRealtimeClientFilter).map { chunk in
             channel.postgresChange(
@@ -497,7 +497,7 @@ final class ChatViewModel: ObservableObject {
         var shouldRestartChatRealtime = false
         do {
             try await channel.subscribeWithError()
-            print("[PresenceDebug] onlineUsersCount=\(chatPresenceOnlineCount())")
+            DebugLogGate.debug("[PresenceDebug] onlineUsersCount=\(chatPresenceOnlineCount())")
             await withTaskGroup(of: Void.self) { group in
                 for stream in streams {
                     group.addTask { [weak self] in
@@ -508,7 +508,7 @@ final class ChatViewModel: ObservableObject {
         } catch is CancellationError {
         } catch {
 #if DEBUG
-            print("[PresenceDebug] subscribeError=\(error.localizedDescription) channelName=\(channelName)")
+            DebugLogGate.debug("[PresenceDebug] subscribeError=\(error.localizedDescription) channelName=\(channelName)")
 #endif
             shouldRestartChatRealtime = realtimeErrorIndicatesGlobalRetryExhausted(error)
         }
@@ -547,8 +547,8 @@ final class ChatViewModel: ObservableObject {
         let isOnline = PresenceOnlineStatus.parse(lastSeenAtRaw).map {
             Date().timeIntervalSince($0) <= PresenceOnlineStatus.onlineWindowSeconds
         } ?? false
-        print("[PresenceDebug] userOnline=\(isOnline) userId=\(userLow) source=\(source)")
-        print("[PresenceDebug] lastSeen=\(lastSeenAtRaw ?? "nil") userId=\(userLow)")
+        DebugLogGate.debug("[PresenceDebug] userOnline=\(isOnline) userId=\(userLow) source=\(source)")
+        DebugLogGate.debug("[PresenceDebug] lastSeen=\(lastSeenAtRaw ?? "nil") userId=\(userLow)")
 
         var changed = false
         let nextFriends = friends.map { display -> FriendDisplay in
@@ -566,7 +566,7 @@ final class ChatViewModel: ObservableObject {
         }
         if changed {
             friends = nextFriends
-            print("[PresenceDebug] onlineUsersCount=\(chatPresenceOnlineCount(in: nextFriends))")
+            DebugLogGate.debug("[PresenceDebug] onlineUsersCount=\(chatPresenceOnlineCount(in: nextFriends))")
         }
 
         var incomingChanged = false
@@ -612,7 +612,7 @@ final class ChatViewModel: ObservableObject {
             }
         } catch {
 #if DEBUG
-            print("[PresenceDebug] refreshFailed reason=\(reason) error=\(error.localizedDescription)")
+            DebugLogGate.debug("[PresenceDebug] refreshFailed reason=\(reason) error=\(error.localizedDescription)")
 #endif
         }
     }
@@ -1830,7 +1830,7 @@ final class ChatViewModel: ObservableObject {
             return resolved
         } catch {
 #if DEBUG
-            print("[PresenceDebug] directChatPresenceRefreshFailed=true friendId=\(userId.uuidString.lowercased()) presenceSource=\(source) error=\(error.localizedDescription)")
+            DebugLogGate.debug("[PresenceDebug] directChatPresenceRefreshFailed=true friendId=\(userId.uuidString.lowercased()) presenceSource=\(source) error=\(error.localizedDescription)")
 #endif
             return nil
         }

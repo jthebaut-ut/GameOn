@@ -1459,6 +1459,14 @@ struct CalendarScreen: View {
         guard isCalendarTabSelected else { return }
         sanitizeBusinessCalendarFilterIfNeeded()
         scheduleCalendarProGamesDeferredRefresh(reason: "calendar_scene_active")
+        guard !shouldDeferCalendarPickupRefreshAfterTabPreload() else {
+            AppPerfDebug.refreshSkipped(
+                tab: "calendar",
+                source: "pickupSources",
+                reason: "foregroundTabPreloadRecentOrInFlight"
+            )
+            return
+        }
         refreshCalendarPickupSourcesIfNeeded(reason: "calendar_scene_active")
     }
 

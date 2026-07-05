@@ -144,6 +144,7 @@ final class BootstrapLoadingCoordinator: ObservableObject {
         viewModel: MapViewModel,
         chatViewModel: ChatViewModel
     ) {
+        LaunchBootstrapState.markBootstrapWarmPreloadScheduled()
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 350_000_000)
             LaunchWarmPreloadCoordinator.shared.beginIfNeeded(

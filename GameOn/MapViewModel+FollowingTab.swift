@@ -221,16 +221,28 @@ extension MapViewModel {
             let activeServerGoingEventIDs = mergedServerEventIDs.subtracting(localInterestedOnly)
             let localInterestedOnlyIDs = localInterestedOnly
 
+            var resolvedBarsById = barsById
+            let referencedVenueIds = Set(allDisplayEventIDs.compactMap { eventRowsByID[$0]?.venue_id })
+            let missingVenueIds = referencedVenueIds.subtracting(resolvedBarsById.keys)
+            if !missingVenueIds.isEmpty {
+                let extraBars = try await fetchBarsForFavoriteVenueIDs(Array(missingVenueIds))
+                for bar in extraBars {
+                    resolvedBarsById[bar.id] = bar
+                }
+            }
+
             var goingItems: [FollowingGoingDisplayItem] = []
             goingItems.reserveCapacity(eventRowsByID.count)
+            var nameFetchCache: [String: BarVenue] = [:]
 
             for id in allDisplayEventIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
                 guard let row = eventRowsByID[id] else { continue }
 
                 let bar = try await resolveBarForFollowingVenueEvent(
                     row: row,
-                    barsById: barsById,
-                    savedBars: savedBars
+                    barsById: resolvedBarsById,
+                    savedBars: savedBars,
+                    nameFetchCache: &nameFetchCache
                 )
                 let userHasServerInterestRow = activeServerGoingEventIDs.contains(id)
                 let attendeeCount = totals[id] ?? 0
@@ -253,9 +265,13 @@ extension MapViewModel {
 
             let finalFollowingItemsCount = goingItems.count
 
-            followingTabGoingItems = goingItems
-            followingTabGoingInterestCounts = totals
-            followingTabUserVenueEventInterestIDs = activeServerGoingEventIDs
+            applyFollowingTabVenuePlanSnapshot(
+                FollowingTabVenuePlanSnapshot(
+                    goingItems: goingItems,
+                    interestCounts: totals,
+                    userVenueEventInterestIDs: activeServerGoingEventIDs
+                )
+            )
             await reconcileGameRemindersAfterFollowingRefresh()
 
 #if DEBUG
@@ -281,6 +297,19 @@ extension MapViewModel {
     }
 
     // MARK: - Private helpers
+
+    private struct FollowingTabVenuePlanSnapshot {
+        let goingItems: [FollowingGoingDisplayItem]
+        let interestCounts: [UUID: Int]
+        let userVenueEventInterestIDs: Set<UUID>
+    }
+
+    @MainActor
+    private func applyFollowingTabVenuePlanSnapshot(_ snapshot: FollowingTabVenuePlanSnapshot) {
+        followingTabGoingItems = snapshot.goingItems
+        followingTabGoingInterestCounts = snapshot.interestCounts
+        followingTabUserVenueEventInterestIDs = snapshot.userVenueEventInterestIDs
+    }
 
     private func fetchOrderedFavoriteVenueIDs(userEmail: String) async throws -> [UUID] {
         let rows: [FavoriteVenueRow] = try await supabase
@@ -335,7 +364,8 @@ extension MapViewModel {
     private func resolveBarForFollowingVenueEvent(
         row: VenueEventRow,
         barsById: [UUID: BarVenue],
-        savedBars: [BarVenue]
+        savedBars: [BarVenue],
+        nameFetchCache: inout [String: BarVenue]
     ) async throws -> BarVenue {
         if let vid = row.venue_id {
             if let b = barsById[vid] {
@@ -369,9 +399,23 @@ extension MapViewModel {
             }
         }
 
-        if let venueRow = try await fetchVenueRowForFollowing(ownerEmail: owner.isEmpty ? nil : owner, venueName: venueName) {
-            let (bars, _) = DiscoverVenueLoadAssembler.buildMappedBars(venueRows: [venueRow], fetchedVenueEventRows: [])
-            if let b = bars.first { return b }
+        if !venueName.isEmpty {
+            let cacheKey = "\(venueName.lowercased())|\(owner)"
+            if let cached = nameFetchCache[cacheKey] {
+                return cached
+            }
+
+            if let venueRow = try await fetchVenueRowForFollowing(ownerEmail: owner.isEmpty ? nil : owner, venueName: venueName) {
+                let (bars, _) = DiscoverVenueLoadAssembler.buildMappedBars(venueRows: [venueRow], fetchedVenueEventRows: [])
+                if let b = bars.first {
+                    nameFetchCache[cacheKey] = b
+                    return b
+                }
+            }
+
+            let placeholder = Self.placeholderBarForFollowing(event: row)
+            nameFetchCache[cacheKey] = placeholder
+            return placeholder
         }
 
         return Self.placeholderBarForFollowing(event: row)

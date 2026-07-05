@@ -46,6 +46,10 @@ extension MapViewModel {
             await refreshLiveMatchesForLiveTab(forceRefresh: true)
             return
         }
+        if liveMatchesAreFreshForTabPreload(within: 90) {
+            TabPerf.refreshSkipped(name: "liveMatches", reason: "activationFresh")
+            return
+        }
         if let last = LiveTabActivationRefreshDedup.lastRequestAt,
            Date().timeIntervalSince(last) < LiveTabActivationRefreshDedup.interval {
             TabPerf.refreshSkipped(name: "liveMatches", reason: "activationDedup")

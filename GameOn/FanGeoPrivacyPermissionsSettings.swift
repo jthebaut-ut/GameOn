@@ -31,9 +31,11 @@ enum FanGeoPrivacyPermissionsStatusReader {
         let notification = await notificationDisplayState()
         let ads = personalizedAdsDisplayState()
 
+#if DEBUG
         print("[PrivacySettingsDebug] locationStatus=\(location.debugToken)")
         print("[PrivacySettingsDebug] notificationStatus=\(notification.debugToken)")
         print("[PrivacySettingsDebug] adsStatus=\(ads.debugToken)")
+#endif
 
         return FanGeoPrivacyPermissionsSnapshot(
             locationStatusLabel: location.label,

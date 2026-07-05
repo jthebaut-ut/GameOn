@@ -12,10 +12,12 @@ enum DMRealtimeDiagnostics {
         return f
     }()
 
-    /// Lightweight DM realtime trace kept in all builds so TestFlight/device-console runs can verify subscriptions.
+    /// DM realtime trace (DEBUG only — avoids Release hot-path console I/O).
     static func debug(_ fields: String) {
+#if DEBUG
         let wall = isoFormatter.string(from: Date())
         print("[DMRealtimeDebug] \(fields) wall=\(wall)")
+#endif
     }
 
     /// Extra key=value fields only; prefix and timestamps are added automatically.

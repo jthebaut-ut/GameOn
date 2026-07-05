@@ -6,6 +6,7 @@ enum LaunchBootstrapState {
     private(set) static var didCompleteCriticalBootstrap = false
     private(set) static var didRunLaunchDiscoverCoreRefresh = false
     private(set) static var didStartWarmPreload = false
+    private(set) static var didBootstrapScheduleWarmPreload = false
     private(set) static var didBecomeAppReady = false
 
     static func markCriticalBootstrapCompleted() {
@@ -30,11 +31,16 @@ enum LaunchBootstrapState {
         return true
     }
 
+    static func markBootstrapWarmPreloadScheduled() {
+        didBootstrapScheduleWarmPreload = true
+    }
+
 #if DEBUG
     static func resetForTesting() {
         didCompleteCriticalBootstrap = false
         didRunLaunchDiscoverCoreRefresh = false
         didStartWarmPreload = false
+        didBootstrapScheduleWarmPreload = false
         didBecomeAppReady = false
     }
 #endif

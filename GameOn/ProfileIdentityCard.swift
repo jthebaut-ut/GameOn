@@ -135,6 +135,8 @@ struct ProfileIdentityCard: View {
     private static let incomingPokesLiveRefreshIntervalSeconds = 20
     private static let incomingPokesLiveRefreshIntervalNs: UInt64 =
         UInt64(incomingPokesLiveRefreshIntervalSeconds) * 1_000_000_000
+    /// Yields the first Account-tab paint before non-critical profile network extras.
+    private static let profileExtrasFirstPaintDeferNanoseconds: UInt64 = 400_000_000
     private static let profileHeroAvatarDiameter: CGFloat = 126
     private static let profileHeroAvatarRingWidth: CGFloat = 4
     private static let profileHeroAvatarOuterPadding: CGFloat = 4
@@ -441,7 +443,9 @@ struct ProfileIdentityCard: View {
 #if DEBUG
                 print("[SettingsPerf] profileIdentityCard appear isAccountTabActive=\(isAccountTabActive)")
 #endif
+#if DEBUG
                 print("[SponsoredPlacementDebug] profileIdentityCardAppeared=true isAccountTabActive=\(isAccountTabActive)")
+#endif
 #if DEBUG
                 print("[FanUpdatesStoreMigrationDebug] ProfileIdentityReadsStore=true")
                 print("[ProfileIdentityCardDebug] layout=modern_light_social_profile")
@@ -485,10 +489,16 @@ struct ProfileIdentityCard: View {
                 await loadProfileStatsIfNeeded()
             }
             .task(id: sponsoredPlacementLoadToken) {
+#if DEBUG
                 print("[SponsoredPlacementDebug] profileTaskStarted=true token=\(sponsoredPlacementLoadToken)")
+#endif
+                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
+                guard !Task.isCancelled, isAccountTabActive else { return }
                 await loadSponsoredProfileRecommendation(reason: "profileTask")
                 if Task.isCancelled {
+#if DEBUG
                     print("[SponsoredPlacementDebug] taskCancelledAfterLoader=true reason=profileTask")
+#endif
                 }
             }
             .sheet(isPresented: $showSponsoredPromotionSupportSheet) {
@@ -548,6 +558,8 @@ struct ProfileIdentityCard: View {
 #endif
                     return
                 }
+                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
+                guard !Task.isCancelled, isAccountTabActive else { return }
 #if DEBUG
                 print("[PerfPhase1C] profileLoadStarted reason=accountTabVisible")
 #endif
@@ -556,6 +568,7 @@ struct ProfileIdentityCard: View {
             }
             .task(id: pokesLiveRefreshLoopToken) {
                 guard isAccountTabActive else { return }
+                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
                 while !Task.isCancelled {
                     do {
                         try await Task.sleep(nanoseconds: Self.incomingPokesLiveRefreshIntervalNs)
@@ -568,11 +581,15 @@ struct ProfileIdentityCard: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else {
+#if DEBUG
                     print("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=scenePhaseInactive phase=\(String(describing: phase))")
+#endif
                     return
                 }
                 guard isAccountTabActive else {
+#if DEBUG
                     print("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=accountTabInactive")
+#endif
                     return
                 }
                 Task {

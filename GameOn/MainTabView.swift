@@ -233,11 +233,6 @@ struct MainTabView: View {
                 reason: "mainTabOnAppear"
             )
 
-            LaunchWarmPreloadCoordinator.shared.beginIfNeeded(
-                viewModel: viewModel,
-                chatViewModel: chatViewModel,
-                accountTabVisible: selectedTab == .account
-            )
             schedulePostAuthBadgeRefresh(reason: "mainTabOnAppear")
         }
         .animation(.spring(response: 0.38, dampingFraction: 0.88), value: chatViewModel.hidesFloatingTabBarForDirectChat)
@@ -257,11 +252,18 @@ struct MainTabView: View {
                     chatViewModel: chatViewModel
                 )
             }
-            LaunchWarmPreloadCoordinator.shared.beginIfNeeded(
-                viewModel: viewModel,
-                chatViewModel: chatViewModel,
-                accountTabVisible: selectedTab == .account
-            )
+            if performsInitialBootstrap,
+               !LaunchBootstrapState.didBootstrapScheduleWarmPreload {
+                LaunchWarmPreloadCoordinator.shared.beginIfNeeded(
+                    viewModel: viewModel,
+                    chatViewModel: chatViewModel,
+                    accountTabVisible: selectedTab == .account
+                )
+                UserPreferencesWarmCacheCoordinator.shared.beginIfNeeded(
+                    viewModel: viewModel,
+                    delayMs: 1_400
+                )
+            }
             schedulePostAuthBadgeRefresh(reason: "criticalBootstrapCompleted")
             scheduleDeferredChatSocialRealtimeStartupIfNeeded()
         }
