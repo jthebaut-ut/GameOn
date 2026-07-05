@@ -2679,6 +2679,17 @@ struct DiscoverScreen: View {
         mapVenueReloadDelta(from: previous, to: new).isMeaningful
     }
 
+    /// True when MapKit re-reports a region that differs only by float / sub-pixel settle noise.
+    /// Thresholds are far below venue reload (4 mi / 20% span) and any intentional pan or zoom.
+    private func discoverCameraRegionIsEffectivelyIdentical(_ previous: MKCoordinateRegion, _ reported: MKCoordinateRegion) -> Bool {
+        let centerMeters = MapViewModel.distanceMeters(from: previous.center, to: reported.center)
+        let prevLatSpan = max(previous.span.latitudeDelta, 1e-9)
+        let prevLonSpan = max(previous.span.longitudeDelta, 1e-9)
+        let spanLatRatio = abs(previous.span.latitudeDelta - reported.span.latitudeDelta) / prevLatSpan
+        let spanLonRatio = abs(previous.span.longitudeDelta - reported.span.longitudeDelta) / prevLonSpan
+        return centerMeters < 3.0 && spanLatRatio < 0.0005 && spanLonRatio < 0.0005
+    }
+
     private func mapVenueReloadDelta(from previous: MKCoordinateRegion, to new: MKCoordinateRegion) -> (
         isMeaningful: Bool,
         distanceMovedMiles: Double,
@@ -3916,7 +3927,12 @@ struct DiscoverScreen: View {
         .onMapCameraChange(frequency: .onEnd) { context in
             dismissDiscoverSearchKeyboard()
             viewModel.visibleLatitudeDelta = context.region.span.latitudeDelta
-            viewModel.cameraPosition = .region(context.region)
+            let shouldWriteCameraPosition = viewModel.cameraPosition.region.map { currentRegion in
+                !discoverCameraRegionIsEffectivelyIdentical(currentRegion, context.region)
+            } ?? true
+            if shouldWriteCameraPosition {
+                viewModel.cameraPosition = .region(context.region)
+            }
             rebuildDiscoverAnnotationCache(reason: "cameraEnd")
 
             let region = context.region

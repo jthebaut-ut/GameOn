@@ -12,11 +12,23 @@ final class PushNotificationRegistrationService {
     private static let deviceTokenDefaultsKey = "gameon.apnsDeviceToken.v1"
     private static let environmentDefaultsKey = "gameon.apnsEnvironment.v1"
 
+    /// Skips duplicate foreground lifecycle refresh after launch/foreground already ran this process.
+    private var didCompleteLifecyclePushTokenRefresh = false
+
     private init() {}
 
     func refreshPushTokenRegistration(reason: String) async {
+        if reason == "foreground", didCompleteLifecyclePushTokenRefresh {
+            print("[PushTokenDebug] refreshSkipped reason=foreground alreadyRefreshedThisSession=true")
+            return
+        }
+
         await upsertCurrentTokenIfPossible(reason: reason)
         await registerForRemoteNotificationsIfAuthorized(reason: reason)
+
+        if reason == "appLaunch" || reason == "foreground" {
+            didCompleteLifecyclePushTokenRefresh = true
+        }
     }
 
     func registerForRemoteNotificationsIfAuthorized(reason: String) async {
@@ -101,6 +113,7 @@ final class PushNotificationRegistrationService {
     }
 
     func deleteCurrentTokenForCurrentSession(reason: String) async {
+        didCompleteLifecyclePushTokenRefresh = false
         guard let token = Self.storedToken, !token.isEmpty else { return }
         guard let session = try? await supabase.auth.session else { return }
         let userID = session.user.id

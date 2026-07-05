@@ -130,6 +130,7 @@ nonisolated enum ImageCacheDebug {
         inFlightJoin: Bool,
         source: String = "DiscoverMapImageCache"
     ) {
+#if DEBUG
         let identity = diagnosticIdentity(for: url, bucket: bucket)
         lock.lock()
         lookupCount += 1
@@ -163,6 +164,7 @@ nonisolated enum ImageCacheDebug {
         if networkFetch, url.absoluteString != identity.normalizedURL {
             trace("[ImageCacheDebug] versionedDisplayURL=true rawURL=\(url.absoluteString)")
         }
+#endif
     }
 
     static func logInFlightJoin(
