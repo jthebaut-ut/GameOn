@@ -109,6 +109,8 @@ struct ProfileIdentityCard: View {
     @State private var showClearAllPokesConfirmation = false
     @State private var suggestedFans: [FriendSuggestionProfile] = []
     @State private var isLoadingSuggestedFans = false
+    @State private var hasCompletedSuggestedFansLoad = false
+    @State private var suggestedFansLoadStartedAt: Date?
     @State private var suggestedFansMessage: String?
     @State private var sendingSuggestedFanRequestIds: Set<UUID> = []
     @State private var profileStatsCounts: ProfileStatsCounts?
@@ -385,7 +387,7 @@ struct ProfileIdentityCard: View {
         if shouldBlockFanIdentityCardForBusiness {
             EmptyView()
                 .onAppear {
-                    print("[SponsoredPlacementDebug] profileIdentityCardBypassed=true reason=businessProfileContext")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] profileIdentityCardBypassed=true reason=businessProfileContext")
 #if DEBUG
                     print("[BusinessDashboardCleanup] FAN_LEVEL_CARD_BLOCKED_FOR_BUSINESS")
 #endif
@@ -439,12 +441,13 @@ struct ProfileIdentityCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
             .overlay(cardBorder)
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.06), radius: 14, y: 8)
+            .profileReadableContentWidth()
             .onAppear {
 #if DEBUG
                 print("[SettingsPerf] profileIdentityCard appear isAccountTabActive=\(isAccountTabActive)")
 #endif
 #if DEBUG
-                print("[SponsoredPlacementDebug] profileIdentityCardAppeared=true isAccountTabActive=\(isAccountTabActive)")
+                SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] profileIdentityCardAppeared=true isAccountTabActive=\(isAccountTabActive)")
 #endif
 #if DEBUG
                 print("[FanUpdatesStoreMigrationDebug] ProfileIdentityReadsStore=true")
@@ -463,6 +466,9 @@ struct ProfileIdentityCard: View {
 #if DEBUG
                 print("[ProfileBioDebug] identityCardDisplayedBio=\(newValue.trimmingCharacters(in: .whitespacesAndNewlines))")
 #endif
+            }
+            .onChange(of: viewModel.currentUserAuthId) { _, _ in
+                resetSuggestedFansLoadStateForAuthChange()
             }
             .onChange(of: isAccountTabActive) { _, isActive in
                 if isActive {
@@ -490,14 +496,14 @@ struct ProfileIdentityCard: View {
             }
             .task(id: sponsoredPlacementLoadToken) {
 #if DEBUG
-                print("[SponsoredPlacementDebug] profileTaskStarted=true token=\(sponsoredPlacementLoadToken)")
+                SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] profileTaskStarted=true token=\(sponsoredPlacementLoadToken)")
 #endif
                 try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
                 guard !Task.isCancelled, isAccountTabActive else { return }
                 await loadSponsoredProfileRecommendation(reason: "profileTask")
                 if Task.isCancelled {
 #if DEBUG
-                    print("[SponsoredPlacementDebug] taskCancelledAfterLoader=true reason=profileTask")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] taskCancelledAfterLoader=true reason=profileTask")
 #endif
                 }
             }
@@ -563,6 +569,7 @@ struct ProfileIdentityCard: View {
 #if DEBUG
                 print("[PerfPhase1C] profileLoadStarted reason=accountTabVisible")
 #endif
+                primeSuggestedFansLoadingStateIfNeeded()
                 await refreshIncomingPokesLive(reason: "accountVisible")
                 await loadSuggestedFans()
             }
@@ -582,13 +589,13 @@ struct ProfileIdentityCard: View {
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active else {
 #if DEBUG
-                    print("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=scenePhaseInactive phase=\(String(describing: phase))")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=scenePhaseInactive phase=\(String(describing: phase))")
 #endif
                     return
                 }
                 guard isAccountTabActive else {
 #if DEBUG
-                    print("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=accountTabInactive")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] foregroundRefreshSkipped=true reason=accountTabInactive")
 #endif
                     return
                 }
@@ -1238,6 +1245,7 @@ struct ProfileIdentityCard: View {
             await Task.yield()
             guard !Task.isCancelled, isAccountTabActive else { return }
             profileBelowFoldSectionsReady = true
+            primeSuggestedFansLoadingStateIfNeeded()
 #if DEBUG
             print("[SettingsPerf] profileBelowFoldSections rendered")
 #endif
@@ -1266,14 +1274,14 @@ struct ProfileIdentityCard: View {
            Date().timeIntervalSince(loadedAt) < Self.incomingPokesFreshnessIntervalSeconds {
             let age = Date().timeIntervalSince(loadedAt)
 #if DEBUG
-            print("[TabPerfDebug] accountPokesRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
+            TabPerfDebug.log("[TabPerfDebug] accountPokesRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
 #endif
             acknowledgePokesCardAfterSuccessfulLoad()
             return
         }
 
 #if DEBUG
-        print("[TabPerfDebug] accountPokesRefreshStarted reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] accountPokesRefreshStarted reason=\(reason)")
 #endif
 
         await MainActor.run {
@@ -1305,7 +1313,7 @@ struct ProfileIdentityCard: View {
             }
             DebugLogGate.debug("[PokesUI] incoming load count=\(items.count) total=\(items.count)")
 #if DEBUG
-            print("[TabPerfDebug] accountPokesRefreshSucceeded count=\(items.count)")
+            TabPerfDebug.log("[TabPerfDebug] accountPokesRefreshSucceeded count=\(items.count)")
 #endif
         } catch {
             await MainActor.run {
@@ -1326,12 +1334,16 @@ struct ProfileIdentityCard: View {
     private var suggestedFansSection: some View {
         ProfileSuggestedFansSection(
             suggestions: displayedSuggestedFans,
-            isLoading: isLoadingSuggestedFans,
+            hasCompletedLoad: hasCompletedSuggestedFansLoad,
+            isRefreshing: isLoadingSuggestedFans && !displayedSuggestedFans.isEmpty,
             message: suggestedFansMessage,
             sendingRequestIds: sendingSuggestedFanRequestIds,
             chipKind: { chatViewModel.chipKind(forOtherUserId: $0) },
             onAdd: { suggestion in
                 Task { await addSuggestedFan(suggestion) }
+            },
+            onCancel: { suggestion in
+                Task { await cancelSuggestedFanRequest(suggestion) }
             },
             onDismiss: { suggestion in
                 Task { await dismissSuggestedFan(suggestion) }
@@ -1345,6 +1357,8 @@ struct ProfileIdentityCard: View {
                 suggestedFans = []
                 suggestedFansMessage = nil
                 isLoadingSuggestedFans = false
+                hasCompletedSuggestedFansLoad = false
+                suggestedFansLoadStartedAt = nil
                 sendingSuggestedFanRequestIds = []
             }
             return
@@ -1354,11 +1368,17 @@ struct ProfileIdentityCard: View {
            !ignoreCache,
            let loadedAt = ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId],
            Date().timeIntervalSince(loadedAt) < ProfilePhase1PersonalizationCache.ttlSeconds {
-            suggestedFans = ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] ?? suggestedFans
-            suggestedFansMessage = nil
-            isLoadingSuggestedFans = false
+            let cached = ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] ?? []
+            await MainActor.run {
+                suggestedFans = cached
+                suggestedFansMessage = nil
+                isLoadingSuggestedFans = false
+                hasCompletedSuggestedFansLoad = true
+                suggestedFansLoadStartedAt = nil
+            }
 #if DEBUG
             print("[PerfPhase1C] profileCacheHit key=suggestedFans")
+            SuggestedFansDebug.loadingFinished(count: cached.count)
 #endif
             return
         }
@@ -1367,6 +1387,10 @@ struct ProfileIdentityCard: View {
         print("[SuggestedFansUI] load start")
 #endif
         await MainActor.run {
+            if suggestedFansLoadStartedAt == nil {
+                suggestedFansLoadStartedAt = Date()
+                SuggestedFansDebug.loadingStarted()
+            }
             isLoadingSuggestedFans = true
             suggestedFansMessage = nil
         }
@@ -1375,28 +1399,31 @@ struct ProfileIdentityCard: View {
             let suggestions = try await friendSuggestionsService.fetchSuggestions(
                 limit: Self.suggestedFansFetchLimit
             )
-            let previewsById = (try? await socialIdentityService.fetchUserPreviews(
+            let profileRowsById = await SuggestedFansEligibility.fetchProfileRows(
                 for: suggestions.map(\.userID)
-            )) ?? [:]
-            let filteredSuggestions = suggestions.filter { suggestion in
-                let suggestionEmail = OwnerBusinessEmail.normalized(suggestion.email ?? "")
-                if Self.isDeletedSuggestionIdentity(email: suggestionEmail) {
-                    return false
-                }
-                guard let preview = previewsById[suggestion.userID] else {
-                    return true
-                }
-                let previewEmail = OwnerBusinessEmail.normalized(preview.email ?? "")
-                return !preview.isDeleted && !Self.isDeletedSuggestionIdentity(email: previewEmail)
-            }
+            )
+            let filteredSuggestions = await SuggestedFansEligibility.filterSuggestions(
+                suggestions,
+                viewerId: viewModel.currentUserAuthId,
+                profileRowsById: profileRowsById,
+                isBlocked: { chatViewModel.isEitherDirectionBlocked(with: $0) }
+            )
             await MainActor.run {
+                let startedAt = suggestedFansLoadStartedAt
                 suggestedFans = filteredSuggestions
                 suggestedFansMessage = nil
                 isLoadingSuggestedFans = false
+                hasCompletedSuggestedFansLoad = true
                 if let authId = viewModel.currentUserAuthId {
                     ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId] = Date()
                     ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] = filteredSuggestions
                 }
+                if let startedAt, !filteredSuggestions.isEmpty {
+                    let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+                    SuggestedFansDebug.firstContentVisibleMs(ms)
+                }
+                suggestedFansLoadStartedAt = nil
+                SuggestedFansDebug.loadingFinished(count: filteredSuggestions.count)
             }
 #if DEBUG
             print("[SuggestedFansUI] load success count=\(filteredSuggestions.count)")
@@ -1406,6 +1433,9 @@ struct ProfileIdentityCard: View {
                 suggestedFans = []
                 suggestedFansMessage = "More fan matches coming soon"
                 isLoadingSuggestedFans = false
+                hasCompletedSuggestedFansLoad = true
+                suggestedFansLoadStartedAt = nil
+                SuggestedFansDebug.loadingFinished(count: 0)
             }
 #if DEBUG
             print("[SuggestedFansUI] load failed error=\(error.localizedDescription)")
@@ -1413,9 +1443,61 @@ struct ProfileIdentityCard: View {
         }
     }
 
-    private static func isDeletedSuggestionIdentity(email raw: String) -> Bool {
-        let email = OwnerBusinessEmail.normalized(raw)
-        return email.hasPrefix("deleted-user-") || email.contains("@deleted.fangeo.local")
+    @MainActor
+    private func primeSuggestedFansLoadingStateIfNeeded() {
+        guard canShowSuggestedFans else { return }
+
+        if let authId = viewModel.currentUserAuthId {
+            let cached = ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] ?? []
+            let isFresh = ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId].map {
+                Date().timeIntervalSince($0) < ProfilePhase1PersonalizationCache.ttlSeconds
+            } ?? false
+
+            if isFresh {
+                if suggestedFans.isEmpty {
+                    suggestedFans = cached
+                }
+                isLoadingSuggestedFans = false
+                hasCompletedSuggestedFansLoad = true
+                suggestedFansLoadStartedAt = nil
+#if DEBUG
+                SuggestedFansDebug.loadingFinished(count: cached.count)
+#endif
+                return
+            }
+
+            if !cached.isEmpty {
+                if suggestedFans.isEmpty {
+                    suggestedFans = cached
+                }
+                hasCompletedSuggestedFansLoad = true
+                if suggestedFansLoadStartedAt == nil {
+                    suggestedFansLoadStartedAt = Date()
+                    SuggestedFansDebug.loadingStarted()
+                }
+                isLoadingSuggestedFans = true
+                suggestedFansMessage = nil
+                return
+            }
+        }
+
+        guard !hasCompletedSuggestedFansLoad, suggestedFans.isEmpty else { return }
+        if suggestedFansLoadStartedAt == nil {
+            suggestedFansLoadStartedAt = Date()
+            SuggestedFansDebug.loadingStarted()
+        }
+        isLoadingSuggestedFans = true
+        suggestedFansMessage = nil
+    }
+
+    @MainActor
+    private func resetSuggestedFansLoadStateForAuthChange() {
+        hasCompletedSuggestedFansLoad = false
+        suggestedFansLoadStartedAt = nil
+        suggestedFans = []
+        isLoadingSuggestedFans = false
+        suggestedFansMessage = nil
+        sendingSuggestedFanRequestIds = []
     }
 
     private func addSuggestedFan(_ suggestion: FriendSuggestionProfile) async {
@@ -1432,6 +1514,14 @@ struct ProfileIdentityCard: View {
         await MainActor.run {
             _ = sendingSuggestedFanRequestIds.remove(suggestion.userID)
         }
+    }
+
+    private func cancelSuggestedFanRequest(_ suggestion: FriendSuggestionProfile) async {
+        guard canShowSuggestedFans else { return }
+#if DEBUG
+        print("[SuggestedFansUI] cancel request tapped user_id=\(suggestion.userID.uuidString.lowercased())")
+#endif
+        await chatViewModel.cancelOutgoingFriendRequest(to: suggestion.userID)
     }
 
     @MainActor
@@ -1531,22 +1621,22 @@ struct ProfileIdentityCard: View {
     }
 
     private func loadSponsoredProfileRecommendation(reason: String) async {
-        print("[SponsoredPlacementDebug] loaderStarted=true reason=\(reason) isAccountTabActive=\(isAccountTabActive) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") taskCancelled=\(Task.isCancelled)")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] loaderStarted=true reason=\(reason) isAccountTabActive=\(isAccountTabActive) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") taskCancelled=\(Task.isCancelled)")
         guard !Task.isCancelled else {
-            print("[SponsoredPlacementDebug] exclusionReason=taskCancelledBeforeFetch reason=\(reason)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=taskCancelledBeforeFetch reason=\(reason)")
             return
         }
         guard isAccountTabActive else {
-            print("[SponsoredPlacementDebug] exclusionReason=accountTabInactive")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=accountTabInactive")
             return
         }
         guard viewModel.isLoggedIn else {
-            print("[SponsoredPlacementDebug] exclusionReason=noAuthSession")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=noAuthSession")
             sponsoredProfileRecommendation = nil
             return
         }
         guard viewModel.currentUserAuthId != nil || !viewModel.currentUserEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            print("[SponsoredPlacementDebug] exclusionReason=noAuthSession authId=nil emailEmpty=true")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=noAuthSession authId=nil emailEmpty=true")
             sponsoredProfileRecommendation = nil
             return
         }
@@ -1555,7 +1645,7 @@ struct ProfileIdentityCard: View {
 
         let userLocation = await currentSponsoredPlacementUserLocation(reason: "profileRecommendationLoad")
         guard !Task.isCancelled else {
-            print("[SponsoredPlacementDebug] exclusionReason=taskCancelledAfterLocation reason=\(reason)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=taskCancelledAfterLocation reason=\(reason)")
             return
         }
         let locationTargets = await sponsoredProfileResolvedLocationTargets(userLocation: userLocation)
@@ -1568,7 +1658,7 @@ struct ProfileIdentityCard: View {
                 userLocation: userLocation
             )
             if Task.isCancelled {
-                print("[SponsoredPlacementDebug] exclusionReason=taskCancelledAfterQuery reason=\(reason)")
+                SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=taskCancelledAfterQuery reason=\(reason)")
                 return
             }
             await MainActor.run {
@@ -1590,9 +1680,9 @@ struct ProfileIdentityCard: View {
             await MainActor.run {
                 sponsoredProfileRecommendation = nil
                 if error is CancellationError {
-                    print("[SponsoredPlacementDebug] exclusionReason=taskCancelledDuringFetch reason=\(reason)")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=taskCancelledDuringFetch reason=\(reason)")
                 } else {
-                    print("[SponsoredPlacementDebug] exclusionReason=loadFailed error=\(error.localizedDescription)")
+                    SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=loadFailed error=\(error.localizedDescription)")
                 }
 #if DEBUG
                 print("[SponsoredProfileDebug] source=none")
@@ -1605,26 +1695,26 @@ struct ProfileIdentityCard: View {
 
     private func beginSponsoredPlacementLoadIfAllowed(reason: String) -> Bool {
         if isSponsoredProfilePlacementLoading {
-            print("[SponsoredPlacementDebug] exclusionReason=alreadyLoading reason=\(reason)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=alreadyLoading reason=\(reason)")
             return false
         }
 
         let now = Date()
         if let lastSponsoredProfilePlacementRefreshAt,
            now.timeIntervalSince(lastSponsoredProfilePlacementRefreshAt) < Self.sponsoredPlacementRefreshDebounceSeconds {
-            print("[SponsoredPlacementDebug] exclusionReason=skippedDueToRefreshDebounce reason=\(reason) elapsed=\(String(format: "%.2f", now.timeIntervalSince(lastSponsoredProfilePlacementRefreshAt)))")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=skippedDueToRefreshDebounce reason=\(reason) elapsed=\(String(format: "%.2f", now.timeIntervalSince(lastSponsoredProfilePlacementRefreshAt)))")
             return false
         }
 
         isSponsoredProfilePlacementLoading = true
         lastSponsoredProfilePlacementRefreshAt = now
-        print("[SponsoredPlacementDebug] loadAllowed=true reason=\(reason)")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] loadAllowed=true reason=\(reason)")
         return true
     }
 
     private func finishSponsoredPlacementLoad(reason: String) {
         isSponsoredProfilePlacementLoading = false
-        print("[SponsoredPlacementDebug] loaderFinished=true reason=\(reason)")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] loaderFinished=true reason=\(reason)")
     }
 
     private func currentSponsoredPlacementUserLocation(reason: String) async -> CLLocationCoordinate2D? {
@@ -1644,11 +1734,11 @@ struct ProfileIdentityCard: View {
             logSponsoredPlacementUserLocation(homeCrowdCoordinate, source: "homeCrowdVenue", reason: reason)
             return homeCrowdCoordinate
         } else if viewModel.currentUserHomeCrowdVenueId != nil {
-            print("[SponsoredPlacementDebug] exclusionReason=missingVenue reason=homeCrowdVenueCoordinateUnavailable venueId=\(viewModel.currentUserHomeCrowdVenueId?.uuidString.lowercased() ?? "nil")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=missingVenue reason=homeCrowdVenueCoordinateUnavailable venueId=\(viewModel.currentUserHomeCrowdVenueId?.uuidString.lowercased() ?? "nil")")
         }
 
         logSponsoredPlacementUserLocation(nil, source: refreshed ? "deviceLocationInvalid" : "noAuthorizedDeviceLocation", reason: reason)
-        print("[SponsoredPlacementDebug] exclusionReason=missingLocation reason=\(refreshed ? "deviceLocationInvalid" : "noAuthorizedDeviceLocation")")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=missingLocation reason=\(refreshed ? "deviceLocationInvalid" : "noAuthorizedDeviceLocation")")
         return nil
     }
 
@@ -1681,12 +1771,12 @@ struct ProfileIdentityCard: View {
             country = await reverseGeocodeSponsoredPlacementCountry(for: userLocation)
         }
 
-        print("[SponsoredPlacementDebug] targetCity=\(city ?? "nil") targetState=\(state ?? "nil") targetCountry=\(country ?? "nil")")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] targetCity=\(city ?? "nil") targetState=\(state ?? "nil") targetCountry=\(country ?? "nil")")
         return (city, state, country)
     }
 
     private func reverseGeocodeSponsoredPlacementCountry(for _: CLLocationCoordinate2D) async -> String? {
-        print("[SponsoredPlacementDebug] countrySource=defaultCountryCodeForCurrentDevice")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] countrySource=defaultCountryCodeForCurrentDevice")
         return BusinessLocationCountryPolicy.defaultCountryCode
     }
 
@@ -1695,7 +1785,7 @@ struct ProfileIdentityCard: View {
         userLocation: CLLocationCoordinate2D?
     ) -> SponsoredProfileVenueRecommendation? {
         guard !paidPlacements.isEmpty else {
-            print("[SponsoredPlacementDebug] exclusionReason=noActivePlacementReturned")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=noActivePlacementReturned")
             print("[SponsoredPlacementRotation] eligibleCount=0")
             return nil
         }
@@ -1704,15 +1794,15 @@ struct ProfileIdentityCard: View {
 
         for paidPlacement in paidPlacements {
             let eligibility = paidPlacement.regionalEligibility(for: userLocation, now: now)
-            print("[SponsoredPlacementDebug] placementId=\(paidPlacement.placementID.uuidString.lowercased())")
-            print("[SponsoredPlacementDebug] venueId=\(paidPlacement.venue.id.uuidString.lowercased()) venueName=\(paidPlacement.venue.name)")
-            print("[SponsoredPlacementDebug] starts_at=\(paidPlacement.startsAtRaw ?? "nil") ends_at=\(paidPlacement.endsAtRaw ?? "nil") currentTime=\(Self.sponsoredPlacementDebugDateFormatter.string(from: now))")
-            print("[SponsoredPlacementDebug] userLat=\(userLocation.map { "\($0.latitude)" } ?? "nil") userLng=\(userLocation.map { "\($0.longitude)" } ?? "nil")")
-            print("[SponsoredPlacementDebug] radiusCheck=\(eligibility.isEligible) distanceMiles=\(eligibility.distanceMiles.map { String(format: "%.2f", $0) } ?? "nil") radiusMiles=\(paidPlacement.targetRadiusMiles.map { "\($0)" } ?? "nil")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] placementId=\(paidPlacement.placementID.uuidString.lowercased())")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] venueId=\(paidPlacement.venue.id.uuidString.lowercased()) venueName=\(paidPlacement.venue.name)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] starts_at=\(paidPlacement.startsAtRaw ?? "nil") ends_at=\(paidPlacement.endsAtRaw ?? "nil") currentTime=\(Self.sponsoredPlacementDebugDateFormatter.string(from: now))")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] userLat=\(userLocation.map { "\($0.latitude)" } ?? "nil") userLng=\(userLocation.map { "\($0.longitude)" } ?? "nil")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] radiusCheck=\(eligibility.isEligible) distanceMiles=\(eligibility.distanceMiles.map { String(format: "%.2f", $0) } ?? "nil") radiusMiles=\(paidPlacement.targetRadiusMiles.map { "\($0)" } ?? "nil")")
             if eligibility.isEligible {
                 eligiblePlacements.append(paidPlacement)
             } else {
-                print("[SponsoredPlacementDebug] exclusionReason=\(eligibility.reason)")
+                SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=\(eligibility.reason)")
             }
         }
 
@@ -1849,14 +1939,14 @@ struct ProfileIdentityCard: View {
 
     private func refreshSponsoredProfilePlacement(reason: String) {
         Task {
-            print("[SponsoredPlacementDebug] refreshRequested reason=\(reason)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] refreshRequested reason=\(reason)")
             await loadSponsoredProfileRecommendation(reason: reason)
         }
     }
 
     private func logSponsoredPlacementUserLocation(_ location: CLLocationCoordinate2D?, source: String, reason: String) {
-        print("[SponsoredPlacementDebug] locationSource=\(source) reason=\(reason)")
-        print("[SponsoredPlacementDebug] userLat=\(location.map { "\($0.latitude)" } ?? "nil") userLng=\(location.map { "\($0.longitude)" } ?? "nil")")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] locationSource=\(source) reason=\(reason)")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] userLat=\(location.map { "\($0.latitude)" } ?? "nil") userLng=\(location.map { "\($0.longitude)" } ?? "nil")")
     }
 
     private func organicProfileRecommendation() -> SponsoredProfileVenueRecommendation? {
@@ -2656,18 +2746,9 @@ struct ProfileIdentityCard: View {
             return
         }
 
-        let trimmed = editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let nextName = trimmed.isEmpty ? displayName : trimmed
-        if ModerationService.containsProfanity(nextName) {
-            await MainActor.run {
-                viewModel.showSocialActionToast(ModerationService.profanityRejectionUserMessage(), isError: true)
-            }
-            return
-        }
-        if let err = await viewModel.saveUserProfile(
-            displayName: nextName,
-            avatarURL: urls.fullURL,
-            avatarThumbnailURL: urls.thumbnailURL
+        if let err = await viewModel.persistUserProfileAvatar(
+            fullURL: urls.fullURL,
+            thumbnailURL: urls.thumbnailURL
         ) {
             await MainActor.run {
                 localAvatarPreviewImage = nil
@@ -3329,7 +3410,7 @@ private final class SponsoredPlacementService {
         sport: String?,
         userLocation: CLLocationCoordinate2D?
     ) async throws -> [SponsoredProfileVenueRecommendation] {
-        print("[SponsoredPlacementDebug] queryExecuting=true rpc=get_active_sponsored_placement table=public.sponsored_placements placementKey=profile_recommended_near_you country=\(normalizedTarget(country) ?? "nil") state=\(normalizedTarget(state) ?? "nil") city=\(normalizedTarget(city) ?? "nil") sport=\(normalizedTarget(sport) ?? "nil")")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] queryExecuting=true rpc=get_active_sponsored_placement table=public.sponsored_placements placementKey=profile_recommended_near_you country=\(normalizedTarget(country) ?? "nil") state=\(normalizedTarget(state) ?? "nil") city=\(normalizedTarget(city) ?? "nil") sport=\(normalizedTarget(sport) ?? "nil")")
         let rows: [SponsoredPlacementRPCRow] = try await client
             .rpc(
                 "get_active_sponsored_placement",
@@ -3344,18 +3425,18 @@ private final class SponsoredPlacementService {
             .execute()
             .value
 
-        print("[SponsoredPlacementDebug] activePlacementsFetched=\(rows.count)")
-        print("[SponsoredPlacementDebug] currentTime=\(Self.debugDateFormatter.string(from: Date()))")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] activePlacementsFetched=\(rows.count)")
+        SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] currentTime=\(Self.debugDateFormatter.string(from: Date()))")
         for row in rows {
-            print("[SponsoredPlacementDebug] placementId=\(row.id.uuidString.lowercased())")
-            print("[SponsoredPlacementDebug] venueId=\(row.venue_id.uuidString.lowercased()) venueName=\(row.venue_name ?? "nil")")
-            print("[SponsoredPlacementDebug] starts_at=\(row.starts_at ?? "nil") ends_at=\(row.ends_at ?? "nil")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] placementId=\(row.id.uuidString.lowercased())")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] venueId=\(row.venue_id.uuidString.lowercased()) venueName=\(row.venue_name ?? "nil")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] starts_at=\(row.starts_at ?? "nil") ends_at=\(row.ends_at ?? "nil")")
             print("[SponsoredPlacementRotation] placementId=\(row.id.uuidString.lowercased()) venueName=\(row.venue_name ?? "nil") priority_weight=\(row.resolvedPriorityWeight)")
         }
 
         let recommendations = rows.compactMap { $0.recommendation(userLocation: userLocation) }
         if recommendations.isEmpty {
-            print("[SponsoredPlacementDebug] exclusionReason=\(rows.isEmpty ? "rpcReturnedNoRows" : "invalidPlacementVenuePayload")")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=\(rows.isEmpty ? "rpcReturnedNoRows" : "invalidPlacementVenuePayload")")
         }
         return recommendations
     }
@@ -3449,7 +3530,7 @@ private struct SponsoredPlacementRPCRow: Decodable {
         let venueName = trimmed(venue_name)
         let placementTitle = trimmed(title)
         guard !venueName.isEmpty || !placementTitle.isEmpty else {
-            print("[SponsoredPlacementDebug] exclusionReason=missingVenue placementId=\(id.uuidString.lowercased()) venueId=\(venue_id.uuidString.lowercased())")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=missingVenue placementId=\(id.uuidString.lowercased()) venueId=\(venue_id.uuidString.lowercased())")
             return nil
         }
 
@@ -3457,7 +3538,7 @@ private struct SponsoredPlacementRPCRow: Decodable {
         let resolvedSport = sport.isEmpty ? "Sports" : sport
         let coordinate = CLLocationCoordinate2D(latitude: latitude ?? 0, longitude: longitude ?? 0)
         if !CLLocationCoordinate2DIsValid(coordinate) || (abs(coordinate.latitude) <= 0.0001 && abs(coordinate.longitude) <= 0.0001) {
-            print("[SponsoredPlacementDebug] exclusionReason=missingVenueLocation placementId=\(id.uuidString.lowercased()) venueId=\(venue_id.uuidString.lowercased()) venueName=\(venueName.isEmpty ? placementTitle : venueName)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=missingVenueLocation placementId=\(id.uuidString.lowercased()) venueId=\(venue_id.uuidString.lowercased()) venueName=\(venueName.isEmpty ? placementTitle : venueName)")
         }
         let subtitleLine = trimmed(subtitle)
         let bar = BarVenue(
@@ -4283,10 +4364,12 @@ struct SuggestedFanCard: View {
     let isSending: Bool
     let chipKind: ChatViewModel.FriendshipChipKind
     let onAdd: (FriendSuggestionProfile) -> Void
+    let onCancel: (FriendSuggestionProfile) -> Void
     let onDismiss: (FriendSuggestionProfile) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @State private var showCancelRequestConfirmation = false
 
     enum Metrics {
         static let width: CGFloat = 130
@@ -4347,6 +4430,18 @@ struct SuggestedFanCard: View {
         }
         .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.10 : 0.055), radius: 8, y: 4)
         .accessibilityElement(children: .combine)
+        .confirmationDialog(
+            "Cancel friend request?",
+            isPresented: $showCancelRequestConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Cancel Request", role: .destructive) {
+                onCancel(suggestion)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This will remove your pending request.")
+        }
     }
 
     private var avatar: some View {
@@ -4404,7 +4499,12 @@ struct SuggestedFanCard: View {
     private var addButton: some View {
         let state = buttonState
         return Button {
-            onAdd(suggestion)
+            switch chipKind {
+            case .pendingOutgoing:
+                showCancelRequestConfirmation = true
+            default:
+                onAdd(suggestion)
+            }
         } label: {
             HStack(spacing: 5) {
                 if isSending {
@@ -4581,7 +4681,7 @@ struct SuggestedFanCard: View {
             return ButtonState(
                 title: "Requested",
                 systemImage: "clock.fill",
-                isEnabled: false,
+                isEnabled: true,
                 foreground: FGColor.secondaryText(colorScheme),
                 fill: Color.white.opacity(colorScheme == .dark ? 0.07 : 0.72),
                 stroke: Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
@@ -4619,11 +4719,13 @@ struct SuggestedFanCard: View {
 
 private struct ProfileSuggestedFansSection: View {
     let suggestions: [FriendSuggestionProfile]
-    let isLoading: Bool
+    let hasCompletedLoad: Bool
+    let isRefreshing: Bool
     let message: String?
     let sendingRequestIds: Set<UUID>
     let chipKind: (UUID) -> ChatViewModel.FriendshipChipKind
     let onAdd: (FriendSuggestionProfile) -> Void
+    let onCancel: (FriendSuggestionProfile) -> Void
     let onDismiss: (FriendSuggestionProfile) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -4671,11 +4773,14 @@ private struct ProfileSuggestedFansSection: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
-            if isLoading && suggestions.isEmpty {
-                loadingRow
+            if !hasCompletedLoad && suggestions.isEmpty {
+                initialLoadingPlaceholder
             } else if suggestions.isEmpty {
                 emptyState
             } else {
+                if isRefreshing {
+                    refreshingIndicator
+                }
                 suggestionsRow
             }
         }
@@ -4714,22 +4819,31 @@ private struct ProfileSuggestedFansSection: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var loadingRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(spacing: 10) {
-                ForEach(0..<3, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color.white.opacity(colorScheme == .dark ? 0.05 : 0.72))
-                        .frame(width: CardMetrics.width, height: CardMetrics.minHeight)
-                        .redacted(reason: .placeholder)
-                }
-            }
-            .padding(.horizontal, 2)
-            .padding(.top, CardMetrics.rowTopPadding)
-            .padding(.bottom, CardMetrics.rowBottomPadding)
+    private var refreshingIndicator: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Updating suggestions…")
+                .font(.system(size: 10, weight: .medium, design: .rounded))
+                .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.88))
+            Spacer(minLength: 0)
         }
-        .frame(minHeight: CardMetrics.rowMinHeight, alignment: .top)
-        .accessibilityLabel(L10n.t("suggested_fans", languageCode: appLanguageRaw))
+        .padding(.horizontal, 2)
+        .accessibilityLabel("Updating suggestions")
+    }
+
+    private var initialLoadingPlaceholder: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finding fans near you…")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 2)
+        .padding(.vertical, 4)
+        .accessibilityLabel("Finding fans near you")
     }
 
     private var emptyState: some View {
@@ -4822,6 +4936,7 @@ private struct ProfileSuggestedFansSection: View {
             isSending: sendingRequestIds.contains(suggestion.userID),
             chipKind: chipKind(suggestion.userID),
             onAdd: onAdd,
+            onCancel: onCancel,
             onDismiss: onDismiss
         )
     }
@@ -5129,7 +5244,7 @@ private struct ProfileSuggestedFansSection: View {
             return SuggestedFanButtonState(
                 title: "Requested",
                 systemImage: "clock.fill",
-                isEnabled: false,
+                isEnabled: true,
                 foreground: FGColor.secondaryText(colorScheme),
                 fill: Color.white.opacity(colorScheme == .dark ? 0.07 : 0.72),
                 stroke: Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
