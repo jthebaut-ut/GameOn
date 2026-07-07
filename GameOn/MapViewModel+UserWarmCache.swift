@@ -207,7 +207,7 @@ extension MapViewModel {
             logUserWarmCacheSkipped(.favoriteTeamProGames, reason: reason)
             return
         }
-        guard UserDefaults.standard.bool(forKey: ProGamesFavoriteTeamAutoFollowPreference.enabledKey) else {
+        guard UserDefaults.standard.bool(forKey: ProGameNotificationPreferenceKeys.favoriteTeamAlerts) else {
             return
         }
         let teams = FavoriteTeamsStore.resolvedTeams(

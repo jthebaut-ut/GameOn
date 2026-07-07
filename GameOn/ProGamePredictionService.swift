@@ -107,6 +107,7 @@ final class ProGamePredictionService {
                 summaryCache[proGameID] = (loadedAt: Date(), userID: currentUserID, summary: summary)
                 resolved[proGameID] = summary
             }
+        } catch is CancellationError {
         } catch {
 #if DEBUG
             print("[ProGamePredictionDebug] loadSummaryFailed=\(error.localizedDescription)")

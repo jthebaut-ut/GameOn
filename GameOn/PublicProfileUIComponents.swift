@@ -215,14 +215,16 @@ struct SelfProfileOpenToPreviewGrid: View {
     let onAdd: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
-    private let columns = [
-        GridItem(.flexible(), spacing: 8),
-        GridItem(.flexible(), spacing: 8),
-        GridItem(.flexible(), spacing: 8)
-    ]
+    private var columns: [GridItem] {
+        PublicProfileSheetLayout.openToGridColumns()
+    }
+
+    private var gridMaxWidth: CGFloat {
+        PublicProfileSheetLayout.openToGridMaxWidth(itemCount: 3)
+    }
 
     var body: some View {
-        LazyVGrid(columns: columns, spacing: 8) {
+        LazyVGrid(columns: columns, alignment: .leading, spacing: PublicProfileSheetLayout.openToTileSpacing) {
             ForEach(items) { item in
                 ZStack(alignment: .topTrailing) {
                     FanOpenToCompactTile(
@@ -235,14 +237,17 @@ struct SelfProfileOpenToPreviewGrid: View {
                     removeOpenToButton(item: item)
                         .padding(5)
                 }
+                .frame(width: PublicProfileSheetLayout.openToTileWidth)
             }
 
             Button(action: onAdd) {
                 FanOpenToCompactAddTile()
             }
             .buttonStyle(.plain)
+            .frame(width: PublicProfileSheetLayout.openToTileWidth)
             .accessibilityLabel("Add Open To")
         }
+        .frame(maxWidth: gridMaxWidth, alignment: .leading)
     }
 
     private func removeOpenToButton(item: PublicProfileOpenToItem) -> some View {

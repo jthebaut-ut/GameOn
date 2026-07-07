@@ -37,18 +37,12 @@ struct LiveScreen: View {
     @AppStorage(LiveLeagueCountryFilterPreference.appStorageKey) private var liveLeagueCountryFilterRaw: String = ""
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
-    @State private var showVenueDetails = false
-    @State private var showVenueRatingSheet = false
+    @State private var activeSheet: LiveScreenActiveSheet?
     @State private var fanFeatureGateAlertMessage: String?
     @State private var liveAutoRefreshTask: Task<Void, Never>?
     @State private var liveGamesSportFilter: LiveSportVisualType?
     @State private var liveFeaturedEventFilterSlug: String?
     @State private var liveNowExpanded = false
-    @State private var liveWatchSpotsPresentation: LiveWatchSpotsPresentation?
-    @State private var fanUpdatesSheetEvent: FanUpdatesSheetEvent?
-    @State private var liveMatchDetailSelection: LiveMatch?
-    @State private var proGamePredictionSheet: ProGamePredictionSheetContext?
-    @State private var showLiveCountryFilterSheet = false
     @State private var liveNowFeedRowsExpanded = false
     @State private var liveUpcomingFeedRowsExpanded = false
     @State private var liveActivationRefreshTask: Task<Void, Never>?
@@ -61,6 +55,35 @@ struct LiveScreen: View {
     private struct LiveWatchSpotsPresentation: Identifiable {
         let id: String
         let items: [LiveFeedItem]
+    }
+
+    private enum LiveScreenActiveSheet: Identifiable {
+        case venueDetails
+        case venueRating
+        case watchSpots(LiveWatchSpotsPresentation)
+        case matchDetail(LiveMatch)
+        case proGamePrediction(ProGamePredictionSheetContext)
+        case countryFilter
+        case fanUpdates(FanUpdatesSheetEvent)
+
+        var id: String {
+            switch self {
+            case .venueDetails:
+                return "venueDetails"
+            case .venueRating:
+                return "venueRating"
+            case .watchSpots(let presentation):
+                return "watchSpots-\(presentation.id)"
+            case .matchDetail(let match):
+                return "matchDetail-\(match.id)"
+            case .proGamePrediction(let context):
+                return "proGamePrediction-\(context.id)"
+            case .countryFilter:
+                return "countryFilter"
+            case .fanUpdates(let event):
+                return "fanUpdates-\(event.id)"
+            }
+        }
     }
 
     private struct LiveFeedItem: Identifiable {
@@ -271,9 +294,6 @@ struct LiveScreen: View {
         let savedProGamesByKey = Dictionary(
             uniqueKeysWithValues: viewModel.savedProGames.map { ($0.stableKey, $0) }
         )
-        if selectedLiveFeaturedEvent?.isFifaWorldCupDefinition == true {
-            logLiveFIFADiagnostic(todayBase: todayBase, savedProGamesByKey: savedProGamesByKey)
-        }
         let sportFiltered: [LiveMatch]
         if selectedLiveFeaturedEvent == nil, let liveGamesSportFilter {
             sportFiltered = todayBase.filter { $0.liveSportVisualType == liveGamesSportFilter }
@@ -452,55 +472,21 @@ struct LiveScreen: View {
             .accessibilityHidden(true)
     }
 
+    private var canPresentVenueDetails: Bool {
+        viewModel.selectedBar != nil
+            && (viewModel.canViewDiscoverDetails() || viewModel.isGuestDiscoverMode)
+    }
+
+    private var canPresentVenueRating: Bool {
+        viewModel.canRateVenues
+            && viewModel.isAuthenticatedForSocialFeatures
+            && viewModel.selectedBar != nil
+    }
+
     var body: some View {
         liveRootContent
-            .sheet(isPresented: Binding(
-                get: {
-                    showVenueDetails
-                        && viewModel.selectedBar != nil
-                        && (viewModel.canViewDiscoverDetails() || viewModel.isGuestDiscoverMode)
-                },
-                set: { if !$0 { showVenueDetails = false } }
-            )) {
-                liveVenueDetailSheet()
-            }
-            .sheet(isPresented: Binding(
-                get: { showVenueRatingSheet && viewModel.canRateVenues && viewModel.isAuthenticatedForSocialFeatures && viewModel.selectedBar != nil },
-                set: { if !$0 { showVenueRatingSheet = false } }
-            )) {
-                if let bar = viewModel.selectedBar {
-                    VenueUserRatingSheet(viewModel: viewModel, bar: bar)
-                }
-            }
-            .sheet(item: $liveWatchSpotsPresentation) { presentation in
-                liveWatchSpotsSheet(items: presentation.items)
-            }
-            .sheet(item: $liveMatchDetailSelection) { match in
-                LiveMatchDetailSheet(match: match)
-            }
-            .sheet(item: $proGamePredictionSheet) { context in
-                ProGamePredictionSheet(viewModel: viewModel, game: context.game)
-            }
-            .sheet(isPresented: $showLiveCountryFilterSheet) {
-                LiveLeagueCountryFilterSheet(
-                    countries: liveLeagueCountryOptions,
-                    selectedCountries: Binding(
-                        get: { selectedLiveLeagueCountries },
-                        set: { updateSelectedLiveLeagueCountries($0) }
-                    )
-                )
-            }
-            .sheet(item: Binding(
-                get: {
-                    guard viewModel.isAuthenticatedForSocialFeatures else { return nil }
-                    return fanUpdatesSheetEvent
-                },
-                set: { fanUpdatesSheetEvent = $0 }
-            )) { event in
-                VenueEventCommentsSheet(
-                    viewModel: viewModel,
-                    venueEventID: event.id
-                )
+            .sheet(item: $activeSheet) { sheet in
+                liveScreenSheetContent(for: sheet)
             }
             .alert(
                 "FanGeo",
@@ -1352,7 +1338,7 @@ struct LiveScreen: View {
 
     private var liveCountryFilterChip: some View {
         Button {
-            showLiveCountryFilterSheet = true
+            activeSheet = .countryFilter
         } label: {
             HStack(spacing: 6) {
                 Text("🌎")
@@ -1424,70 +1410,6 @@ struct LiveScreen: View {
         print("[LiveFeaturedFilter] afterFeaturedFilter=\(afterFeaturedFilter.count)")
 #endif
     }
-
-#if DEBUG
-    private static let liveFIFADiagnosticDateFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-
-    private func logLiveFIFADiagnostic(
-        todayBase: [LiveMatch],
-        savedProGamesByKey: [String: SavedProGame]
-    ) {
-        let formatter = Self.liveFIFADiagnosticDateFormatter
-        for match in todayBase.prefix(30) {
-            print(
-                "[LiveFIFADiagnostic] " +
-                "id=\(match.id) " +
-                "homeTeam=\(match.homeTeam) " +
-                "awayTeam=\(match.awayTeam) " +
-                "league=\(match.league) " +
-                "sourceLeagueName=\(match.sourceLeagueName ?? "nil") " +
-                "leagueAlternate=\(match.leagueAlternate ?? "nil") " +
-                "eventName=\(match.eventName ?? "nil") " +
-                "featuredEventSlug=\(match.featuredEventSlug ?? "nil") " +
-                "sport=\(match.sport) " +
-                "status=\(match.matchStatus.rawValue) " +
-                "startTime=\(formatter.string(from: match.startTime))"
-            )
-        }
-
-        let explicitWorldCupMatches = todayBase.filter {
-            LiveMatchFilters.isFifaWorldCupMatch($0, linkedSavedProGame: nil)
-        }.count
-
-        let savedProGameLinkedMatches = todayBase.filter { match in
-            guard let linked = savedProGamesByKey[SavedProGame.stableKey(for: match)]
-                ?? savedProGamesByKey[match.id] else {
-                return false
-            }
-            return diagnosticSavedProGameHasWorldCupMetadata(linked)
-        }.count
-
-        print("[LiveFIFADiagnostic] todayCount=\(todayBase.count)")
-        print("[LiveFIFADiagnostic] explicitWorldCupMatches=\(explicitWorldCupMatches)")
-        print("[LiveFIFADiagnostic] savedProGameLinkedMatches=\(savedProGameLinkedMatches)")
-    }
-
-    private func diagnosticSavedProGameHasWorldCupMetadata(_ game: SavedProGame) -> Bool {
-        let haystack = [
-            game.league,
-            game.sport,
-            game.featuredEventSlug
-        ]
-            .compactMap { $0 }
-            .joined(separator: " ")
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-        guard !haystack.isEmpty else { return false }
-        if haystack.contains("world cup") {
-            return true
-        }
-        return haystack.contains("fifa") && haystack.contains("wc")
-    }
-#endif
 
     private func logLiveNowSectionDebug(liveNowExpanded: Bool, liveNowCount: Int) {
 #if DEBUG
@@ -1892,7 +1814,7 @@ struct LiveScreen: View {
         if sorted.items.isEmpty {
             liveFindVenuesOpenDiscoverFallback(sportType: match.liveSportVisualType)
         } else {
-            liveWatchSpotsPresentation = LiveWatchSpotsPresentation(id: match.id, items: sorted.items)
+            activeSheet = .watchSpots(LiveWatchSpotsPresentation(id: match.id, items: sorted.items))
         }
     }
 
@@ -1912,7 +1834,7 @@ struct LiveScreen: View {
 #if DEBUG
         print("[LiveFindVenues] opened_venue=\(item.bar.id.uuidString.lowercased()) name=\(item.bar.name)")
 #endif
-        liveWatchSpotsPresentation = nil
+        activeSheet = nil
         openLiveItem(item)
     }
 
@@ -1939,7 +1861,7 @@ struct LiveScreen: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
-                        liveWatchSpotsPresentation = nil
+                        activeSheet = nil
                     }
                 }
             }
@@ -2127,7 +2049,7 @@ struct LiveScreen: View {
             logLiveMatchScoringEventDebug(match)
         }
         .onTapGesture {
-            liveMatchDetailSelection = match
+            activeSheet = .matchDetail(match)
         }
     }
 
@@ -2137,7 +2059,7 @@ struct LiveScreen: View {
             game: game,
             summary: viewModel.proGamePredictionSummaries[game.stableKey]
         ) {
-            proGamePredictionSheet = ProGamePredictionSheetContext(game: game)
+            activeSheet = .proGamePrediction(ProGamePredictionSheetContext(game: game))
         }
         .task(id: game.stableKey) {
             await viewModel.prefetchProGamePredictionSummaries(for: [game])
@@ -3376,7 +3298,42 @@ struct LiveScreen: View {
         withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) {
             viewModel.selectedBar = item.bar
             viewModel.selectedEvent = item.event
-            showVenueDetails = true
+            activeSheet = .venueDetails
+        }
+    }
+
+    @ViewBuilder
+    private func liveScreenSheetContent(for sheet: LiveScreenActiveSheet) -> some View {
+        switch sheet {
+        case .venueDetails:
+            if canPresentVenueDetails {
+                liveVenueDetailSheet()
+            }
+        case .venueRating:
+            if let bar = viewModel.selectedBar, canPresentVenueRating {
+                VenueUserRatingSheet(viewModel: viewModel, bar: bar)
+            }
+        case .watchSpots(let presentation):
+            liveWatchSpotsSheet(items: presentation.items)
+        case .matchDetail(let match):
+            LiveMatchDetailSheet(match: match)
+        case .proGamePrediction(let context):
+            ProGamePredictionSheet(viewModel: viewModel, game: context.game)
+        case .countryFilter:
+            LiveLeagueCountryFilterSheet(
+                countries: liveLeagueCountryOptions,
+                selectedCountries: Binding(
+                    get: { selectedLiveLeagueCountries },
+                    set: { updateSelectedLiveLeagueCountries($0) }
+                )
+            )
+        case .fanUpdates(let event):
+            if viewModel.isAuthenticatedForSocialFeatures {
+                VenueEventCommentsSheet(
+                    viewModel: viewModel,
+                    venueEventID: event.id
+                )
+            }
         }
     }
 
@@ -3430,8 +3387,7 @@ struct LiveScreen: View {
                 onAddressTap: { viewModel.openDirections(to: selectedBar) },
                 onRateVenue: {
                     if viewModel.canRateVenues {
-                        showVenueDetails = false
-                        showVenueRatingSheet = true
+                        activeSheet = .venueRating
                     } else if viewModel.isGuestDiscoverMode {
                         viewModel.discoverNavigateToAccountForUserAuth = true
                     } else if viewModel.isAuthenticatedForSocialFeatures {
@@ -3481,7 +3437,7 @@ struct LiveScreen: View {
                         return
                     }
                     FanUpdatesTapPerf.handleTap(eventId: id) {
-                        fanUpdatesSheetEvent = FanUpdatesSheetEvent(id: id)
+                        activeSheet = .fanUpdates(FanUpdatesSheetEvent(id: id))
                     }
                 },
                 onToggleVenueEventVibe: { id, vibeType in

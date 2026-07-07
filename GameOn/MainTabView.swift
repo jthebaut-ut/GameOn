@@ -204,9 +204,9 @@ struct MainTabView: View {
             mountTab(restoredTab, reason: "mainTabOnAppear")
 #if DEBUG
             print("[PerfLazyTab] restoredSelected tab=\(restoredTab.rawValue)")
-            print("[TabPerfDebug] tabAppeared=\(restoredTab.rawValue)")
-            print("[TabPerfDebug] cacheAge=\(tabCacheAgeDescription(restoredTab)) tab=\(restoredTab.rawValue)")
-            print("[TabPerfDebug] usedCachedData=\(tabHasCachedData(restoredTab))")
+            TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(restoredTab.rawValue)")
+            TabPerfDebug.log("[TabPerfDebug] cacheAge=\(tabCacheAgeDescription(restoredTab)) tab=\(restoredTab.rawValue)")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(tabHasCachedData(restoredTab))")
             for tab in AppTab.allCases where !mountedTabs.contains(tab) {
                 print("[PerfLazyTab] deferred tab=\(tab.rawValue)")
             }
@@ -377,11 +377,11 @@ struct MainTabView: View {
             let switchStartedAt = tabSwitchStartAt ?? Date()
             let usedCachedData = tabSwitchCachedData ?? tabHasCachedData(tab)
 #if DEBUG
-            print("[TabPerfDebug] selectedTab=\(newRaw)")
-            print("[TabPerfDebug] tabAppeared=\(newRaw)")
-            print("[TabPerfDebug] cacheAge=\(tabCacheAgeDescription(tab)) tab=\(newRaw)")
-            print("[TabPerfDebug] tabSwitchStart=\(switchStartedAt.timeIntervalSince1970)")
-            print("[TabPerfDebug] usedCachedData=\(usedCachedData)")
+            TabPerfDebug.log("[TabPerfDebug] selectedTab=\(newRaw)")
+            TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(newRaw)")
+            TabPerfDebug.log("[TabPerfDebug] cacheAge=\(tabCacheAgeDescription(tab)) tab=\(newRaw)")
+            TabPerfDebug.log("[TabPerfDebug] tabSwitchStart=\(switchStartedAt.timeIntervalSince1970)")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(usedCachedData)")
 #endif
             DispatchQueue.main.async {
                 logTabFirstContentVisible(tab: tab, startedAt: switchStartedAt, usedCachedData: usedCachedData)
@@ -540,10 +540,10 @@ struct MainTabView: View {
 #if DEBUG
         if DebugLogGate.verboseTabSwitchPerfLogging {
             print("[UISmoothnessDebug] tabTransition=\(tabSwitchFromTab?.rawValue ?? "unknown")->\(tab.rawValue)")
-            print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
-            print("[TabPerfDebug] tabSwitchStart=\(tabSwitchStartAt?.timeIntervalSince1970 ?? 0)")
-            print("[TabPerfDebug] usedCachedData=\(tabSwitchCachedData ?? false)")
-            print("[TabPerfDebug] reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] selectedTab=\(tab.rawValue)")
+            TabPerfDebug.log("[TabPerfDebug] tabSwitchStart=\(tabSwitchStartAt?.timeIntervalSince1970 ?? 0)")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(tabSwitchCachedData ?? false)")
+            TabPerfDebug.log("[TabPerfDebug] reason=\(reason)")
         }
 #endif
     }
@@ -575,10 +575,10 @@ struct MainTabView: View {
         }
 #if DEBUG
         if DebugLogGate.verboseTabSwitchPerfLogging {
-            print("[TabPerfDebug] selectedTab=\(tab.rawValue)")
-            print("[TabPerfDebug] firstContentVisibleMs=\(ms)")
-            print("[TabPerfDebug] firstPaintMs=\(ms) tab=\(tab.rawValue)")
-            print("[TabPerfDebug] usedCachedData=\(usedCachedData)")
+            TabPerfDebug.log("[TabPerfDebug] selectedTab=\(tab.rawValue)")
+            TabPerfDebug.log("[TabPerfDebug] firstContentVisibleMs=\(ms)")
+            TabPerfDebug.log("[TabPerfDebug] firstPaintMs=\(ms) tab=\(tab.rawValue)")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(usedCachedData)")
         }
 #endif
         tabSwitchStartAt = nil

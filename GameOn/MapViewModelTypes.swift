@@ -1318,6 +1318,50 @@ struct UserProfileRow: Decodable {
     }
 }
 
+/// Partial profile update for existing rows — excludes avatar columns so identity saves cannot wipe uploaded avatars.
+struct UserProfileSavePatch: Encodable {
+    let email: String
+    let display_name: String
+    let username: String?
+    let bio: String?
+    let live_visibility_enabled: Bool
+    let live_visibility_mode: String
+    let selected_live_visibility_friend_ids: [String]
+    let discoverable_by_fans: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case email
+        case display_name
+        case username
+        case bio
+        case live_visibility_enabled
+        case live_visibility_mode
+        case selected_live_visibility_friend_ids
+        case discoverable_by_fans
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(email, forKey: .email)
+        try c.encode(display_name, forKey: .display_name)
+        try c.encodeIfPresent(username, forKey: .username)
+        if let bio {
+            try c.encode(bio, forKey: .bio)
+        } else {
+            try c.encodeNil(forKey: .bio)
+        }
+        try c.encode(live_visibility_enabled, forKey: .live_visibility_enabled)
+        try c.encode(live_visibility_mode, forKey: .live_visibility_mode)
+        try c.encode(selected_live_visibility_friend_ids, forKey: .selected_live_visibility_friend_ids)
+        try c.encode(discoverable_by_fans, forKey: .discoverable_by_fans)
+    }
+}
+
+struct UserProfileAvatarPatch: Encodable {
+    let avatar_url: String
+    let avatar_thumbnail_url: String?
+}
+
 struct UserProfileInsert: Encodable {
     /// Must equal `auth.users.id` (`user_profiles_id_fkey`).
     let id: UUID
@@ -1371,6 +1415,7 @@ struct UserProfileBootstrapInsert: Encodable {
     let id: UUID
     let email: String
     let display_name: String
+    let username: String?
     let bio: String?
     /// Empty string when the column is `NOT NULL` and no asset yet.
     let avatar_url: String
@@ -1379,6 +1424,39 @@ struct UserProfileBootstrapInsert: Encodable {
     let live_visibility_mode: String
     let selected_live_visibility_friend_ids: [String]
     let discoverable_by_fans: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case display_name
+        case username
+        case bio
+        case avatar_url
+        case avatar_thumbnail_url
+        case live_visibility_enabled
+        case live_visibility_mode
+        case selected_live_visibility_friend_ids
+        case discoverable_by_fans
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(email, forKey: .email)
+        try c.encode(display_name, forKey: .display_name)
+        try c.encodeIfPresent(username, forKey: .username)
+        if let bio {
+            try c.encode(bio, forKey: .bio)
+        } else {
+            try c.encodeNil(forKey: .bio)
+        }
+        try c.encode(avatar_url, forKey: .avatar_url)
+        try c.encodeIfPresent(avatar_thumbnail_url, forKey: .avatar_thumbnail_url)
+        try c.encode(live_visibility_enabled, forKey: .live_visibility_enabled)
+        try c.encode(live_visibility_mode, forKey: .live_visibility_mode)
+        try c.encode(selected_live_visibility_friend_ids, forKey: .selected_live_visibility_friend_ids)
+        try c.encode(discoverable_by_fans, forKey: .discoverable_by_fans)
+    }
 }
 
 struct UserLiveVisibilityPatch: Encodable {

@@ -569,7 +569,7 @@ extension MapViewModel {
         let t0 = Date()
         #if DEBUG
         print("[PerfPhase1D] discoverCriticalPathPreserved=true")
-        print("[TabPerfDebug] refreshStarted=discover source=core force=\(forceVenueRefresh)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=discover source=core force=\(forceVenueRefresh)")
         print("[Perf] Discover startup begin forceVenueRefresh=\(forceVenueRefresh)")
         #endif
         await loadVenuesFromSupabase(forceRefresh: forceVenueRefresh)
@@ -577,7 +577,7 @@ extension MapViewModel {
         lastDiscoverCoreRefreshAt = Date()
         #if DEBUG
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) tab=discover source=core")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=discover source=core")
         print("[CriticalPath] fresh core visible ms=\(ms) bars=\(bars.count) events=\(events.count)")
         if startupDiscoverPreloadCompletionLogPending {
             startupDiscoverPreloadCompletionLogPending = false
@@ -3010,12 +3010,12 @@ extension MapViewModel {
         loadGamesCoalesceNeedsAnotherPass = true
         guard loadGamesCoalesceTask == nil else {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true source=schedule")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true source=schedule")
 #endif
             return
         }
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=discover source=schedule")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=discover source=schedule")
 #endif
         loadGamesCoalesceTask = Task { @MainActor in
             defer { self.loadGamesCoalesceTask = nil }
@@ -3145,7 +3145,7 @@ extension MapViewModel {
 
             #if DEBUG
             let wallMs = Int(Date().timeIntervalSince(perfWallStart) * 1000)
-            print("[TabPerfDebug] refreshDurationMs=\(wallMs) tab=discover source=schedule")
+            TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(wallMs) tab=discover source=schedule")
             print("[Phase3Perf] performLoadGamesFromSupabase totalMs=\(wallMs) official=\(officialEvents.count) venueEvents=\(venueEventsAsSportsEvents.count)")
             print("[DiscoverPerf] loadGames DONE official=\(officialEvents.count) venueEvents=\(venueEventsAsSportsEvents.count)")
             #endif

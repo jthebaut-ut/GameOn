@@ -77,6 +77,12 @@ final class ChatViewModel: ObservableObject {
     @Published var unfriendError: String?
     @Published private(set) var requiresSignIn: Bool = false
     @Published var isLoading: Bool = false
+    /// True while the first inbox load is in flight and there is no cached inbox to show.
+    @Published private(set) var isInboxInitialLoadInFlight: Bool = false
+    /// True while refreshing inbox when cached rows are already visible (stale-while-revalidate).
+    @Published private(set) var isInboxBackgroundRefreshInFlight: Bool = false
+    /// Set after the first inbox load attempt finishes (success or failure) so empty state can appear safely.
+    @Published private(set) var hasCompletedInitialInboxLoad: Bool = false
 
     /// Other user id → chip state. Keys only for users with an active friendship row; missing key ⇒ ``FriendshipChipKind.addFriend``.
     @Published private(set) var friendshipChipByOtherUserId: [UUID: FriendshipChipKind] = [:]
@@ -111,6 +117,7 @@ final class ChatViewModel: ObservableObject {
     private var lastChatTabIntentPreloadAt: Date?
     private var lastChatTabSurfaceRefreshAt: Date?
     private static let chatTabRefreshCoalesceInterval: TimeInterval = 25
+    private var inboxEnrichmentTask: Task<Void, Never>?
 
     private var chatTabVisibleForDirectReadState = false
     private var privateChatUnlockedForDirectReadState = false
@@ -274,8 +281,13 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         inboxDeleteError = nil
         requiresSignIn = true
+        isInboxInitialLoadInFlight = false
+        isInboxBackgroundRefreshInFlight = false
+        hasCompletedInitialInboxLoad = false
         lastLoadAt = nil
         lastInboxLoadAt = nil
+        inboxEnrichmentTask?.cancel()
+        inboxEnrichmentTask = nil
         friendshipChipByOtherUserId = [:]
         currentUserAuthId = nil
         hiddenInboxPeerUserIds = []
@@ -1656,74 +1668,183 @@ final class ChatViewModel: ObservableObject {
     /// Refreshes Chat → Friends inbox summaries (preview/time/unread + sorted order) without reloading requests.
     func refreshInboxSummariesIfNeeded() async {
         if isLoading { return }
+        if friends.isEmpty && !hasCompletedInitialInboxLoad {
+            await refreshInboxSummaries()
+            return
+        }
         if let last = lastInboxLoadAt, Date().timeIntervalSince(last) < minInboxRefreshInterval {
             return
         }
         await refreshInboxSummaries()
     }
 
+    /// Marks inbox loading UI before a deferred fetch begins (Chat tab appear path).
+    func prepareInboxLoadUIStateIfNeeded() {
+        guard !hasCompletedInitialInboxLoad else { return }
+        if friends.isEmpty {
+            isInboxInitialLoadInFlight = true
+        } else {
+            isInboxBackgroundRefreshInFlight = true
+        }
+    }
+
     func refreshInboxSummaries() async {
         let refreshStartedAt = CFAbsoluteTimeGetCurrent()
+#if DEBUG
+        ChatLoadPerf.loadStarted()
+        if !friends.isEmpty {
+            ChatLoadPerf.cachedRowsShown(count: friends.count)
+        }
+#endif
         guard let me = try? await directChatService.currentUserId() else {
             clearForSignOut()
             return
         }
         noteAuthenticatedChatSession(userId: me, source: "inboxSummaries")
+
+        let hadCachedRows = !friends.isEmpty
+        if hadCachedRows {
+            isInboxBackgroundRefreshInFlight = true
+        } else if !hasCompletedInitialInboxLoad {
+            isInboxInitialLoadInFlight = true
+        }
+
         await reloadModerationBlockSets()
         do {
+            let inboxFetchStartedAt = CFAbsoluteTimeGetCurrent()
             let rows = try await directChatService.fetchInboxSummaries()
-            let participantPreviews = try await fetchDmParticipantPreviews(for: rows)
-            let displays = rows.map { row -> FriendDisplay in
-                let preview = inboxPreview(
-                    for: row,
-                    resolvedPreview: participantPreviews[row.friend_user_id],
-                    profileLookupAttempted: true
-                )
-                logChatRowDebug(preview: preview)
-                logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
-
-                let body = row.last_message_body?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                let displayBody = body.flatMap { FanProfileShareMessage.inboxPreview(from: $0) ?? $0 }
-                let rawPreview: String
-                if let displayBody, !displayBody.isEmpty {
-                    if row.last_message_sender_id == me {
-                        rawPreview = "You: \(displayBody)"
-                    } else {
-                        rawPreview = displayBody
-                    }
-                } else {
-                    rawPreview = "Say hi"
-                }
-
-                let lastAt = Self.parseISO8601(row.last_message_created_at)
-                let unread = max(0, row.unread_count ?? 0)
-                return FriendDisplay(
-                    id: row.friend_user_id,
-                    preview: preview,
-                    subtitle: rawPreview,
-                    lastMessageAt: lastAt,
-                    unreadCount: unread,
-                    isConversationBacked: true
-                )
-            }
-
-            // Hide users blocked in either direction.
-            var visible = displays.filter { !isEitherDirectionBlocked(with: $0.id) }
-            visible = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: visible)
-            visible = applyHiddenInboxPeerFilter(visible)
-            friends = visible
-            syncChatPresenceRealtimeIfNeeded(reason: "inboxSummariesLoaded")
 #if DEBUG
-            print("[BadgeSyncDebug] chat list updated")
-            let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000)
-            print("[DMRealtimeLatencyDebug] inboxUpdated conversationId=refresh_inbox_summaries elapsedMs=\(elapsed)")
+            ChatLoadPerf.inboxFetchMs(Int((CFAbsoluteTimeGetCurrent() - inboxFetchStartedAt) * 1000))
 #endif
+            let visible = buildInboxFriendDisplays(from: rows, me: me, participantPreviews: [:], profileLookupAttempted: false)
+            friends = visible
             let totalUnread = visible.reduce(0) { $0 + $1.unreadCount }
-            await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "refresh_inbox_summaries")
+            await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "refresh_inbox_summaries_fast")
             lastInboxLoadAt = Date()
             noteAuthenticatedChatSession(userId: me, source: "inboxSummariesLoaded")
+#if DEBUG
+            print("[BadgeSyncDebug] chat list updated (fast path)")
+            let recentMs = Int((CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000)
+            ChatLoadPerf.recentChatsVisibleMs(recentMs)
+            ChatLoadPerf.presenceFetchDeferred(deferred: true)
+#endif
+
+            if !visible.isEmpty {
+                isInboxInitialLoadInFlight = false
+                hasCompletedInitialInboxLoad = true
+#if DEBUG
+                ChatLoadPerf.totalInitialLoadMs(Int((CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000))
+#endif
+            }
+
+            inboxEnrichmentTask?.cancel()
+            inboxEnrichmentTask = Task { [weak self] in
+                await self?.enrichInboxSummariesAfterFirstPaint(
+                    me: me,
+                    rows: rows,
+                    refreshStartedAt: refreshStartedAt,
+                    finishInitialLoadIfStillPending: visible.isEmpty
+                )
+                await MainActor.run {
+                    self?.isInboxBackgroundRefreshInFlight = false
+                }
+            }
         } catch {
+            isInboxInitialLoadInFlight = false
+            isInboxBackgroundRefreshInFlight = false
+            hasCompletedInitialInboxLoad = true
             // Keep existing list on transient failures; unread badge may be stale until next refresh.
+        }
+    }
+
+    private func buildInboxFriendDisplays(
+        from rows: [DmInboxSummaryRow],
+        me: UUID,
+        participantPreviews: [UUID: UserPreview],
+        profileLookupAttempted: Bool
+    ) -> [FriendDisplay] {
+        let displays = rows.map { row -> FriendDisplay in
+            let preview = inboxPreview(
+                for: row,
+                resolvedPreview: participantPreviews[row.friend_user_id],
+                profileLookupAttempted: profileLookupAttempted
+            )
+            logChatRowDebug(preview: preview)
+            logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
+
+            let body = row.last_message_body?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            let displayBody = body.flatMap { FanProfileShareMessage.inboxPreview(from: $0) ?? $0 }
+            let rawPreview: String
+            if let displayBody, !displayBody.isEmpty {
+                if row.last_message_sender_id == me {
+                    rawPreview = "You: \(displayBody)"
+                } else {
+                    rawPreview = displayBody
+                }
+            } else {
+                rawPreview = "Say hi"
+            }
+
+            let lastAt = Self.parseISO8601(row.last_message_created_at)
+            let unread = max(0, row.unread_count ?? 0)
+            return FriendDisplay(
+                id: row.friend_user_id,
+                preview: preview,
+                subtitle: rawPreview,
+                lastMessageAt: lastAt,
+                unreadCount: unread,
+                isConversationBacked: true
+            )
+        }
+
+        var visible = displays.filter { !isEitherDirectionBlocked(with: $0.id) }
+        visible = applyHiddenInboxPeerFilter(visible)
+        return visible
+    }
+
+    private func enrichInboxSummariesAfterFirstPaint(
+        me: UUID,
+        rows: [DmInboxSummaryRow],
+        refreshStartedAt: CFAbsoluteTime,
+        finishInitialLoadIfStillPending: Bool
+    ) async {
+        defer {
+            if finishInitialLoadIfStillPending {
+                isInboxInitialLoadInFlight = false
+                hasCompletedInitialInboxLoad = true
+#if DEBUG
+                ChatLoadPerf.totalInitialLoadMs(Int((CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000))
+#endif
+            }
+        }
+        guard !Task.isCancelled else { return }
+        do {
+            let participantPreviews = try await fetchDmParticipantPreviews(for: rows)
+            guard !Task.isCancelled else { return }
+
+            var visible = buildInboxFriendDisplays(
+                from: rows,
+                me: me,
+                participantPreviews: participantPreviews,
+                profileLookupAttempted: true
+            )
+            visible = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: visible)
+            guard !Task.isCancelled else { return }
+
+            friends = visible
+            syncChatPresenceRealtimeIfNeeded(reason: "inboxSummariesEnriched")
+#if DEBUG
+            print("[BadgeSyncDebug] chat list updated (enriched)")
+            let elapsed = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000)
+            print("[DMRealtimeLatencyDebug] inboxUpdated conversationId=refresh_inbox_summaries_enriched elapsedMs=\(elapsed)")
+#endif
+            let totalUnread = visible.reduce(0) { $0 + $1.unreadCount }
+            await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "refresh_inbox_summaries_enriched")
+            lastInboxLoadAt = Date()
+            noteAuthenticatedChatSession(userId: me, source: "inboxSummariesEnriched")
+        } catch {
+            if ignoreCancellationIfNeeded(error, context: "inbox_summaries_enrichment") { return }
+            // Keep fast-path rows; enrichment retries on next refresh.
         }
     }
 
@@ -2117,12 +2238,15 @@ final class ChatViewModel: ObservableObject {
 
     func cancel(_ item: OutgoingRequestDisplay) async {
         guard item.friendship.isPendingStatus else { return }
+        let peerId = item.addressee.id
+#if DEBUG
+        print("[FriendRequestDebug] cancelStarted peer=\(peerId.uuidString.lowercased())")
+#endif
         DebugLogGate.debug("[FriendRequest] outgoing cancel requested id=\(item.id)")
         let snapshotOut = outgoingRequests
         let snapshotChips = friendshipChipByOtherUserId
 
         outgoingRequests.removeAll { $0.id == item.id }
-        let peerId = item.addressee.id
         if friendshipChipByOtherUserId[peerId] == .pendingOutgoing {
             var m = friendshipChipByOtherUserId
             m.removeValue(forKey: peerId)
@@ -2131,6 +2255,9 @@ final class ChatViewModel: ObservableObject {
 
         do {
             try await service.cancelFriendRequest(requestId: item.friendship.id)
+#if DEBUG
+            print("[FriendRequestDebug] cancelSucceeded peer=\(peerId.uuidString.lowercased())")
+#endif
             DebugLogGate.debug("[FriendRequest] outgoing cancel completed id=\(item.id)")
             await refreshFriendRequestListsOnly()
         } catch {
@@ -2139,8 +2266,62 @@ final class ChatViewModel: ObservableObject {
                 friendshipChipByOtherUserId = snapshotChips
                 return
             }
+#if DEBUG
+            print("[FriendRequestDebug] cancelFailed peer=\(peerId.uuidString.lowercased()) error=\(error.localizedDescription)")
+#endif
             DebugLogGate.debug("[FriendRequest] outgoing cancel failed id=\(item.id) error=\(error)")
             outgoingRequests = snapshotOut
+            friendshipChipByOtherUserId = snapshotChips
+            errorMessage = error.localizedDescription
+            await refreshFriendRequestListsOnly()
+        }
+    }
+
+    /// Cancels the viewer's outgoing pending request to a fan (Suggested Fans / public profile).
+    func cancelOutgoingFriendRequest(to peerId: UUID) async {
+        guard chipKind(forOtherUserId: peerId) == .pendingOutgoing else { return }
+
+        if let item = outgoingRequests.first(where: {
+            $0.addressee.id == peerId || $0.friendship.addressee_id == peerId
+        }) {
+            await cancel(item)
+            return
+        }
+
+#if DEBUG
+        print("[FriendRequestDebug] cancelStarted peer=\(peerId.uuidString.lowercased())")
+#endif
+        let snapshotChips = friendshipChipByOtherUserId
+        if friendshipChipByOtherUserId[peerId] == .pendingOutgoing {
+            var m = friendshipChipByOtherUserId
+            m.removeValue(forKey: peerId)
+            friendshipChipByOtherUserId = m
+        }
+
+        do {
+            let me = try await service.currentUserId()
+            let rows = try await service.fetchFriendshipsBetween(me: me, other: peerId)
+            guard let row = rows.first(where: { $0.isPendingStatus && $0.requester_id == me }) else {
+#if DEBUG
+                print("[FriendRequestDebug] cancelFailed peer=\(peerId.uuidString.lowercased()) error=no_pending_row")
+#endif
+                friendshipChipByOtherUserId = snapshotChips
+                await refreshFriendRequestListsOnly()
+                return
+            }
+            try await service.cancelFriendRequest(requestId: row.id)
+#if DEBUG
+            print("[FriendRequestDebug] cancelSucceeded peer=\(peerId.uuidString.lowercased())")
+#endif
+            await refreshFriendRequestListsOnly()
+        } catch {
+            if ignoreCancellationIfNeeded(error, context: "friend_request_cancel_peer") {
+                friendshipChipByOtherUserId = snapshotChips
+                return
+            }
+#if DEBUG
+            print("[FriendRequestDebug] cancelFailed peer=\(peerId.uuidString.lowercased()) error=\(error.localizedDescription)")
+#endif
             friendshipChipByOtherUserId = snapshotChips
             errorMessage = error.localizedDescription
             await refreshFriendRequestListsOnly()

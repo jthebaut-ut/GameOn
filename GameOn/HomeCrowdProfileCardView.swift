@@ -138,7 +138,6 @@ struct HomeCrowdProfileCardView: View {
                                 .lineLimit(1)
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     VStack(spacing: 8) {
                         HomeCrowdShieldStarBadge(diameter: 30, visualState: .active)
@@ -147,7 +146,6 @@ struct HomeCrowdProfileCardView: View {
                             .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.85))
                     }
-                    .padding(.trailing, 2)
                 }
             }
             .padding(.horizontal, 14)

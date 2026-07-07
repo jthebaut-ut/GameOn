@@ -2037,6 +2037,7 @@ nonisolated enum LiveScoringEventDebug {
         timelineEvents: [LiveTimelineEvent],
         timelineFetched: Bool
     ) {
+#if DEBUG
         let effectiveSportType = LiveScoringTimelineBuilder.resolvedSportTypeForDebug(
             sportType: sportType,
             timelineEvents: timelineEvents
@@ -2098,6 +2099,7 @@ nonisolated enum LiveScoringEventDebug {
             print("[ScoringEventDebug] team=\(latest.teamName ?? "nil")")
             print("[ScoringEventDebug] minuteOrClock=\(latest.clock ?? "nil")")
         }
+#endif
     }
 
     private static func renderedSummaryText(

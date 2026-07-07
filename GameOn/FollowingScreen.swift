@@ -26,9 +26,8 @@ struct FollowingScreen: View {
     /// Venue events the user marked "Interested" from Following without a Supabase row (table has no status column).
     @AppStorage("gameon.following.interestedOnlyVenueEventIDs") private var interestedOnlyEncoded: String = ""
     @AppStorage(FavoriteTeamsStore.appStorageKey) private var favoriteTeamIDsRaw: String = ""
-    @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.enabledKey) private var proGamesAutoFollowFavoriteTeams = false
-    @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.windowDaysKey) private var proGamesFavoriteTeamWindowDays = ProGamesFavoriteTeamAutoFollowPreference.Window.next30.rawValue
     @AppStorage(ProGameNotificationPreferenceKeys.favoriteTeamAlerts) private var favoriteTeamProGameAlertsEnabled = false
+    @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.windowDaysKey) private var proGamesFavoriteTeamWindowDays = ProGamesFavoriteTeamAutoFollowPreference.Window.next30.rawValue
     @AppStorage("gameon.going.completedFavoriteTeamProGamesCleared.v1") private var clearedCompletedFavoriteTeamProGamesRaw: String = ""
     @State private var pickupDetailNav: PickupDetailNavigationToken?
     @State private var followingPickupWithdrawConfirm: PickupJoinWithdrawConfirmState?
@@ -103,7 +102,7 @@ struct FollowingScreen: View {
         let auth = viewModel.currentUserAuthId?.uuidString ?? "signedOut"
         return [
             auth,
-            proGamesAutoFollowFavoriteTeams ? "on" : "off",
+            favoriteTeamProGameAlertsEnabled ? "on" : "off",
             "\(proGamesFavoriteTeamWindowDays)",
             favoriteTeamIDsRaw
         ].joined(separator: "|")
@@ -132,7 +131,7 @@ struct FollowingScreen: View {
     private var goingProGamesAdPlan: GoingProGamesAdPlan {
         GoingProGamesAdPlacement.plan(
             savedGames: manualSavedProGamesForDisplay,
-            favoriteTeamGames: proGamesAutoFollowFavoriteTeams ? favoriteTeamProGamesForDisplay : [],
+            favoriteTeamGames: favoriteTeamProGameAlertsEnabled ? favoriteTeamProGamesForDisplay : [],
             businessMyTeamSavedGames: businessMyTeamSavedProGamesForDisplay,
             businessMyTeamAutoGames: businessMyTeamProGamesForDisplay
         )
@@ -212,7 +211,7 @@ struct FollowingScreen: View {
             guard isFollowingTabSelected else { return }
             scheduleGoingProGamesDisplayCacheRebuild(reason: "favoriteTeamProGamesChanged")
         }
-        .onChange(of: proGamesAutoFollowFavoriteTeams) { _, _ in
+        .onChange(of: favoriteTeamProGameAlertsEnabled) { _, _ in
             guard isFollowingTabSelected else { return }
             scheduleGoingProGamesDisplayCacheRebuild(reason: "autoFollowToggled")
         }
@@ -453,7 +452,7 @@ struct FollowingScreen: View {
             .sorted()
             .joined(separator: ",")
         let prefs = [
-            proGamesAutoFollowFavoriteTeams ? "autoOn" : "autoOff",
+            favoriteTeamProGameAlertsEnabled ? "autoOn" : "autoOff",
             "\(proGamesFavoriteTeamWindowDays)",
             favoriteTeamIDsRaw
         ].joined(separator: "|")
@@ -480,7 +479,7 @@ struct FollowingScreen: View {
             .sorted()
             .joined(separator: ",")
         let prefs = [
-            proGamesAutoFollowFavoriteTeams ? "autoOn" : "autoOff",
+            favoriteTeamProGameAlertsEnabled ? "autoOn" : "autoOff",
             "\(proGamesFavoriteTeamWindowDays)",
             favoriteTeamIDsRaw,
             clearedCompletedFavoriteTeamProGamesRaw
@@ -1339,42 +1338,43 @@ struct FollowingScreen: View {
             VStack(alignment: .leading, spacing: 10) {
                 sectionEyebrow("Favorite Team Games")
                 favoriteTeamAlertsToggleRow
-                if proGamesAutoFollowFavoriteTeams {
-                    if favoriteTeamProGamesForDisplay.isEmpty {
-                        goingRichEmptyCard(
-                            title: "⭐ No favorite teams selected",
-                            description: "Follow your favorite teams to receive kickoff, goal, and final-score alerts.",
-                            buttonTitle: "Add Favorite Teams",
-                            buttonAction: { showFavoriteTeamsPicker = true }
-                        )
-                    } else {
-                        VStack(spacing: 12) {
-                            ForEach(goingProGamesAdPlan.favoriteTeamItems) { item in
-                                switch item {
-                                case .game(let autoGame):
-                                    savedProGameCard(
-                                        autoGame.game,
-                                        badges: favoriteTeamProGameBadges(),
-                                        showsUnsaveButton: false,
-                                        showsScoreUpdatesControl: true,
-                                        favoriteTeamAlertItem: autoGame,
-                                        onClearCompleted: {
-                                            clearCompletedFavoriteTeamProGame(autoGame.game, scope: "fan")
-                                        }
-                                    )
-                                case .nativeAd(let slot):
-                                    goingNativeAdRow(slot: slot)
-                                }
-                            }
-                        }
-                    }
-                } else {
+                if resolvedFavoriteTeamsForGoing.isEmpty {
                     goingRichEmptyCard(
                         title: "⭐ No favorite teams selected",
                         description: "Follow your favorite teams to receive kickoff, goal, and final-score alerts.",
                         buttonTitle: "Add Favorite Teams",
                         buttonAction: { showFavoriteTeamsPicker = true }
                     )
+                } else if !favoriteTeamProGameAlertsEnabled {
+                    goingRichEmptyCard(
+                        title: "Team Alerts are off",
+                        description: "Turn on Team Alerts to get kickoff, score, and final alerts for your favorite teams."
+                    )
+                } else if favoriteTeamProGamesForDisplay.isEmpty {
+                    goingRichEmptyCard(
+                        title: "No upcoming favorite team games",
+                        description: "We'll show games here when your favorite teams have upcoming matches."
+                    )
+                } else {
+                    VStack(spacing: 12) {
+                        ForEach(goingProGamesAdPlan.favoriteTeamItems) { item in
+                            switch item {
+                            case .game(let autoGame):
+                                savedProGameCard(
+                                    autoGame.game,
+                                    badges: favoriteTeamProGameBadges(),
+                                    showsUnsaveButton: false,
+                                    showsScoreUpdatesControl: true,
+                                    favoriteTeamAlertItem: autoGame,
+                                    onClearCompleted: {
+                                        clearCompletedFavoriteTeamProGame(autoGame.game, scope: "fan")
+                                    }
+                                )
+                            case .nativeAd(let slot):
+                                goingNativeAdRow(slot: slot)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1514,6 +1514,10 @@ struct FollowingScreen: View {
 
     private var favoriteTeamProGamesForDisplay: [FavoriteTeamProGame] {
         goingTabPerf.cachedFavoriteTeamProGamesForDisplay
+    }
+
+    private var resolvedFavoriteTeamsForGoing: [FavoriteTeam] {
+        FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
     }
 
     private func markGoingScreenAppear(source: String) {
@@ -1996,7 +2000,7 @@ struct FollowingScreen: View {
 #endif
         let window = ProGamesFavoriteTeamAutoFollowPreference.Window.resolved(rawValue: proGamesFavoriteTeamWindowDays)
         await viewModel.refreshFavoriteTeamProGames(
-            enabled: proGamesAutoFollowFavoriteTeams,
+            enabled: favoriteTeamProGameAlertsEnabled,
             windowDays: window.rawValue,
             favoriteTeamIDsRaw: favoriteTeamIDsRaw,
             forceRefresh: forceRefresh

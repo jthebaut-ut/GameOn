@@ -843,7 +843,7 @@ extension MapViewModel {
         let key = appleCalendarPickupSyncFingerprint(reason: reason)
         if let existing = appleCalendarPickupSyncTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true source=appleCalendarPickupSync reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true source=appleCalendarPickupSync reason=\(reason)")
 #endif
             await existing.value
             return
@@ -854,15 +854,15 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastAppleCalendarPickupSyncAt)
             if age < 60 {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) source=appleCalendarPickupSync")
-                print("[TabPerfDebug] refreshSkippedReason=fresh source=appleCalendarPickupSync reason=\(reason)")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) source=appleCalendarPickupSync")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh source=appleCalendarPickupSync reason=\(reason)")
 #endif
                 return
             }
         }
         let startedAt = Date()
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=appleCalendarPickupSync reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=appleCalendarPickupSync reason=\(reason)")
 #endif
         let task = Task<Void, Never> { @MainActor [weak self] in
             await self?.syncPickupGamesToAppleCalendarNow(reason: reason)
@@ -874,7 +874,7 @@ extension MapViewModel {
         lastAppleCalendarPickupSyncKey = key
 #if DEBUG
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) source=appleCalendarPickupSync reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) source=appleCalendarPickupSync reason=\(reason)")
 #endif
     }
 
@@ -910,7 +910,7 @@ extension MapViewModel {
         let key = appleCalendarGlobalSyncFingerprint(reason: reason)
         if let existing = appleCalendarGlobalSyncTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true source=appleCalendarGlobalSync reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true source=appleCalendarGlobalSync reason=\(reason)")
 #endif
             await existing.value
             return
@@ -921,8 +921,8 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastAppleCalendarGlobalSyncAt)
             if age < 60 {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) source=appleCalendarGlobalSync")
-                print("[TabPerfDebug] refreshSkippedReason=fresh source=appleCalendarGlobalSync reason=\(reason)")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) source=appleCalendarGlobalSync")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh source=appleCalendarGlobalSync reason=\(reason)")
 #endif
                 logProGameCalendarSync(
                     action: "reconcile",
@@ -936,7 +936,7 @@ extension MapViewModel {
         }
         let startedAt = Date()
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=appleCalendarGlobalSync reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=appleCalendarGlobalSync reason=\(reason)")
 #endif
         let task = Task<Void, Never> { @MainActor [weak self] in
             await self?.syncFanGeoAttendingEventsToAppleCalendarNow(
@@ -951,7 +951,7 @@ extension MapViewModel {
         lastAppleCalendarGlobalSyncKey = key
 #if DEBUG
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) source=appleCalendarGlobalSync reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) source=appleCalendarGlobalSync reason=\(reason)")
 #endif
     }
 

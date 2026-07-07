@@ -76,16 +76,16 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastBusinessFavoriteTeamProGamesRefreshAt)
             if age < 45, !businessFavoriteTeamProGames.contains(where: { $0.game.matchStatus.isHappeningNow }) {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=businessFavoriteTeamProGames")
-                print("[TabPerfDebug] usedCachedData=true tab=going source=businessFavoriteTeamProGames")
-                print("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=businessFavoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=businessFavoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=going source=businessFavoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=businessFavoriteTeamProGames")
 #endif
                 return
             }
         }
         if !forceRefresh, let existing = businessFavoriteTeamProGamesRefreshTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true tab=going source=businessFavoriteTeamProGames")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=going source=businessFavoriteTeamProGames")
 #endif
             await existing.value
             return
@@ -93,7 +93,7 @@ extension MapViewModel {
 
         let startedAt = Date()
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=going source=businessFavoriteTeamProGames force=\(forceRefresh)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=going source=businessFavoriteTeamProGames force=\(forceRefresh)")
 #endif
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
@@ -108,7 +108,7 @@ extension MapViewModel {
         businessFavoriteTeamProGamesRefreshTask = nil
 #if DEBUG
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=businessFavoriteTeamProGames")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=businessFavoriteTeamProGames")
 #endif
     }
 

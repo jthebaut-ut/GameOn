@@ -536,7 +536,7 @@ struct FanGeoAnnouncementService {
     """
 
     private static let selectColumnsWithoutOptionalFields = """
-    id,title,subtitle,description,image_url,cta_label,cta_action,audience_fans,audience_businesses,display_type,status,start_date,end_date,priority,created_at,updated_at,target_country,target_state,target_city,dismiss_version,promotion_type,promoted_venue_id,target_radius_miles,promo_offer_type,promo_offer_chip
+    id,title,subtitle,description,image_url,secondary_image_url,cta_label,cta_action,audience_fans,audience_businesses,display_type,status,start_date,end_date,priority,created_at,updated_at,target_country,target_state,target_city,dismiss_version,promotion_type,promoted_venue_id,target_radius_miles,promo_offer_type,promo_offer_chip
     """
 
     @MainActor

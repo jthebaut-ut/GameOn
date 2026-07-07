@@ -13,9 +13,11 @@ nonisolated enum ProGameNotificationFormatting {
         guard let flag = CountryFlagHelper.flag(for: cleaned, source: source)?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !flag.isEmpty else {
+#if DEBUG
             if source.localizedCaseInsensitiveContains("calendar") {
                 print("[CalendarFlagDebug] missingFlagFor=\(cleaned)")
             }
+#endif
             return cleaned
         }
         return "\(flag) \(cleaned)"

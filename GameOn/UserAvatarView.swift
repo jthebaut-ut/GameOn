@@ -48,6 +48,13 @@ struct UserAvatarView: View {
         .frame(width: size, height: size)
         .clipShape(Circle())
         .contentShape(Circle())
+        .onAppear {
+#if DEBUG
+            if localPreviewImage == nil, resolvedListURL == nil {
+                ProfileAvatarDebug.avatarRenderSource("initials")
+            }
+#endif
+        }
     }
 
     @ViewBuilder
@@ -124,7 +131,7 @@ private struct SmoothCachedAvatarImage: View {
                 uiImage = cached
                 imageOpacity = 1
 #if DEBUG
-                print("[UISmoothnessDebug] avatarLoadedFromCache=true")
+                ProfileAvatarDebug.avatarRenderSource("cache")
 #endif
                 return
             }
@@ -133,7 +140,7 @@ private struct SmoothCachedAvatarImage: View {
                   !Task.isCancelled else { return }
             uiImage = loaded
 #if DEBUG
-            print("[UISmoothnessDebug] avatarLoadedFromCache=false")
+            ProfileAvatarDebug.avatarRenderSource("server")
 #endif
             withAnimation(.easeOut(duration: 0.22)) {
                 imageOpacity = 1

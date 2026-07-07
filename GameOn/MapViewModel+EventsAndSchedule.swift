@@ -53,9 +53,9 @@ extension MapViewModel {
                     cacheHit: true
                 )
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=pickupSources")
-                print("[TabPerfDebug] usedCachedData=true tab=calendar source=pickupSources")
-                print("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=pickupSources reason=\(reason)")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=pickupSources")
+                TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=calendar source=pickupSources")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=pickupSources reason=\(reason)")
 #endif
                 return
             }
@@ -63,7 +63,7 @@ extension MapViewModel {
 
         if !forceRefresh, let existing = calendarTabPickupSourcesRefreshTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true tab=calendar source=pickupSources reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=calendar source=pickupSources reason=\(reason)")
 #endif
             await existing.value
             return
@@ -77,7 +77,7 @@ extension MapViewModel {
         AppPerfDebug.networkFetchStarted(tab: "calendar", source: "pickupSources:\(reason)")
 #if DEBUG
         print("[CalendarPickupPublicMode] personalStateHidden=true reason=refreshCalendarTabPickupSources")
-        print("[TabPerfDebug] refreshStarted=calendar source=pickupSources force=\(forceRefresh) reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=calendar source=pickupSources force=\(forceRefresh) reason=\(reason)")
 #endif
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
@@ -91,7 +91,7 @@ extension MapViewModel {
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
         AppPerfDebug.networkFetchFinished(tab: "calendar", source: "pickupSources:\(reason)", durationMs: ms)
 #if DEBUG
-        print("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=pickupSources reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=pickupSources reason=\(reason)")
 #endif
     }
 
@@ -286,14 +286,14 @@ extension MapViewModel {
         let age = lastDiscoverCoreRefreshAt.map { Date().timeIntervalSince($0) }
         if let age, age < 90, !events.isEmpty {
 #if DEBUG
-            print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=schedule")
-            print("[TabPerfDebug] usedCachedData=true tab=calendar source=schedule")
-            print("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=schedule reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=schedule")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=calendar source=schedule")
+            TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=schedule reason=\(reason)")
 #endif
             return
         }
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=calendar source=schedule reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=calendar source=schedule reason=\(reason)")
 #endif
         loadGamesFromSupabase()
     }

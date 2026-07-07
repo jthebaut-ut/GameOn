@@ -34,6 +34,7 @@ extension MapViewModel {
     func deleteProGamePredictionsForUnsave(proGameId: String) async {
         do {
             try await ProGamePredictionService.shared.deleteAllPredictionsForUser(proGameId: proGameId)
+        } catch is CancellationError {
         } catch {
 #if DEBUG
             print("[ProGamePredictionDebug] deleteOnUnsaveFailed id=\(proGameId) error=\(error.localizedDescription)")

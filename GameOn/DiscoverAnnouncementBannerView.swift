@@ -1019,8 +1019,19 @@ struct DiscoverAnnouncementBannerPageView: View {
     private static let sponsoredContentMaxHeight: CGFloat = fixedPageHeight
     private static let sponsoredDescriptionLineLimit = 2
 
-    @State private var showOfficialDetailSheet = false
-    @State private var showSponsoredDetailSheet = false
+    @State private var activeDetailSheet: DiscoverAnnouncementDetailSheet?
+
+    private enum DiscoverAnnouncementDetailSheet: Identifiable {
+        case official
+        case sponsored
+
+        var id: String {
+            switch self {
+            case .official: return "official"
+            case .sponsored: return "sponsored"
+            }
+        }
+    }
 
     private var sponsoredInfoChips: [DiscoverSponsoredAnnouncementChip] {
         chipMetadata.chips(for: announcement)
@@ -1043,30 +1054,30 @@ struct DiscoverAnnouncementBannerPageView: View {
         .overlay(alignment: .topTrailing) {
             dismissButton
         }
-        .sheet(isPresented: $showOfficialDetailSheet, onDismiss: {
+        .sheet(item: $activeDetailSheet, onDismiss: {
             onDetailSheetDismissed?()
-        }) {
-            FanGeoOfficialAnnouncementDetailSheet(
-                announcement: announcement,
-                onClose: { showOfficialDetailSheet = false },
-                onCTA: {
-                    showOfficialDetailSheet = false
-                    onCTA()
-                }
-            )
-        }
-        .sheet(isPresented: $showSponsoredDetailSheet, onDismiss: {
-            onDetailSheetDismissed?()
-        }) {
-            DiscoverSponsoredAnnouncementDetailSheet(
-                announcement: announcement,
-                chipMetadata: chipMetadata,
-                onClose: { showSponsoredDetailSheet = false },
-                onCTA: {
-                    showSponsoredDetailSheet = false
-                    onCTA()
-                }
-            )
+        }) { sheet in
+            switch sheet {
+            case .official:
+                FanGeoOfficialAnnouncementDetailSheet(
+                    announcement: announcement,
+                    onClose: { activeDetailSheet = nil },
+                    onCTA: {
+                        activeDetailSheet = nil
+                        onCTA()
+                    }
+                )
+            case .sponsored:
+                DiscoverSponsoredAnnouncementDetailSheet(
+                    announcement: announcement,
+                    chipMetadata: chipMetadata,
+                    onClose: { activeDetailSheet = nil },
+                    onCTA: {
+                        activeDetailSheet = nil
+                        onCTA()
+                    }
+                )
+            }
         }
     }
 
@@ -1156,7 +1167,7 @@ struct DiscoverAnnouncementBannerPageView: View {
 
             Button {
                 onDetailSheetPresented?()
-                showSponsoredDetailSheet = true
+                activeDetailSheet = .sponsored
             } label: {
                 Text("More")
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -1201,7 +1212,7 @@ struct DiscoverAnnouncementBannerPageView: View {
             .onTapGesture {
                 guard officialShowsMoreLink else { return }
                 onDetailSheetPresented?()
-                showOfficialDetailSheet = true
+                activeDetailSheet = .official
             }
 
             if hasCTA {
@@ -1245,7 +1256,7 @@ struct DiscoverAnnouncementBannerPageView: View {
                 if officialShowsMoreLink {
                     Button {
                         onDetailSheetPresented?()
-                        showOfficialDetailSheet = true
+                        activeDetailSheet = .official
                     } label: {
                         Text("More")
                             .font(.system(size: 11, weight: .semibold, design: .rounded))
@@ -1797,8 +1808,12 @@ private struct DiscoverSponsoredAnnouncementChipView: View {
 private struct DiscoverSponsoredAnnouncementMoreSheetMedia: Equatable {
     let secondaryImageURL: URL?
 
-    init(chipMetadata: DiscoverSponsoredAnnouncementChipMetadata) {
-        secondaryImageURL = Self.resolvedVenueSecondaryImageURL(from: chipMetadata)
+    init(
+        announcement: FanGeoAnnouncement,
+        chipMetadata: DiscoverSponsoredAnnouncementChipMetadata
+    ) {
+        secondaryImageURL = announcement.resolvedSecondaryImageURL
+            ?? Self.resolvedVenueSecondaryImageURL(from: chipMetadata)
     }
 
     private static func resolvedVenueSecondaryImageURL(
@@ -1898,7 +1913,10 @@ private struct DiscoverSponsoredAnnouncementDetailSheet: View {
     private static let sponsoredGoldTint = Color(red: 0.79, green: 0.60, blue: 0.14)
 
     private var sheetMedia: DiscoverSponsoredAnnouncementMoreSheetMedia {
-        DiscoverSponsoredAnnouncementMoreSheetMedia(chipMetadata: chipMetadata)
+        DiscoverSponsoredAnnouncementMoreSheetMedia(
+            announcement: announcement,
+            chipMetadata: chipMetadata
+        )
     }
 
     private var userVisibleTitle: String {

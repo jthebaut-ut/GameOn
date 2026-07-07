@@ -86,6 +86,7 @@ enum PublicUserProfileService {
         print("[PublicProfileLoadDebug] requestedUserId=\(userId.uuidString.lowercased())")
 #endif
         if cachedProfile?.isDeletedAccount == true {
+            logPublicProfileBlocked(userId: userId, reason: "deleted_cached")
             return hiddenProfile(userId: userId)
         }
 
@@ -93,11 +94,39 @@ enum PublicUserProfileService {
             if identity.visible {
                 return await assembleFromIdentityRPC(identity, userId: userId, cachedProfile: cachedProfile)
             }
+            logPublicProfileBlocked(userId: userId, reason: "identity_not_visible")
             return hiddenProfile(userId: userId)
         }
 
         return await loadLegacy(userId: userId, cachedProfile: cachedProfile)
     }
+
+    /// Matches ``get_public_fan_identity_profile`` visibility for suggestion filtering.
+    static func isPublicIdentityVisible(userId: UUID) async -> Bool {
+        if let identity = await fetchPublicIdentityRPC(targetUserId: userId) {
+            return identity.visible
+        }
+
+        let fetched = await fetchProfileRow(userId: userId)
+        guard let row = fetched.row else { return false }
+        if row.isDeletedAccount { return false }
+        if row.isBusinessIdentity { return false }
+        if !row.discoverableByFans { return false }
+        if let adminStatus = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !adminStatus.isEmpty,
+           adminStatus != "active" {
+            return false
+        }
+        return true
+    }
+
+#if DEBUG
+    private static func logPublicProfileBlocked(userId: UUID, reason: String) {
+        print("[PublicProfileDebug] loadBlocked reason=\(reason) user_id=\(userId.uuidString.lowercased())")
+    }
+#else
+    private static func logPublicProfileBlocked(userId: UUID, reason: String) {}
+#endif
 
     static func userProfileRow(from preview: UserPreview) -> UserProfileRow {
         UserProfileRow(
@@ -610,6 +639,7 @@ enum PublicUserProfileService {
 #endif
 
         if row?.isDeletedAccount == true {
+            logPublicProfileBlocked(userId: userId, reason: "deleted_legacy")
             return hiddenProfile(userId: userId)
         }
 
@@ -621,6 +651,7 @@ enum PublicUserProfileService {
         let discoverable = row?.discoverableByFans ?? true
 
         if isBusiness || discoverable == false {
+            logPublicProfileBlocked(userId: userId, reason: isBusiness ? "business_legacy" : "not_discoverable_legacy")
             return hiddenProfile(userId: userId)
         }
 

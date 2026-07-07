@@ -412,11 +412,14 @@ struct FanGeoIdentitySetupView: View {
             localAvatarPreviewImage = nil
             return
         }
-        _ = await viewModel.saveUserProfile(
-            displayName: viewModel.currentUserDisplayName,
-            avatarURL: urls.fullURL,
-            avatarThumbnailURL: urls.thumbnailURL
-        )
+        if let err = await viewModel.persistUserProfileAvatar(
+            fullURL: urls.fullURL,
+            thumbnailURL: urls.thumbnailURL
+        ) {
+            localAvatarPreviewImage = nil
+            errorMessage = err
+            return
+        }
         if let previewImage {
             let cacheURLs = ImageDisplayURL.displayURLs(
                 thumbnail: urls.thumbnailURL,

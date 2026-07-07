@@ -1467,10 +1467,26 @@ extension MapViewModel {
             emailForRow = fallback
         }
 
+        guard !FanProfileDefaults.isAnonymizedOrDeletedEmail(emailForRow) else {
+#if DEBUG
+            print("[ProfileBootstrap] skipped profile defaults for deleted/anonymized email")
+#endif
+            return
+        }
+
+        let defaultDisplayName = FanProfileDefaults.defaultDisplayName(email: emailForRow)
+        let usernameBase = FanProfileDefaults.defaultUsernameBase(email: emailForRow, authUserId: authId)
+        let defaultUsername = await resolveAvailableDefaultUsername(base: usernameBase, authId: authId)
+#if DEBUG
+        ProfileDefaultsDebug.generatedDisplayName(defaultDisplayName)
+        ProfileDefaultsDebug.generatedUsername(defaultUsername)
+#endif
+
         let row = UserProfileBootstrapInsert(
             id: authId,
             email: emailForRow,
-            display_name: "",
+            display_name: defaultDisplayName,
+            username: defaultUsername,
             bio: nil,
             avatar_url: "",
             avatar_thumbnail_url: nil,
@@ -1488,7 +1504,16 @@ extension MapViewModel {
 #if DEBUG
             print("[ProfileBootstrap] profile created successfully")
 #endif
-            await MainActor.run { currentUserAuthId = authId }
+            await MainActor.run {
+                currentUserAuthId = authId
+                if currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    currentUserDisplayName = defaultDisplayName
+                }
+                if currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    currentUserUsername = defaultUsername
+                }
+                cacheCurrentUserProfileLocally()
+            }
         } catch {
             Self.logPostgrestError("[ProfileBootstrap] insert failed", error)
             if let pe = error as? PostgrestError, pe.code == "23505" {
@@ -1498,6 +1523,45 @@ extension MapViewModel {
                 await MainActor.run { currentUserAuthId = authId }
             }
         }
+    }
+
+    private func resolveAvailableDefaultUsername(base: String, authId: UUID) async -> String {
+        let normalizedBase = FanGeoHandleRules.normalizeForStorage(base)
+        guard !normalizedBase.isEmpty else {
+            return FanProfileDefaults.defaultUsernameBase(email: "", authUserId: authId)
+        }
+
+        if await checkUsernameAvailable(normalizedBase) == true {
+            return normalizedBase
+        }
+
+        let idSuffix = FanProfileDefaults.shortAuthSuffix(authId, length: 4)
+        let idCandidate = FanProfileDefaults.usernameByAppendingSuffix(normalizedBase, suffix: idSuffix)
+        if await checkUsernameAvailable(idCandidate) == true {
+#if DEBUG
+            ProfileDefaultsDebug.usernameCollisionResolved(base: normalizedBase, resolved: idCandidate)
+#endif
+            return idCandidate
+        }
+
+        for index in 2...99 {
+            let numbered = FanProfileDefaults.usernameByAppendingSuffix(normalizedBase, suffix: "\(index)")
+            if await checkUsernameAvailable(numbered) == true {
+#if DEBUG
+                ProfileDefaultsDebug.usernameCollisionResolved(base: normalizedBase, resolved: numbered)
+#endif
+                return numbered
+            }
+        }
+
+        let fallback = FanProfileDefaults.usernameByAppendingSuffix(
+            "fan",
+            suffix: FanProfileDefaults.shortAuthSuffix(authId, length: 6)
+        )
+#if DEBUG
+        ProfileDefaultsDebug.usernameCollisionResolved(base: normalizedBase, resolved: fallback)
+#endif
+        return fallback
     }
 
     func bumpCurrentUserAvatarDisplayRefresh() {
@@ -2019,6 +2083,12 @@ extension MapViewModel {
             currentUserIsBusinessAccount = false
             currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(UserDefaults.standard.string(forKey: "cachedUserAvatarURL"))
             currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(UserDefaults.standard.string(forKey: "cachedUserAvatarThumbnailURL"))
+#if DEBUG
+            ProfileAvatarDebug.profileReloaded(
+                handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
+            )
+#endif
             currentUserNationalTeam = cachedNationalTeamIdentity()
             currentUserHomeCity = UserDefaults.standard.string(forKey: "cachedUserHomeCity") ?? ""
             currentUserHomeRegion = UserDefaults.standard.string(forKey: "cachedUserHomeRegion") ?? ""
@@ -2511,6 +2581,12 @@ extension MapViewModel {
                         currentUserIsBusinessAccount = profile.isBusinessIdentity
                         currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
                         currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
+#if DEBUG
+                        ProfileAvatarDebug.profileReloaded(
+                            handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                            avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
+                        )
+#endif
                         currentUserNationalTeam = profile.nationalTeamIdentity
                         applyCurrentUserHomeCityFromProfile(profile)
                         currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
@@ -2590,6 +2666,12 @@ extension MapViewModel {
                     currentUserIsBusinessAccount = profile.isBusinessIdentity
                     currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
                     currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
+#if DEBUG
+                    ProfileAvatarDebug.profileReloaded(
+                        handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                        avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
+                    )
+#endif
                         currentUserNationalTeam = profile.nationalTeamIdentity
                     applyCurrentUserHomeCityFromProfile(profile)
                     currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
@@ -2666,6 +2748,65 @@ extension MapViewModel {
             print("[HandleAvailabilityDebug] rpc_failed handle=\(stored) error=\(error.localizedDescription)")
 #endif
             return nil
+        }
+    }
+
+    /// Writes avatar URLs to `user_profiles` without touching identity/handle fields.
+    @discardableResult
+    func persistUserProfileAvatar(fullURL: String, thumbnailURL: String?) async -> String? {
+        let session: Session
+        do {
+            session = try await supabase.auth.session
+        } catch {
+            return "You need to be signed in to save your profile."
+        }
+
+        let authId = session.user.id
+        let authIdKey = authId.uuidString.lowercased()
+        await MainActor.run { currentUserAuthId = authId }
+
+        let canonFull = ImageDisplayURL.canonicalStorageURLString(fullURL)
+        guard !canonFull.isEmpty else {
+            return "Unable to save avatar URL."
+        }
+
+        let finalThumb: String? = {
+            guard let thumbnailURL else { return nil }
+            let trimmed = thumbnailURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let canonical = ImageDisplayURL.canonicalStorageURLString(trimmed)
+            return canonical.isEmpty ? nil : canonical
+        }()
+
+        await ensureUserProfileExists()
+
+        do {
+            let avatarPatch = UserProfileAvatarPatch(
+                avatar_url: canonFull,
+                avatar_thumbnail_url: finalThumb
+            )
+#if DEBUG
+            ProfileAvatarDebug.profileUpdateStarted(fields: "avatar_url,avatar_thumbnail_url")
+#endif
+            try await supabase
+                .from("user_profiles")
+                .update(avatarPatch)
+                .eq("id", value: authIdKey)
+                .execute()
+
+            await MainActor.run {
+                currentUserAvatarURL = canonFull
+                currentUserAvatarThumbnailURL = finalThumb ?? ""
+                bumpCurrentUserAvatarDisplayRefresh()
+                cacheCurrentUserProfileLocally()
+            }
+#if DEBUG
+            ProfileAvatarDebug.profileUpdated(avatarURLPresent: true)
+#endif
+            return nil
+        } catch {
+            print("ERROR PERSISTING USER AVATAR:", error)
+            return "Couldn't save your avatar. Please try again."
         }
     }
 
@@ -2814,13 +2955,15 @@ extension MapViewModel {
 
         do {
             let canonFull = ImageDisplayURL.canonicalStorageURLString(avatarURL)
+            let updatingAvatar = !canonFull.isEmpty
             let existingAvatarURL = ImageDisplayURL.canonicalStorageURLString(existingProfile?.avatar_url)
             let finalAvatarURL: String
-            if canonFull.isEmpty, !existingAvatarURL.isEmpty {
-                finalAvatarURL = existingAvatarURL
-                preventedBlankProfileOverwrite = true
-            } else {
+            if updatingAvatar {
                 finalAvatarURL = canonFull
+            } else if !existingAvatarURL.isEmpty {
+                finalAvatarURL = existingAvatarURL
+            } else {
+                finalAvatarURL = ""
             }
 
             let resolvedThumb: String? = {
@@ -2837,6 +2980,12 @@ extension MapViewModel {
             }()
             let existingAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(existingProfile?.avatar_thumbnail_url)
             let finalAvatarThumbnailURL: String? = {
+                guard updatingAvatar else {
+                    if !existingAvatarThumbnailURL.isEmpty {
+                        return existingAvatarThumbnailURL
+                    }
+                    return nil
+                }
                 let incoming = ImageDisplayURL.canonicalStorageURLString(resolvedThumb)
                 if incoming.isEmpty, !existingAvatarThumbnailURL.isEmpty {
                     preventedBlankProfileOverwrite = true
@@ -2854,35 +3003,84 @@ extension MapViewModel {
                 finalUsernameToSave = usernameToSave
             }
 
-            let profile = UserProfileInsert(
-                id: authId,
-                email: emailForRow,
-                display_name: finalDisplayName,
-                username: finalUsernameToSave,
-                bio: finalBioToSave,
-                avatar_url: finalAvatarURL,
-                avatar_thumbnail_url: finalAvatarThumbnailURL,
-                live_visibility_enabled: currentUserLiveVisibilityEnabled,
-                live_visibility_mode: currentUserLiveVisibilityMode.rawValue,
-                selected_live_visibility_friend_ids: currentUserSelectedLiveVisibilityFriendIDs
-                    .sorted { $0.uuidString < $1.uuidString }
-                    .map { $0.uuidString.lowercased() },
-                discoverable_by_fans: currentUserDiscoverableByFans
-            )
+            let authIdKey = authId.uuidString.lowercased()
 
 #if DEBUG
             print(
-                "[ProfilePersistenceDebug] profileUpsertPayload=id=\(authId.uuidString.lowercased()), email=\(emailForRow), displayNameEmpty=\(finalDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), usernameEmpty=\((finalUsernameToSave ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), bioLength=\(finalBioToSave?.count ?? 0), avatarEmpty=\(finalAvatarURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), live_visibility_enabled=\(currentUserLiveVisibilityEnabled), live_visibility_mode=\(currentUserLiveVisibilityMode.rawValue), selectedFriendCount=\(currentUserSelectedLiveVisibilityFriendIDs.count), discoverable_by_fans=\(currentUserDiscoverableByFans)"
+                "[ProfilePersistenceDebug] profileUpsertPayload=id=\(authIdKey), email=\(emailForRow), displayNameEmpty=\(finalDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), usernameEmpty=\((finalUsernameToSave ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), bioLength=\(finalBioToSave?.count ?? 0), avatarEmpty=\(finalAvatarURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty), updatingAvatar=\(updatingAvatar), live_visibility_enabled=\(currentUserLiveVisibilityEnabled), live_visibility_mode=\(currentUserLiveVisibilityMode.rawValue), selectedFriendCount=\(currentUserSelectedLiveVisibilityFriendIDs.count), discoverable_by_fans=\(currentUserDiscoverableByFans)"
             )
             if preventedBlankProfileOverwrite {
                 print("[ProfilePersistenceDebug] preventedBlankProfileOverwrite=true")
             }
 #endif
 
-            try await supabase
-                .from("user_profiles")
-                .upsert(profile, onConflict: "id")
-                .execute()
+            if existingProfile != nil {
+                let savePatch = UserProfileSavePatch(
+                    email: emailForRow,
+                    display_name: finalDisplayName,
+                    username: finalUsernameToSave,
+                    bio: finalBioToSave,
+                    live_visibility_enabled: currentUserLiveVisibilityEnabled,
+                    live_visibility_mode: currentUserLiveVisibilityMode.rawValue,
+                    selected_live_visibility_friend_ids: currentUserSelectedLiveVisibilityFriendIDs
+                        .sorted { $0.uuidString < $1.uuidString }
+                        .map { $0.uuidString.lowercased() },
+                    discoverable_by_fans: currentUserDiscoverableByFans
+                )
+                try await supabase
+                    .from("user_profiles")
+                    .update(savePatch)
+                    .eq("id", value: authIdKey)
+                    .execute()
+
+                if updatingAvatar {
+#if DEBUG
+                    ProfileAvatarDebug.profileUpdateStarted(fields: "avatar_url,avatar_thumbnail_url")
+#endif
+                    let avatarPatch = UserProfileAvatarPatch(
+                        avatar_url: finalAvatarURL,
+                        avatar_thumbnail_url: finalAvatarThumbnailURL
+                    )
+                    try await supabase
+                        .from("user_profiles")
+                        .update(avatarPatch)
+                        .eq("id", value: authIdKey)
+                        .execute()
+#if DEBUG
+                    ProfileAvatarDebug.profileUpdated(avatarURLPresent: !finalAvatarURL.isEmpty)
+#endif
+                }
+            } else {
+                let profile = UserProfileInsert(
+                    id: authId,
+                    email: emailForRow,
+                    display_name: finalDisplayName,
+                    username: finalUsernameToSave,
+                    bio: finalBioToSave,
+                    avatar_url: finalAvatarURL,
+                    avatar_thumbnail_url: finalAvatarThumbnailURL,
+                    live_visibility_enabled: currentUserLiveVisibilityEnabled,
+                    live_visibility_mode: currentUserLiveVisibilityMode.rawValue,
+                    selected_live_visibility_friend_ids: currentUserSelectedLiveVisibilityFriendIDs
+                        .sorted { $0.uuidString < $1.uuidString }
+                        .map { $0.uuidString.lowercased() },
+                    discoverable_by_fans: currentUserDiscoverableByFans
+                )
+                if updatingAvatar {
+#if DEBUG
+                    ProfileAvatarDebug.profileUpdateStarted(fields: "avatar_url,avatar_thumbnail_url")
+#endif
+                }
+                try await supabase
+                    .from("user_profiles")
+                    .upsert(profile, onConflict: "id")
+                    .execute()
+#if DEBUG
+                if updatingAvatar {
+                    ProfileAvatarDebug.profileUpdated(avatarURLPresent: !finalAvatarURL.isEmpty)
+                }
+#endif
+            }
 
             await MainActor.run {
                 if currentUserEmail != emailForRow {
@@ -2893,12 +3091,17 @@ extension MapViewModel {
                     currentUserUsername = finalUsernameToSave
                 }
                 currentUserBio = finalBioToSave ?? ""
-                currentUserAvatarURL = finalAvatarURL
-                currentUserAvatarThumbnailURL = finalAvatarThumbnailURL ?? ""
+                if updatingAvatar {
+                    currentUserAvatarURL = finalAvatarURL
+                    currentUserAvatarThumbnailURL = finalAvatarThumbnailURL ?? ""
+                    bumpCurrentUserAvatarDisplayRefresh()
+                } else if !finalAvatarURL.isEmpty {
+                    currentUserAvatarURL = finalAvatarURL
+                    currentUserAvatarThumbnailURL = finalAvatarThumbnailURL ?? ""
+                }
                 cacheCurrentUserProfileLocally()
                 applyCurrentUserBioToProfileCaches(bio: finalBioToSave)
                 publicProfileBioRevision &+= 1
-                bumpCurrentUserAvatarDisplayRefresh()
             }
 
 #if DEBUG
@@ -3396,6 +3599,7 @@ extension MapViewModel {
             let session = try await supabase.auth.session
             let authUserId = session.user.id
 #if DEBUG
+            ProfileAvatarDebug.uploadStarted(userId: authUserId)
             print("[ProfileSave] auth user id = \(authUserId) (avatar storage path prefix)")
 #endif
             let folder = authUserId.uuidString.lowercased()
@@ -3451,6 +3655,9 @@ extension MapViewModel {
             await deleteReplacedStorageObjectIfNeeded(oldPublicURL: oldFull.isEmpty ? nil : oldFull, newPublicURL: fullStr, bucket: "user-avatars")
             await deleteReplacedStorageObjectIfNeeded(oldPublicURL: oldThumb.isEmpty ? nil : oldThumb, newPublicURL: thumbStr, bucket: "user-avatars")
 
+#if DEBUG
+            ProfileAvatarDebug.uploadSucceeded(urlPresent: !fullStr.isEmpty)
+#endif
             return UploadedAvatarURLs(fullURL: fullStr, thumbnailURL: thumbStr)
 
         } catch {

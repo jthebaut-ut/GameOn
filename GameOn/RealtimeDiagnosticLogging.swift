@@ -89,13 +89,32 @@ nonisolated enum DebugLogGate {
     }
 }
 
-/// Tab / screen performance tracing (`[AppPerfDebug]`); DEBUG unless ``DebugLogGate/releaseHotPathPerfLogging``.
+/// Hot-path tab tracing lines (`[TabPerfDebug]`); stripped in Release.
+enum TabPerfDebug {
+    static func log(_ message: @autoclosure () -> String) {
+#if DEBUG
+        print(message())
+#endif
+    }
+}
+
+/// Sponsored placement investigation lines (`[SponsoredPlacementDebug]`); stripped in Release.
+enum SponsoredPlacementDebugLog {
+    static func log(_ message: @autoclosure () -> String) {
+#if DEBUG
+        print(message())
+#endif
+    }
+}
+
+/// Tab / screen performance tracing (`[AppPerfDebug]`); DEBUG only.
 enum AppPerfDebug {
     private static let imageLoadLock = NSLock()
     private static var imageLoadCount = 0
     private static var imageCacheHitCount = 0
 
     static func tabSwitchStart(tab: String, from: String?, cacheHit: Bool, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] tabSwitchStart=\(Date().timeIntervalSince1970)")
         print("[AppPerfDebug] tab=\(tab)")
@@ -104,31 +123,38 @@ enum AppPerfDebug {
         if let from, !from.isEmpty {
             print("[AppPerfDebug] fromTab=\(from)")
         }
+#endif
     }
 
     static func tabSwitchEnd(tab: String, durationMs: Int, cacheHit: Bool, source: String = "firstPaint") {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] tabSwitchEnd=\(Date().timeIntervalSince1970)")
         print("[AppPerfDebug] tab=\(tab)")
         print("[AppPerfDebug] durationMs=\(durationMs)")
         print("[AppPerfDebug] cacheHit=\(cacheHit)")
         print("[AppPerfDebug] source=\(source)")
+#endif
     }
 
     static func screenLoadStart(tab: String, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] screenLoadStart=\(Date().timeIntervalSince1970)")
         print("[AppPerfDebug] tab=\(tab)")
         print("[AppPerfDebug] source=\(source)")
+#endif
     }
 
     static func networkFetchStarted(tab: String? = nil, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         if let tab {
             print("[AppPerfDebug] networkFetchStarted=true tab=\(tab) source=\(source)")
         } else {
             print("[AppPerfDebug] networkFetchStarted=true source=\(source)")
         }
+#endif
     }
 
     static func networkFetchFinished(
@@ -137,15 +163,18 @@ enum AppPerfDebug {
         durationMs: Int,
         cacheHit: Bool = false
     ) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         if let tab {
             print("[AppPerfDebug] networkFetchFinished=true tab=\(tab) source=\(source) durationMs=\(durationMs) cacheHit=\(cacheHit)")
         } else {
             print("[AppPerfDebug] networkFetchFinished=true source=\(source) durationMs=\(durationMs) cacheHit=\(cacheHit)")
         }
+#endif
     }
 
     static func mainActorBlocked(ms: Double, tab: String? = nil, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         let rounded = Int(ms.rounded())
         Perf.mainActorWork(name: source, durationMs: rounded)
@@ -154,9 +183,11 @@ enum AppPerfDebug {
         } else {
             print("[AppPerfDebug] mainActorBlockedMs=\(rounded) source=\(source)")
         }
+#endif
     }
 
     static func imageLoad(cacheHit: Bool, source: String = "DiscoverMapImageCache") {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         imageLoadLock.lock()
         imageLoadCount += 1
@@ -165,21 +196,28 @@ enum AppPerfDebug {
         let hits = imageCacheHitCount
         imageLoadLock.unlock()
         print("[AppPerfDebug] imageLoadCount=\(total) cacheHit=\(cacheHit) source=\(source) cacheHits=\(hits)")
+#endif
     }
 
     static func realtimeRestarted(_ restarted: Bool, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] realtimeRestarted=\(restarted) source=\(source)")
+#endif
     }
 
     static func deferredWork(tab: String, work: String, source: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] deferredWork=true tab=\(tab) work=\(work) source=\(source)")
+#endif
     }
 
     static func refreshSkipped(tab: String, source: String, reason: String) {
+#if DEBUG
         guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
         print("[AppPerfDebug] refreshSkipped=true tab=\(tab) source=\(source) reason=\(reason)")
+#endif
     }
 }
 
@@ -317,6 +355,177 @@ nonisolated enum GoingPerfDebug {
         DebugLogGate.goingTabPerfVerbose("[GoingPerfDebug] source=\(source)")
     }
 }
+
+enum SuggestedFansDebug {
+    static func loadingStarted() {
+#if DEBUG
+        print("[SuggestedFansDebug] loadingStarted")
+#endif
+    }
+
+    static func firstContentVisibleMs(_ milliseconds: Int) {
+#if DEBUG
+        print("[SuggestedFansDebug] firstContentVisibleMs=\(milliseconds)")
+#endif
+    }
+
+    static func loadingFinished(count: Int) {
+#if DEBUG
+        print("[SuggestedFansDebug] loadingFinished count=\(count)")
+#endif
+    }
+}
+
+#if DEBUG
+enum ProSchedulePerf {
+    private static var loadStartedAt: CFAbsoluteTime?
+    private static var firstContentLogged = false
+    private static var visibleGamesRendered = 0
+
+    static func loadStarted() {
+        loadStartedAt = CFAbsoluteTimeGetCurrent()
+        firstContentLogged = false
+        visibleGamesRendered = 0
+        print("[ProSchedulePerf] loadStarted")
+    }
+
+    static func totalGamesFetched(_ count: Int) {
+        print("[ProSchedulePerf] totalGamesFetched=\(count)")
+    }
+
+    static func logHydrationDeferredCount(_ count: Int) {
+        print("[ProSchedulePerf] hydrationDeferredCount=\(count)")
+    }
+
+    static func noteVisibleGameRendered() {
+        visibleGamesRendered += 1
+        if !firstContentLogged, let start = loadStartedAt {
+            firstContentLogged = true
+            let ms = Int((CFAbsoluteTimeGetCurrent() - start) * 1000)
+            print("[ProSchedulePerf] firstContentVisibleMs=\(ms)")
+        }
+        print("[ProSchedulePerf] visibleGamesRendered=\(visibleGamesRendered)")
+    }
+
+    static func noteHydrationStarted() {
+        // Reserved for per-card hydration tracing when needed.
+    }
+}
+
+enum ChatLoadPerf {
+    private static var loadStartedAt: CFAbsoluteTime?
+
+    static func loadStarted() {
+#if DEBUG
+        loadStartedAt = CFAbsoluteTimeGetCurrent()
+        print("[ChatLoadPerf] loadStarted")
+#endif
+    }
+
+    static func cachedRowsShown(count: Int) {
+#if DEBUG
+        print("[ChatLoadPerf] cachedRowsShown count=\(count)")
+#endif
+    }
+
+    static func recentChatsVisibleMs(_ ms: Int) {
+#if DEBUG
+        print("[ChatLoadPerf] recentChatsVisibleMs=\(ms)")
+#endif
+    }
+
+    static func liveFansVisibleMs(_ ms: Int) {
+#if DEBUG
+        print("[ChatLoadPerf] liveFansVisibleMs=\(ms)")
+#endif
+    }
+
+    static func totalInitialLoadMs(_ ms: Int) {
+#if DEBUG
+        print("[ChatLoadPerf] totalInitialLoadMs=\(ms)")
+#endif
+    }
+
+    static func inboxFetchMs(_ ms: Int) {
+#if DEBUG
+        print("[ChatLoadPerf] inboxFetchMs=\(ms)")
+#endif
+    }
+
+    static func presenceFetchDeferred(deferred: Bool) {
+#if DEBUG
+        print("[ChatLoadPerf] presenceFetchDeferred=\(deferred)")
+#endif
+    }
+
+    static func elapsedMsSinceLoadStarted() -> Int? {
+#if DEBUG
+        guard let loadStartedAt else { return nil }
+        return Int((CFAbsoluteTimeGetCurrent() - loadStartedAt) * 1000)
+#else
+        return nil
+#endif
+    }
+}
+
+enum ProfileDefaultsDebug {
+    static func generatedDisplayName(_ value: String) {
+#if DEBUG
+        print("[ProfileDefaultsDebug] generated displayName=\(value)")
+#endif
+    }
+
+    static func generatedUsername(_ value: String) {
+#if DEBUG
+        print("[ProfileDefaultsDebug] generated username=\(value)")
+#endif
+    }
+
+    static func usernameCollisionResolved(base: String, resolved: String) {
+#if DEBUG
+        print("[ProfileDefaultsDebug] usernameCollisionResolved base=\(base) resolved=\(resolved)")
+#endif
+    }
+}
+
+enum ProfileAvatarDebug {
+    static func uploadStarted(userId: UUID) {
+#if DEBUG
+        print("[ProfileAvatarDebug] uploadStarted userId=\(userId.uuidString.lowercased())")
+#endif
+    }
+
+    static func uploadSucceeded(urlPresent: Bool) {
+#if DEBUG
+        print("[ProfileAvatarDebug] uploadSucceeded urlPresent=\(urlPresent)")
+#endif
+    }
+
+    static func profileUpdateStarted(fields: String) {
+#if DEBUG
+        print("[ProfileAvatarDebug] profileUpdateStarted field=\(fields)")
+#endif
+    }
+
+    static func profileUpdated(avatarURLPresent: Bool) {
+#if DEBUG
+        print("[ProfileAvatarDebug] profileUpdated avatarURLPresent=\(avatarURLPresent)")
+#endif
+    }
+
+    static func profileReloaded(handlePresent: Bool, avatarURLPresent: Bool) {
+#if DEBUG
+        print("[ProfileAvatarDebug] profileReloaded handlePresent=\(handlePresent) avatarURLPresent=\(avatarURLPresent)")
+#endif
+    }
+
+    static func avatarRenderSource(_ source: String) {
+#if DEBUG
+        print("[ProfileAvatarDebug] avatarRenderSource=\(source)")
+#endif
+    }
+}
+#endif
 
 enum UIPerformanceDiagnostics {
     /// Profiling switch: temporarily set this to `true` to enable `[UIPerf]` logs and os_signpost events.

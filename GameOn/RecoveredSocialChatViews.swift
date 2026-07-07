@@ -368,20 +368,20 @@ struct FriendsTabView: View {
         viewModel.mapViewModel = mapViewModel
         logChatAuthGate(reason: "appear")
         consumePendingDmOpenPreviewIfNeeded()
+        if chatNeedsInboxBodyLoad {
+            viewModel.prepareInboxLoadUIStateIfNeeded()
+        }
         Task { @MainActor in
             await Task.yield()
             try? await Task.sleep(nanoseconds: 90_000_000)
             guard isTabSelected else { return }
-            if mapViewModel.didCompleteTabIntentPreloadRecently("chat", within: 25) {
-                AppPerfDebug.refreshSkipped(tab: "chat", source: "inboxSummaries", reason: "tabPreloadRecent")
-                DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear skipped=tabPreloadRecent")
-            } else if viewModel.shouldSkipChatTabSurfaceRefresh() {
-                AppPerfDebug.refreshSkipped(tab: "chat", source: "inboxSummaries", reason: "freshCache")
-                DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear skipped=fresh")
+            if shouldSkipInboxRefreshOnAppear {
+                AppPerfDebug.refreshSkipped(tab: "chat", source: "inboxSummaries", reason: chatSkipInboxRefreshReason)
+                DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear skipped=\(chatSkipInboxRefreshReason)")
             } else {
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear started")
                 await viewModel.refreshInboxSummariesIfNeeded()
-                await viewModel.refreshFriendRequestListsOnly()
+                Task { await viewModel.refreshFriendRequestListsOnly() }
                 viewModel.noteChatTabSurfaceRefreshCompleted()
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear finished")
             }
@@ -389,6 +389,26 @@ struct FriendsTabView: View {
                 await viewModel.ensureSignedInSocialRealtimeIfNeeded()
             }
         }
+    }
+
+    private var chatNeedsInboxBodyLoad: Bool {
+        !shouldShowChatSignInRequired
+            && !viewModel.hasCompletedInitialInboxLoad
+            && viewModel.friends.filter(\.isConversationBacked).isEmpty
+    }
+
+    private var shouldSkipInboxRefreshOnAppear: Bool {
+        if chatNeedsInboxBodyLoad { return false }
+        if mapViewModel.didCompleteTabIntentPreloadRecently("chat", within: 25) { return true }
+        if viewModel.shouldSkipChatTabSurfaceRefresh() { return true }
+        return false
+    }
+
+    private var chatSkipInboxRefreshReason: String {
+        if mapViewModel.didCompleteTabIntentPreloadRecently("chat", within: 25) {
+            return "tabPreloadRecent"
+        }
+        return "freshCache"
     }
 
     private func rebuildFriendDisplaySnapshots(reason: String) {
@@ -742,26 +762,67 @@ struct FriendsTabView: View {
             fansLiveNowEntries = entries
 #if DEBUG
             print("[FansLiveNow] refresh reason=\(reason) count=\(entries.count)")
+            if !entries.isEmpty, let ms = ChatLoadPerf.elapsedMsSinceLoadStarted() {
+                ChatLoadPerf.liveFansVisibleMs(ms)
+            }
 #endif
         }
     }
 
-    private var fansLiveNowStrip: some View {
-        ChatFansLiveNowStripView(
-            entries: fansLiveNowEntries,
-            onSeeAll: { selectedSection = .friends },
-            onOpenProfile: { userId in
-                mapViewModel.presentPublicProfile(userId: userId, context: "fans_live_now")
-            },
-            onOpenChat: { preview in
-                dmBannerNavigationFriend = preview
-            }
-        )
+    private var shouldShowChatInboxLoadingState: Bool {
+        viewModel.isInboxInitialLoadInFlight && chatConversationFriends.isEmpty
+    }
+
+    private var shouldShowChatInboxEmptyState: Bool {
+        viewModel.hasCompletedInitialInboxLoad && chatConversationFriends.isEmpty
+    }
+
+    private var chatInboxUpdatingIndicator: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Updating conversations…")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+    }
+
+    private var chatInboxLoadingCard: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Loading conversations…")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(FGColor.divider(colorScheme).opacity(0.55), lineWidth: 1)
+        }
+        .softCardShadow()
     }
 
     private var chatsList: some View {
         Group {
-            if chatConversationFriends.isEmpty {
+            if shouldShowChatInboxLoadingState {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        chatInboxLoadingCard
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                    .padding(.bottom, 110)
+                }
+                .background(chatRootBackground)
+            } else if shouldShowChatInboxEmptyState {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         if !fansLiveNowEntries.isEmpty {
@@ -777,6 +838,9 @@ struct FriendsTabView: View {
             } else {
                 GeometryReader { layoutGeo in
                     VStack(spacing: 8) {
+                        if viewModel.isInboxBackgroundRefreshInFlight {
+                            chatInboxUpdatingIndicator
+                        }
                         if !fansLiveNowEntries.isEmpty {
                             fansLiveNowStrip
                                 .padding(.horizontal, 16)
@@ -792,6 +856,22 @@ struct FriendsTabView: View {
             logChatInboxAdPlacement()
             refreshFansLiveNowAfterFirstPaint(reason: "chatsListAppear")
         }
+        .onChange(of: viewModel.friends) { _, _ in
+            refreshFansLiveNowAfterFirstPaint(reason: "friendsUpdated")
+        }
+    }
+
+    private var fansLiveNowStrip: some View {
+        ChatFansLiveNowStripView(
+            entries: fansLiveNowEntries,
+            onSeeAll: { selectedSection = .friends },
+            onOpenProfile: { userId in
+                mapViewModel.presentPublicProfile(userId: userId, context: "fans_live_now")
+            },
+            onOpenChat: { preview in
+                dmBannerNavigationFriend = preview
+            }
+        )
     }
 
     private func chatsInboxList(layoutWidth: CGFloat) -> some View {
@@ -1965,9 +2045,10 @@ private struct AddFriendGlassSheet: View {
 
     private var header: some View {
         HStack {
-            Button("Close", action: onClose)
+            Button(successMessage == nil ? "Close" : "Done", action: onClose)
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(successMessage == nil ? Color.secondary : Color.accentColor)
                 .frame(width: 68, alignment: .leading)
 
             Spacer()

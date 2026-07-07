@@ -52,10 +52,14 @@ struct CompactNativeAdCard: View {
         )
     }
 
+    private var shouldMountNativeAdHost: Bool {
+        FanGeoAdPolicy.shouldMountAdViews()
+            && hostTabAdInteractionEnabled
+            && !AdDebugContext.isTabOffscreenPreserved(tabRaw: hostTabRaw)
+    }
+
     var body: some View {
-        if !FanGeoAdPolicy.shouldMountAdViews() {
-            EmptyView()
-        } else {
+        if shouldMountNativeAdHost {
             nativeAdContent
         }
     }

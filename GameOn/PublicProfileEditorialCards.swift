@@ -11,11 +11,29 @@ enum PublicProfileSheetLayout {
     static let editorialCardRadius: CGFloat = 24
     /// Grid section card corners (Open To, Mutual Fans).
     static let gridCardRadius: CGFloat = 20
+    /// Centered readable column on iPad regular width class (landscape / wide portrait).
+    static let maxContentWidth: CGFloat = 980
+    /// Open To icon grid: fixed tile width so icons do not stretch on wide cards.
+    static let openToTileWidth: CGFloat = 84
+    static let openToTileSpacing: CGFloat = 8
 
     @MainActor
     static func horizontalPadding(screenWidth: CGFloat? = nil) -> CGFloat {
         let resolvedWidth = screenWidth ?? currentWindowSceneScreenWidth()
         return resolvedWidth <= 375 ? 20 : 22
+    }
+
+    static func openToGridColumns(tileWidth: CGFloat = openToTileWidth, spacing: CGFloat = openToTileSpacing) -> [GridItem] {
+        [
+            GridItem(.fixed(tileWidth), spacing: spacing),
+            GridItem(.fixed(tileWidth), spacing: spacing),
+            GridItem(.fixed(tileWidth), spacing: spacing)
+        ]
+    }
+
+    static func openToGridMaxWidth(itemCount: Int, tileWidth: CGFloat = openToTileWidth, spacing: CGFloat = openToTileSpacing) -> CGFloat {
+        let count = max(itemCount, 1)
+        return CGFloat(count) * tileWidth + CGFloat(max(0, count - 1)) * spacing
     }
 
     @MainActor
@@ -30,6 +48,27 @@ enum PublicProfileSheetLayout {
                 .compactMap { ($0 as? UIWindowScene)?.screen.bounds.width }
                 .first
             ?? 393
+    }
+}
+
+/// Centers profile scroll content on iPad regular horizontal size class without changing iPhone layout.
+struct ProfileReadableContentWidthModifier: ViewModifier {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    func body(content: Content) -> some View {
+        if horizontalSizeClass == .regular {
+            content
+                .frame(maxWidth: PublicProfileSheetLayout.maxContentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func profileReadableContentWidth() -> some View {
+        modifier(ProfileReadableContentWidthModifier())
     }
 }
 
@@ -880,11 +919,13 @@ struct PublicProfileGridOpenToCard: View {
     let items: [PublicProfileOpenToItem]
     @Environment(\.colorScheme) private var colorScheme
 
-    private let gridColumns = [
-        GridItem(.flexible(), spacing: 6),
-        GridItem(.flexible(), spacing: 6),
-        GridItem(.flexible(), spacing: 6)
-    ]
+    private var gridColumns: [GridItem] {
+        PublicProfileSheetLayout.openToGridColumns(tileWidth: 76, spacing: 6)
+    }
+
+    private var gridMaxWidth: CGFloat {
+        PublicProfileSheetLayout.openToGridMaxWidth(itemCount: max(items.count, 1), tileWidth: 76, spacing: 6)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -900,7 +941,7 @@ struct PublicProfileGridOpenToCard: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else {
-                LazyVGrid(columns: gridColumns, spacing: 6) {
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
                     ForEach(items) { item in
                         VStack(spacing: 5) {
                             if item.isSocial {
@@ -920,9 +961,10 @@ struct PublicProfileGridOpenToCard: View {
                                 .minimumScaleFactor(0.7)
                                 .frame(minHeight: 24)
                         }
-                        .frame(maxWidth: .infinity)
+                        .frame(width: 76)
                     }
                 }
+                .frame(maxWidth: gridMaxWidth, alignment: .leading)
             }
         }
         .padding(10)
@@ -1347,7 +1389,7 @@ struct PublicProfileSocialActionBar: View {
         case .requestFriendship:
             actionCapsule(title: "Add Friend", icon: "person.badge.plus", filled: true, disabled: isFriendActionInFlight, action: onFriendAction)
         case .friendshipRequested:
-            actionCapsule(title: "Requested", icon: "clock.fill", filled: false, disabled: true, action: {})
+            actionCapsule(title: "Requested", icon: "clock.fill", filled: false, disabled: isFriendActionInFlight, action: onFriendAction)
         }
     }
 

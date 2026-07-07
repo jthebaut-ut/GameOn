@@ -30,9 +30,9 @@ extension MapViewModel {
             )
 #if DEBUG
             let age = lastFollowingTabGlobalRefreshAt.map { Date().timeIntervalSince($0) } ?? 0
-            print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=followingGlobal")
-            print("[TabPerfDebug] usedCachedData=true tab=going source=followingGlobal")
-            print("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=followingGlobal")
+            TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=followingGlobal")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=going source=followingGlobal")
+            TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=followingGlobal")
             print("[PerfPhase1] followingRefreshSkipped reason=fresh")
 #endif
             return
@@ -86,7 +86,7 @@ extension MapViewModel {
             TabPerf.duplicateRefreshCoalesced(name: "followingGlobal")
             Perf.duplicateTaskCoalesced(name: "followingGlobal")
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true tab=going source=followingGlobal")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=going source=followingGlobal")
             print("[PerfPhase1] followingRefreshCoalesced=true")
 #endif
             await inFlight.value

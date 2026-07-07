@@ -435,9 +435,9 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastSavedProGamesFetchAt)
             if age < 45 {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=savedProGames")
-                print("[TabPerfDebug] usedCachedData=true tab=going source=savedProGames")
-                print("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=savedProGames reason=\(reason)")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=savedProGames")
+                TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=going source=savedProGames")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=savedProGames reason=\(reason)")
 #endif
                 skipProGamesCalendarReconcileAtStartup(reason: "savedProGamesFresh:\(reason)")
                 if LaunchBootstrapState.didBecomeAppReady {
@@ -452,7 +452,7 @@ extension MapViewModel {
 
         if !forceRefresh, let existing = savedProGamesFetchTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true tab=going source=savedProGames reason=\(reason)")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=going source=savedProGames reason=\(reason)")
 #endif
             await existing.value
             return
@@ -460,7 +460,7 @@ extension MapViewModel {
 
         let startedAt = Date()
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=going source=savedProGames force=\(forceRefresh) reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=going source=savedProGames force=\(forceRefresh) reason=\(reason)")
 #endif
 
         let task = Task<Void, Never> { @MainActor [weak self] in
@@ -476,7 +476,7 @@ extension MapViewModel {
         savedProGamesFetchTask = nil
 #if DEBUG
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=savedProGames reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=savedProGames reason=\(reason)")
 #endif
     }
 
@@ -1225,16 +1225,16 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastFavoriteTeamProGamesRefreshAt)
             if age < 45, !favoriteTeamProGames.contains(where: { $0.game.matchStatus.isHappeningNow }) {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=favoriteTeamProGames")
-                print("[TabPerfDebug] usedCachedData=true tab=going source=favoriteTeamProGames")
-                print("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=favoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=going source=favoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=going source=favoriteTeamProGames")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=going source=favoriteTeamProGames")
 #endif
                 return
             }
         }
         if !forceRefresh, let existing = favoriteTeamProGamesRefreshTask {
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true tab=going source=favoriteTeamProGames")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=going source=favoriteTeamProGames")
 #endif
             await existing.value
             return
@@ -1242,7 +1242,7 @@ extension MapViewModel {
 
         let startedAt = Date()
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=going source=favoriteTeamProGames force=\(forceRefresh)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=going source=favoriteTeamProGames force=\(forceRefresh)")
 #endif
         let task = Task<Void, Never> { @MainActor [weak self] in
             guard let self else { return }
@@ -1257,7 +1257,7 @@ extension MapViewModel {
         favoriteTeamProGamesRefreshTask = nil
 #if DEBUG
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=favoriteTeamProGames")
+        TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=going source=favoriteTeamProGames")
 #endif
     }
 

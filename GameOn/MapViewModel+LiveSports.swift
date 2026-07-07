@@ -65,7 +65,7 @@ extension MapViewModel {
             TabPerf.duplicateRefreshCoalesced(name: "liveMatches")
             Perf.duplicateTaskCoalesced(name: "liveMatches")
 #if DEBUG
-            print("[TabPerfDebug] refreshCoalesced=true source=liveMatches force=\(forceRefresh)")
+            TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true source=liveMatches force=\(forceRefresh)")
 #endif
             await inFlight.value
             if !forceRefresh { return }
@@ -332,9 +332,9 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(lastRefresh)
             if age < 90, !calendarSelectedDayHasHappeningNowProGame(day) {
 #if DEBUG
-                print("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=proGames")
-                print("[TabPerfDebug] usedCachedData=true tab=calendar source=proGames")
-                print("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=proGames")
+                TabPerfDebug.log("[TabPerfDebug] cacheAge=\(String(format: "%.1f", age)) tab=calendar source=proGames")
+                TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=calendar source=proGames")
+                TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=proGames")
 #endif
                 return
             }
@@ -343,7 +343,7 @@ extension MapViewModel {
         defer { isLoadingLiveMatches = false }
 
 #if DEBUG
-        print("[TabPerfDebug] refreshStarted=calendar source=proGames force=\(forceRefresh)")
+        TabPerfDebug.log("[TabPerfDebug] refreshStarted=calendar source=proGames force=\(forceRefresh)")
         print("[CalendarProGamesDebug] selectedDateFetchStarted forceRefresh=\(forceRefresh)")
 #endif
         let startedAt = Date()
@@ -359,7 +359,7 @@ extension MapViewModel {
             calendarProGamesRefreshAtByDay[dayKey] = Date()
 #if DEBUG
             let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-            print("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=proGames")
+            TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=proGames")
             print("[CalendarProGamesDebug] selectedDateFetchCount=\(matches.count)")
 #endif
         } catch {

@@ -6,6 +6,14 @@ import UserNotifications
 import UIKit
 #endif
 
+#if DEBUG
+private func pushTokenDebugLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+private func pushTokenDebugLog(_ message: @autoclosure () -> String) {}
+#endif
+
 final class PushNotificationRegistrationService {
     static let shared = PushNotificationRegistrationService()
 
@@ -19,7 +27,7 @@ final class PushNotificationRegistrationService {
 
     func refreshPushTokenRegistration(reason: String) async {
         if reason == "foreground", didCompleteLifecyclePushTokenRefresh {
-            print("[PushTokenDebug] refreshSkipped reason=foreground alreadyRefreshedThisSession=true")
+            pushTokenDebugLog("[PushTokenDebug] refreshSkipped reason=foreground alreadyRefreshedThisSession=true")
             return
         }
 
@@ -34,13 +42,13 @@ final class PushNotificationRegistrationService {
     func registerForRemoteNotificationsIfAuthorized(reason: String) async {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         guard Self.canRegisterRemoteNotifications(status: settings.authorizationStatus) else {
-            print("[PushTokenDebug] registerSkipped reason=\(reason) permission=\(Self.authorizationStatusDescription(settings.authorizationStatus))")
+            pushTokenDebugLog("[PushTokenDebug] registerSkipped reason=\(reason) permission=\(Self.authorizationStatusDescription(settings.authorizationStatus))")
             return
         }
 
 #if canImport(UIKit)
         await MainActor.run {
-            print("[PushTokenDebug] registerForRemoteNotifications reason=\(reason)")
+            pushTokenDebugLog("[PushTokenDebug] registerForRemoteNotifications reason=\(reason)")
             UIApplication.shared.registerForRemoteNotifications()
         }
 #endif
@@ -51,21 +59,21 @@ final class PushNotificationRegistrationService {
         let environment = Self.resolvedEnvironment()
         UserDefaults.standard.set(token, forKey: Self.deviceTokenDefaultsKey)
         UserDefaults.standard.set(environment, forKey: Self.environmentDefaultsKey)
-        print("[PushTokenDebug] didRegister tokenPrefix=\(String(token.prefix(12))) environment=\(environment)")
+        pushTokenDebugLog("[PushTokenDebug] didRegister tokenPrefix=\(String(token.prefix(12))) environment=\(environment)")
         Task { await upsertCurrentTokenIfPossible(reason: "didRegisterForRemoteNotifications") }
     }
 
     func handleRegistrationFailure(_ error: Error) {
-        print("[PushTokenDebug] registrationFailed error=\(error.localizedDescription)")
+        pushTokenDebugLog("[PushTokenDebug] registrationFailed error=\(error.localizedDescription)")
     }
 
     func upsertCurrentTokenIfPossible(reason: String) async {
         guard let token = Self.storedToken, !token.isEmpty else {
-            print("[PushTokenDebug] upsertSkipped reason=\(reason) missingToken=true")
+            pushTokenDebugLog("[PushTokenDebug] upsertSkipped reason=\(reason) missingToken=true")
             return
         }
         guard let session = try? await supabase.auth.session else {
-            print("[PushTokenDebug] upsertSkipped reason=\(reason) missingSession=true")
+            pushTokenDebugLog("[PushTokenDebug] upsertSkipped reason=\(reason) missingSession=true")
             return
         }
         let userID = session.user.id
@@ -103,12 +111,12 @@ final class PushNotificationRegistrationService {
                 .eq("token", value: token)
                 .eq("environment", value: environment)
                 .execute()
-            print(
+            pushTokenDebugLog(
                 "[PushTokenDebug] upsertSucceeded userId=\(row.user_id) environment=\(row.environment) " +
                 "tokenPrefix=\(String(token.prefix(12))) reactivated=true reason=\(reason)"
             )
         } catch {
-            print("[PushTokenDebug] upsertFailed reason=\(reason) error=\(error.localizedDescription)")
+            pushTokenDebugLog("[PushTokenDebug] upsertFailed reason=\(reason) error=\(error.localizedDescription)")
         }
     }
 
@@ -126,13 +134,9 @@ final class PushNotificationRegistrationService {
                 .eq("token", value: token)
                 .eq("environment", value: Self.storedEnvironment)
                 .execute()
-#if DEBUG
-            print("[PushTokenDebug] deleteSucceeded userId=\(userID.uuidString.lowercased()) reason=\(reason)")
-#endif
+            pushTokenDebugLog("[PushTokenDebug] deleteSucceeded userId=\(userID.uuidString.lowercased()) reason=\(reason)")
         } catch {
-#if DEBUG
-            print("[PushTokenDebug] deleteFailed reason=\(reason) error=\(error.localizedDescription)")
-#endif
+            pushTokenDebugLog("[PushTokenDebug] deleteFailed reason=\(reason) error=\(error.localizedDescription)")
         }
     }
 
@@ -172,9 +176,9 @@ final class PushNotificationRegistrationService {
             environment = buildConfigurationDefaultEnvironment
         }
 
-        print("[PushTokenDebug] buildConfiguration=\(buildConfiguration)")
-        print("[PushTokenDebug] apsEnvironmentEntitlement=\(entitlement ?? "nil")")
-        print("[PushTokenDebug] storingEnvironment=\(environment)")
+        pushTokenDebugLog("[PushTokenDebug] buildConfiguration=\(buildConfiguration)")
+        pushTokenDebugLog("[PushTokenDebug] apsEnvironmentEntitlement=\(entitlement ?? "nil")")
+        pushTokenDebugLog("[PushTokenDebug] storingEnvironment=\(environment)")
         return environment
     }
 
@@ -210,13 +214,9 @@ final class PushNotificationRegistrationService {
                 .eq("token", value: token)
                 .neq("environment", value: storingEnvironment)
                 .execute()
-#if DEBUG
-            print("[PushTokenDebug] invalidatedMismatchedEnvironmentRows userId=\(userID) storingEnvironment=\(storingEnvironment) reason=\(reason)")
-#endif
+            pushTokenDebugLog("[PushTokenDebug] invalidatedMismatchedEnvironmentRows userId=\(userID) storingEnvironment=\(storingEnvironment) reason=\(reason)")
         } catch {
-#if DEBUG
-            print("[PushTokenDebug] invalidateMismatchedEnvironmentRowsFailed reason=\(reason) error=\(error.localizedDescription)")
-#endif
+            pushTokenDebugLog("[PushTokenDebug] invalidateMismatchedEnvironmentRowsFailed reason=\(reason) error=\(error.localizedDescription)")
         }
     }
 

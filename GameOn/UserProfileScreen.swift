@@ -463,19 +463,9 @@ struct UserProfileScreen: View {
             return
         }
 
-        let trimmed = editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let nextName = trimmed.isEmpty ? resolvedDisplayName : trimmed
-        if ModerationService.containsProfanity(nextName) {
-            await MainActor.run {
-                localAvatarPreviewImage = nil
-                message = ModerationService.profanityRejectionUserMessage()
-            }
-            return
-        }
-        if let err = await viewModel.saveUserProfile(
-            displayName: nextName,
-            avatarURL: urls.fullURL,
-            avatarThumbnailURL: urls.thumbnailURL
+        if let err = await viewModel.persistUserProfileAvatar(
+            fullURL: urls.fullURL,
+            thumbnailURL: urls.thumbnailURL
         ) {
             await MainActor.run {
                 localAvatarPreviewImage = nil

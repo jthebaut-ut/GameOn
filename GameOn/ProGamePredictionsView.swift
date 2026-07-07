@@ -743,12 +743,14 @@ struct ProGamePredictionSheet: View {
     }
 
     private func logProPredictionScorerHeaderDebug(_ presentation: ProPredictionHeaderScorerPresentation) {
+#if DEBUG
         print("[ProPredictionScorerHeaderDebug] gameId=\(displayGame.stableKey)")
         print("[ProPredictionScorerHeaderDebug] score=\(displayGame.scoreAway)-\(displayGame.scoreHome)")
         print("[ProPredictionScorerHeaderDebug] timelineEventsCount=\(presentation.timelineEventsCount)")
         print("[ProPredictionScorerHeaderDebug] scoringSummaryEntriesCount=\(presentation.scoringSummaryEntriesCount)")
         print("[ProPredictionScorerHeaderDebug] renderedScorers=\(presentation.renderedScorers)")
         print("[ProPredictionScorerHeaderDebug] scoreTimelineMismatch=\(presentation.scoreTimelineMismatch)")
+#endif
     }
 
     private var savedProGameHasKnownScore: Bool {

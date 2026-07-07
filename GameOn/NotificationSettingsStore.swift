@@ -284,7 +284,20 @@ final class NotificationSettingsStore: ObservableObject {
         migrateProGameReminderTimingIfNeeded()
         migrateFavoriteTeamProGameReminderTimingIfNeeded()
         migrateProGameKickoffAlertSplitIfNeeded()
+        migrateLegacyFavoriteTeamAutoFollowEnabledIfNeeded()
         print("[NotificationSettingsStoreDebug] initialized")
+    }
+
+    /// One-time: legacy Going auto-follow key (`gameon.proGames.favoriteTeams.autoFollowEnabled.v1`) → team alerts preference.
+    private func migrateLegacyFavoriteTeamAutoFollowEnabledIfNeeded() {
+        let migrationKey = "favoriteTeamAutoFollowEnabledMerged.v1"
+        guard !UserDefaults.standard.bool(forKey: migrationKey) else { return }
+        defer { UserDefaults.standard.set(true, forKey: migrationKey) }
+
+        guard UserDefaults.standard.bool(forKey: ProGamesFavoriteTeamAutoFollowPreference.enabledKey) else { return }
+        if !favoriteTeamProGameAlertsEnabled {
+            favoriteTeamProGameAlertsEnabled = true
+        }
     }
 
     private func migrateProGameKickoffAlertSplitIfNeeded() {

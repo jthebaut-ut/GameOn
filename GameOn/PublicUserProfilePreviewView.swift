@@ -22,6 +22,7 @@ struct PublicUserProfilePreviewView: View {
     @State private var showShareFanProfileSheet = false
     @State private var showBlockFanConfirmation = false
     @State private var showReportFanSheet = false
+    @State private var showCancelFriendRequestConfirmation = false
     @State private var isBlockActionInFlight = false
     @State private var safetyActionBanner: String?
 
@@ -54,6 +55,7 @@ struct PublicUserProfilePreviewView: View {
                 .padding(.horizontal, profileContentHorizontalPadding)
                 .padding(.top, 8)
                 .padding(.bottom, 28)
+                .profileReadableContentWidth()
             }
             .background(sheetBackground.ignoresSafeArea())
             .navigationTitle("Fan Profile")
@@ -106,6 +108,18 @@ struct PublicUserProfilePreviewView: View {
                         safetyActionBanner = Self.reportSubmittedBannerText
                     }
                 )
+            }
+            .confirmationDialog(
+                "Cancel friend request?",
+                isPresented: $showCancelFriendRequestConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Cancel Request", role: .destructive) {
+                    Task { await cancelOutgoingFriendRequest() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This will remove your pending request.")
             }
             .confirmationDialog(
                 "Block \(profile?.displayName ?? "this fan")?",
@@ -291,7 +305,9 @@ struct PublicUserProfilePreviewView: View {
             await messageFriend(data)
         case .requestFriendship:
             await requestFriendship(userId: data.userId)
-        case .hidden, .friendshipRequested:
+        case .friendshipRequested:
+            showCancelFriendRequestConfirmation = true
+        case .hidden:
             break
         }
     }
@@ -551,6 +567,19 @@ struct PublicUserProfilePreviewView: View {
             isSelf: isSelf,
             isBusiness: profile.isBusinessAccount
         )
+    }
+
+    private func cancelOutgoingFriendRequest() async {
+        guard !isFriendActionInFlight else { return }
+        await MainActor.run {
+            isFriendActionInFlight = true
+            friendActionError = nil
+        }
+        await chatViewModel.cancelOutgoingFriendRequest(to: userId)
+        await MainActor.run {
+            isFriendActionInFlight = false
+            refreshFriendButtonState()
+        }
     }
 
     private func requestFriendship(userId: UUID) async {

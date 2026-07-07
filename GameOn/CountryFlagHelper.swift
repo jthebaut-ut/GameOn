@@ -231,7 +231,6 @@ nonisolated enum CountryFlagHelper {
     static func logCalendarFlagDebug(teamName: String, source: String = "AppleCalendar") {
 #if DEBUG
         guard calendarFlagVerboseLogging else { return }
-#endif
         let trimmed = teamName.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = normalizedTeamName(trimmed)
         let countryCode = countryCode(for: trimmed)
@@ -240,6 +239,7 @@ nonisolated enum CountryFlagHelper {
         print("[CalendarFlagDebug] normalizedName=\(normalizedName)")
         print("[CalendarFlagDebug] countryCode=\(countryCode ?? "nil")")
         print("[CalendarFlagDebug] emojiFlag=\(emojiFlag)")
+#endif
     }
 
     static func logCalendarMatchupFlagDebug(
@@ -250,7 +250,6 @@ nonisolated enum CountryFlagHelper {
     ) {
 #if DEBUG
         guard CountryFlagHelper.calendarFlagVerboseLogging else { return }
-#endif
         let away = awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let home = homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let awayCode = countryCode(for: away)
@@ -273,6 +272,7 @@ nonisolated enum CountryFlagHelper {
         if !away.isEmpty, awayFlag.isEmpty {
             print("[CalendarFlagDebug] missingFlagFor=\(away)")
         }
+#endif
     }
 
 #if DEBUG

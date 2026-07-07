@@ -244,8 +244,22 @@ struct SettingsScreen: View {
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(FanGeoAppearancePreference.appStorageKey) private var appearancePreferenceRaw = FanGeoAppearancePreference.system.rawValue
     @AppStorage(PrivateChatSecuritySettings.requireFaceIDSettingKey) private var requireFaceIDForPrivateChat = false
-    @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.enabledKey) private var proGamesAutoFollowFavoriteTeams = false
     @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.windowDaysKey) private var proGamesFavoriteTeamWindowDays = ProGamesFavoriteTeamAutoFollowPreference.Window.next30.rawValue
+
+    private var favoriteTeamProGameAlertsToggleBinding: Binding<Bool> {
+        Binding(
+            get: { notificationSettingsStore.favoriteTeamProGameAlertsEnabled },
+            set: { enabled in
+                Task {
+                    await viewModel.setFavoriteTeamProGameAlertsEnabled(
+                        enabled,
+                        games: viewModel.favoriteTeamProGames,
+                        reason: "settingsFavoriteTeamAutoFollowToggle"
+                    )
+                }
+            }
+        )
+    }
 
     private var appearancePreference: FanGeoAppearancePreference {
         FanGeoAppearancePreference(rawValue: appearancePreferenceRaw) ?? .system
@@ -791,7 +805,7 @@ struct SettingsScreen: View {
 #if DEBUG
                 SettingsPerf.log("appear isAccountTabSelected=\(isAccountTabSelected) isLoggedIn=\(viewModel.isLoggedIn) businessContext=\(isBusinessAccountProfileContext)")
 #endif
-                print("[SponsoredPlacementDebug] accountScreenAppeared=true isAccountTabSelected=\(isAccountTabSelected) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") businessContext=\(isBusinessAccountProfileContext)")
+                SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] accountScreenAppeared=true isAccountTabSelected=\(isAccountTabSelected) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") businessContext=\(isBusinessAccountProfileContext)")
                 refreshSettingsActiveVenueSelectionCTAVisibility()
                 if isAccountTabSelected {
                     AppPerfDebug.screenLoadStart(tab: "account", source: "onAppear")
@@ -819,7 +833,7 @@ struct SettingsScreen: View {
     var body: some View {
         accountTabRootContent
         .onChange(of: isAccountTabSelected) { _, isSelected in
-            print("[SponsoredPlacementDebug] accountTabSelectionChanged isSelected=\(isSelected) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") businessContext=\(isBusinessAccountProfileContext)")
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] accountTabSelectionChanged isSelected=\(isSelected) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") businessContext=\(isBusinessAccountProfileContext)")
             if isSelected {
                 AppPerfDebug.screenLoadStart(tab: "account", source: "tabSelected")
                 UIPerformanceDiagnostics.signpost("Profile tab open", "source=tabSelected")
@@ -2534,7 +2548,7 @@ struct SettingsScreen: View {
                 tint: FGColor.accentBlue,
                 showsChevron: false
             ) {
-                Toggle("Automatically follow games from my Favorite Teams", isOn: $proGamesAutoFollowFavoriteTeams)
+                Toggle("Automatically follow games from my Favorite Teams", isOn: favoriteTeamProGameAlertsToggleBinding)
                     .labelsHidden()
                     .disabled(!viewModel.isAuthenticatedForSocialFeatures)
             }
@@ -2543,9 +2557,9 @@ struct SettingsScreen: View {
 
             proGamesFavoriteTeamWindowRow
                 .opacity(
-                    viewModel.isAuthenticatedForSocialFeatures && proGamesAutoFollowFavoriteTeams ? 1 : 0.48
+                    viewModel.isAuthenticatedForSocialFeatures && notificationSettingsStore.favoriteTeamProGameAlertsEnabled ? 1 : 0.48
                 )
-                .disabled(!viewModel.isAuthenticatedForSocialFeatures || !proGamesAutoFollowFavoriteTeams)
+                .disabled(!viewModel.isAuthenticatedForSocialFeatures || !notificationSettingsStore.favoriteTeamProGameAlertsEnabled)
 
             if !viewModel.isAuthenticatedForSocialFeatures {
                 Text("Sign in to follow teams and receive game alerts.")

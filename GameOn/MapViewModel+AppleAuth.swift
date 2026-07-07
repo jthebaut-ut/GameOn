@@ -379,6 +379,7 @@ extension MapViewModel {
                 id: session.user.id,
                 email: email,
                 display_name: Self.appleDisplayName(from: fullName),
+                username: nil,
                 bio: nil,
                 avatar_url: "",
                 avatar_thumbnail_url: nil,

@@ -107,8 +107,10 @@ final class GameReminderNotificationService {
     }
 
     private func logProGameScheduling(_ message: @autoclosure () -> String) {
+#if DEBUG
         guard !suppressVerboseProGameSchedulingLogs else { return }
         print(message())
+#endif
     }
 
     func authorizationStatus() async -> UNAuthorizationStatus {
@@ -341,11 +343,13 @@ final class GameReminderNotificationService {
         logProGameScheduling("[\(debugLabel)] permissionStatus=\(Self.authorizationStatusDescription(permissionBefore))")
         guard await authorizationForScheduling() else {
             if !suppressVerboseProGameSchedulingLogs {
+#if DEBUG
                 let permissionAfter = await authorizationStatus()
                 print("[\(debugLabel)] notificationCreated=false")
                 print("[\(debugLabel)] schedulingSuccess=false")
                 print("[\(debugLabel)] schedulingFailure=permissionDenied")
                 print("[\(debugLabel)] permissionStatus=\(Self.authorizationStatusDescription(permissionAfter))")
+#endif
             }
             return
         }
@@ -419,13 +423,17 @@ final class GameReminderNotificationService {
     }
 
     private func cancelProGamePreKickoffReminder(identifier: String, prefix: String, debugLabel: String) async {
+#if DEBUG
         print("[\(debugLabel)] cancelReminder gameId=\(identifier)")
+#endif
         let baseIdentifier = proGameReminderIdentifier(for: identifier, prefix: prefix)
         let identifiers = await center.pendingNotificationRequests()
             .map(\.identifier)
             .filter { $0 == baseIdentifier || $0.hasPrefix("\(baseIdentifier).") }
         center.removePendingNotificationRequests(withIdentifiers: identifiers.isEmpty ? [baseIdentifier] : identifiers)
+#if DEBUG
         print("[\(debugLabel)] canceledIdentifiers=\((identifiers.isEmpty ? [baseIdentifier] : identifiers).joined(separator: ","))")
+#endif
     }
 
     func cancelAllFavoriteTeamProGamePreKickoffReminders() async {
@@ -792,7 +800,9 @@ final class GameReminderNotificationService {
         let now = Date()
         guard eventStartDate > now else { return [] }
         guard preferredFireDate < eventStartDate, preferredFireDate > now else { return [] }
+#if DEBUG
         print("[ProGameReminderDebug] reminderDate=\(Self.debugDateString(preferredFireDate))")
+#endif
         return [preferredFireDate]
     }
 
@@ -807,7 +817,9 @@ final class GameReminderNotificationService {
 
         guard repeatUntilStart else {
             let fireDate = preferredFireDate > now ? preferredFireDate : eventStartDate
+#if DEBUG
             print("[ProGameReminderDebug] reminderDate=\(Self.debugDateString(fireDate))")
+#endif
             return [fireDate]
         }
 
@@ -816,7 +828,9 @@ final class GameReminderNotificationService {
         var next = preferredFireDate
         while next < eventStartDate {
             if next > now {
+#if DEBUG
                 print("[ProGameReminderDebug] reminderDate=\(Self.debugDateString(next))")
+#endif
                 dates.append(next)
             }
             guard let advanced = Calendar.current.date(byAdding: .minute, value: step, to: next) else {
@@ -825,7 +839,9 @@ final class GameReminderNotificationService {
             next = advanced
         }
         if dates.isEmpty || (dates.last ?? .distantPast) < eventStartDate {
+#if DEBUG
             print("[ProGameReminderDebug] reminderDate=\(Self.debugDateString(eventStartDate))")
+#endif
             dates.append(eventStartDate)
         }
         return dates

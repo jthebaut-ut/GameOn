@@ -1632,14 +1632,14 @@ extension MapViewModel {
             let age = Date().timeIntervalSince(refreshedAt)
             if age < Self.followingJoinRequestsFreshnessInterval {
 #if DEBUG
-                print("[TabPerfDebug] followingJoinRequestsRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
+                TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
 #endif
                 return
             }
         }
 
 #if DEBUG
-        print("[TabPerfDebug] followingJoinRequestsRefreshStarted reason=\(reason)")
+        TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshStarted reason=\(reason)")
         print("[PickupPlayingDebug] loadStarted=true")
 #endif
 
@@ -1692,7 +1692,7 @@ extension MapViewModel {
                 lastSuccessfulFollowingJoinRequestsRefreshAt = Date()
                 lastSuccessfulFollowingJoinRequestsRefreshUserId = uid
 #if DEBUG
-                print("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=0")
+                TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=0")
 #endif
                 return
             }
@@ -1946,7 +1946,7 @@ extension MapViewModel {
             lastSuccessfulFollowingJoinRequestsRefreshAt = Date()
             lastSuccessfulFollowingJoinRequestsRefreshUserId = uid
 #if DEBUG
-            print("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=\(cards.count)")
+            TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=\(cards.count)")
 #endif
         } catch {
 #if DEBUG

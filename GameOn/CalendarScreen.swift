@@ -251,6 +251,9 @@ struct CalendarScreen: View {
         }
 
         if isProGamesSelected {
+#if DEBUG
+            ProSchedulePerf.loadStarted()
+#endif
             updateCalendarProGamesDisplayCache(reason: reason)
             if !shouldSkipCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceNetworkRefresh) {
                 await performCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceNetworkRefresh)
@@ -318,6 +321,9 @@ struct CalendarScreen: View {
         guard isCalendarTabSelected else { return }
 
         if isProGamesSelected {
+#if DEBUG
+            ProSchedulePerf.loadStarted()
+#endif
             updateCalendarProGamesDisplayCache(reason: reason)
         }
         refreshCalendarSegmentBadgeCounts(reason: reason)
@@ -358,6 +364,12 @@ struct CalendarScreen: View {
             calendarProGamesPerf.cachedDisplayedProMatchesKey = key
             calendarProGamesPerf.cachedDisplayedProMatches = cached
             logScheduleTapPerfDisplayedCacheUpdated(count: cached.count, reason: reason)
+#if DEBUG
+            ProSchedulePerf.totalGamesFetched(viewModel.liveMatches.count)
+            ProSchedulePerf.logHydrationDeferredCount(
+                cached.filter(\.supportsProGamePredictions).count
+            )
+#endif
             return true
         }
         if calendarProGamesPerf.cachedDisplayedProMatchesKey != key {
@@ -387,11 +399,17 @@ struct CalendarScreen: View {
         logScheduleTapPerfDisplayedCacheUpdated(count: matches.count, reason: reason)
 #if DEBUG
         print("[CalendarProGamesPerf] displayCacheUpdated reason=\(reason) count=\(matches.count)")
+        ProSchedulePerf.totalGamesFetched(viewModel.liveMatches.count)
+        ProSchedulePerf.logHydrationDeferredCount(
+            matches.filter(\.supportsProGamePredictions).count
+        )
 #endif
     }
 
     private func scheduleCalendarProGamesStripDateCachePrewarm(reason: String) {
         guard isProGamesSelected, isCalendarTabSelected else { return }
+        prewarmCalendarProGamesDisplayCacheForSelectedDate(reason: reason)
+        _ = applyCalendarProGamesDisplayCacheIfAvailable(reason: "prewarmSelected:\(reason)")
         calendarProGamesPerf.deferredDisplayCachePrewarmTask?.cancel()
         calendarProGamesPerf.deferredDisplayCachePrewarmTask = Task { @MainActor in
             await Task.yield()
@@ -400,14 +418,29 @@ struct CalendarScreen: View {
                 syncCalendarProGamesStatusIndicatorIfIdle(reason: "cancelled")
                 return
             }
-            prewarmCalendarProGamesDisplayCacheForStripDates(reason: reason)
+            prewarmCalendarProGamesDisplayCacheForRemainingStripDates(reason: reason)
             calendarProGamesPerf.deferredDisplayCachePrewarmTask = nil
         }
     }
 
-    private func prewarmCalendarProGamesDisplayCacheForStripDates(reason: String) {
+    private func prewarmCalendarProGamesDisplayCacheForSelectedDate(reason: String) {
         guard isProGamesSelected else { return }
+        let selectedDate = viewModel.calendarTabSelectedDate
+        let key = calendarProGamesDisplayCacheKey(for: selectedDate)
+        guard calendarProGamesPerf.displayCacheByKey[key] == nil else { return }
+        let matches = calendarBaseDisplayedProMatches(for: selectedDate)
+        storeCalendarProGamesDisplayCacheEntry(key: key, matches: matches)
+#if DEBUG
+        print("[CalendarProGamesPerf] prewarmSelectedDate reason=\(reason) count=\(matches.count)")
+#endif
+    }
+
+    private func prewarmCalendarProGamesDisplayCacheForRemainingStripDates(reason: String) {
+        guard isProGamesSelected else { return }
+        let selectedDate = viewModel.calendarTabSelectedDate
+        let calendar = Calendar.current
         for date in calendarDateStripDates {
+            guard !calendar.isDate(date, inSameDayAs: selectedDate) else { continue }
             let key = calendarProGamesDisplayCacheKey(for: date)
             guard calendarProGamesPerf.displayCacheByKey[key] == nil else { continue }
             let matches = calendarBaseDisplayedProMatches(for: date)
@@ -418,6 +451,21 @@ struct CalendarScreen: View {
 
     private var calendarProGamesBackgroundWorkActive: Bool {
         calendarProGamesPerf.displayCacheRebuildInFlight || calendarProGamesPerf.networkRefreshInFlight
+    }
+
+    private var scheduleProListBackgroundWorkActive: Bool {
+        calendarProGamesBackgroundWorkActive
+            || viewModel.isLoadingLiveMatches
+            || viewModel.liveSportsDataRefreshInFlight
+            || viewModel.isLiveMatchesNetworkRefreshInFlight
+    }
+
+    private var scheduleProGamesListStatusMessage: String? {
+        guard isProGamesSelected, !isCalendarSearchModeActive else { return nil }
+        guard scheduleProListBackgroundWorkActive else { return nil }
+        return scheduleProHasCachedGamesVisible
+            ? "Updating games…"
+            : "Loading game information…"
     }
 
     private var shouldShowCalendarProGamesStatusIndicatorSurface: Bool {
@@ -831,13 +879,7 @@ struct CalendarScreen: View {
             calendarTopControls
             calendarSearchSuggestionsSlot
             eventsHeader
-            if isProGamesSelected, !isCalendarSearchModeActive {
-                if viewModel.sportsDataUpdateIndicatorVisible {
-                    SportsDataUpdateIndicator()
-                        .padding(.horizontal)
-                }
-                calendarProGamesUpdatingStatusBanner
-            }
+            scheduleProGamesListStatusRow
             if effectiveCalendarGameFilter == .venueGames && !isCalendarSearchModeActive {
                 calendarVenueGamesRegionNotice
             }
@@ -1419,6 +1461,11 @@ struct CalendarScreen: View {
         noteScheduleRecentInteraction()
         logScheduleTapProtectedIfNeeded()
         logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=proTab value=\(effectiveCalendarGameFilter.rawValue)")
+#if DEBUG
+        if isProGamesSelected {
+            ProSchedulePerf.loadStarted()
+        }
+#endif
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "gameFilterInstant")
         scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_filter_change")
     }
@@ -1432,6 +1479,11 @@ struct CalendarScreen: View {
         }
         AppPerfDebug.screenLoadStart(tab: "calendar", source: "tabSelected")
         sanitizeBusinessCalendarFilterIfNeeded()
+#if DEBUG
+        if isProGamesSelected {
+            ProSchedulePerf.loadStarted()
+        }
+#endif
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "tabSelectedInstant")
         scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_selected")
         scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_selected")
@@ -1706,19 +1758,35 @@ struct CalendarScreen: View {
 
             Spacer()
 
-            if isProGamesSelected {
-                if viewModel.isLoadingLiveMatches {
+            if !isProGamesSelected {
+                if viewModel.isLoadingEvents {
                     ProgressView()
-                        .controlSize(displayedProMatches.isEmpty ? .regular : .small)
+                } else if viewModel.isRefreshingDiscoverEvents && !displayedEvents.isEmpty {
+                    ProgressView()
+                        .controlSize(.small)
                 }
-            } else if viewModel.isLoadingEvents {
-                ProgressView()
-            } else if viewModel.isRefreshingDiscoverEvents && !displayedEvents.isEmpty {
-                ProgressView()
-                    .controlSize(.small)
             }
         }
         .padding(.horizontal)
+    }
+
+    @ViewBuilder
+    private var scheduleProGamesListStatusRow: some View {
+        if let message = scheduleProGamesListStatusMessage {
+            let isUpdatingWithCache = scheduleProHasCachedGamesVisible
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(message)
+                    .font(isUpdatingWithCache ? .caption.weight(.semibold) : .subheadline.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
+            }
+            .padding(.horizontal)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(message)
+        }
     }
 
     @ViewBuilder
@@ -2002,14 +2070,19 @@ struct CalendarScreen: View {
                     Group {
                         if isProGamesSelected {
                             let proMatches = displayedProMatches
-                            if viewModel.isLoadingLiveMatches && proMatches.isEmpty {
-                                calendarLoadingState("Loading games…")
-                            } else if proMatches.isEmpty {
-                                calendarEmptyState(calendarProGamesEmptyStateMessage)
+                            if proMatches.isEmpty {
+                                if scheduleProListBackgroundWorkActive {
+                                    Color.clear
+                                        .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight)
+                                } else {
+                                    calendarEmptyState(calendarProGamesEmptyStateMessage)
+                                }
                             } else {
-                                VStack(spacing: 12) {
+                                LazyVStack(spacing: 12) {
                                     ForEach(proMatches) { match in
-                                        calendarProGameCard(match)
+                                        CalendarProGameLazyCard { deferExpensiveSections in
+                                            calendarProGameCard(match, deferExpensiveSections: deferExpensiveSections)
+                                        }
                                     }
                                 }
                                 .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .top)
@@ -2074,7 +2147,9 @@ struct CalendarScreen: View {
         case .venue(let event), .pickup(let event):
             calendarEventCard(event)
         case .pro(let match):
-            calendarProGameCard(match)
+            CalendarProGameLazyCard { deferExpensiveSections in
+                calendarProGameCard(match, deferExpensiveSections: deferExpensiveSections)
+            }
         }
     }
 
@@ -2311,7 +2386,7 @@ struct CalendarScreen: View {
         }
     }
 
-    private func calendarProGameCard(_ match: LiveMatch) -> some View {
+    private func calendarProGameCard(_ match: LiveMatch, deferExpensiveSections: Bool = false) -> some View {
         let sportKey = match.liveSportVisualType.sportFilterCatalogKey
         let accent = match.matchStatus.isHappeningNow ? FGColor.dangerRed : viewModel.colorForSport(sportKey)
         let featuredEvent = calendarFeaturedEvent(for: match)
@@ -2399,7 +2474,7 @@ struct CalendarScreen: View {
             }
 
             if match.supportsProGamePredictions {
-                calendarProGamePredictionFooter(for: match)
+                calendarProGamePredictionFooter(for: match, prefetchEnabled: !deferExpensiveSections)
             }
         }
         .padding(14)
@@ -2408,11 +2483,12 @@ struct CalendarScreen: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .shadow(color: Color.black.opacity(calendarColorScheme == .dark ? 0.16 : 0.045), radius: 8, y: 3)
         .onAppear {
+            guard !deferExpensiveSections else { return }
             logCalendarScoringEventDebug(match)
         }
     }
 
-    private func calendarProGamePredictionFooter(for match: LiveMatch) -> some View {
+    private func calendarProGamePredictionFooter(for match: LiveMatch, prefetchEnabled: Bool) -> some View {
         let game = SavedProGame.forPredictions(match: match, savedGames: viewModel.savedProGames)
         return ProGamePredictionFooterRow(
             game: game,
@@ -2420,7 +2496,11 @@ struct CalendarScreen: View {
         ) {
             calendarProGamePredictionSheet = ProGamePredictionSheetContext(game: game)
         }
-        .task(id: game.stableKey) {
+        .task(id: prefetchEnabled ? game.stableKey : nil) {
+            guard prefetchEnabled else { return }
+#if DEBUG
+            ProSchedulePerf.noteHydrationStarted()
+#endif
             await viewModel.prefetchProGamePredictionSummaries(for: [game])
         }
     }
@@ -3665,6 +3745,23 @@ struct CalendarScreen: View {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.setLocalizedDateFormatFromTemplate("MMM d")
         return formatter
+    }
+}
+
+private struct CalendarProGameLazyCard<Content: View>: View {
+    @ViewBuilder let content: (_ deferExpensiveSections: Bool) -> Content
+
+    @State private var expensiveWorkEnabled = false
+
+    var body: some View {
+        content(!expensiveWorkEnabled)
+            .onAppear {
+                guard !expensiveWorkEnabled else { return }
+                expensiveWorkEnabled = true
+#if DEBUG
+                ProSchedulePerf.noteVisibleGameRendered()
+#endif
+            }
     }
 }
 
