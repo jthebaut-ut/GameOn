@@ -2481,9 +2481,18 @@ struct CalendarScreen: View {
         }
     }
 
+    private func calendarProGameIsInactiveCompleted(_ match: LiveMatch) -> Bool {
+        match.matchStatus == .fullTime
+    }
+
     private func calendarProGameCard(_ match: LiveMatch, deferExpensiveSections: Bool = false) -> some View {
         let sportKey = match.liveSportVisualType.sportFilterCatalogKey
-        let accent = match.matchStatus.isHappeningNow ? FGColor.dangerRed : viewModel.colorForSport(sportKey)
+        let isInactiveCompleted = calendarProGameIsInactiveCompleted(match)
+        let accent = match.matchStatus.isHappeningNow
+            ? FGColor.dangerRed
+            : (isInactiveCompleted
+                ? FGColor.secondaryText(calendarColorScheme)
+                : viewModel.colorForSport(sportKey))
         let featuredEvent = calendarFeaturedEvent(for: match)
         let isSaved = viewModel.isProGameSaved(match)
         let watchPartyCount = watchPartyCount(for: match)
@@ -2574,9 +2583,32 @@ struct CalendarScreen: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.secondarySystemGroupedBackground))
+        .background(
+            isInactiveCompleted
+                ? Color(.tertiarySystemGroupedBackground)
+                : Color(.secondarySystemGroupedBackground)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .shadow(color: Color.black.opacity(calendarColorScheme == .dark ? 0.16 : 0.045), radius: 8, y: 3)
+        .overlay {
+            if isInactiveCompleted {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(
+                        FGColor.divider(calendarColorScheme).opacity(calendarColorScheme == .dark ? 0.34 : 0.48),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .saturation(isInactiveCompleted ? 0.84 : 1)
+        .opacity(isInactiveCompleted ? 0.94 : 1)
+        .shadow(
+            color: Color.black.opacity(
+                isInactiveCompleted
+                    ? (calendarColorScheme == .dark ? 0.06 : 0.02)
+                    : (calendarColorScheme == .dark ? 0.16 : 0.045)
+            ),
+            radius: isInactiveCompleted ? 4 : 8,
+            y: isInactiveCompleted ? 1 : 3
+        )
         .onAppear {
             guard !deferExpensiveSections else { return }
             logCalendarScoringEventDebug(match)
