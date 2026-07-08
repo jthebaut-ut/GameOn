@@ -644,6 +644,7 @@ struct SettingsScreen: View {
                                         viewModel: viewModel,
                                         chrome: .settings,
                                         onRequestAddNewLocation: { openAddLocationFromPicker() },
+                                        onEditApprovedVenue: openManagedVenueDetailsForEditing,
                                         isHydrating: businessProfileVenueSelectorIsHydrating,
                                         hydrationReason: businessProfileVenueHydrationState.reason,
                                         onBlockedEarlyTap: logBusinessProfileHydrationBlockedEarlyTap
@@ -684,6 +685,7 @@ struct SettingsScreen: View {
                                         viewModel: viewModel,
                                         chrome: .settings,
                                         onRequestAddNewLocation: { openAddLocationFromPicker() },
+                                        onEditApprovedVenue: openManagedVenueDetailsForEditing,
                                         isHydrating: businessProfileVenueSelectorIsHydrating,
                                         hydrationReason: businessProfileVenueHydrationState.reason,
                                         onBlockedEarlyTap: logBusinessProfileHydrationBlockedEarlyTap
@@ -1707,15 +1709,15 @@ struct SettingsScreen: View {
                 .frame(width: 48, height: 48)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Advertise with FanGeo")
+                    Text("Promote Your Venue")
                         .font(.system(size: 16, weight: .bold, design: .rounded))
                         .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
-                    Text("Reach more local fans and grow your venue.")
+                    Text("Reach local sports fans with business advertising opportunities.")
                         .font(.system(size: 12, weight: .regular, design: .rounded))
                         .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Learn About Sponsorships")
+                    Text("Learn More")
                         .font(.system(size: 11, weight: .heavy, design: .rounded))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
@@ -3329,6 +3331,7 @@ struct SettingsScreen: View {
             onActiveVenueSelection: {
                 handleActiveVenueSelectionQuickAction()
             },
+            onEditApprovedVenue: openManagedVenueDetailsForEditing,
             onCommentsReports: {
                 presentBusinessDashboardQuickAction(source: "commentsReportsQuickAction") {
                     showReportedCommentsSheet = true
@@ -4238,6 +4241,13 @@ struct SettingsScreen: View {
     /// Presents add-location sheet with a blank form (used from Current managed venue menu).
     private func openAddLocationFromPicker() {
         openAddLocationIfAllowed(action: "picker")
+    }
+
+    private func openManagedVenueDetailsForEditing(venueID: UUID) {
+        Task {
+            await viewModel.selectManagedVenue(id: venueID)
+            openBusinessVenueToolRoute(.manageVenue)
+        }
     }
 
     private func openBusinessVenueToolRoute(_ route: VenueOwnerDashboardSheetRoute) {
@@ -5703,12 +5713,22 @@ private struct SettingsUserAuthSheet: View {
             }
         }
         .onAppear {
-            if !OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail).isEmpty {
-                showRegisterMode = true
+            Task {
+                await viewModel.syncAppleFanSignupOnboardingFromActiveSession()
+                await MainActor.run {
+                    if viewModel.isAppleFanSignupOnboardingActive {
+                        showRegisterMode = true
+                    }
+                }
             }
         }
         .onChange(of: viewModel.applePendingFanSignupEmail) { _, newEmail in
             if !OwnerBusinessEmail.normalized(newEmail).isEmpty {
+                showRegisterMode = true
+            }
+        }
+        .onChange(of: viewModel.appleFanOnboardingPasswordBypassActive) { _, isActive in
+            if isActive {
                 showRegisterMode = true
             }
         }
@@ -7089,7 +7109,7 @@ private struct SettingsFanLoginCard: View {
     }
 
     private var isApplePendingFanProfileSetup: Bool {
-        !OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail).isEmpty
+        viewModel.isAppleFanSignupOnboardingActive
     }
 
     var body: some View {
@@ -10496,6 +10516,8 @@ struct BusinessLocationVenuePicker: View {
     var chrome: Chrome = .settings
     /// When set (Settings), shown as the last menu action to submit a new business location for review.
     var onRequestAddNewLocation: (() -> Void)?
+    /// When set, approved managed venue rows show a compact Edit affordance that opens Venue Details.
+    var onEditApprovedVenue: ((UUID) -> Void)?
     var isHydrating = false
     var hydrationReason = "ready"
     var onBlockedEarlyTap: ((String, String) -> Void)?
@@ -10507,6 +10529,7 @@ struct BusinessLocationVenuePicker: View {
         viewModel: MapViewModel,
         chrome: Chrome = .settings,
         onRequestAddNewLocation: (() -> Void)? = nil,
+        onEditApprovedVenue: ((UUID) -> Void)? = nil,
         isHydrating: Bool = false,
         hydrationReason: String = "ready",
         onBlockedEarlyTap: ((String, String) -> Void)? = nil
@@ -10514,6 +10537,7 @@ struct BusinessLocationVenuePicker: View {
         self.viewModel = viewModel
         self.chrome = chrome
         self.onRequestAddNewLocation = onRequestAddNewLocation
+        self.onEditApprovedVenue = onEditApprovedVenue
         self.isHydrating = isHydrating
         self.hydrationReason = hydrationReason
         self.onBlockedEarlyTap = onBlockedEarlyTap
@@ -11159,86 +11183,121 @@ struct BusinessLocationVenuePicker: View {
     private func managedVenueSheetRow(_ row: ManagedVenueSelectorRow) -> some View {
         let isSelected = row.status == .approved && row.venueID == viewModel.ownerVenueDatabaseId
         let tint = statusTint(for: row.status)
-        return Button {
-            guard !blockHydratingTap(action: "viewingVenueSelector") else { return }
-            logBusinessManagedVenueTapDebug("tapped", row: row)
-            guard let id = row.venueID else {
-                if row.status == .pending {
-                    venueSelectorNotice = "This venue is waiting for admin approval."
-#if DEBUG
-                    print("[BusinessVenueSelectorDebug] pendingVenueTapped id=\(row.claimID?.uuidString ?? row.venueID?.uuidString ?? "nil")")
-#endif
-                } else {
-                    venueSelectorNotice = "This venue request was rejected."
-                }
-                return
+        return HStack(spacing: FGSpacing.md) {
+            ZStack {
+                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    .fill(tint.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                Image(systemName: "building.2")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(tint)
             }
+            .frame(width: 42, height: 42)
 
-            if row.status == .locked {
-                venueSelectorNotice = inactiveVenueSelectionNotice
-                logBusinessManagedVenueTapDebug("ignoredInactiveVenue", row: row, venueId: id)
-                return
-            }
-
-            guard row.status == .approved else {
-                venueSelectorNotice = row.status == .pending
-                    ? "This venue is waiting for admin approval."
-                    : "This venue request was rejected."
-                return
-            }
-
-            showVenueListSheet = false
-            Task {
-                await viewModel.selectManagedVenue(id: id)
-#if DEBUG
-                print("[BusinessManagedVenueTapDebug] selectedVenueUpdated venueId=\(id.uuidString.lowercased())")
-#endif
-            }
-        } label: {
-            HStack(spacing: FGSpacing.md) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                        .fill(tint.opacity(colorScheme == .dark ? 0.18 : 0.12))
-                    Image(systemName: "building.2")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(tint)
-                }
-                .frame(width: 42, height: 42)
-
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(row.title)
-                            .font(FGTypography.cardTitle)
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
-                            .lineLimit(1)
-                        managedVenueStatusBadge(status: row.status)
-                    }
-
-                    Text(row.subtitle)
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(row.title)
+                        .font(FGTypography.cardTitle)
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(1)
-
-                    if let note = row.statusNote {
-                        Text(note)
-                            .font(FGTypography.caption.weight(.semibold))
-                            .foregroundStyle(tint)
-                            .lineLimit(1)
-                    }
+                    managedVenueStatusBadge(status: row.status)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if isSelected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(FGColor.accentGreen)
+                Text(row.subtitle)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+
+                if let note = row.statusNote {
+                    Text(note)
+                        .font(FGTypography.caption.weight(.semibold))
+                        .foregroundStyle(tint)
+                        .lineLimit(1)
                 }
             }
-            .padding(FGSpacing.md)
-            .background(FGAdaptiveSurface.cardElevated)
-            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if row.status == .approved, onEditApprovedVenue != nil {
+                managedVenueEditAffordance(for: row)
+            }
+
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(FGColor.accentGreen)
+            }
+        }
+        .padding(FGSpacing.md)
+        .background(FGAdaptiveSurface.cardElevated)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            handleManagedVenueRowTap(row)
+        }
+    }
+
+    private func managedVenueEditAffordance(for row: ManagedVenueSelectorRow) -> some View {
+        Button {
+            handleManagedVenueEditTap(row)
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Edit")
+                    .font(FGTypography.metadata.weight(.semibold))
+            }
+            .foregroundStyle(FGColor.accentBlue)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.14 : 0.08))
+            .clipShape(Capsule(style: .continuous))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("Edit venue \(row.title)")
+    }
+
+    private func handleManagedVenueRowTap(_ row: ManagedVenueSelectorRow) {
+        guard !blockHydratingTap(action: "viewingVenueSelector") else { return }
+        logBusinessManagedVenueTapDebug("tapped", row: row)
+        guard let id = row.venueID else {
+            if row.status == .pending {
+                venueSelectorNotice = "This venue is waiting for admin approval."
+#if DEBUG
+                print("[BusinessVenueSelectorDebug] pendingVenueTapped id=\(row.claimID?.uuidString ?? row.venueID?.uuidString ?? "nil")")
+#endif
+            } else {
+                venueSelectorNotice = "This venue request was rejected."
+            }
+            return
+        }
+
+        if row.status == .locked {
+            venueSelectorNotice = inactiveVenueSelectionNotice
+            logBusinessManagedVenueTapDebug("ignoredInactiveVenue", row: row, venueId: id)
+            return
+        }
+
+        guard row.status == .approved else {
+            venueSelectorNotice = row.status == .pending
+                ? "This venue is waiting for admin approval."
+                : "This venue request was rejected."
+            return
+        }
+
+        showVenueListSheet = false
+        Task {
+            await viewModel.selectManagedVenue(id: id)
+#if DEBUG
+            print("[BusinessManagedVenueTapDebug] selectedVenueUpdated venueId=\(id.uuidString.lowercased())")
+#endif
+        }
+    }
+
+    private func handleManagedVenueEditTap(_ row: ManagedVenueSelectorRow) {
+        guard row.status == .approved, let id = row.venueID else { return }
+        guard !blockHydratingTap(action: "editVenueDetails") else { return }
+        logBusinessManagedVenueTapDebug("editTapped", row: row, venueId: id)
+        showVenueListSheet = false
+        onEditApprovedVenue?(id)
     }
 
     private func logBusinessManagedVenueTapDebug(
@@ -11252,6 +11311,8 @@ struct BusinessLocationVenuePicker: View {
         let status = statusTitle(for: row.status)
         if event == "tapped" {
             print("[BusinessManagedVenueTapDebug] tapped venueId=\(venueId?.uuidString.lowercased() ?? "nil") venueName=\(venueName.isEmpty ? "nil" : venueName) status=\(status)")
+        } else if event == "editTapped" {
+            print("[BusinessManagedVenueTapDebug] editTapped venueId=\(venueId?.uuidString.lowercased() ?? "nil") venueName=\(venueName.isEmpty ? "nil" : venueName) status=\(status)")
         } else if event == "ignoredInactiveVenue" {
             print("[BusinessManagedVenueTapDebug] ignoredInactiveVenue venueId=\(venueId?.uuidString.lowercased() ?? "nil")")
         }

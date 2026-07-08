@@ -885,6 +885,7 @@ extension MapViewModel {
         passwordResetUpdateError = ""
         applePendingFanSignupEmail = ""
         applePendingFanSignupDisplayName = ""
+        appleFanOnboardingPasswordBypassActive = false
         applePendingBusinessSignupEmail = ""
         applePendingBusinessSignupDisplayName = ""
         appleAuthFanMessage = ""
@@ -1391,6 +1392,69 @@ extension MapViewModel {
         userProfileExistsForPresentation = profileExists
         hasLoadedUserProfileForPresentation = true
         isUserProfileLoadingForPresentation = false
+    }
+
+    /// Account-tab recovery: fetch active fan profile when presentation state was reset but warm preload has not hydrated yet.
+    func recoverUserProfilePresentationForAccountTabIfNeeded() async {
+        let shouldRecover = await MainActor.run { () -> Bool in
+            guard isLoggedIn, !isVenueOwnerLoggedIn, currentUserAuthId != nil else { return false }
+            return !hasLoadedUserProfileForPresentation && !isUserProfileLoadingForPresentation
+        }
+        guard shouldRecover else { return }
+
+#if DEBUG
+        print("[ProfilePersistenceDebug] accountTabRecoveryLoadStarted=true")
+#endif
+        await MainActor.run {
+            beginProfilePresentationLoad()
+        }
+        await loadUserProfile()
+    }
+
+    @MainActor
+    private func shouldApplyLoadedUserProfile(authId: UUID) -> Bool {
+        guard let activeAuthId = currentUserAuthId else { return true }
+        guard activeAuthId == authId else {
+#if DEBUG
+            print("[ProfilePersistenceDebug] staleProfileApplyDiscarded=true fetchedAuthId=\(authId.uuidString.lowercased()) activeAuthId=\(activeAuthId.uuidString.lowercased())")
+#endif
+            return false
+        }
+        return true
+    }
+
+    @MainActor
+    @discardableResult
+    private func applyLoadedUserProfileRow(_ profile: UserProfileRow, authId: UUID) -> Bool {
+        guard shouldApplyLoadedUserProfile(authId: authId) else { return false }
+
+        if let em = profile.email?.trimmingCharacters(in: .whitespacesAndNewlines), !em.isEmpty {
+            currentUserEmail = em
+        }
+        currentUserDisplayName = profile.display_name ?? ""
+        currentUserUsername = profile.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        currentUserBio = profile.bio?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        currentUserProfileCreatedAt = profile.created_at?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        currentUserIsBusinessAccount = profile.isBusinessIdentity
+        currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
+        currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
+#if DEBUG
+        ProfileAvatarDebug.profileReloaded(
+            handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
+        )
+#endif
+        currentUserNationalTeam = profile.nationalTeamIdentity
+        applyCurrentUserHomeCityFromProfile(profile)
+        currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
+        currentUserLiveVisibilityMode = profile.liveVisibilityMode
+        currentUserSelectedLiveVisibilityFriendIDs = profile.selectedLiveVisibilityFriendIDs
+        currentUserDiscoverableByFans = profile.discoverableByFans
+        currentUserAuthId = authId
+        FanGeoUserEntitlements.apply(adFreeEnabled: profile.adFreeEnabled)
+        bumpCurrentUserAvatarDisplayRefresh()
+        cacheCurrentUserProfileLocally()
+        return true
     }
 
     /// Ensures `public.user_profiles` has a row with `id == auth.uid`; inserts a minimal row if missing. Does not use email as PK or random UUIDs.
@@ -2571,32 +2635,9 @@ extension MapViewModel {
                         return
                     }
                     await MainActor.run {
-                        if let em = profile.email?.trimmingCharacters(in: .whitespacesAndNewlines), !em.isEmpty {
-                            currentUserEmail = em
+                        if applyLoadedUserProfileRow(profile, authId: authId) {
+                            finishProfilePresentationLoad(profileExists: true)
                         }
-                        currentUserDisplayName = profile.display_name ?? ""
-                        currentUserUsername = profile.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        currentUserBio = profile.bio?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        currentUserProfileCreatedAt = profile.created_at?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        currentUserIsBusinessAccount = profile.isBusinessIdentity
-                        currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
-                        currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
-#if DEBUG
-                        ProfileAvatarDebug.profileReloaded(
-                            handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                            avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
-                        )
-#endif
-                        currentUserNationalTeam = profile.nationalTeamIdentity
-                        applyCurrentUserHomeCityFromProfile(profile)
-                        currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
-                        currentUserLiveVisibilityMode = profile.liveVisibilityMode
-                        currentUserSelectedLiveVisibilityFriendIDs = profile.selectedLiveVisibilityFriendIDs
-                        currentUserDiscoverableByFans = profile.discoverableByFans
-                        currentUserAuthId = authId
-                        FanGeoUserEntitlements.apply(adFreeEnabled: profile.adFreeEnabled)
-                        cacheCurrentUserProfileLocally()
-                        finishProfilePresentationLoad(profileExists: true)
                     }
 #if DEBUG
                     print("[ProfileDiscoverabilityDebug] loaded=\(profile.discoverableByFans)")
@@ -2659,28 +2700,13 @@ extension MapViewModel {
                     return
                 }
                 await MainActor.run {
-                    currentUserDisplayName = profile.display_name ?? ""
-                    currentUserUsername = profile.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    currentUserBio = profile.bio?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    currentUserProfileCreatedAt = profile.created_at?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    currentUserIsBusinessAccount = profile.isBusinessIdentity
-                    currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
-                    currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
-#if DEBUG
-                    ProfileAvatarDebug.profileReloaded(
-                        handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                        avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
-                    )
-#endif
-                        currentUserNationalTeam = profile.nationalTeamIdentity
-                    applyCurrentUserHomeCityFromProfile(profile)
-                    currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
-                    currentUserLiveVisibilityMode = profile.liveVisibilityMode
-                    currentUserSelectedLiveVisibilityFriendIDs = profile.selectedLiveVisibilityFriendIDs
-                    currentUserDiscoverableByFans = profile.discoverableByFans
-                    FanGeoUserEntitlements.apply(adFreeEnabled: profile.adFreeEnabled)
-                    cacheCurrentUserProfileLocally()
-                    finishProfilePresentationLoad(profileExists: true)
+                    guard let profileAuthId = profile.id else {
+                        finishProfilePresentationLoad(profileExists: false)
+                        return
+                    }
+                    if applyLoadedUserProfileRow(profile, authId: profileAuthId) {
+                        finishProfilePresentationLoad(profileExists: true)
+                    }
                 }
 #if DEBUG
                 print("[ProfileDiscoverabilityDebug] loaded=\(profile.discoverableByFans)")
@@ -2907,6 +2933,10 @@ extension MapViewModel {
             preventedBlankProfileOverwrite = true
         } else {
             finalDisplayName = displayName
+        }
+
+        if ReservedNameValidation.containsReservedTerm(finalDisplayName) {
+            return ReservedNameValidation.rejectionMessage
         }
 
         if let username {

@@ -1767,6 +1767,7 @@ struct MainTabView: View {
                     fallbackStyle: colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome,
                     imagePlaceholderTint: colorScheme == .dark ? .white : nil
                 )
+                .id("\(viewModel.currentUserAuthId?.uuidString ?? "none")|\(viewModel.currentUserAvatarURL)|\(viewModel.currentUserAvatarThumbnailURL)|\(viewModel.currentUserAvatarDisplayRefreshToken.uuidString)")
             } else {
                 Image(systemName: accountIconName)
                     .font(.title3)

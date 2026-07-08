@@ -274,6 +274,11 @@ struct FanGeoIdentitySetupView: View {
             print("[SignupProfileDebug] validationError field=displayName")
             return
         }
+        if ReservedNameValidation.containsReservedTerm(trimmed) {
+            displayNameError = ReservedNameValidation.rejectionMessage
+            print("[SignupProfileDebug] validationError field=displayName")
+            return
+        }
         displayNameError = ""
     }
 
@@ -343,6 +348,12 @@ struct FanGeoIdentitySetupView: View {
 
         if ModerationService.containsProfanity(name) {
             errorMessage = ModerationService.profanityRejectionUserMessage()
+            print("[SignupProfileDebug] validationError field=displayName")
+            return
+        }
+
+        if ReservedNameValidation.containsReservedTerm(name) {
+            errorMessage = ReservedNameValidation.rejectionMessage
             print("[SignupProfileDebug] validationError field=displayName")
             return
         }

@@ -1884,7 +1884,7 @@ struct VenueOwnerDashboardView: View {
         }
     }
 
-    /// When true, venue name, address, region, and coordinates are read-only (FanGeo-approved active managed venue).
+    /// When true, venue address, region, and coordinates are read-only (FanGeo-approved active managed venue). Venue display name remains editable.
     private var venueCoreIdentityLocked: Bool {
         viewModel.venueCoreIdentityLockedForSelectedVenue()
     }
@@ -1893,8 +1893,12 @@ struct VenueOwnerDashboardView: View {
         viewModel.selectedManagedVenueIsPlanLocked()
     }
 
-    private var venueProfileEditingLocked: Bool {
+    private var venueAddressProfileEditingLocked: Bool {
         venueCoreIdentityLocked || selectedVenuePlanLocked
+    }
+
+    private var venueProfileEditingLocked: Bool {
+        venueAddressProfileEditingLocked
     }
 
     private var selectedVenueCanHostGames: Bool {
@@ -3659,36 +3663,36 @@ struct VenueOwnerDashboardView: View {
                 venueFanGeoVerifiedExplainerCard()
             }
 
-            field("Bar / Pub / Restaurant Name", text: $viewModel.ownerVenueName, locked: venueProfileEditingLocked)
+            field("Bar / Pub / Restaurant Name", text: $viewModel.ownerVenueName, locked: selectedVenuePlanLocked)
             BusinessLocationCountryField(countryCode: $venueCountry)
-                .disabled(venueProfileEditingLocked)
+                .disabled(venueAddressProfileEditingLocked)
                 .fanGeoInputFieldStyle()
-                .opacity(venueProfileEditingLocked ? 0.78 : 1)
-            field("Address Line 1", text: $venueStreetAddress, locked: venueProfileEditingLocked)
-            field("Address Line 2 (optional)", text: $venueAddressLine2, locked: venueProfileEditingLocked)
-            field(venueAddressLabels.locality, text: $venueCity, locked: venueProfileEditingLocked)
+                .opacity(venueAddressProfileEditingLocked ? 0.78 : 1)
+            field("Address Line 1", text: $venueStreetAddress, locked: venueAddressProfileEditingLocked)
+            field("Address Line 2 (optional)", text: $venueAddressLine2, locked: venueAddressProfileEditingLocked)
+            field(venueAddressLabels.locality, text: $venueCity, locked: venueAddressProfileEditingLocked)
 
             HStack(alignment: .center, spacing: 10) {
                 BusinessLocationRegionField(countryCode: venueCountry, labels: venueAddressLabels, region: $venueState)
-                    .disabled(venueProfileEditingLocked)
+                    .disabled(venueAddressProfileEditingLocked)
                     .padding()
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(FGAdaptiveSurface.controlFill)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
 
-                if venueProfileEditingLocked {
+                if venueAddressProfileEditingLocked {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(.tertiary)
                         .accessibilityLabel("Locked")
                 }
             }
-            .opacity(venueProfileEditingLocked ? 0.78 : 1)
+            .opacity(venueAddressProfileEditingLocked ? 0.78 : 1)
 
-            field(venueAddressLabels.postalCode, text: $venueZipCode, locked: venueProfileEditingLocked)
+            field(venueAddressLabels.postalCode, text: $venueZipCode, locked: venueAddressProfileEditingLocked)
             BusinessVenueLocationPinPreview(
                 draft: venueLocationDraft,
-                isLocked: venueProfileEditingLocked,
+                isLocked: venueAddressProfileEditingLocked,
                 onAdjust: { showVenuePinPicker = true }
             )
             BusinessPhoneNumberField(dialISO: $viewModel.ownerVenuePhoneDialISO, localNumber: $viewModel.ownerVenuePhone)
@@ -3776,9 +3780,15 @@ struct VenueOwnerDashboardView: View {
             profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle
             return
         }
-        let nameBad = ModerationService.containsProfanity(viewModel.ownerVenueName)
+        let trimmedName = viewModel.ownerVenueName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            profileSaveMessage = "Venue name is required."
+            return
+        }
+        viewModel.ownerVenueName = trimmedName
+        let nameBad = ModerationService.containsProfanity(trimmedName)
         let descBad = ModerationService.containsProfanity(viewModel.ownerVenueDescription)
-        if descBad || (!venueCoreIdentityLocked && nameBad) {
+        if descBad || nameBad {
             profileSaveMessage = ModerationService.profanityRejectionUserMessage()
             return
         }
@@ -4140,10 +4150,10 @@ struct VenueOwnerDashboardView: View {
                     .foregroundStyle(Color.accentColor)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Venue information verified by FanGeo.")
+                    Text("Venue address and location are verified by FanGeo.")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
-                    Text("To change the venue name, address, or core business information, please contact FanGeo Support.")
+                    Text("You can edit the venue name and profile details, but contact FanGeo Support to change address or core location details.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

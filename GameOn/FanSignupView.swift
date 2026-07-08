@@ -4,6 +4,11 @@ import UIKit
 
 /// Unified fan account creation: auth credentials + profile on one screen before submit.
 struct FanSignupView: View {
+    private enum FanSignupAuthMode {
+        case apple
+        case emailPassword
+    }
+
     private enum SignupStep: Int, CaseIterable {
         case profile = 1
         case teams = 2
@@ -149,10 +154,21 @@ struct FanSignupView: View {
         .fanGeoScreenBackground()
         .onAppear {
             print("[SignupUX] render mode=create")
-            applyApplePendingSignupState()
-            if !isApplePendingProfile, email.isEmpty, !prefilledEmail.isEmpty {
+            Task {
+                await viewModel.syncAppleFanSignupOnboardingFromActiveSession()
+                await MainActor.run {
+                    applyApplePendingSignupState()
+                }
+            }
+            if !usesAppleSignupAuth, email.isEmpty, !prefilledEmail.isEmpty {
                 email = prefilledEmail
             }
+#if DEBUG
+            print("[FanSignupDebug] authMode=\(fanSignupAuthMode == .apple ? "apple" : "emailPassword") passwordFieldsHidden=\(usesAppleSignupAuth)")
+#endif
+        }
+        .onChange(of: viewModel.appleFanOnboardingPasswordBypassActive) { _, _ in
+            applyApplePendingSignupState()
         }
         .onChange(of: handleDraft) { _, newValue in
             viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "signupEdited")
@@ -160,18 +176,18 @@ struct FanSignupView: View {
             scheduleHandleAvailabilityCheck()
         }
         .onChange(of: email) { _, _ in
-            if !isApplePendingProfile {
+            if !usesAppleSignupAuth {
                 viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "emailEdited")
             }
         }
         .onChange(of: password) { _, _ in
-            if !isApplePendingProfile {
+            if !usesAppleSignupAuth {
                 viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "passwordEdited")
                 passwordError = ""
             }
         }
         .onChange(of: confirmPassword) { _, _ in
-            if !isApplePendingProfile {
+            if !usesAppleSignupAuth {
                 viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "passwordEdited")
                 passwordError = ""
             }
@@ -311,7 +327,7 @@ struct FanSignupView: View {
             .padding(.top, 6)
 
             VStack(spacing: 13) {
-                if isApplePendingProfile {
+                if usesAppleSignupAuth {
                     appleSignedInBanner
                 } else {
                     onboardingField(systemImage: "envelope", placeholder: "you@email.com", text: $email)
@@ -715,26 +731,34 @@ struct FanSignupView: View {
 
         let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmedEmail.isEmpty {
-            emailError = isApplePendingProfile ? "Apple did not return a usable email address." : "Email is required."
+            emailError = usesAppleSignupAuth ? "Apple did not return a usable email address." : "Email is required."
             return false
         }
         if !OwnerBusinessEmail.isValidStrict(OwnerBusinessEmail.normalized(trimmedEmail)) {
             emailError = OwnerBusinessEmail.invalidOwnerEmailUserMessage
             return false
         }
-        if !isApplePendingProfile, password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !usesAppleSignupAuth, password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             passwordError = "Password is required."
             return false
         }
-        if !isApplePendingProfile, confirmPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !usesAppleSignupAuth, confirmPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             passwordError = "Confirm password is required."
             return false
         }
-        if !isApplePendingProfile, password != confirmPassword {
+        if !usesAppleSignupAuth, password != confirmPassword {
             passwordError = "Passwords do not match."
             return false
         }
         if !displayNameError.isEmpty, !usesAppleProvidedDisplayName {
+            return false
+        }
+        if ReservedNameValidation.containsReservedTerm(effectiveDisplayNameForSignup) {
+            if usesAppleProvidedDisplayName {
+                errorMessage = ReservedNameValidation.rejectionMessage
+            } else {
+                displayNameError = ReservedNameValidation.rejectionMessage
+            }
             return false
         }
         if let issue = FanGeoHandleRules.validate(handleDraft) {
@@ -780,7 +804,7 @@ struct FanSignupView: View {
         VStack(alignment: .leading, spacing: FGSpacing.md) {
             avatarPickerRow
 
-            if isApplePendingProfile {
+            if usesAppleSignupAuth {
                 appleSignedInBanner
             } else {
                 labeledField(title: "Email", required: true) {
@@ -1001,7 +1025,7 @@ struct FanSignupView: View {
 
     private var submitButtonTitle: String {
         if isSubmitting {
-            if isApplePendingProfile {
+            if usesAppleSignupAuth {
                 return "Creating profile…"
             }
             return profileRetryMode ? "Saving profile…" : "Creating account…"
@@ -1009,7 +1033,7 @@ struct FanSignupView: View {
         if profileRetryMode {
             return "Retry saving profile"
         }
-        if isApplePendingProfile {
+        if usesAppleSignupAuth {
             return "Create profile"
         }
         return "Create FanGeo account"
@@ -1019,7 +1043,7 @@ struct FanSignupView: View {
         if profileRetryMode {
             return profileFieldsValid && termsAccepted
         }
-        if isApplePendingProfile {
+        if usesAppleSignupAuth {
             return profileFieldsValid
                 && !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 && termsAccepted
@@ -1032,8 +1056,12 @@ struct FanSignupView: View {
             && termsAccepted
     }
 
-    private var isApplePendingProfile: Bool {
-        !OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail).isEmpty
+    private var fanSignupAuthMode: FanSignupAuthMode {
+        viewModel.isAppleFanSignupOnboardingActive ? .apple : .emailPassword
+    }
+
+    private var usesAppleSignupAuth: Bool {
+        fanSignupAuthMode == .apple
     }
 
     private var appleProvidedDisplayName: String {
@@ -1041,7 +1069,7 @@ struct FanSignupView: View {
     }
 
     private var usesAppleProvidedDisplayName: Bool {
-        isApplePendingProfile && !appleProvidedDisplayName.isEmpty
+        usesAppleSignupAuth && !appleProvidedDisplayName.isEmpty
     }
 
     private var effectiveDisplayNameForSignup: String {
@@ -1068,7 +1096,7 @@ struct FanSignupView: View {
 
     @MainActor
     private func applyApplePendingSignupState() {
-        guard isApplePendingProfile else { return }
+        guard usesAppleSignupAuth else { return }
         let normalizedEmail = OwnerBusinessEmail.normalized(viewModel.applePendingFanSignupEmail)
         if !normalizedEmail.isEmpty {
             email = normalizedEmail
@@ -1132,7 +1160,15 @@ struct FanSignupView: View {
             }
             return
         }
-        displayNameError = trimmed.count > Self.displayNameMaxLength ? "Display name is too long." : ""
+        if trimmed.count > Self.displayNameMaxLength {
+            displayNameError = "Display name is too long."
+            return
+        }
+        if ReservedNameValidation.containsReservedTerm(trimmed) {
+            displayNameError = ReservedNameValidation.rejectionMessage
+            return
+        }
+        displayNameError = ""
     }
 
     @MainActor
@@ -1193,19 +1229,19 @@ struct FanSignupView: View {
             return false
         }
 
-        if !isApplePendingProfile, password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !usesAppleSignupAuth, password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             passwordError = "Password is required."
             print("[SignupUX] submitFailed step=validation error=password")
             print("[EmailConfirmDebug] formValidationFailed reason=password_required")
             return false
         }
-        if !isApplePendingProfile, confirmPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if !usesAppleSignupAuth, confirmPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             passwordError = "Confirm password is required."
             print("[SignupUX] submitFailed step=validation error=confirm_password")
             print("[EmailConfirmDebug] formValidationFailed reason=confirm_password_required")
             return false
         }
-        if !isApplePendingProfile, password != confirmPassword {
+        if !usesAppleSignupAuth, password != confirmPassword {
             passwordError = "Passwords do not match."
             print("[SignupUX] submitFailed step=validation error=password_mismatch")
             print("[EmailConfirmDebug] formValidationFailed reason=password_mismatch")
@@ -1221,6 +1257,17 @@ struct FanSignupView: View {
         if effectiveDisplayNameForSignup.isEmpty {
             print("[SignupUX] submitFailed step=validation error=displayName")
             print("[EmailConfirmDebug] formValidationFailed reason=display_name_required")
+            return false
+        }
+
+        if ReservedNameValidation.containsReservedTerm(effectiveDisplayNameForSignup) {
+            if usesAppleProvidedDisplayName {
+                errorMessage = ReservedNameValidation.rejectionMessage
+            } else {
+                displayNameError = ReservedNameValidation.rejectionMessage
+            }
+            print("[SignupUX] submitFailed step=validation error=displayNameReserved")
+            print("[EmailConfirmDebug] formValidationFailed reason=display_name_reserved")
             return false
         }
 
@@ -1256,14 +1303,14 @@ struct FanSignupView: View {
 
     @MainActor
     private func submitSignup() async {
-        if !isApplePendingProfile {
+        if !usesAppleSignupAuth {
             print("[EmailConfirmDebug] signupButtonTapped=true")
         }
         guard validateBeforeSubmit() else { return }
 
         viewModel.clearAppleAuthMessage(
             accountMode: .fan,
-            reason: isApplePendingProfile ? "appleProfileSubmit" : "emailPasswordSignUp"
+            reason: usesAppleSignupAuth ? "appleProfileSubmit" : "emailPasswordSignUp"
         )
         print("[SignupUX] submitStarted")
         isSubmitting = true
@@ -1283,7 +1330,7 @@ struct FanSignupView: View {
             return
         }
 
-        if isApplePendingProfile {
+        if usesAppleSignupAuth {
             print("[FanSignupDebug] submitApplePendingProfile=true email=\(email)")
             let outcome = await viewModel.completeAppleFanSignupProfile(
                 profile: profile,

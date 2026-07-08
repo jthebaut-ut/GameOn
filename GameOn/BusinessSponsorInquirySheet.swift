@@ -37,7 +37,7 @@ struct BusinessSponsorInquirySheet: View {
     }
 
     private static let defaultMessage =
-        "I’m interested in learning more about advertising and sponsored placement opportunities for my venue on FanGeo. Please contact me with available sponsorship options and pricing."
+        "I’m interested in learning more about real-world advertising and promotional opportunities for my venue or event on FanGeo. Please contact me with available options."
 
     private static let isoFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -67,7 +67,7 @@ struct BusinessSponsorInquirySheet: View {
 
     private var subject: String {
         let name = trimmedBusinessName.isEmpty ? "Business" : trimmedBusinessName
-        return "FanGeo Sponsor Inquiry - \(String(name.prefix(120)))"
+        return "FanGeo Venue Advertising Inquiry - \(String(name.prefix(120)))"
     }
 
     private var canSubmit: Bool {
@@ -85,7 +85,7 @@ struct BusinessSponsorInquirySheet: View {
                 businessDetailsSection
                 sponsorshipInterestSection
             }
-            .navigationTitle("Advertising & Sponsorship Inquiry")
+            .navigationTitle("Venue Advertising")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -109,12 +109,12 @@ struct BusinessSponsorInquirySheet: View {
             .alert("Inquiry sent", isPresented: $showSuccessAlert) {
                 Button("OK") { dismiss() }
             } message: {
-                Text("FanGeo received your sponsorship inquiry.")
+                Text("FanGeo received your advertising inquiry.")
             }
             .alert("Couldn’t send", isPresented: $showFailureAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
-                Text("Unable to send the sponsor inquiry right now. Please try again later.")
+                Text("Unable to send your advertising inquiry right now. Please try again later.")
             }
             .alert(
                 "Check your inquiry",
@@ -133,10 +133,13 @@ struct BusinessSponsorInquirySheet: View {
     private var headerSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
-                Label("Advertise with FanGeo", systemImage: "megaphone.fill")
+                Label("Promote Your Venue", systemImage: "megaphone.fill")
                     .font(.headline.weight(.bold))
-                Text("Tell the FanGeo team about your advertising goals. We’ll contact you with available sponsorship opportunities and pricing.")
+                Text("FanGeo offers real-world venue and event advertising opportunities arranged outside the app. Share your goals and our team will reach out with options.")
                     .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("This is separate from Business Pro and FanGeo+, which are digital subscriptions purchased through Apple In-App Purchase when available. Advertising does not unlock premium app features.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
@@ -162,9 +165,9 @@ struct BusinessSponsorInquirySheet: View {
             TextField("Optional budget/timeframe", text: $budgetTimeframe)
                 .textInputAutocapitalization(.sentences)
         } header: {
-            Text("Sponsorship interest")
+            Text("Advertising interest")
         } footer: {
-            Text("Submitting this inquiry does not purchase advertising. A FanGeo representative will contact you with available sponsorship opportunities and pricing.")
+            Text("Submitting this inquiry does not purchase advertising or any app subscription. A FanGeo representative will contact you about real-world promotion for your venue or event. Business Pro and FanGeo+ digital subscriptions are purchased separately through Apple In-App Purchase when launched.")
         }
     }
 
@@ -228,7 +231,7 @@ struct BusinessSponsorInquirySheet: View {
         let timestamp = Self.isoFormatter.string(from: Date())
         let budgetLine = trimmedBudgetTimeframe.isEmpty ? "Not provided" : trimmedBudgetTimeframe
         return """
-        Sponsor inquiry
+        Venue advertising inquiry
 
         Business ID: \(businessId?.uuidString.lowercased() ?? "nil")
         Business name: \(trimmedBusinessName)

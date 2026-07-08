@@ -83,6 +83,15 @@ struct UserProfileScreen: View {
                 }
             }
             .onAppear {
+                guard viewModel.hasLoadedUserProfileForPresentation,
+                      !viewModel.isUserProfileLoadingForPresentation else { return }
+                editedDisplayName = resolvedDisplayName
+                editedUsername = viewModel.currentUserUsername
+                editedBio = limitedBio(viewModel.currentUserBio)
+            }
+            .onChange(of: viewModel.profileEditPresentationEvaluationKey) { _, _ in
+                guard viewModel.hasLoadedUserProfileForPresentation,
+                      !viewModel.isUserProfileLoadingForPresentation else { return }
                 editedDisplayName = resolvedDisplayName
                 editedUsername = viewModel.currentUserUsername
                 editedBio = limitedBio(viewModel.currentUserBio)
@@ -365,6 +374,11 @@ struct UserProfileScreen: View {
             await MainActor.run { message = "Please sign in to edit your profile." }
             return
         }
+        guard viewModel.hasLoadedUserProfileForPresentation,
+              !viewModel.isUserProfileLoadingForPresentation else {
+            await MainActor.run { message = "Your profile is still loading. Please try again in a moment." }
+            return
+        }
 
         isSaving = true
         defer { isSaving = false }
@@ -373,6 +387,10 @@ struct UserProfileScreen: View {
         let nextName = trimmed.isEmpty ? resolvedDisplayName : trimmed
         if ModerationService.containsProfanity(nextName) {
             await MainActor.run { message = ModerationService.profanityRejectionUserMessage() }
+            return
+        }
+        if ReservedNameValidation.containsReservedTerm(nextName) {
+            await MainActor.run { message = ReservedNameValidation.rejectionMessage }
             return
         }
         if let issue = FanGeoHandleRules.validate(editedUsername) {

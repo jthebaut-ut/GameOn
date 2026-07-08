@@ -117,6 +117,17 @@ extension MapViewModel {
             )
         }
 
+        if ReservedNameValidation.containsReservedTerm(displayName) {
+            let message = ReservedNameValidation.rejectionMessage
+            print("[EmailConfirmDebug] formValidationFailed reason=display_name_reserved")
+            return FanSignupSubmitOutcome(
+                succeeded: false,
+                failureStep: .validation,
+                errorMessage: message,
+                authSucceeded: false
+            )
+        }
+
         if let issue = FanGeoHandleRules.validate(profile.handle) {
             print("[HandleValidationDebug] handleRejected reason=\(issue)")
             print("[EmailConfirmDebug] formValidationFailed reason=invalid_handle")
@@ -387,6 +398,7 @@ extension MapViewModel {
             authSessionState = .signedIn
             applePendingFanSignupEmail = ""
             applePendingFanSignupDisplayName = ""
+            appleFanOnboardingPasswordBypassActive = false
             authErrorMessage = ""
             clearAppleAuthMessage(accountMode: .fan, reason: "profileCreated")
             bumpCurrentUserAvatarDisplayRefresh()

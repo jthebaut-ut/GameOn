@@ -10,6 +10,7 @@ enum FanGeoHandleRules {
         case invalidCharacters
         case edgePeriod
         case consecutiveSpecialCharacters
+        case reservedName
     }
 
     /// Strips leading `@`, lowercases, trims — value persisted in `user_profiles.username`.
@@ -22,6 +23,9 @@ enum FanGeoHandleRules {
     }
 
     static func validate(_ raw: String) -> ValidationIssue? {
+        if ReservedNameValidation.containsReservedTerm(raw) {
+            return .reservedName
+        }
         let stored = normalizeForStorage(raw)
         guard stored.count >= minLength, stored.count <= maxLength else {
             return .tooShortOrLong
@@ -49,6 +53,8 @@ enum FanGeoHandleRules {
             return "Handle cannot start or end with a period."
         case .consecutiveSpecialCharacters:
             return "Avoid consecutive periods or underscores."
+        case .reservedName:
+            return ReservedNameValidation.rejectionMessage
         }
     }
 

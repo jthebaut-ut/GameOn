@@ -181,6 +181,7 @@ struct BusinessVenueDashboardOverviewView: View {
     let favoriteTeamsCount: Int
     let onManageFavoriteTeams: () -> Void
     var onActiveVenueSelection: (() -> Void)?
+    var onEditApprovedVenue: ((UUID) -> Void)?
     let onCommentsReports: () -> Void
     let onViewAllGames: () -> Void
     let onRefreshVenues: () -> Void
@@ -621,7 +622,6 @@ struct BusinessVenueDashboardOverviewView: View {
             }
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.20 : 0.05), radius: 12, y: 6)
         }
-        .allowsHitTesting(false)
     }
 
     private var managedVenuesLoadingPlaceholder: some View {
@@ -715,7 +715,12 @@ struct BusinessVenueDashboardOverviewView: View {
                     .lineLimit(2)
             }
             Spacer(minLength: 0)
-            statusPill(venue.isPlanLocked ? "Inactive" : "Active", tint: tint)
+            HStack(spacing: 6) {
+                statusPill(venue.isPlanLocked ? "Inactive" : "Active", tint: tint)
+                if !venue.isPlanLocked, onEditApprovedVenue != nil {
+                    approvedVenueEditAffordance(for: venue)
+                }
+            }
         }
         .padding(10)
         .background(
@@ -727,6 +732,26 @@ struct BusinessVenueDashboardOverviewView: View {
                 .strokeBorder(tint.opacity(venue.isPlanLocked ? 0.22 : 0.28), lineWidth: 1)
         }
         .opacity(venue.isPlanLocked ? 0.72 : 1)
+    }
+
+    private func approvedVenueEditAffordance(for venue: BusinessVenueDashboardApprovedVenueItem) -> some View {
+        Button {
+            onEditApprovedVenue?(venue.id)
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 10, weight: .bold))
+                Text("Edit")
+                    .font(FGTypography.metadata.weight(.semibold))
+            }
+            .foregroundStyle(FGColor.accentBlue)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.14 : 0.08))
+            .clipShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Edit venue \(venue.name)")
     }
 
     private func venueThumbnail(_ venue: BusinessVenueDashboardApprovedVenueItem) -> some View {

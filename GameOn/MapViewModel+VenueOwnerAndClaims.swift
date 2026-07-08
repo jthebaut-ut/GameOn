@@ -1282,7 +1282,7 @@ extension MapViewModel {
         }
     }
 
-    /// When true, venue name, address, coordinates, and identity metadata must stay read-only in UI and must not be sent on `venues` updates (FanGeo-verified active managed venue).
+    /// When true, venue address, coordinates, and identity metadata must stay read-only in UI and must not be sent on `venues` updates (FanGeo-verified active managed venue). Venue display name may still be updated by the owning business.
     ///
     /// Signal: at least one approved managed location (``businessSettingsLocationChrome()`` == ``BusinessSettingsLocationChrome/approved``), selected venue is in ``managedVenuesForOwner()``, and ``VenueProfileRow/admin_status`` is **active** (or omitted / legacy-empty, matching active listings).
     func venueCoreIdentityLockedForSelectedVenue() -> Bool {
@@ -3697,9 +3697,8 @@ extension MapViewModel {
         ownerVenuePhone = parsed.localDigits
     }
 
-    /// Re-applies server truth for fields that must not change client-side when the venue is FanGeo-approved (see ``venueCoreIdentityLockedForSelectedVenue()``).
+    /// Re-applies server truth for address fields that must not change client-side when the venue is FanGeo-approved (see ``venueCoreIdentityLockedForSelectedVenue()``).
     func applyLockedVenueIdentityFromServerRow(_ saved: VenueProfileRow) {
-        ownerVenueName = saved.venue_name ?? ""
         ownerVenueAddress = saved.address ?? ""
         ownerVenueAddressLine2 = saved.address_line2 ?? ""
         ownerVenueCity = saved.city ?? ""
@@ -5712,7 +5711,16 @@ extension MapViewModel {
                     }
                 }
 
+                let trimmedVenueName = ownerVenueName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedVenueName.isEmpty else {
+#if DEBUG
+                    print("[VenueDetailsLock] save blocked reason=empty_venue_name venueId=\(ownerVenueDatabaseId?.uuidString.lowercased() ?? "nil")")
+#endif
+                    return false
+                }
+
                 let operationalPatch = VenueProfileOperationalUpdate(
+                    venue_name: trimmedVenueName,
                     supporter_country: supporterCountryForSave,
                     phone: phoneForSave,
                     website: ownerVenueWebsite,

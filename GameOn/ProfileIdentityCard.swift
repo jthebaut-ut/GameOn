@@ -185,6 +185,11 @@ struct ProfileIdentityCard: View {
         return "\(auth)|active=\(isAccountTabActive)"
     }
 
+    private var accountProfileHydrationRecoveryToken: String {
+        let auth = viewModel.currentUserAuthId?.uuidString ?? "none"
+        return "\(auth)|active=\(isAccountTabActive)|loaded=\(viewModel.hasLoadedUserProfileForPresentation)|loading=\(viewModel.isUserProfileLoadingForPresentation)"
+    }
+
     private var pokesLiveRefreshLoopToken: String {
         let auth = viewModel.currentUserAuthId?.uuidString ?? "anonymous"
         return "\(auth)|pokesLive=\(isAccountTabActive)"
@@ -242,6 +247,15 @@ struct ProfileIdentityCard: View {
 
     /// Persisted @handle without fan-since suffix (shown separately in compact identity rows).
     private var handleLine: String {
+        let stored = viewModel.currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !viewModel.hasLoadedUserProfileForPresentation || viewModel.isUserProfileLoadingForPresentation {
+            guard !stored.isEmpty else { return "" }
+            return FanGeoHandleRules.handleDisplayLine(
+                base: FanGeoHandleRules.displayHandle(stored: stored),
+                profileCreatedAt: viewModel.currentUserProfileCreatedAt,
+                showFanSince: false
+            )
+        }
         let base = FanGeoHandleRules.publicHandleLine(
             storedUsername: viewModel.currentUserUsername,
             email: viewModel.currentUserEmail
@@ -251,6 +265,22 @@ struct ProfileIdentityCard: View {
             profileCreatedAt: viewModel.currentUserProfileCreatedAt,
             showFanSince: false
         )
+    }
+
+    private var shouldShowHandlePromptBanner: Bool {
+        viewModel.hasLoadedUserProfileForPresentation
+            && !viewModel.isUserProfileLoadingForPresentation
+            && viewModel.needsFanHandleSelection
+            && !viewModel.needsBlockingFanIdentitySetup
+    }
+
+    private var avatarPresentationIdentity: String {
+        [
+            viewModel.currentUserAuthId?.uuidString ?? "none",
+            viewModel.currentUserAvatarURL,
+            viewModel.currentUserAvatarThumbnailURL,
+            viewModel.currentUserAvatarDisplayRefreshToken.uuidString
+        ].joined(separator: "|")
     }
 
     private var profileIdentityStripColumns: [ProfileIdentityStripColumn] {
@@ -394,7 +424,7 @@ struct ProfileIdentityCard: View {
                 }
         } else {
             LazyVStack(alignment: .leading, spacing: Self.profileMajorSectionSpacing) {
-                if viewModel.needsFanHandleSelection && !viewModel.needsBlockingFanIdentitySetup {
+                if shouldShowHandlePromptBanner {
                     handlePromptBanner
                         .padding(.horizontal, 16)
                 }
@@ -469,6 +499,15 @@ struct ProfileIdentityCard: View {
             }
             .onChange(of: viewModel.currentUserAuthId) { _, _ in
                 resetSuggestedFansLoadStateForAuthChange()
+                if showIdentityEditor {
+                    resetIdentityDraft()
+                }
+            }
+            .onChange(of: viewModel.profileEditPresentationEvaluationKey) { _, _ in
+                guard showIdentityEditor,
+                      viewModel.hasLoadedUserProfileForPresentation,
+                      !viewModel.isUserProfileLoadingForPresentation else { return }
+                resetIdentityDraft()
             }
             .onChange(of: isAccountTabActive) { _, isActive in
                 if isActive {
@@ -556,6 +595,10 @@ struct ProfileIdentityCard: View {
                     DebugLogGate.debug("[PokesUI] history opened")
                     viewModel.acknowledgeIncomingPokes(reason: "pokesHistorySheet")
                 }
+            }
+            .task(id: accountProfileHydrationRecoveryToken) {
+                guard isAccountTabActive else { return }
+                await viewModel.recoverUserProfilePresentationForAccountTabIfNeeded()
             }
             .task(id: profilePersonalizationLoadToken) {
                 guard isAccountTabActive else {
@@ -2406,6 +2449,7 @@ struct ProfileIdentityCard: View {
             .padding(Self.profileHeroAvatarOuterPadding)
             .background(Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.96)))
             .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.16), radius: 12, y: 5)
+            .id(avatarPresentationIdentity)
 
             Circle()
                 .fill(Color(.secondarySystemGroupedBackground))
@@ -2546,11 +2590,19 @@ struct ProfileIdentityCard: View {
                     Button(isSavingIdentity ? "Saving..." : "Save") {
                         Task { await saveIdentity() }
                     }
-                    .disabled(isSavingIdentity || isUploadingAvatar)
+                    .disabled(
+                        isSavingIdentity
+                            || isUploadingAvatar
+                            || !viewModel.hasLoadedUserProfileForPresentation
+                            || viewModel.isUserProfileLoadingForPresentation
+                    )
                 }
             }
             .onAppear {
-                resetIdentityDraft()
+                if viewModel.hasLoadedUserProfileForPresentation,
+                   !viewModel.isUserProfileLoadingForPresentation {
+                    resetIdentityDraft()
+                }
             }
         }
     }
@@ -2584,10 +2636,26 @@ struct ProfileIdentityCard: View {
     }
 
     private func presentIdentityEditor(focusedField: IdentityField) {
-        resetIdentityDraft()
-        showIdentityEditor = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            self.focusedIdentityField = focusedField
+        if viewModel.hasLoadedUserProfileForPresentation, !viewModel.isUserProfileLoadingForPresentation {
+            resetIdentityDraft()
+            showIdentityEditor = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                self.focusedIdentityField = focusedField
+            }
+            return
+        }
+
+        Task {
+            await viewModel.recoverUserProfilePresentationForAccountTabIfNeeded()
+            await MainActor.run {
+                guard viewModel.hasLoadedUserProfileForPresentation,
+                      !viewModel.isUserProfileLoadingForPresentation else { return }
+                resetIdentityDraft()
+                showIdentityEditor = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    self.focusedIdentityField = focusedField
+                }
+            }
         }
     }
 
@@ -2666,6 +2734,13 @@ struct ProfileIdentityCard: View {
             await MainActor.run { identityMessage = "Please sign in to edit your profile." }
             return
         }
+        guard viewModel.hasLoadedUserProfileForPresentation,
+              !viewModel.isUserProfileLoadingForPresentation else {
+            await MainActor.run {
+                identityMessage = "Your profile is still loading. Please try again in a moment."
+            }
+            return
+        }
 
         await MainActor.run { isSavingIdentity = true }
         defer { Task { @MainActor in isSavingIdentity = false } }
@@ -2676,6 +2751,13 @@ struct ProfileIdentityCard: View {
             await MainActor.run {
                 localAvatarPreviewImage = nil
                 identityMessage = ModerationService.profanityRejectionUserMessage()
+            }
+            return
+        }
+        if ReservedNameValidation.containsReservedTerm(nextName) {
+            await MainActor.run {
+                localAvatarPreviewImage = nil
+                identityMessage = ReservedNameValidation.rejectionMessage
             }
             return
         }

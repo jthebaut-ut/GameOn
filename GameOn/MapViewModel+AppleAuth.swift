@@ -9,6 +9,57 @@ private struct AppleExistingFanProfileRow: Decodable {
 }
 
 extension MapViewModel {
+    var isAppleFanSignupOnboardingActive: Bool {
+        if !OwnerBusinessEmail.normalized(applePendingFanSignupEmail).isEmpty {
+            return true
+        }
+        return appleFanOnboardingPasswordBypassActive
+    }
+
+    static func authUserIsAppleOnly(_ user: User) -> Bool {
+        let identityProviders = user.identities?
+            .map { $0.provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty } ?? []
+        if !identityProviders.isEmpty {
+            return identityProviders.contains("apple") && !identityProviders.contains("email")
+        }
+
+        if let provider = user.appMetadata["provider"]?.stringValue {
+            return provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "apple"
+        }
+        return false
+    }
+
+    func syncAppleFanSignupOnboardingFromActiveSession() async {
+        guard !isLoggedIn else { return }
+        do {
+            let session = try await supabase.auth.session
+            guard Self.authUserIsAppleOnly(session.user) else { return }
+
+            let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+            guard OwnerBusinessEmail.isValidStrict(sessionEmail) else { return }
+
+            await MainActor.run {
+                appleFanOnboardingPasswordBypassActive = true
+                if applePendingFanSignupEmail.isEmpty {
+                    applePendingFanSignupEmail = sessionEmail
+                }
+                if currentUserAuthId == nil {
+                    currentUserAuthId = session.user.id
+                }
+                if currentUserEmail.isEmpty {
+                    currentUserEmail = sessionEmail
+                }
+            }
+            print("[AppleAuthDebug] appleFanOnboardingPasswordBypassActive=true source=activeSession")
+            if sessionEmail.lowercased().contains("privaterelay.appleid.com") {
+                print("[AppleAuthDebug] relayEmailUsed=true")
+            }
+        } catch {
+            print("[AppleAuthDebug] syncAppleFanOnboardingFromActiveSessionSkipped=true reason=no_session")
+        }
+    }
+
     func clearAppleAuthMessage(accountMode: AppleAuthAccountMode, reason: String) {
         switch accountMode {
         case .fan:
@@ -158,10 +209,12 @@ extension MapViewModel {
             await MainActor.run {
                 applePendingFanSignupEmail = sessionEmail
                 applePendingFanSignupDisplayName = displayName
+                appleFanOnboardingPasswordBypassActive = true
                 currentUserAuthId = session.user.id
                 currentUserEmail = sessionEmail
                 authErrorMessage = ""
             }
+            print("[AppleAuthDebug] appleFanOnboardingPasswordBypassActive=true source=pendingProfileCreation")
             print("[AppleAuthDebug] profileMissing=true")
             print("[AppleAuthDebug] enteringPendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased())")
             print("[AppleAuthDebug] routedToOnboarding=true")

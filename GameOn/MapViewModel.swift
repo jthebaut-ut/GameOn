@@ -223,6 +223,8 @@ final class MapViewModel: ObservableObject {
     @Published var appleAuthBusinessMessageIsError = false
     @Published var applePendingFanSignupEmail = ""
     @Published var applePendingFanSignupDisplayName = ""
+    /// True after Sign in with Apple when fan profile onboarding should skip password creation.
+    @Published var appleFanOnboardingPasswordBypassActive = false
     @Published var applePendingBusinessSignupEmail = ""
     @Published var applePendingBusinessSignupDisplayName = ""
     var appleAuthFanMessageAutoClearTask: Task<Void, Never>?

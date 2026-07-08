@@ -520,8 +520,9 @@ struct VenueProfileUpdate: Encodable {
     let menu_photo_thumbnail_url: String?
 }
 
-/// Partial `venues` update for FanGeo-approved listings: omits identity, address, and coordinates so they cannot be changed from the client.
+/// Partial `venues` update for FanGeo-approved listings: omits address and coordinates; includes owner-editable `venue_name` plus operational profile fields.
 struct VenueProfileOperationalUpdate: Encodable {
+    let venue_name: String
     let supporter_country: String?
     let phone: String
     let website: String
