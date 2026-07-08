@@ -580,6 +580,7 @@ extension MapViewModel {
 
             let payload = BusinessInsertPayload(
                 display_name: Self.appleBusinessDisplayName(email: email, fullName: fullName),
+                business_handle: nil,
                 owner_email: email,
                 owner_user_id: session.user.id,
                 admin_status: "active"

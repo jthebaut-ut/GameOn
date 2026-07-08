@@ -208,8 +208,9 @@ struct SettingsScreen: View {
     @State private var showSponsorInquirySheet = false
     @State private var showBusinessActiveVenueSelectionSheet = false
     @State private var showBusinessFavoriteTeamsSheet = false
+    @State private var showBusinessIdentitySheet = false
     @State private var businessDashboardQuickActionNotice: String?
-    @State private var activeVenueSelectionQuickActionNotice: String?
+    @State private var businessProfileManagedVenuesScrollToken: UInt = 0
     @State private var settingsBusinessMembershipStatus: BusinessVenueGamePostingStatus?
     @State private var settingsBusinessHostedGameCycleAudit: BusinessHostedGameCycleAudit?
     @State private var settingsBusinessHostedGameCycleAuditLoading = false
@@ -454,6 +455,7 @@ struct SettingsScreen: View {
 
     private var accountTabNavigationStack: some View {
         NavigationStack {
+            ScrollViewReader { businessProfileScrollProxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     FanGeoPagePurposeHeader(
@@ -769,6 +771,16 @@ struct SettingsScreen: View {
                 .padding(.bottom, SettingsScrollBottomLayout.accountTabScrollBottomInset)
             }
             .scrollIndicators(.hidden)
+            .onChange(of: businessProfileManagedVenuesScrollToken) { _, token in
+                guard token > 0 else { return }
+                withAnimation(.easeInOut(duration: 0.35)) {
+                    businessProfileScrollProxy.scrollTo(
+                        BusinessVenueDashboardScrollTarget.managedVenues,
+                        anchor: .top
+                    )
+                }
+            }
+            }
             .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
@@ -1033,7 +1045,6 @@ struct SettingsScreen: View {
                 venues: settingsBusinessActiveVenueSelectionRows,
                 approvedDateText: { row in settingsApprovedVenueDateInfo(for: row).displayText },
                 onSaved: {
-                    activeVenueSelectionQuickActionNotice = nil
                     Task { await refreshSettingsBusinessProfile(trigger: "activeVenueSelectionSaved", refreshBusinessData: true, debounce: false) }
                 }
             )
@@ -1045,6 +1056,18 @@ struct SettingsScreen: View {
             BusinessFavoriteTeamsManagementSheet(
                 viewModel: viewModel,
                 businessId: viewModel.currentBusinessIdForAddLocation()
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
+        }
+        .sheet(isPresented: $showBusinessIdentitySheet) {
+            BusinessIdentityEditSheet(
+                viewModel: viewModel,
+                businessId: viewModel.currentBusinessIdForAddLocation(),
+                initialDisplayName: settingsBusinessIdentityInitialDisplayName,
+                initialBusinessHandle: settingsBusinessIdentityInitialHandle,
+                suggestedHandlePlaceholder: settingsBusinessIdentitySuggestedHandlePlaceholder
             )
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
@@ -1635,56 +1658,9 @@ struct SettingsScreen: View {
         return value
     }
 
-    private var settingsCanOpenBusinessActiveVenueSelection: Bool {
-        guard let status = settingsBusinessMembershipStatus,
-              !status.computedIsPro,
-              let business = settingsBusinessActiveVenueSelectionBusiness else {
-            return false
-        }
-        return settingsBusinessActiveVenueSelectionRows(for: business).count > settingsBusinessActiveVenueSelectionLimit
-            && settingsNormalizedFreeActiveVenuesSelectedAt(for: business) == nil
-    }
-
-    private var settingsActiveVenueSelectionQuickActionSubtitle: String? {
-        if settingsBusinessMembershipStatus?.computedIsPro == true {
-            return "All active"
-        }
-        if settingsCanOpenBusinessActiveVenueSelection {
-            return "Choose \(settingsBusinessActiveVenueSelectionLimit)"
-        }
-        if let business = settingsBusinessActiveVenueSelectionBusiness,
-           settingsNormalizedFreeActiveVenuesSelectedAt(for: business) != nil {
-            return "Selection used"
-        }
-        return "Within limit"
-    }
-
     private var settingsActiveVenueSelectionQuickActionFootnote: String? {
         guard settingsBusinessMembershipStatus?.computedIsPro != true else { return nil }
         return "Regular businesses can choose active venues once after moving from Pro to Regular."
-    }
-
-    private func handleActiveVenueSelectionQuickAction() {
-        if settingsCanOpenBusinessActiveVenueSelection {
-            activeVenueSelectionQuickActionNotice = nil
-            presentBusinessDashboardQuickAction(source: "activeVenueSelectionQuickAction") {
-                showBusinessActiveVenueSelectionSheet = true
-            }
-            return
-        }
-
-        if settingsBusinessMembershipStatus?.computedIsPro == true {
-            activeVenueSelectionQuickActionNotice = "All approved venues are active on Business Pro."
-            return
-        }
-
-        if let business = settingsBusinessActiveVenueSelectionBusiness,
-           settingsNormalizedFreeActiveVenuesSelectedAt(for: business) != nil {
-            activeVenueSelectionQuickActionNotice = "Your one-time active venue choice has already been saved. Contact FanGeo or upgrade to Pro to change it."
-            return
-        }
-
-        activeVenueSelectionQuickActionNotice = "Active venue selection appears when a Regular business has more approved venues than its plan limit."
     }
 
     private var settingsSponsorInquiryCard: some View {
@@ -3283,13 +3259,34 @@ struct SettingsScreen: View {
         return true
     }
 
+    private var settingsBusinessIdentityBusinessRow: BusinessRow? {
+        if let businessId = viewModel.currentBusinessIdForAddLocation(),
+           let business = viewModel.ownedBusinesses.first(where: { $0.id == businessId }) {
+            return business
+        }
+        return viewModel.ownedBusinesses.first
+    }
+
+    private var settingsBusinessIdentityInitialDisplayName: String {
+        settingsBusinessIdentityBusinessRow?.display_name ?? ""
+    }
+
+    private var settingsBusinessIdentityInitialHandle: String? {
+        let raw = settingsBusinessIdentityBusinessRow?.business_handle?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    private var settingsBusinessIdentitySuggestedHandlePlaceholder: String {
+        BusinessProfileDefaults.defaultHandle(email: viewModel.venueOwnerEmail)
+    }
+
     private var settingsInlineBusinessDashboard: some View {
         BusinessVenueDashboardOverviewView(
             data: settingsBusinessDashboardData,
             businessId: viewModel.currentBusinessIdForAddLocation(),
             businessUsageStatus: settingsBusinessMembershipStatus,
-            activeVenueSelectionSubtitle: settingsActiveVenueSelectionQuickActionSubtitle,
-            activeVenueSelectionNotice: businessDashboardQuickActionNotice ?? activeVenueSelectionQuickActionNotice,
+            activeVenueSelectionNotice: businessDashboardQuickActionNotice,
             activeVenueSelectionFootnote: settingsActiveVenueSelectionQuickActionFootnote,
             onNotifications: {
                 presentBusinessDashboardQuickAction(source: "notifications") {
@@ -3328,8 +3325,13 @@ struct SettingsScreen: View {
                     showBusinessFavoriteTeamsSheet = true
                 }
             },
-            onActiveVenueSelection: {
-                handleActiveVenueSelectionQuickAction()
+            onManageVenues: {
+                businessProfileManagedVenuesScrollToken &+= 1
+            },
+            onBusinessIdentity: {
+                presentBusinessDashboardQuickAction(source: "businessIdentityQuickAction") {
+                    showBusinessIdentitySheet = true
+                }
             },
             onEditApprovedVenue: openManagedVenueDetailsForEditing,
             onCommentsReports: {
@@ -3472,6 +3474,10 @@ struct SettingsScreen: View {
                         name: name.isEmpty ? "Approved venue" : name,
                         locationLine: [city, state].filter { !$0.isEmpty }.joined(separator: ", "),
                         approvedDateText: approvedDate.displayText,
+                        ownershipApprovalLine: ManagedVenueOwnershipDisplay.ownershipApprovalLine(
+                            originType: row.origin_type,
+                            approvedDateText: approvedDate.displayText
+                        ),
                         venuePhotoURL: row.cover_photo_url?.trimmingCharacters(in: .whitespacesAndNewlines),
                         venuePhotoThumbnailURL: row.cover_photo_thumbnail_url?.trimmingCharacters(in: .whitespacesAndNewlines),
                         isPlanLocked: MapViewModel.venueIsPlanLocked(row)
@@ -5971,6 +5977,12 @@ private struct SettingsProfileHero: View {
         return venueOwnerBusinessHeroTitle
     }
 
+    private var businessHeaderHandleLine: String? {
+        guard let stored = trimmedNonEmpty(currentBusinessRow?.business_handle) else { return nil }
+        let display = FanGeoHandleRules.displayHandle(stored: stored)
+        return display.isEmpty ? nil : display
+    }
+
     private var businessHeaderLocation: String {
         businessLocationLine ?? "Business dashboard"
     }
@@ -6332,6 +6344,13 @@ private struct SettingsProfileHero: View {
                                 .font(.system(size: 15, weight: .bold))
                                 .symbolRenderingMode(.hierarchical)
                                 .foregroundStyle(businessStatusIconColor)
+                        }
+
+                        if let businessHeaderHandleLine {
+                            Text(businessHeaderHandleLine)
+                                .font(FGTypography.caption.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.84))
+                                .lineLimit(1)
                         }
 
                         Text("Business Account")
@@ -9098,6 +9117,9 @@ private struct SettingsVenueOwnerCard: View {
     @State private var showBusinessLoginPassword = false
 
     @State private var signupBusinessName = ""
+    @State private var signupBusinessHandle = ""
+    @State private var signupBusinessHandleInlineError: String?
+    @State private var isCheckingBusinessSignupHandle = false
     @State private var signupLocationName = ""
     @State private var signupStreet = ""
     @State private var signupAddressLine2 = ""
@@ -9148,6 +9170,7 @@ private struct SettingsVenueOwnerCard: View {
             venuePassword: venuePassword,
             policiesAccepted: venueSignupPoliciesAccepted,
             businessName: signupBusinessName,
+            businessHandle: signupBusinessHandle,
             locationName: signupLocationName,
             streetAddress: signupStreet,
             country: signupCountry,
@@ -9170,6 +9193,7 @@ private struct SettingsVenueOwnerCard: View {
 
     private var signupPrimarySubmitDisabled: Bool {
         isSignupSubmitting
+            || isCheckingBusinessSignupHandle
             || (showVenueRegisterMode && businessSignupMissingRequirementMessage != nil)
             || (showVenueRegisterMode && businessSignupStep == .account && !authTermsAccepted)
     }
@@ -9177,6 +9201,7 @@ private struct SettingsVenueOwnerCard: View {
     private var businessSignupPrimaryTitle: String {
         if isSignupSubmitting { return "Submitting..." }
         if businessSignupStep == .account, isCheckingBusinessSignupEmail { return "Checking email..." }
+        if businessSignupStep == .account, isCheckingBusinessSignupHandle { return "Checking handle..." }
         return businessSignupStep == .review ? "Create account & submit location" : "Continue"
     }
 
@@ -9290,6 +9315,8 @@ private struct SettingsVenueOwnerCard: View {
             if !isRegister {
                 venueSignupPoliciesAccepted = false
                 signupBusinessName = ""
+                signupBusinessHandle = ""
+                signupBusinessHandleInlineError = nil
                 signupLocationName = ""
                 signupStreet = ""
                 signupAddressLine2 = ""
@@ -9512,6 +9539,9 @@ private struct SettingsVenueOwnerCard: View {
 
             businessSignupNavigation
         }
+        .onAppear {
+            applyBusinessSignupDefaultsFromEmail()
+        }
     }
 
     private var businessSignupProgressHeader: some View {
@@ -9625,6 +9655,48 @@ private struct SettingsVenueOwnerCard: View {
         TextField("Business / brand name", text: $signupBusinessName)
             .textInputAutocapitalization(.words)
             .fanGeoInputFieldStyle()
+            .onChange(of: viewModel.venueOwnerEmail) { _, _ in
+                applyBusinessSignupDefaultsFromEmail()
+            }
+
+        businessSignupHandleField
+    }
+
+    private var businessSignupHandleField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Business @handle")
+                .font(FGTypography.metadata.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+            HStack(spacing: 6) {
+                Text("@")
+                    .font(FGTypography.body.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                TextField("pizzahut", text: $signupBusinessHandle)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.asciiCapable)
+                    .fanGeoInputFieldStyle()
+                    .onChange(of: signupBusinessHandle) { _, newValue in
+                        let normalized = FanGeoHandleRules.normalizeForStorage(newValue)
+                        if normalized != newValue {
+                            signupBusinessHandle = normalized
+                        }
+                        signupBusinessHandleInlineError = nil
+                    }
+            }
+
+            Text("Fans can find your business by this handle.")
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+            if let signupBusinessHandleInlineError {
+                Text(signupBusinessHandleInlineError)
+                    .font(FGTypography.caption.weight(.semibold))
+                    .foregroundStyle(FGColor.dangerRed)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     @ViewBuilder
@@ -9782,6 +9854,18 @@ private struct SettingsVenueOwnerCard: View {
     }
 
     @MainActor
+    private func applyBusinessSignupDefaultsFromEmail() {
+        let email = OwnerBusinessEmail.normalized(viewModel.venueOwnerEmail)
+        guard OwnerBusinessEmail.isValidStrict(email) else { return }
+        if signupBusinessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signupBusinessName = BusinessProfileDefaults.defaultDisplayName(email: email)
+        }
+        if signupBusinessHandle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signupBusinessHandle = BusinessProfileDefaults.defaultHandle(email: email)
+        }
+    }
+
+    @MainActor
     private func applyApplePendingBusinessSignupState() {
         guard isApplePendingBusinessSignup else { return }
         let normalizedEmail = OwnerBusinessEmail.normalized(viewModel.applePendingBusinessSignupEmail)
@@ -9798,11 +9882,12 @@ private struct SettingsVenueOwnerCard: View {
            !appleBusinessName.isEmpty {
             signupBusinessName = appleBusinessName
         }
+        applyBusinessSignupDefaultsFromEmail()
     }
 
     @MainActor
     private func advanceBusinessSignupWizard() async {
-        guard !isCheckingBusinessSignupEmail else { return }
+        guard !isCheckingBusinessSignupEmail, !isCheckingBusinessSignupHandle else { return }
         businessSignupStepMessage = nil
         if businessSignupStep == .account {
             businessSignupEmailInlineError = nil
@@ -9820,6 +9905,25 @@ private struct SettingsVenueOwnerCard: View {
             }
             if let conflictMessage {
                 businessSignupEmailInlineError = conflictMessage
+                return
+            }
+
+            applyBusinessSignupDefaultsFromEmail()
+            signupBusinessHandleInlineError = nil
+            if let handleError = BusinessIdentityValidation.validateBusinessHandle(signupBusinessHandle) {
+                signupBusinessHandleInlineError = handleError
+                return
+            }
+            isCheckingBusinessSignupHandle = true
+            let handle = FanGeoHandleRules.normalizeForStorage(signupBusinessHandle)
+            let handleAvailable = await viewModel.checkBusinessHandleAvailableForSignup(handle)
+            isCheckingBusinessSignupHandle = false
+            guard let handleAvailable else {
+                signupBusinessHandleInlineError = "Unable to verify handle availability. Try again."
+                return
+            }
+            guard handleAvailable else {
+                signupBusinessHandleInlineError = "This business handle is already taken."
                 return
             }
         }
@@ -9865,6 +9969,15 @@ private struct SettingsVenueOwnerCard: View {
             }
             guard !signupBusinessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return block("Business name missing")
+            }
+            if let nameError = BusinessIdentityValidation.validateBusinessName(signupBusinessName) {
+                return block(nameError)
+            }
+            guard !signupBusinessHandle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return block("Business handle missing")
+            }
+            if let handleError = BusinessIdentityValidation.validateBusinessHandle(signupBusinessHandle) {
+                return block(handleError)
             }
             return true
         case .venue:
@@ -9968,6 +10081,7 @@ private struct SettingsVenueOwnerCard: View {
 #endif
         let payload = BusinessOwnerSignupPayload(
             businessDisplayName: signupBusinessName,
+            businessHandle: signupBusinessHandle,
             firstLocation: form
         )
 #if DEBUG
@@ -10005,6 +10119,8 @@ private struct SettingsVenueOwnerCard: View {
         TextField("Business / brand name", text: $signupBusinessName)
             .textInputAutocapitalization(.words)
             .fanGeoInputFieldStyle()
+
+        businessSignupHandleField
 
         SettingsSheetSectionLabel(title: "First location")
         TextField("Location name", text: $signupLocationName)
@@ -10499,6 +10615,7 @@ struct BusinessLocationVenuePicker: View {
         let claimID: UUID?
         let title: String
         let subtitle: String
+        let ownershipApprovalLine: String?
         let statusNote: String?
         let status: ManagedVenueSelectorStatus
         let venueRow: VenueProfileRow?
@@ -10568,6 +10685,9 @@ struct BusinessLocationVenuePicker: View {
                 subtitle: MapViewModel.venueIsPlanLocked(row)
                     ? BusinessLimitCopy.planLockedVenueSubtitle
                     : (venueLocationSubtitle(for: row).isEmpty ? "Approved location for listings, games, and analytics." : venueLocationSubtitle(for: row)),
+                ownershipApprovalLine: MapViewModel.venueIsPlanLocked(row)
+                    ? nil
+                    : managedVenueOwnershipApprovalLine(for: row),
                 statusNote: MapViewModel.venueIsPlanLocked(row) ? BusinessLimitCopy.planLockedVenueSubtitle : nil,
                 status: managedVenueStatus(for: row),
                 venueRow: row
@@ -10656,6 +10776,41 @@ struct BusinessLocationVenuePicker: View {
         return row.address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    private func managedVenueOwnershipApprovalLine(for row: VenueProfileRow) -> String {
+        let approvedDateText = managedVenueApprovedDateText(for: row)
+        return ManagedVenueOwnershipDisplay.ownershipApprovalLine(
+            originType: row.origin_type,
+            approvedDateText: approvedDateText
+        )
+    }
+
+    private func managedVenueApprovedDateText(for row: VenueProfileRow) -> String {
+        let claimApprovedRaw = row.id.flatMap { venueId -> String? in
+            guard let metadata = viewModel.approvedVenueClaimMetadataByVenueID[venueId] else { return nil }
+            return metadata.approvedAtRaw ?? metadata.createdAtRaw
+        }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !claimApprovedRaw.isEmpty,
+           let date = SupabaseTimestampParsing.parseTimestamptz(claimApprovedRaw) {
+            return "Approved \(Self.managedVenueApprovedDateDisplayFormatter.string(from: date))"
+        }
+
+        let venueCreatedRaw = row.created_at?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !venueCreatedRaw.isEmpty,
+           let date = SupabaseTimestampParsing.parseTimestamptz(venueCreatedRaw) {
+            return "Approved \(Self.managedVenueApprovedDateDisplayFormatter.string(from: date))"
+        }
+
+        return "Approved date unavailable"
+    }
+
+    private static let managedVenueApprovedDateDisplayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM d, yyyy"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
     private func managedVenueStatus(for row: VenueProfileRow) -> ManagedVenueSelectorStatus {
         let raw = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if raw.isEmpty || raw == "active" { return .approved }
@@ -10739,6 +10894,7 @@ struct BusinessLocationVenuePicker: View {
             claimID: claim.id,
             title: title,
             subtitle: location.isEmpty ? "Business location" : location,
+            ownershipApprovalLine: nil,
             statusNote: status == .pending ? "Waiting for admin approval" : "Review rejected",
             status: status,
             venueRow: nil
@@ -11206,6 +11362,13 @@ struct BusinessLocationVenuePicker: View {
                     .font(FGTypography.caption)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .lineLimit(1)
+
+                if let ownershipApprovalLine = row.ownershipApprovalLine {
+                    Text(ownershipApprovalLine)
+                        .font(FGTypography.metadata.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(2)
+                }
 
                 if let note = row.statusNote {
                     Text(note)

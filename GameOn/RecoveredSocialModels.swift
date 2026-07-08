@@ -694,6 +694,14 @@ final class FriendshipService {
         return d == q || d.contains(q)
     }
 
+    private static func businessHandleMatches(query normalizedQuery: String, businessHandle: String?) -> Bool {
+        let q = FanGeoHandleRules.normalizeForStorage(normalizedQuery)
+        guard !q.isEmpty else { return false }
+        let handle = FanGeoHandleRules.normalizeForStorage(businessHandle ?? "")
+        guard !handle.isEmpty else { return false }
+        return handle == q || handle.contains(q)
+    }
+
     /// Auth users who own an active `businesses` row (`owner_user_id`), for friend lookup when `user_profiles.is_business_account` is absent.
     private func profileIdsWithActiveBusinessOwnerRole(_ ids: [UUID]) async throws -> Set<UUID> {
         let unique = Array(Set(ids))
@@ -711,7 +719,7 @@ final class FriendshipService {
 
     /// Searches fan ``user_profiles`` and ``businesses`` for Add Friend (does not collapse different entities that share an email).
     func searchAddFriendTargets(normalizedQuery raw: String, excludingUserId: UUID?) async throws -> [AddFriendSearchTarget] {
-        let n = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let n = Self.normalizedFriendLookupQuery(raw)
         guard !n.isEmpty else { return [] }
 
 #if DEBUG
@@ -743,7 +751,8 @@ final class FriendshipService {
         var seenKeys = Set<String>()
 
         let ilikePattern = "%\(Self.escapeForIlike(n))%"
-        let businessSelect = "id,display_name,owner_email,owner_user_id,admin_status,created_at"
+        let businessSelect = "id,display_name,business_handle,owner_email,owner_user_id,admin_status,created_at"
+        let normalizedHandleQuery = FanGeoHandleRules.normalizeForStorage(n)
 
         let exactUsernameRows: [FanProfileRow] = (try? await client
             .from("user_profiles")
@@ -845,12 +854,18 @@ final class FriendshipService {
             let display = trimmedNonEmpty(row.display_name)
             let name = display.isEmpty ? (emailNorm.isEmpty ? "Business" : emailNorm) : display
             let emailOut = matchedEmail ?? (OwnerBusinessEmail.isValidStrict(emailNorm) ? emailNorm : nil)
+            let handleRaw = trimmedNonEmpty(row.business_handle)
+            let handleStored: String? = {
+                guard !handleRaw.isEmpty else { return nil }
+                let normalized = FanGeoHandleRules.normalizeForStorage(handleRaw)
+                return normalized.isEmpty ? nil : normalized
+            }()
             results.append(
                 AddFriendSearchTarget(
                     entityType: .business,
                     entityId: row.id,
                     displayName: name,
-                    username: nil,
+                    username: handleStored,
                     avatarURL: nil,
                     avatarThumbnailURL: nil,
                     matchedEmail: emailOut
@@ -858,7 +873,7 @@ final class FriendshipService {
             )
 #if DEBUG
             print(
-                "[AddFriendSearchDebug] businessMatched id=\(row.id.uuidString) display_name=\(display) owner_email=\(emailNorm)"
+                "[AddFriendSearchDebug] businessMatched id=\(row.id.uuidString) display_name=\(display) business_handle=\(handleStored ?? "nil") owner_email=\(emailNorm)"
             )
 #endif
         }
@@ -927,6 +942,30 @@ final class FriendshipService {
                 .value
         }
 
+        if !normalizedHandleQuery.isEmpty {
+            await fetchBusinesses("business_handle.eq") {
+                try await client
+                    .from("businesses")
+                    .select(businessSelect)
+                    .eq("admin_status", value: "active")
+                    .eq("business_handle", value: normalizedHandleQuery)
+                    .limit(24)
+                    .execute()
+                    .value
+            }
+
+            await fetchBusinesses("business_handle.ilike") {
+                try await client
+                    .from("businesses")
+                    .select(businessSelect)
+                    .eq("admin_status", value: "active")
+                    .ilike("business_handle", pattern: ilikePattern)
+                    .limit(24)
+                    .execute()
+                    .value
+            }
+        }
+
         let businessNamePattern = Self.businessDisplayNameIlikePattern(normalizedQuery: n)
         await fetchBusinesses("display_name.ilike.tokens") {
             try await client
@@ -964,6 +1003,7 @@ final class FriendshipService {
         let businessMatched = businessCandidates.filter { row in
             Self.businessOwnerEmailMatches(query: n, ownerEmail: row.owner_email ?? "")
                 || Self.businessDisplayNameMatches(query: n, displayName: row.display_name)
+                || Self.businessHandleMatches(query: n, businessHandle: row.business_handle)
         }
 
 #if DEBUG

@@ -11,6 +11,7 @@ enum BusinessCreationFormValidation {
         venuePassword: String,
         policiesAccepted: Bool,
         businessName: String,
+        businessHandle: String,
         locationName: String,
         streetAddress: String,
         country: String,
@@ -39,6 +40,15 @@ enum BusinessCreationFormValidation {
 
         let biz = businessName.trimmingCharacters(in: .whitespacesAndNewlines)
         if biz.isEmpty { return "Business name missing" }
+        if BusinessIdentityValidation.validateBusinessName(biz) != nil {
+            return "Business name not allowed"
+        }
+
+        let handle = FanGeoHandleRules.normalizeForStorage(businessHandle)
+        if handle.isEmpty { return "Business handle missing" }
+        if BusinessIdentityValidation.validateBusinessHandle(businessHandle) != nil {
+            return "Business handle not allowed"
+        }
 
         let loc = locationName.trimmingCharacters(in: .whitespacesAndNewlines)
         if loc.isEmpty { return "Location name missing" }

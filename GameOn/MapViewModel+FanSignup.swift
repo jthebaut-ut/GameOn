@@ -28,6 +28,31 @@ struct FanSignupSubmitOutcome: Sendable {
 extension MapViewModel {
     static let defaultFanSignupBio = "I am a FanGeo Fan."
 
+    /// Pre-auth business @handle availability (business signup). Uses `check_business_handle_available_for_registration`.
+    func checkBusinessHandleAvailableForSignup(_ rawHandle: String) async -> Bool? {
+        let stored = FanGeoHandleRules.normalizeForStorage(rawHandle)
+        guard FanGeoHandleRules.validate(rawHandle) == nil else { return false }
+        guard BusinessIdentityValidation.validateBusinessHandle(rawHandle) == nil else { return false }
+
+        struct RpcParams: Encodable {
+            let p_handle: String
+        }
+
+        do {
+            let available: Bool = try await supabase
+                .rpc(
+                    "check_business_handle_available_for_registration",
+                    params: RpcParams(p_handle: stored)
+                )
+                .execute()
+                .value
+            return available
+        } catch {
+            print("[BusinessSignup] businessHandleCheckFailed handle=\(stored) error=\(error.localizedDescription)")
+            return nil
+        }
+    }
+
     /// Pre-auth @handle availability (signup form). Uses `check_username_available_for_registration` when not signed in.
     func checkUsernameAvailableForSignup(_ rawHandle: String) async -> Bool? {
         let stored = FanGeoHandleRules.normalizeForStorage(rawHandle)

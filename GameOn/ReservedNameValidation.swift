@@ -1,10 +1,18 @@
 import Foundation
 
+nonisolated private func reservedNameNormalizeForComparison(_ raw: String) -> String {
+    raw
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+        .components(separatedBy: CharacterSet(charactersIn: " _-"))
+        .joined()
+}
+
 /// Shared reserved display-name and @handle protection (client-side validation only).
 enum ReservedNameValidation {
-    static let rejectionMessage = "This name is reserved. Please choose another display name or handle."
+    nonisolated static let rejectionMessage = "This name is reserved. Please choose another display name or handle."
 
-    private static let rawReservedTerms: [String] = [
+    private nonisolated static let rawReservedTerms: [String] = [
         // FanGeo
         "fangeo",
         "fangio",
@@ -63,22 +71,18 @@ enum ReservedNameValidation {
         "resend",
     ]
 
-    static let normalizedReservedTerms: [String] = {
-        Array(Set(rawReservedTerms.map(normalizeForComparison).filter { !$0.isEmpty }))
+    nonisolated static let normalizedReservedTerms: [String] = {
+        Array(Set(rawReservedTerms.map(reservedNameNormalizeForComparison).filter { !$0.isEmpty }))
             .sorted()
     }()
 
     /// Lowercases, trims, removes spaces/underscores/hyphens (repeated separators collapse via join).
-    static func normalizeForComparison(_ raw: String) -> String {
-        raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .components(separatedBy: CharacterSet(charactersIn: " _-"))
-            .joined()
+    nonisolated static func normalizeForComparison(_ raw: String) -> String {
+        reservedNameNormalizeForComparison(raw)
     }
 
-    static func containsReservedTerm(_ raw: String) -> Bool {
-        let normalized = normalizeForComparison(raw)
+    nonisolated static func containsReservedTerm(_ raw: String) -> Bool {
+        let normalized = reservedNameNormalizeForComparison(raw)
         guard !normalized.isEmpty else { return false }
         return normalizedReservedTerms.contains { normalized.contains($0) }
     }

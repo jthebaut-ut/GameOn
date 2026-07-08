@@ -186,6 +186,12 @@ extension MapViewModel {
     }
 
     /// True when ``auth.signUp`` failed because the email is already registered (wording varies by Supabase / network).
+    private static func validationErrorForBusinessIdentity(displayName: String, handle: String) -> String? {
+        BusinessIdentityValidation.validateBusinessName(displayName)
+            ?? BusinessIdentityValidation.validateBusinessHandle(handle)
+    }
+
+    /// True when ``auth.signUp`` failed because the email is already registered (wording varies by Supabase / network).
     private static func isVenueOwnerSignupDuplicateEmailError(_ message: String) -> Bool {
         let m = message
         if m.contains("user already registered") { return true }
@@ -222,6 +228,7 @@ extension MapViewModel {
 
         let ownerEmail = OwnerBusinessEmail.normalized(email)
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
 
         guard OwnerBusinessEmail.isValidStrict(ownerEmail) else {
 #if DEBUG
@@ -255,6 +262,21 @@ extension MapViewModel {
 #endif
             await MainActor.run { venueAuthErrorMessage = "Please enter your business name." }
             print("[EmailConfirmDebug] formValidationFailed reason=business_name_required")
+            return
+        }
+
+        if let identityError = Self.validationErrorForBusinessIdentity(displayName: businessName, handle: businessHandle) {
+            await MainActor.run { venueAuthErrorMessage = identityError }
+            print("[EmailConfirmDebug] formValidationFailed reason=business_identity_invalid")
+            return
+        }
+
+        guard let handleAvailable = await checkBusinessHandleAvailableForSignup(businessHandle) else {
+            await MainActor.run { venueAuthErrorMessage = "Unable to verify business handle availability. Please try again." }
+            return
+        }
+        guard handleAvailable else {
+            await MainActor.run { venueAuthErrorMessage = "This business handle is already taken. Choose another." }
             return
         }
 
@@ -409,6 +431,7 @@ extension MapViewModel {
 
         let ownerEmail = OwnerBusinessEmail.normalized(session.user.email ?? applePendingBusinessSignupEmail)
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
 
         guard OwnerBusinessEmail.isValidStrict(ownerEmail) else {
             await MainActor.run { venueAuthErrorMessage = "Apple did not return a usable email address." }
@@ -427,6 +450,20 @@ extension MapViewModel {
 
         guard !businessName.isEmpty else {
             await MainActor.run { venueAuthErrorMessage = "Please enter your business name." }
+            return
+        }
+
+        if let identityError = Self.validationErrorForBusinessIdentity(displayName: businessName, handle: businessHandle) {
+            await MainActor.run { venueAuthErrorMessage = identityError }
+            return
+        }
+
+        guard let handleAvailable = await checkBusinessHandleAvailableForSignup(businessHandle) else {
+            await MainActor.run { venueAuthErrorMessage = "Unable to verify business handle availability. Please try again." }
+            return
+        }
+        guard handleAvailable else {
+            await MainActor.run { venueAuthErrorMessage = "This business handle is already taken. Choose another." }
             return
         }
 
@@ -478,6 +515,7 @@ extension MapViewModel {
         recordVenueGuidelinesAcceptance: Bool
     ) async {
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
         guard let coverData = coverPhotoJPEGData, !coverData.isEmpty else {
             await MainActor.run { venueAuthErrorMessage = "Main venue photo is required." }
             return
@@ -570,6 +608,7 @@ extension MapViewModel {
 
         let businessPayload = BusinessInsertPayload(
             display_name: businessName,
+            business_handle: businessHandle,
             owner_email: ownerEmail,
             owner_user_id: ownerUserId,
             admin_status: "active"
@@ -577,7 +616,7 @@ extension MapViewModel {
 
 #if DEBUG
         print(
-            "[BusinessSignup] business insert payload display_name=\(businessName) owner_email=\(ownerEmail) owner_user_id=\(ownerUserId.uuidString) admin_status=active"
+            "[BusinessSignup] business insert payload display_name=\(businessName) business_handle=\(businessHandle) owner_email=\(ownerEmail) owner_user_id=\(ownerUserId.uuidString) admin_status=active"
         )
 #endif
 
@@ -759,6 +798,7 @@ extension MapViewModel {
 
         let signup = draft.signup
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
         guard let coverData = draft.coverPhotoJPEGData, !coverData.isEmpty else {
             await MainActor.run {
                 venueAuthErrorMessage = "Main venue photo is required."
@@ -853,6 +893,7 @@ extension MapViewModel {
 
         let businessPayload = BusinessInsertPayload(
             display_name: businessName,
+            business_handle: businessHandle,
             owner_email: ownerEmail,
             owner_user_id: ownerUserId,
             admin_status: "active"

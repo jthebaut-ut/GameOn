@@ -1806,6 +1806,7 @@ struct VenueOwnerDashboardView: View {
     @State private var showBusinessProSubscriptionSheet = false
     @State private var showBusinessUsageSheet = false
     @State private var showBusinessFavoriteTeamsSheet = false
+    @State private var showBusinessIdentitySheet = false
     @State private var businessHostedGameCycleAudit: BusinessHostedGameCycleAudit?
     @State private var businessHostedGameCycleAuditLoading = false
     @State private var businessHostedGameCycleAuditUnavailable = false
@@ -2045,6 +2046,18 @@ struct VenueOwnerDashboardView: View {
             BusinessFavoriteTeamsManagementSheet(
                 viewModel: viewModel,
                 businessId: viewModel.currentBusinessIdForAddLocation()
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
+        }
+        .sheet(isPresented: $showBusinessIdentitySheet) {
+            BusinessIdentityEditSheet(
+                viewModel: viewModel,
+                businessId: viewModel.currentBusinessIdForAddLocation(),
+                initialDisplayName: businessDashboardIdentityInitialDisplayName,
+                initialBusinessHandle: businessDashboardIdentityInitialHandle,
+                suggestedHandlePlaceholder: businessDashboardIdentitySuggestedHandlePlaceholder
             )
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
@@ -2467,6 +2480,18 @@ struct VenueOwnerDashboardView: View {
             BusinessFavoriteTeamsManagementSheet(
                 viewModel: viewModel,
                 businessId: viewModel.currentBusinessIdForAddLocation()
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
+        }
+        .sheet(isPresented: $showBusinessIdentitySheet) {
+            BusinessIdentityEditSheet(
+                viewModel: viewModel,
+                businessId: viewModel.currentBusinessIdForAddLocation(),
+                initialDisplayName: businessDashboardIdentityInitialDisplayName,
+                initialBusinessHandle: businessDashboardIdentityInitialHandle,
+                suggestedHandlePlaceholder: businessDashboardIdentitySuggestedHandlePlaceholder
             )
             .presentationDetents([.large])
             .presentationDragIndicator(.visible)
@@ -2905,6 +2930,9 @@ struct VenueOwnerDashboardView: View {
             onManageFavoriteTeams: {
                 showBusinessFavoriteTeamsSheet = true
             },
+            onBusinessIdentity: {
+                showBusinessIdentitySheet = true
+            },
             onCommentsReports: {
                 handleBusinessStatisticsEntryTapped(source: "commentsReportsQuickAction")
             },
@@ -2989,6 +3017,28 @@ struct VenueOwnerDashboardView: View {
     private var businessDashboardVenueName: String {
         let name = viewModel.ownerVenueName.trimmingCharacters(in: .whitespacesAndNewlines)
         return name.isEmpty ? "Your venue" : name
+    }
+
+    private var businessDashboardIdentityBusinessRow: BusinessRow? {
+        if let businessId = viewModel.currentBusinessIdForAddLocation(),
+           let business = viewModel.ownedBusinesses.first(where: { $0.id == businessId }) {
+            return business
+        }
+        return viewModel.ownedBusinesses.first
+    }
+
+    private var businessDashboardIdentityInitialDisplayName: String {
+        businessDashboardIdentityBusinessRow?.display_name ?? ""
+    }
+
+    private var businessDashboardIdentityInitialHandle: String? {
+        let raw = businessDashboardIdentityBusinessRow?.business_handle?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    private var businessDashboardIdentitySuggestedHandlePlaceholder: String {
+        BusinessProfileDefaults.defaultHandle(email: viewModel.venueOwnerEmail)
     }
 
     private var businessDashboardLocationLine: String {
@@ -3920,6 +3970,13 @@ struct VenueOwnerDashboardView: View {
         }
     }
 
+    private var venueRemovalDescription: String {
+        if selectedVenueIsCommunityClaim {
+            return "This removes your business link from this community venue. The venue will remain available in FanGeo."
+        }
+        return "Permanently remove this venue and its hosted games, fan chats, attendance, reactions, saved venue links, statistics, and uploaded venue photos.\nThis does not delete your business account."
+    }
+
     private var deleteVenueDangerZone: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
@@ -3929,9 +3986,7 @@ struct VenueOwnerDashboardView: View {
                 Text(venueRemovalActionTitle)
                     .font(.subheadline.weight(.heavy))
                     .foregroundStyle(venueRemovalTint)
-                Text(selectedVenueIsCommunityClaim
-                    ? "Remove your ownership, photos, games, and business details from this venue."
-                    : "Permanently remove this venue, its games, fan chats, attendance, reactions, saved-venue links, stats, and uploaded venue photos. This does not delete the business account.")
+                Text(venueRemovalDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -8539,6 +8594,13 @@ struct VenueOwnerDashboardView: View {
                 .font(.title2)
                 .fontWeight(.bold)
 
+            BusinessAddGameVenueContextHeader(
+                presentation: selectedHostedGameVenuePresentation,
+                ownerCity: viewModel.ownerVenueCity,
+                ownerState: viewModel.ownerVenueState,
+                ownerAddress: viewModel.ownerVenueAddress
+            )
+
             Text("Tell fans what you’re showing. Same details as before — saved to your venue listing.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -11229,6 +11291,70 @@ private struct BusinessHostedGameVenuePresentation {
     private static func trimmedNonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private struct BusinessAddGameVenueContextHeader: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let presentation: BusinessHostedGameVenuePresentation
+    let ownerCity: String
+    let ownerState: String
+    let ownerAddress: String
+
+    private var venueName: String {
+        let trimmed = presentation.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Your venue" : trimmed
+    }
+
+    private var locationLine: String? {
+        if let address = presentation.address {
+            return address
+        }
+        if let city = presentation.city {
+            return city
+        }
+        let street = ownerAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !street.isEmpty {
+            return street
+        }
+        let locality = [ownerCity, ownerState]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+        return locality.isEmpty ? nil : locality
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Adding game for")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+            Text(venueName)
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .truncationMode(.tail)
+
+            if let locationLine {
+                Text(locationLine)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    private var accessibilitySummary: String {
+        if let locationLine {
+            return "Adding game for \(venueName), \(locationLine)"
+        }
+        return "Adding game for \(venueName)"
     }
 }
 

@@ -385,6 +385,8 @@ nonisolated enum GoingTabCompletedGameVisibility {
 struct BusinessRow: Decodable, Equatable, Identifiable {
     let id: UUID
     let display_name: String
+    /// Public business @handle (stored without `@`, lowercase). Nil for legacy rows.
+    let business_handle: String?
     let owner_email: String?
     let owner_user_id: UUID?
     let admin_status: String
@@ -395,7 +397,7 @@ struct BusinessRow: Decodable, Equatable, Identifiable {
     let business_fangeo_plus_enabled: Bool?
 
     static let supabaseSelectColumns =
-        "id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at,entitlement_updated_at,free_active_venues_selected_at,business_fangeo_plus_enabled"
+        "id,display_name,business_handle,owner_email,owner_user_id,admin_status,business_origin,created_at,entitlement_updated_at,free_active_venues_selected_at,business_fangeo_plus_enabled"
 
     var businessFanGeoPlusManuallyEnabled: Bool {
         business_fangeo_plus_enabled == true
@@ -446,9 +448,16 @@ struct AdminBusinessVenueOverrideVenue: Decodable, Identifiable, Equatable {
 /// Client insert for `public.businesses` during business-owner signup (no `venues` row yet).
 struct BusinessInsertPayload: Encodable {
     let display_name: String
+    let business_handle: String?
     let owner_email: String
     let owner_user_id: UUID
     let admin_status: String
+}
+
+/// Owner identity update for `public.businesses` (`display_name`, `business_handle` only).
+struct BusinessIdentityUpdatePayload: Encodable {
+    let display_name: String
+    let business_handle: String
 }
 
 struct InsertedBusinessIdRow: Decodable {
@@ -868,7 +877,27 @@ struct AddLocationClaimForm: Codable, Sendable {
 /// Combined signup: organization display name plus the first `venue_claims` row (`venue_id` nil until admin links a venue).
 struct BusinessOwnerSignupPayload: Codable, Sendable {
     let businessDisplayName: String
+    let businessHandle: String
     let firstLocation: AddLocationClaimForm
+
+    private enum CodingKeys: String, CodingKey {
+        case businessDisplayName
+        case businessHandle
+        case firstLocation
+    }
+
+    init(businessDisplayName: String, businessHandle: String, firstLocation: AddLocationClaimForm) {
+        self.businessDisplayName = businessDisplayName
+        self.businessHandle = businessHandle
+        self.firstLocation = firstLocation
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        businessDisplayName = try container.decode(String.self, forKey: .businessDisplayName)
+        businessHandle = try container.decodeIfPresent(String.self, forKey: .businessHandle) ?? ""
+        firstLocation = try container.decode(AddLocationClaimForm.self, forKey: .firstLocation)
+    }
 }
 
 struct PendingFanEmailSignupDraft: Sendable {

@@ -1,5 +1,19 @@
 import SwiftUI
 
+enum ManagedVenueOwnershipDisplay {
+    static func isCommunityLinked(originType: String?) -> Bool {
+        originType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "community"
+    }
+
+    static func ownershipLabel(originType: String?) -> String {
+        isCommunityLinked(originType: originType) ? "Community-linked" : "Business venue"
+    }
+
+    static func ownershipApprovalLine(originType: String?, approvedDateText: String) -> String {
+        "\(ownershipLabel(originType: originType)) • \(approvedDateText)"
+    }
+}
+
 struct BusinessVenueDashboardData: Equatable {
     let venueName: String
     let locationLine: String
@@ -93,6 +107,7 @@ struct BusinessVenueDashboardApprovedVenueItem: Identifiable, Equatable {
     let name: String
     let locationLine: String
     let approvedDateText: String
+    let ownershipApprovalLine: String
     let venuePhotoURL: String?
     let venuePhotoThumbnailURL: String?
     let isPlanLocked: Bool
@@ -159,6 +174,10 @@ enum BusinessVenueDashboardGameDateTimeFormatter {
     }
 }
 
+enum BusinessVenueDashboardScrollTarget {
+    static let managedVenues = "businessVenueDashboardManagedVenues"
+}
+
 struct BusinessVenueDashboardOverviewView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
@@ -166,7 +185,6 @@ struct BusinessVenueDashboardOverviewView: View {
     let data: BusinessVenueDashboardData
     let businessId: UUID?
     let businessUsageStatus: BusinessVenueGamePostingStatus?
-    var activeVenueSelectionSubtitle: String? = nil
     var activeVenueSelectionNotice: String? = nil
     var activeVenueSelectionFootnote: String? = nil
     let onNotifications: () -> Void
@@ -180,7 +198,8 @@ struct BusinessVenueDashboardOverviewView: View {
     let onUsage: () -> Void
     let favoriteTeamsCount: Int
     let onManageFavoriteTeams: () -> Void
-    var onActiveVenueSelection: (() -> Void)?
+    var onManageVenues: (() -> Void)?
+    var onBusinessIdentity: (() -> Void)?
     var onEditApprovedVenue: ((UUID) -> Void)?
     let onCommentsReports: () -> Void
     let onViewAllGames: () -> Void
@@ -364,16 +383,26 @@ struct BusinessVenueDashboardOverviewView: View {
                         badgeText: usageQuickActionState.badgeText,
                         action: onUsage
                     )
-                    if let activeVenueSelectionSubtitle {
+                    BusinessVenueDashboardActionCard(
+                        title: "Business Identity",
+                        subtitle: "Name & @handle",
+                        systemImage: "person.text.rectangle",
+                        tint: FGColor.accentBlue,
+                        badgeText: nil,
+                        isPremium: false,
+                        isLimited: false,
+                        action: { onBusinessIdentity?() }
+                    )
+                    if showsManagedVenuesSection {
                         BusinessVenueDashboardActionCard(
-                            title: "Active Venues",
-                            subtitle: activeVenueSelectionSubtitle,
-                            systemImage: "checkmark.seal",
-                            tint: FGColor.accentGreen,
+                            title: "Manage Venues",
+                            subtitle: "View all venues",
+                            systemImage: "building.2",
+                            tint: FGColor.accentBlue,
                             badgeText: nil,
                             isPremium: false,
                             isLimited: false,
-                            action: { onActiveVenueSelection?() }
+                            action: { onManageVenues?() }
                         )
                     }
                     BusinessVenueDashboardActionCard(
@@ -571,6 +600,7 @@ struct BusinessVenueDashboardOverviewView: View {
         .onChange(of: managedVenuesHitTestingDebugToken) { _, _ in
             logBusinessManagedVenuesSectionRendered()
         }
+        .id(BusinessVenueDashboardScrollTarget.managedVenues)
     }
 
     private var managedVenuesReadySection: some View {
@@ -705,11 +735,13 @@ struct BusinessVenueDashboardOverviewView: View {
                     .font(FGTypography.caption.weight(.bold))
                     .foregroundStyle(venue.isPlanLocked ? FGColor.secondaryText(colorScheme) : FGColor.primaryText(colorScheme))
                     .lineLimit(1)
-                Text(venue.locationLine.isEmpty ? venue.approvedDateText : venue.locationLine)
-                    .font(FGTypography.caption)
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .lineLimit(1)
-                Text(venue.isPlanLocked ? BusinessLimitCopy.planLockedVenueSubtitle : venue.approvedDateText)
+                if !venue.locationLine.isEmpty {
+                    Text(venue.locationLine)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
+                Text(venue.isPlanLocked ? BusinessLimitCopy.planLockedVenueSubtitle : venue.ownershipApprovalLine)
                     .font(FGTypography.metadata.weight(.semibold))
                     .foregroundStyle(venue.isPlanLocked ? Color.gray : FGColor.secondaryText(colorScheme))
                     .lineLimit(2)
