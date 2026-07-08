@@ -571,17 +571,56 @@ struct CalendarScreen: View {
         return String(Int(day.timeIntervalSince1970 / 86_400))
     }
 
+    private func calendarProGamesSelectedDayHasLoadedMatches(
+        on day: Date,
+        calendar: Calendar = .current
+    ) -> Bool {
+        viewModel.liveMatches.contains { calendar.isDate($0.startTime, inSameDayAs: day) }
+    }
+
+#if DEBUG
+    private static let calendarProGamesRefreshDebugDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    private func logCalendarProGamesNetworkRefreshDecision(
+        reason: String,
+        selectedDay: Date,
+        selectedDayHasLoadedMatches: Bool,
+        skipped: Bool
+    ) {
+        let selectedDate = Self.calendarProGamesRefreshDebugDateFormatter.string(from: selectedDay)
+        print(
+            "[CalendarProGamesRefreshDebug] selectedDate=\(selectedDate) reason=\(reason) selectedDayHasLoadedMatches=\(selectedDayHasLoadedMatches) fetchSkipped=\(skipped)"
+        )
+    }
+#endif
+
     private func shouldSkipCalendarProGamesNetworkRefresh(reason: String, forceRefresh: Bool) -> Bool {
         if forceRefresh { return false }
         guard isProGamesSelected else { return true }
 
+        let cal = Calendar.current
+        let day = cal.startOfDay(for: viewModel.calendarTabSelectedDate)
+        let selectedDayHasLoadedMatches = calendarProGamesSelectedDayHasLoadedMatches(on: day, calendar: cal)
+
         if let lastRequest = calendarProGamesPerf.lastNetworkRefreshRequestedAt,
            Date().timeIntervalSince(lastRequest) < CalendarProGamesPerfState.networkCoalesceInterval {
+#if DEBUG
+            logCalendarProGamesNetworkRefreshDecision(
+                reason: reason,
+                selectedDay: day,
+                selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                skipped: true
+            )
+#endif
             return true
         }
 
-        let cal = Calendar.current
-        let day = cal.startOfDay(for: viewModel.calendarTabSelectedDate)
         let dayKey = calendarProGamesDayKey(for: day)
 
         if let lastDayRefresh = viewModel.calendarProGamesRefreshAtByDay[dayKey],
@@ -589,25 +628,77 @@ struct CalendarScreen: View {
            !viewModel.liveMatches.contains(where: { match in
                match.matchStatus.isHappeningNow && cal.isDate(match.startTime, inSameDayAs: day)
            }) {
+#if DEBUG
+            logCalendarProGamesNetworkRefreshDecision(
+                reason: reason,
+                selectedDay: day,
+                selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                skipped: true
+            )
+#endif
             return true
         }
 
-        if reason == "calendar_selected_date_change" || reason == "calendar_tab_filter_change" {
+        if reason == "calendar_selected_date_change" {
+            if selectedDayHasLoadedMatches {
+#if DEBUG
+                logCalendarProGamesNetworkRefreshDecision(
+                    reason: reason,
+                    selectedDay: day,
+                    selectedDayHasLoadedMatches: true,
+                    skipped: true
+                )
+#endif
+                return true
+            }
+        } else if reason == "calendar_tab_filter_change" {
             if viewModel.liveMatchesAreFreshForTabPreload(within: 90), !viewModel.liveMatches.isEmpty {
+#if DEBUG
+                logCalendarProGamesNetworkRefreshDecision(
+                    reason: reason,
+                    selectedDay: day,
+                    selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                    skipped: true
+                )
+#endif
                 return true
             }
         }
 
         if reason == "calendar_tab_selected" || reason == "calendar_tab_appear" || reason == "calendar_scene_active" {
             if viewModel.liveMatchesAreFreshForTabPreload(within: 90), !viewModel.liveMatches.isEmpty {
+#if DEBUG
+                logCalendarProGamesNetworkRefreshDecision(
+                    reason: reason,
+                    selectedDay: day,
+                    selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                    skipped: true
+                )
+#endif
                 return true
             }
         }
 
         if viewModel.liveSportsDataRefreshInFlight || viewModel.isLiveMatchesNetworkRefreshInFlight {
+#if DEBUG
+            logCalendarProGamesNetworkRefreshDecision(
+                reason: reason,
+                selectedDay: day,
+                selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                skipped: true
+            )
+#endif
             return true
         }
 
+#if DEBUG
+        logCalendarProGamesNetworkRefreshDecision(
+            reason: reason,
+            selectedDay: day,
+            selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+            skipped: false
+        )
+#endif
         return false
     }
 
@@ -618,7 +709,11 @@ struct CalendarScreen: View {
 
     private func performCalendarProGamesNetworkRefresh(reason: String, forceRefresh: Bool) async {
         if shouldSkipCalendarProGamesNetworkRefresh(reason: reason, forceRefresh: forceRefresh) {
+#if DEBUG
+            // Decision details logged from shouldSkipCalendarProGamesNetworkRefresh.
+#else
             print("[CalendarProGamesPerf] networkRefreshSkipped reason=\(reason) cached=true")
+#endif
             return
         }
         calendarProGamesPerf.networkRefreshInFlight = true
