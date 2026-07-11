@@ -113,7 +113,10 @@ extension MapViewModel {
         }
 
         await MainActor.run {
-            beginProfilePresentationLoad()
+            let shouldBeginProfileLoad = !hasLoadedUserProfileForPresentation && !isUserProfileLoadingForPresentation
+            if shouldBeginProfileLoad {
+                beginProfilePresentationLoad()
+            }
         }
         await ensureUserProfileExists()
         await loadUserProfile()
@@ -126,7 +129,12 @@ extension MapViewModel {
         }
 
         await loadFavoriteVenuesFromSupabase()
-        await loadFavoriteTeamsFromSupabase()
+        // After logout AppStorage is empty; force refresh so a stale 180s cache cannot skip hydration.
+        let shouldForceFavoriteTeams = await MainActor.run {
+            let raw = UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
+            return FavoriteTeamsStore.decodeIDs(from: raw).isEmpty
+        }
+        await loadFavoriteTeamsFromSupabase(forceRefresh: shouldForceFavoriteTeams)
         favoriteTeamsLoaded = true
         await refreshFollowingTodayVenueEventPlansLightweight()
         goingLoaded = true

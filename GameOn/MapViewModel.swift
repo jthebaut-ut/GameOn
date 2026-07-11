@@ -243,7 +243,152 @@ final class MapViewModel: ObservableObject {
     @Published var emailVerificationMessage = ""
     @Published var emailVerificationError = ""
     var pendingFanEmailSignupDraft: PendingFanEmailSignupDraft?
-    var pendingBusinessEmailSignupDraft: PendingBusinessEmailSignupDraft?
+    @Published var pendingBusinessEmailSignupDraft: PendingBusinessEmailSignupDraft?
+    /// User explicitly chose to resume setup for the persisted draft email (Settings → Business auth sheet).
+    @Published var resumePendingBusinessSetupForDraftEmail = false
+    /// True only after signup sent verification, failed unconfirmed login, or explicit resume — not when the login email field merely matches the draft.
+    @Published var businessEmailVerificationUIFlowActive = false
+
+    var hasPendingBusinessEmailSignupDraft: Bool {
+        pendingBusinessEmailSignupDraft != nil
+    }
+
+    var normalizedPendingBusinessDraftEmail: String? {
+        guard let draft = pendingBusinessEmailSignupDraft else { return nil }
+        let normalized = OwnerBusinessEmail.normalized(draft.email)
+        guard OwnerBusinessEmail.isValidStrict(normalized) else { return nil }
+        return normalized
+    }
+
+    func pendingBusinessDraftMatchesBusinessAuthEmail(_ email: String) -> Bool {
+        guard let draftEmail = normalizedPendingBusinessDraftEmail else { return false }
+        return OwnerBusinessEmail.normalized(email) == draftEmail
+    }
+
+    var pendingBusinessDraftMatchesTypedLoginEmail: Bool {
+        pendingBusinessDraftMatchesBusinessAuthEmail(venueOwnerEmail)
+    }
+
+    /// Full verification waiting UI — never driven by typing a matching email alone.
+    var shouldShowPendingBusinessEmailVerificationUI: Bool {
+        guard pendingEmailVerificationKind == .business else { return false }
+        if let draft = pendingBusinessEmailSignupDraft, draft.emailVerified { return false }
+        if hasPendingVerifiedBusinessVenueSetup { return false }
+        if businessEmailVerifiedNeedsVenueSetup { return false }
+        if resumePendingBusinessSetupForDraftEmail { return true }
+        return businessEmailVerificationUIFlowActive
+    }
+
+    /// Small sign-in banner when the typed email matches an unverified pending business draft.
+    var shouldShowPendingBusinessSignupMatchingEmailBanner: Bool {
+        guard !shouldShowPendingBusinessEmailVerificationUI else { return false }
+        guard !shouldShowFullPendingVerifiedVenueSetupUI else { return false }
+        guard !isVenueOwnerLoggedIn else { return false }
+        guard pendingBusinessEmailSignupDraft != nil else { return false }
+        guard pendingBusinessDraftMatchesTypedLoginEmail else { return false }
+        return !hasPendingVerifiedBusinessVenueSetup
+    }
+
+    /// Post-verification venue wizard only when the signed-in session matches the draft email.
+    var shouldShowFullPendingVerifiedVenueSetupUI: Bool {
+        businessEmailVerifiedNeedsVenueSetup
+    }
+
+    /// Verified draft + matching typed login email, but not signed in yet.
+    var shouldShowVerifiedPendingBusinessSignInPrompt: Bool {
+        guard hasPendingVerifiedBusinessVenueSetup else { return false }
+        guard !businessEmailVerifiedNeedsVenueSetup else { return false }
+        return pendingBusinessDraftMatchesTypedLoginEmail || resumePendingBusinessSetupForDraftEmail
+    }
+
+    /// Optional resume chip for a different typed login email.
+    var hasPendingBusinessSetupDraftForOtherEmail: Bool {
+        guard pendingBusinessEmailSignupDraft != nil else { return false }
+        if shouldShowPendingBusinessEmailVerificationUI { return false }
+        if shouldShowFullPendingVerifiedVenueSetupUI { return false }
+        if shouldShowVerifiedPendingBusinessSignInPrompt { return false }
+        guard let draftEmail = normalizedPendingBusinessDraftEmail else { return false }
+        let typed = OwnerBusinessEmail.normalized(venueOwnerEmail)
+        if OwnerBusinessEmail.isValidStrict(typed) {
+            return typed != draftEmail
+        }
+        return true
+    }
+
+    var pendingBusinessSetupResumeBannerMessage: String {
+        guard let email = normalizedPendingBusinessDraftEmail else { return "" }
+        if hasPendingVerifiedBusinessVenueSetup {
+            return "Finish setup for \(email)"
+        }
+        return "Resume signup for \(email)"
+    }
+
+    @MainActor
+    func activateResumePendingBusinessSetupForDraft() {
+        guard let draftEmail = normalizedPendingBusinessDraftEmail else { return }
+        resumePendingBusinessSetupForDraftEmail = true
+        venueOwnerEmail = draftEmail
+        if let draft = pendingBusinessEmailSignupDraft, !draft.emailVerified {
+            pendingEmailVerificationEmail = draftEmail
+            pendingEmailVerificationKind = .business
+            businessEmailVerificationUIFlowActive = true
+        }
+    }
+
+    @MainActor
+    func clearResumePendingBusinessSetupIfLoginEmailChanged() {
+        guard resumePendingBusinessSetupForDraftEmail,
+              let draftEmail = normalizedPendingBusinessDraftEmail else { return }
+        let typed = OwnerBusinessEmail.normalized(venueOwnerEmail)
+        guard OwnerBusinessEmail.isValidStrict(typed) else { return }
+        if typed != draftEmail {
+            resumePendingBusinessSetupForDraftEmail = false
+        }
+    }
+
+    /// Verified business email with a preserved draft but no business row yet (venue wizard not submitted).
+    var hasPendingVerifiedBusinessVenueSetup: Bool {
+        guard let draft = pendingBusinessEmailSignupDraft,
+              draft.emailVerified,
+              !hasBusinessAccountForOwner() else {
+            return false
+        }
+        guard pendingEmailVerificationKind != .business else { return false }
+        return !draft.isVenueSubmissionReady
+    }
+
+    /// Same as ``hasPendingVerifiedBusinessVenueSetup`` and the signed-in auth session matches the draft email.
+    var businessEmailVerifiedNeedsVenueSetup: Bool {
+        guard hasPendingVerifiedBusinessVenueSetup else { return false }
+        return pendingVerifiedBusinessVenueSetupSessionMatchesDraft
+    }
+
+    /// Verified draft preserved while the user is signed out and should sign in to continue venue setup.
+    var hasPendingVerifiedBusinessVenueSetupAwaitingSignIn: Bool {
+        guard hasPendingVerifiedBusinessVenueSetup else { return false }
+        return !pendingVerifiedBusinessVenueSetupSessionMatchesDraft
+    }
+
+    var pendingVerifiedBusinessVenueSetupSessionMatchesDraft: Bool {
+        guard let draft = pendingBusinessEmailSignupDraft,
+              let _ = currentUserAuthId else {
+            return false
+        }
+        let draftEmail = OwnerBusinessEmail.normalized(draft.email)
+        let sessionEmail = OwnerBusinessEmail.normalized(venueOwnerEmail)
+        guard OwnerBusinessEmail.isValidStrict(sessionEmail) else { return false }
+        return sessionEmail == draftEmail
+    }
+
+    var businessVerifiedVenueSetupBannerMessage: String {
+        if let draft = pendingBusinessEmailSignupDraft {
+            let normalized = OwnerBusinessEmail.normalized(draft.email)
+            if OwnerBusinessEmail.isValidStrict(normalized) {
+                return "\(normalized) is verified. Add your first venue when you're ready."
+            }
+        }
+        return "Your business email is verified. Add your first venue when you're ready."
+    }
     var venueClaimAdminEmailQueuedClaimIDs: Set<String> = []
     /// Set after a venue-owner password-reset email is requested (same Auth API, separate UI feedback).
     @Published var venuePasswordResetMessage = ""
@@ -917,10 +1062,20 @@ final class MapViewModel: ObservableObject {
     @Published var pickupJoinRequestLatestByPickupGameIdForFan: [UUID: PickupGameRequestRow] = [:]
     var lightweightStartupPrefetchTask: Task<Void, Never>?
     var lastLightweightStartupPrefetchAt: Date?
+    /// Monotonic auth/profile lifecycle token; bumped at logout/login start so stale async cleanup cannot affect a newer session.
+    var accountProfileGeneration: UInt64 = 0
+    /// Single owned profile load task for the active generation (cancelled/replaced on auth change).
+    var profileLoadTask: Task<Void, Never>?
+    var profileLoadOwnerUserId: UUID?
+    var profileLoadOwnerGeneration: UInt64 = 0
+    /// Identity token for the active owned profile-load task; stale completions cannot clear a newer task.
+    var profileLoadTaskToken: UUID?
     var favoriteVenueIDsLoadTask: Task<Void, Never>?
     var lastFavoriteVenueIDsLoadAt: Date?
     var favoriteTeamsLoadTask: Task<Void, Never>?
     var lastFavoriteTeamsLoadAt: Date?
+    /// Bumped when favorite teams are written into AppStorage so Profile/@AppStorage views refresh after login hydration.
+    @Published var favoriteTeamsHydrationGeneration: Int = 0
     var followingTodayPlansLoadTask: Task<Void, Never>?
     var lastFollowingTodayPlansLoadAt: Date?
     var followingTabGlobalRefreshTask: Task<Void, Never>?

@@ -524,8 +524,129 @@ enum ProfileAvatarDebug {
         print("[ProfileAvatarDebug] avatarRenderSource=\(source)")
 #endif
     }
+
+    static func profileFetchDecoded(
+        userId: UUID,
+        rawAvatarURL: String?,
+        rawAvatarThumbnailURL: String?,
+        profileFound: Bool
+    ) {
+#if DEBUG
+        print("[ProfileAvatarDebug] profileFetch userId=\(userId.uuidString.lowercased()) found=\(profileFound)")
+        print("[ProfileAvatarDebug] profileFetch raw_avatar_url=\(rawAvatarURL ?? "nil")")
+        print("[ProfileAvatarDebug] profileFetch raw_avatar_thumbnail_url=\(rawAvatarThumbnailURL ?? "nil")")
+#endif
+    }
+
+    static func profileAppliedToViewModel(
+        canonicalAvatarURL: String,
+        canonicalAvatarThumbnailURL: String,
+        source: String
+    ) {
+#if DEBUG
+        print("[ProfileAvatarDebug] profileApplied source=\(source)")
+        print("[ProfileAvatarDebug] profileApplied canonical_avatar_url=\(canonicalAvatarURL.isEmpty ? "(empty)" : canonicalAvatarURL)")
+        print("[ProfileAvatarDebug] profileApplied canonical_avatar_thumbnail_url=\(canonicalAvatarThumbnailURL.isEmpty ? "(empty)" : canonicalAvatarThumbnailURL)")
+#endif
+    }
+
+    static func avatarViewResolved(
+        context: String,
+        thumbnailInput: String?,
+        fullInput: String,
+        displayURLString: String?,
+        urlParseSucceeded: Bool,
+        fallbackReason: String
+    ) {
+#if DEBUG
+        print("[ProfileAvatarDebug] avatarView context=\(context)")
+        print("[ProfileAvatarDebug] avatarView input_thumbnail=\(thumbnailInput ?? "nil")")
+        print("[ProfileAvatarDebug] avatarView input_full=\(fullInput.isEmpty ? "(empty)" : fullInput)")
+        print("[ProfileAvatarDebug] avatarView display_url=\(displayURLString ?? "nil")")
+        print("[ProfileAvatarDebug] avatarView url_parse_ok=\(urlParseSucceeded)")
+        print("[ProfileAvatarDebug] avatarView fallback_reason=\(fallbackReason)")
+#endif
+    }
+
+    static func avatarImageLoadFinished(url: URL, succeeded: Bool, detail: String) {
+#if DEBUG
+        print("[ProfileAvatarDebug] avatarImageLoad url=\(url.absoluteString)")
+        print("[ProfileAvatarDebug] avatarImageLoad succeeded=\(succeeded) detail=\(detail)")
+#endif
+    }
 }
 #endif
+
+enum AccountSwitchDebug {
+    static func generation(_ value: UInt64) {
+#if DEBUG
+        print("[AccountSwitchDebug] generation=\(value)")
+#endif
+    }
+
+    static func logoutCleanup(accountId: UUID?, generation: UInt64) {
+#if DEBUG
+        let accountText = accountId?.uuidString.lowercased() ?? "nil"
+        print("[AccountSwitchDebug] logoutCleanup accountId=\(accountText) generation=\(generation)")
+#endif
+    }
+
+    static func loginStarted(accountId: UUID, generation: UInt64) {
+#if DEBUG
+        print("[AccountSwitchDebug] loginStarted accountId=\(accountId.uuidString.lowercased()) generation=\(generation)")
+#endif
+    }
+
+    static func profileLoadStarted(accountId: UUID, generation: UInt64, reason: String) {
+#if DEBUG
+        print("[AccountSwitchDebug] profileLoadStarted accountId=\(accountId.uuidString.lowercased()) generation=\(generation) reason=\(reason)")
+#endif
+    }
+
+    static func profileLoadCancelled(accountId: UUID, generation: UInt64, stale: Bool, reason: String) {
+#if DEBUG
+        print("[AccountSwitchDebug] profileLoadCancelled accountId=\(accountId.uuidString.lowercased()) generation=\(generation) stale=\(stale) reason=\(reason)")
+#endif
+    }
+
+    static func profileResultApplied(accountId: UUID, generation: UInt64, profileExists: Bool) {
+#if DEBUG
+        print("[AccountSwitchDebug] profileResultApplied accountId=\(accountId.uuidString.lowercased()) generation=\(generation) profileExists=\(profileExists)")
+#endif
+    }
+
+    static func staleCleanupIgnored(oldAccountId: UUID?, currentAccountId: UUID?, expectedGeneration: UInt64, currentGeneration: UInt64) {
+#if DEBUG
+        let oldText = oldAccountId?.uuidString.lowercased() ?? "nil"
+        let currentText = currentAccountId?.uuidString.lowercased() ?? "nil"
+        print("[AccountSwitchDebug] staleCleanupIgnored oldAccountId=\(oldText) currentAccountId=\(currentText) expectedGeneration=\(expectedGeneration) currentGeneration=\(currentGeneration)")
+#endif
+    }
+
+    static func presentationLoadCancelledAndReset(accountId: UUID, generation: UInt64) {
+#if DEBUG
+        print("[AccountSwitchDebug] presentationLoadCancelledAndReset accountId=\(accountId.uuidString.lowercased()) generation=\(generation)")
+#endif
+    }
+
+    static func profileTaskCompleted(accountId: UUID, generation: UInt64, taskToken: UUID) {
+#if DEBUG
+        print("[AccountSwitchDebug] profileTaskCompleted accountId=\(accountId.uuidString.lowercased()) generation=\(generation) taskToken=\(taskToken.uuidString.lowercased())")
+#endif
+    }
+
+    static func profileTaskReferenceCleared(accountId: UUID, generation: UInt64, taskToken: UUID) {
+#if DEBUG
+        print("[AccountSwitchDebug] profileTaskReferenceCleared accountId=\(accountId.uuidString.lowercased()) generation=\(generation) taskToken=\(taskToken.uuidString.lowercased())")
+#endif
+    }
+
+    static func staleTaskCompletionIgnored(accountId: UUID, generation: UInt64, taskToken: UUID) {
+#if DEBUG
+        print("[AccountSwitchDebug] staleTaskCompletionIgnored accountId=\(accountId.uuidString.lowercased()) generation=\(generation) taskToken=\(taskToken.uuidString.lowercased())")
+#endif
+    }
+}
 
 enum UIPerformanceDiagnostics {
     /// Profiling switch: temporarily set this to `true` to enable `[UIPerf]` logs and os_signpost events.

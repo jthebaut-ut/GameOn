@@ -57,6 +57,9 @@ extension MapViewModel {
     ) {
         pendingEmailVerificationEmail = OwnerBusinessEmail.normalized(email)
         pendingEmailVerificationKind = kind
+        if kind == .business {
+            businessEmailVerificationUIFlowActive = true
+        }
         emailVerificationError = ""
         if kind == .business, !verificationEmailConfirmedAsSent {
             emailVerificationMessage = ""
@@ -80,13 +83,125 @@ extension MapViewModel {
     func clearEmailVerificationPending() {
         pendingEmailVerificationEmail = ""
         pendingEmailVerificationKind = nil
+        businessEmailVerificationUIFlowActive = false
         emailVerificationError = ""
         emailVerificationMessage = ""
         pendingFanEmailSignupDraft = nil
-        pendingBusinessEmailSignupDraft = nil
-        clearPersistedPendingBusinessEmailSignupDraft()
     }
 
+    @MainActor
+    func clearPendingBusinessEmailSignupState() {
+        pendingBusinessEmailSignupDraft = nil
+        clearPersistedPendingBusinessEmailSignupDraft()
+        pendingEmailVerificationEmail = ""
+        pendingEmailVerificationKind = nil
+        emailVerificationError = ""
+        emailVerificationMessage = ""
+        resumePendingBusinessSetupForDraftEmail = false
+        businessEmailVerificationUIFlowActive = false
+    }
+
+    /// Hides the verification waiting UI while keeping the persisted business signup draft for resume.
+    @MainActor
+    func dismissBusinessEmailVerificationPendingUIForSignIn() {
+        pendingEmailVerificationKind = nil
+        businessEmailVerificationUIFlowActive = false
+        emailVerificationError = ""
+        resumePendingBusinessSetupForDraftEmail = false
+        if pendingBusinessEmailSignupDraft != nil {
+            emailVerificationMessage = ""
+            venueAuthErrorMessage = "After verifying your email, sign in to add your first venue for FanGeo review."
+        }
+    }
+
+    /// Email is verified; venue setup can begin while the identity-only draft is preserved.
+    @MainActor
+    func markBusinessEmailVerifiedAwaitingVenueSetup(email: String) {
+        let normalized = OwnerBusinessEmail.normalized(email)
+        pendingEmailVerificationKind = nil
+        businessEmailVerificationUIFlowActive = false
+        pendingEmailVerificationEmail = normalized
+        emailVerificationError = ""
+        emailVerificationMessage = ""
+        venueAuthErrorMessage = ""
+
+        if let draft = pendingBusinessEmailSignupDraft,
+           OwnerBusinessEmail.normalized(draft.email) == normalized,
+           !draft.emailVerified {
+            let verifiedDraft = draft.markingEmailVerified()
+            pendingBusinessEmailSignupDraft = verifiedDraft
+            persistPendingBusinessEmailSignupDraft(verifiedDraft)
+        }
+    }
+
+    /// Confirmed Supabase session with a matching pending business draft → verified venue-setup state.
+    @MainActor
+    @discardableResult
+    func applyVerifiedBusinessSignupSessionIfNeeded(session: Session) -> Bool {
+        guard Self.userEmailConfirmed(session.user) else { return false }
+        let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+        guard OwnerBusinessEmail.isValidStrict(sessionEmail) else { return false }
+
+        restorePendingBusinessEmailSignupDraftIfNeeded()
+
+        guard let draft = pendingBusinessEmailSignupDraft,
+              OwnerBusinessEmail.normalized(draft.email) == sessionEmail else {
+            return false
+        }
+
+        if hasBusinessAccountForOwner() {
+            clearPendingBusinessEmailSignupState()
+            return false
+        }
+
+        markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
+        currentUserAuthId = session.user.id
+        venueOwnerEmail = sessionEmail
+        venueAuthErrorMessage = ""
+        return !draft.isVenueSubmissionReady
+    }
+
+    /// Signs out after post-verification venue setup while preserving the pending business draft for resume.
+    func deferBusinessVenueSetupUntilLater() async {
+        let draftEmail = await MainActor.run {
+            pendingBusinessEmailSignupDraft.map { OwnerBusinessEmail.normalized($0.email) } ?? ""
+        }
+
+        await PushNotificationRegistrationService.shared.deleteCurrentTokenForCurrentSession(
+            reason: "deferBusinessVenueSetup"
+        )
+
+        do {
+            try await supabase.auth.signOut()
+        } catch {
+#if DEBUG
+            print("[BusinessVenueSetup] deferSignOutFailed error=\(error.localizedDescription)")
+#endif
+        }
+
+        await stopVenueOwnerAnalyticsRealtime()
+        await removeAllVenueEventCommentsRealtimeListeners()
+        await clearFanActiveSessionOnLogout()
+
+        await MainActor.run {
+            clearAuthenticatedSessionCaches()
+            clearVenueOwnerDraftState()
+            isLoggedIn = false
+            isVenueOwnerLoggedIn = false
+            venueOwnerMode = false
+            isAdminLoggedIn = false
+            markAuthSignedOut(reason: "businessVenueSetupDeferred")
+
+            if !draftEmail.isEmpty {
+                markBusinessEmailVerifiedAwaitingVenueSetup(email: draftEmail)
+            }
+            resumePendingBusinessSetupForDraftEmail = false
+        }
+
+        clearPersistedAccountMode()
+    }
+
+    @MainActor
     func restorePendingBusinessEmailSignupDraftIfNeeded() {
         guard let url = Self.pendingBusinessEmailSignupDraftURL,
               FileManager.default.fileExists(atPath: url.path) else {
@@ -98,10 +213,15 @@ extension MapViewModel {
             let draft = try JSONDecoder().decode(PendingBusinessEmailSignupDraft.self, from: data)
             pendingBusinessEmailSignupDraft = draft
             pendingEmailVerificationEmail = OwnerBusinessEmail.normalized(draft.email)
-            pendingEmailVerificationKind = .business
-            if emailVerificationMessage.isEmpty {
-                emailVerificationMessage = ""
-                emailVerificationError = "Account created, but verification email was not confirmed as sent. Try resend."
+            if draft.emailVerified {
+                pendingEmailVerificationKind = nil
+            } else if pendingEmailVerificationKind == nil {
+                pendingEmailVerificationKind = .business
+            }
+            if emailVerificationMessage.isEmpty, pendingEmailVerificationKind == .business {
+                emailVerificationMessage = Self.withEmailDeliveryGuidance(
+                    "Verification email sent. After you verify, sign in to add your first venue for FanGeo review."
+                )
             }
 #if DEBUG
             print("[BusinessSignupDraft] restoredPendingBusinessEmailSignupDraft=true email=\(pendingEmailVerificationEmail)")
@@ -668,6 +788,31 @@ extension MapViewModel {
             return false
         }
 
+        await MainActor.run {
+            restorePendingBusinessEmailSignupDraftIfNeeded()
+        }
+        let pendingVerifiedVenueSetup = await MainActor.run { () -> Bool in
+            guard hasPendingVerifiedBusinessVenueSetup,
+                  let draft = pendingBusinessEmailSignupDraft,
+                  OwnerBusinessEmail.normalized(draft.email) == sessionEmail else {
+                return false
+            }
+            markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
+            currentUserAuthId = session.user.id
+            venueOwnerEmail = sessionEmail
+            isLoggedIn = false
+            isVenueOwnerLoggedIn = false
+            venueOwnerMode = false
+            isAdminLoggedIn = false
+            markAuthSignedIn(reason: "\(context)_pendingBusinessVenueSetup")
+            isBusinessOwnerSessionRestorePending = false
+            return true
+        }
+        if pendingVerifiedVenueSetup {
+            logBusinessOwnerSessionFlags(context: "\(context)_pending_business_venue_setup")
+            return true
+        }
+
         let validation = await validateActiveBusinessAccount(ownerEmail: sessionEmail, ownerUserId: session.user.id)
         logBusinessSessionRestoreDebug("activeBusinessValidation=\(validation.debugValue)")
         guard case .active = validation else {
@@ -734,7 +879,384 @@ extension MapViewModel {
 
     /// Clears authenticated/private session caches that must never survive logout, session loss, or account switching.
     /// Intentionally does not mutate the high-level signed-in flags; callers clear caches first, then update flags.
-    func clearAuthenticatedSessionCaches() {
+    @MainActor
+    @discardableResult
+    func bumpAccountProfileGeneration(reason: String, accountId: UUID?) -> UInt64 {
+        accountProfileGeneration &+= 1
+        profileLoadTask?.cancel()
+        profileLoadTask = nil
+        profileLoadOwnerUserId = nil
+        profileLoadOwnerGeneration = 0
+        profileLoadTaskToken = nil
+        lightweightStartupPrefetchTask?.cancel()
+        lightweightStartupPrefetchTask = nil
+        lastLightweightStartupPrefetchAt = nil
+#if DEBUG
+        AccountSwitchDebug.generation(accountProfileGeneration)
+        _ = reason
+        _ = accountId
+#endif
+        return accountProfileGeneration
+    }
+
+    @MainActor
+    func clearLogoutProfilePresentationImmediately(for logoutAccountId: UUID?) {
+        currentUserAvatarURL = ""
+        currentUserAvatarThumbnailURL = ""
+        currentUserDisplayName = ""
+        currentUserUsername = ""
+        currentUserBio = ""
+        clearCurrentUserProfileLocalCache()
+        resetProfilePresentationLoadStateForNewAuth()
+        bumpCurrentUserAvatarDisplayRefresh()
+#if DEBUG
+        _ = logoutAccountId
+#endif
+    }
+
+    @MainActor
+    func cancelProfilePresentationLoadIfOwned(userId: UUID, generation: UInt64) {
+        guard profileLoadContextStillValid(userId: userId, generation: generation) else { return }
+        guard isUserProfileLoadingForPresentation else { return }
+        guard !hasLoadedUserProfileForPresentation else { return }
+        isUserProfileLoadingForPresentation = false
+        AccountSwitchDebug.presentationLoadCancelledAndReset(accountId: userId, generation: generation)
+    }
+
+    @MainActor
+    func clearProfileLoadTaskReferenceIfOwned(userId: UUID, generation: UInt64, taskToken: UUID) {
+        guard profileLoadTaskToken == taskToken else {
+            AccountSwitchDebug.staleTaskCompletionIgnored(accountId: userId, generation: generation, taskToken: taskToken)
+            return
+        }
+        guard profileLoadOwnerUserId == userId, profileLoadOwnerGeneration == generation else {
+            AccountSwitchDebug.staleTaskCompletionIgnored(accountId: userId, generation: generation, taskToken: taskToken)
+            return
+        }
+        profileLoadTask = nil
+        profileLoadOwnerUserId = nil
+        profileLoadOwnerGeneration = 0
+        profileLoadTaskToken = nil
+        AccountSwitchDebug.profileTaskReferenceCleared(accountId: userId, generation: generation, taskToken: taskToken)
+    }
+
+    @MainActor
+    func finalizeOwnedProfileLoadSession(
+        userId: UUID,
+        generation: UInt64,
+        taskToken: UUID,
+        applied: Bool
+    ) {
+        AccountSwitchDebug.profileTaskCompleted(accountId: userId, generation: generation, taskToken: taskToken)
+        clearProfileLoadTaskReferenceIfOwned(userId: userId, generation: generation, taskToken: taskToken)
+        if !applied {
+            cancelProfilePresentationLoadIfOwned(userId: userId, generation: generation)
+        }
+    }
+
+    @MainActor
+    func startOwnedProfileLoad(userId: UUID, generation: UInt64, reason: String, allowRetry: Bool = true) {
+        if let ownerId = profileLoadOwnerUserId,
+           profileLoadOwnerGeneration == generation,
+           ownerId == userId,
+           let existing = profileLoadTask,
+           !existing.isCancelled {
+            return
+        }
+        beginProfilePresentationLoad()
+        profileLoadOwnerUserId = userId
+        profileLoadOwnerGeneration = generation
+        let taskToken = UUID()
+        profileLoadTaskToken = taskToken
+        profileLoadTask?.cancel()
+        let capturedUserId = userId
+        let capturedGeneration = generation
+        profileLoadTask = Task { [weak self] in
+            await self?.scheduleAuthoritativeProfileLoad(
+                userId: capturedUserId,
+                generation: capturedGeneration,
+                reason: reason,
+                allowRetry: allowRetry,
+                taskToken: taskToken
+            )
+        }
+    }
+
+    /// Begins a fan login session: bumps generation, clears stale caches, and starts one authoritative profile load.
+    @MainActor
+    func beginFanLoginSession(
+        userId: UUID,
+        reason: String,
+        email: String,
+        displayName: String = "",
+        configure: () -> Void
+    ) {
+        let generation = bumpAccountProfileGeneration(reason: reason, accountId: userId)
+        AccountSwitchDebug.loginStarted(accountId: userId, generation: generation)
+        clearAuthenticatedSessionCaches()
+        resetProfilePresentationLoadStateForNewAuth()
+        currentUserEmail = email
+        currentUserDisplayName = displayName
+        currentUserUsername = ""
+        currentUserBio = ""
+        currentUserIsBusinessAccount = false
+        currentUserAvatarURL = ""
+        currentUserAvatarThumbnailURL = ""
+        configure()
+        currentUserAuthId = userId
+        startOwnedProfileLoad(userId: userId, generation: generation, reason: reason)
+    }
+
+    private func isProfileLoadCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if Task.isCancelled { return true }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain, ns.code == NSURLErrorCancelled { return true }
+        return false
+    }
+
+    @MainActor
+    private func profileLoadContextStillValid(userId: UUID, generation: UInt64) -> Bool {
+        accountProfileGeneration == generation && currentUserAuthId == userId
+    }
+
+    private func scheduleAuthoritativeProfileLoad(
+        userId: UUID,
+        generation: UInt64,
+        reason: String,
+        allowRetry: Bool,
+        taskToken: UUID
+    ) async {
+        var applied = await performProfileLoad(
+            userId: userId,
+            generation: generation,
+            reason: reason,
+            isRetry: false
+        )
+        if !applied, allowRetry, !Task.isCancelled {
+            let shouldRetry = await MainActor.run {
+                profileLoadContextStillValid(userId: userId, generation: generation)
+                    && !hasLoadedUserProfileForPresentation
+            }
+            if shouldRetry {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                if !Task.isCancelled {
+                    let stillValid = await MainActor.run {
+                        profileLoadContextStillValid(userId: userId, generation: generation)
+                    }
+                    if stillValid {
+                        applied = await performProfileLoad(
+                            userId: userId,
+                            generation: generation,
+                            reason: "\(reason).retry",
+                            isRetry: true
+                        )
+                    }
+                }
+            }
+        }
+
+        await MainActor.run { [weak self] in
+            self?.finalizeOwnedProfileLoadSession(
+                userId: userId,
+                generation: generation,
+                taskToken: taskToken,
+                applied: applied
+            )
+        }
+    }
+
+    @discardableResult
+    private func performProfileLoad(
+        userId: UUID,
+        generation: UInt64,
+        reason: String,
+        isRetry: Bool
+    ) async -> Bool {
+        AccountSwitchDebug.profileLoadStarted(accountId: userId, generation: generation, reason: reason)
+
+        let stillValidAtStart = await MainActor.run {
+            profileLoadContextStillValid(userId: userId, generation: generation)
+        }
+        guard stillValidAtStart else {
+            AccountSwitchDebug.profileLoadCancelled(
+                accountId: userId,
+                generation: generation,
+                stale: true,
+                reason: "startContextInvalid"
+            )
+            return false
+        }
+
+        let sessionResolution = await supabaseResolvedAuthSessionResult()
+        if case .refreshFailed(let error) = sessionResolution {
+            await MainActor.run {
+                markAuthRefreshFailed(error, reason: "loadUserProfile")
+                finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+            }
+#if DEBUG
+            print("[ProfilePersistenceDebug] profileLoadSkipped reason=authRefreshFailed")
+#endif
+            return false
+        }
+
+        if case .active(let session) = sessionResolution {
+            guard session.user.id == userId else {
+                AccountSwitchDebug.profileLoadCancelled(
+                    accountId: userId,
+                    generation: generation,
+                    stale: true,
+                    reason: "sessionUserMismatch"
+                )
+                return false
+            }
+
+            guard await checkCurrentUserAdminStatus() else {
+                await MainActor.run {
+                    finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+                }
+                return false
+            }
+
+            let authId = session.user.id
+#if DEBUG
+            print("[ProfilePersistenceDebug] loadingProfileForUserId=\(authId.uuidString.lowercased())")
+#endif
+            do {
+                try Task.checkCancellation()
+                let rows: [UserProfileRow] = try await supabase
+                    .from("user_profiles")
+                    .select(Self.userProfileSelectColumns)
+                    .eq("id", value: authId)
+                    .limit(1)
+                    .execute()
+                    .value
+
+                let stillValidAfterFetch = await MainActor.run {
+                    profileLoadContextStillValid(userId: userId, generation: generation)
+                }
+                guard stillValidAfterFetch else {
+                    AccountSwitchDebug.profileLoadCancelled(
+                        accountId: userId,
+                        generation: generation,
+                        stale: true,
+                        reason: "postFetchContextInvalid"
+                    )
+                    return false
+                }
+
+                if let profile = rows.first {
+#if DEBUG
+                    print("[ProfilePersistenceDebug] existingProfileFound=true")
+                    ProfileAvatarDebug.profileFetchDecoded(
+                        userId: authId,
+                        rawAvatarURL: profile.avatar_url,
+                        rawAvatarThumbnailURL: profile.avatar_thumbnail_url,
+                        profileFound: true
+                    )
+#endif
+                    if profile.isDeletedAccount {
+                        if await shouldSuppressDeletedProfileBlockForBusinessSession(
+                            session: session,
+                            context: "loadUserProfile"
+                        ) {
+                            await MainActor.run {
+                                finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+                            }
+                            return false
+                        }
+                        await handleDeletedCurrentUser()
+                        await MainActor.run {
+                            finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+                        }
+                        return false
+                    }
+                    let applied = await MainActor.run { () -> Bool in
+                        guard profileLoadContextStillValid(userId: userId, generation: generation) else {
+                            return false
+                        }
+                        if applyLoadedUserProfileRow(profile, authId: authId, generation: generation) {
+                            finishProfilePresentationLoad(profileExists: true, userId: userId, generation: generation)
+                            AccountSwitchDebug.profileResultApplied(
+                                accountId: userId,
+                                generation: generation,
+                                profileExists: true
+                            )
+                            return true
+                        }
+                        return false
+                    }
+#if DEBUG
+                    print("[ProfileDiscoverabilityDebug] loaded=\(profile.discoverableByFans)")
+#endif
+                    if applied {
+                        print("USER PROFILE LOADED")
+                    }
+                    return applied
+                }
+
+#if DEBUG
+                print("[ProfilePersistenceDebug] existingProfileFound=false")
+#endif
+                await MainActor.run {
+                    finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+                    AccountSwitchDebug.profileResultApplied(
+                        accountId: userId,
+                        generation: generation,
+                        profileExists: false
+                    )
+                }
+                print("NO USER PROFILE FOUND")
+                return false
+            } catch {
+                if isProfileLoadCancellation(error) {
+                    AccountSwitchDebug.profileLoadCancelled(
+                        accountId: userId,
+                        generation: generation,
+                        stale: !isRetry,
+                        reason: error.localizedDescription
+                    )
+#if DEBUG
+                    print("[ProfilePersistenceDebug] profileDecodeFailed=\(error.localizedDescription)")
+#endif
+                    return false
+                }
+#if DEBUG
+                print("[ProfilePersistenceDebug] profileDecodeFailed=\(error.localizedDescription)")
+#endif
+                await MainActor.run {
+                    finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
+                }
+                print("ERROR LOADING USER PROFILE:", error)
+                return false
+            }
+        }
+
+        return false
+    }
+
+    func clearAuthenticatedSessionCaches(
+        expectedGeneration: UInt64? = nil,
+        logoutAccountId: UUID? = nil
+    ) {
+        if let expectedGeneration {
+            guard accountProfileGeneration == expectedGeneration else {
+                AccountSwitchDebug.staleCleanupIgnored(
+                    oldAccountId: logoutAccountId,
+                    currentAccountId: currentUserAuthId,
+                    expectedGeneration: expectedGeneration,
+                    currentGeneration: accountProfileGeneration
+                )
+                return
+            }
+            AccountSwitchDebug.logoutCleanup(accountId: logoutAccountId, generation: expectedGeneration)
+        }
+
+        profileLoadTask?.cancel()
+        profileLoadTask = nil
+        profileLoadOwnerUserId = nil
+        profileLoadOwnerGeneration = 0
+        profileLoadTaskToken = nil
         currentUserEmail = ""
         currentUserDisplayName = ""
         currentUserUsername = ""
@@ -772,6 +1294,7 @@ extension MapViewModel {
         favoriteTeamProGames = []
         favoriteTeamProGameAlertOverrides = [:]
         FavoriteTeamsStore.clearAppStorage()
+        favoriteTeamsHydrationGeneration &+= 1
         clearBusinessFavoriteTeamState()
         favoriteVenueIDs = []
         interestedVenueEventKeys = []
@@ -1247,6 +1770,13 @@ extension MapViewModel {
         }
         let requiresSuccessfulRemoteSignOut = reason == "explicitUserLogout" || source == "MapViewModel.logoutUser"
 
+        let (logoutAccountId, cleanupGeneration) = await MainActor.run { () -> (UUID?, UInt64) in
+            let accountId = currentUserAuthId
+            let generation = bumpAccountProfileGeneration(reason: reason, accountId: accountId)
+            clearLogoutProfilePresentationImmediately(for: accountId)
+            return (accountId, generation)
+        }
+
         let snapshot = await MainActor.run {
             (
                 currentUserId: currentUserAuthId?.uuidString.lowercased() ?? "nil",
@@ -1288,7 +1818,10 @@ extension MapViewModel {
         await clearFanActiveSessionOnLogout()
 
         await MainActor.run {
-            clearAuthenticatedSessionCaches()
+            clearAuthenticatedSessionCaches(
+                expectedGeneration: cleanupGeneration,
+                logoutAccountId: logoutAccountId
+            )
             clearVenueOwnerDraftState()
             isLoggedIn = false
             isVenueOwnerLoggedIn = false
@@ -1388,7 +1921,13 @@ extension MapViewModel {
     }
 
     @MainActor
-    func finishProfilePresentationLoad(profileExists: Bool) {
+    func finishProfilePresentationLoad(profileExists: Bool, userId: UUID? = nil, generation: UInt64? = nil) {
+        if let generation {
+            guard accountProfileGeneration == generation else { return }
+        }
+        if let userId {
+            guard currentUserAuthId == userId else { return }
+        }
         userProfileExistsForPresentation = profileExists
         hasLoadedUserProfileForPresentation = true
         isUserProfileLoadingForPresentation = false
@@ -1396,19 +1935,24 @@ extension MapViewModel {
 
     /// Account-tab recovery: fetch active fan profile when presentation state was reset but warm preload has not hydrated yet.
     func recoverUserProfilePresentationForAccountTabIfNeeded() async {
-        let shouldRecover = await MainActor.run { () -> Bool in
-            guard isLoggedIn, !isVenueOwnerLoggedIn, currentUserAuthId != nil else { return false }
-            return !hasLoadedUserProfileForPresentation && !isUserProfileLoadingForPresentation
+        let snapshot = await MainActor.run { () -> (UUID, UInt64)? in
+            guard isLoggedIn, !isVenueOwnerLoggedIn, let userId = currentUserAuthId else { return nil }
+            guard !hasLoadedUserProfileForPresentation && !isUserProfileLoadingForPresentation else { return nil }
+            return (userId, accountProfileGeneration)
         }
-        guard shouldRecover else { return }
+        guard let (userId, generation) = snapshot else { return }
 
 #if DEBUG
         print("[ProfilePersistenceDebug] accountTabRecoveryLoadStarted=true")
 #endif
         await MainActor.run {
-            beginProfilePresentationLoad()
+            startOwnedProfileLoad(userId: userId, generation: generation, reason: "accountTabRecovery")
         }
-        await loadUserProfile()
+        if let task = await MainActor.run(body: { profileLoadTask }) {
+            await task.value
+        }
+        // Profile fields can recover without favorite-team AppStorage; force a server reload so Profile does not stay on "Add Team".
+        await loadFavoriteTeamsFromSupabase(forceRefresh: true)
     }
 
     @MainActor
@@ -1425,7 +1969,10 @@ extension MapViewModel {
 
     @MainActor
     @discardableResult
-    private func applyLoadedUserProfileRow(_ profile: UserProfileRow, authId: UUID) -> Bool {
+    private func applyLoadedUserProfileRow(_ profile: UserProfileRow, authId: UUID, generation: UInt64? = nil) -> Bool {
+        if let generation {
+            guard accountProfileGeneration == generation else { return false }
+        }
         guard shouldApplyLoadedUserProfile(authId: authId) else { return false }
 
         if let em = profile.email?.trimmingCharacters(in: .whitespacesAndNewlines), !em.isEmpty {
@@ -1439,6 +1986,11 @@ extension MapViewModel {
         currentUserAvatarURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_url)
         currentUserAvatarThumbnailURL = ImageDisplayURL.canonicalStorageURLString(profile.avatar_thumbnail_url)
 #if DEBUG
+        ProfileAvatarDebug.profileAppliedToViewModel(
+            canonicalAvatarURL: currentUserAvatarURL,
+            canonicalAvatarThumbnailURL: currentUserAvatarThumbnailURL,
+            source: "applyLoadedUserProfileRow"
+        )
         ProfileAvatarDebug.profileReloaded(
             handlePresent: !currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             avatarURLPresent: !currentUserAvatarURL.isEmpty || !currentUserAvatarThumbnailURL.isEmpty
@@ -1471,6 +2023,30 @@ extension MapViewModel {
         print("[ProfileBootstrap] auth uid = \(authId)")
         print("[ProfilePersistenceDebug] loadingProfileForUserId=\(authId.uuidString.lowercased())")
 #endif
+
+        let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+        let skipForPendingBusinessVenueSetup = await MainActor.run {
+            shouldBypassFanAccountConflictForPendingBusinessVenueSetup(
+                email: sessionEmail,
+                userId: authId,
+                sessionEmailConfirmed: Self.userEmailConfirmed(session.user)
+            )
+        }
+        if skipForPendingBusinessVenueSetup {
+#if DEBUG
+            print("[ProfileBootstrap] skipped user_profiles bootstrap for pending business venue setup")
+            logBusinessAuthFanConflictGate(
+                context: "ensureUserProfileExists_skip",
+                email: sessionEmail,
+                userId: authId,
+                userProfileExists: false,
+                blockingReason: nil,
+                pendingDraftOverride: true
+            )
+#endif
+            await MainActor.run { currentUserAuthId = authId }
+            return
+        }
 
         do {
             let existing: [UserProfileRow] = try await supabase
@@ -1698,23 +2274,18 @@ extension MapViewModel {
             }
 
             await MainActor.run {
-                clearAuthenticatedSessionCaches()
-                resetProfilePresentationLoadStateForNewAuth()
-                currentUserEmail = fanEmail
-                currentUserDisplayName = ""
-                currentUserUsername = ""
-                currentUserBio = ""
-                currentUserIsBusinessAccount = false
-                currentUserAvatarURL = ""
-                currentUserAvatarThumbnailURL = ""
-
-                isLoggedIn = true
-                isVenueOwnerLoggedIn = false
-                venueOwnerMode = false
-                markAuthSignedIn(reason: "registerUser")
-                bumpCurrentUserAvatarDisplayRefresh()
+                beginFanLoginSession(
+                    userId: activeSession.user.id,
+                    reason: "registerUser",
+                    email: fanEmail
+                ) {
+                    isLoggedIn = true
+                    isVenueOwnerLoggedIn = false
+                    venueOwnerMode = false
+                    markAuthSignedIn(reason: "registerUser")
+                    bumpCurrentUserAvatarDisplayRefresh()
+                }
             }
-            await MainActor.run { currentUserAuthId = activeSession.user.id }
 
             await persistAccountModeForActiveAuthSession(.fanUser)
 
@@ -1728,7 +2299,10 @@ extension MapViewModel {
                 UserDefaults.standard.set(true, forKey: "fanGuidelinesAccepted")
             }
 
-            Task { await refreshUserPersonalizationInBackground() }
+            Task {
+                await loadFavoriteTeamsFromSupabase(forceRefresh: true)
+                await refreshUserPersonalizationInBackground()
+            }
         } catch {
             print("User registration failed:", error)
         }
@@ -1786,27 +2360,18 @@ extension MapViewModel {
             }
 
             await MainActor.run {
-                clearAuthenticatedSessionCaches()
-                resetProfilePresentationLoadStateForNewAuth()
-                currentUserEmail = fanEmail
-                currentUserDisplayName = ""
-                currentUserUsername = ""
-                currentUserBio = ""
-                currentUserIsBusinessAccount = false
-                currentUserAvatarURL = ""
-                currentUserAvatarThumbnailURL = ""
-
-                isLoggedIn = true
-                isVenueOwnerLoggedIn = false
-                venueOwnerMode = false
-                markAuthSignedIn(reason: "loginUser")
-
-                authErrorMessage = ""
-                bumpCurrentUserAvatarDisplayRefresh()
-            }
-
-            if let session = try? await supabase.auth.session {
-                await MainActor.run { currentUserAuthId = session.user.id }
+                beginFanLoginSession(
+                    userId: session.user.id,
+                    reason: "loginUser",
+                    email: fanEmail
+                ) {
+                    isLoggedIn = true
+                    isVenueOwnerLoggedIn = false
+                    venueOwnerMode = false
+                    markAuthSignedIn(reason: "loginUser")
+                    authErrorMessage = ""
+                    bumpCurrentUserAvatarDisplayRefresh()
+                }
             }
 
             await persistAccountModeForActiveAuthSession(.fanUser)
@@ -1814,7 +2379,11 @@ extension MapViewModel {
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
 
             await registerFanActiveSessionOnLogin()
-            Task { await refreshUserPersonalizationInBackground() }
+            // Logout clears FavoriteTeamsStore AppStorage; force a server reload so Profile does not keep "Add Team".
+            Task {
+                await loadFavoriteTeamsFromSupabase(forceRefresh: true)
+                await refreshUserPersonalizationInBackground()
+            }
         } catch {
             await MainActor.run {
                 isLoggedIn = false
@@ -1890,6 +2459,9 @@ extension MapViewModel {
     func handleEmailVerificationDeepLink(_ url: URL) async {
         guard Self.isEmailVerificationDeepLink(url) else { return }
         print("[EmailVerifyDebug] confirmationDeepLinkReceived=true")
+        await MainActor.run {
+            restorePendingBusinessEmailSignupDraftIfNeeded()
+        }
 
         if let session = try? await supabase.auth.session(from: url) {
             guard await passwordResetRecoverySessionIsAllowed(session: session) else {
@@ -1900,11 +2472,38 @@ extension MapViewModel {
             if await completePendingEmailSignupAfterConfirmationIfPossible(session: session) {
                 return
             }
+
+            let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+            if Self.userEmailConfirmed(session.user),
+               let draft = pendingBusinessEmailSignupDraft,
+               OwnerBusinessEmail.normalized(draft.email) == sessionEmail {
+                await forceLogout(reason: "businessSignupResumeAfterEmailVerification", source: "MapViewModel.handleEmailVerificationDeepLink")
+                await MainActor.run {
+                    markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
+                    authErrorMessage = ""
+                    venueAuthErrorMessage = ""
+                    openVenueOwnerAuthSheetFromClaimFlow = true
+                }
+                return
+            }
+
             await forceLogout(reason: "emailVerificationCompleted", source: "MapViewModel.handleEmailVerificationDeepLink")
         }
 
         await MainActor.run {
             clearEmailVerificationPending()
+            if let draft = pendingBusinessEmailSignupDraft {
+                let draftEmail = OwnerBusinessEmail.normalized(draft.email)
+                if OwnerBusinessEmail.isValidStrict(draftEmail) {
+                    markBusinessEmailVerifiedAwaitingVenueSetup(email: draftEmail)
+                    authErrorMessage = ""
+                    venueAuthErrorMessage = ""
+                    emailVerificationMessage = "Email verified. Sign in to add your first venue for FanGeo review."
+                    emailVerificationError = ""
+                    openVenueOwnerAuthSheetFromClaimFlow = true
+                    return
+                }
+            }
             authErrorMessage = "Email verified. You can now sign in."
             venueAuthErrorMessage = "Email verified. You can now sign in."
             emailVerificationMessage = "Email verified. You can now sign in."
@@ -1913,6 +2512,9 @@ extension MapViewModel {
     }
 
     private func completePendingEmailSignupAfterConfirmationIfPossible(session: Session) async -> Bool {
+        await MainActor.run {
+            restorePendingBusinessEmailSignupDraftIfNeeded()
+        }
         guard Self.userEmailConfirmed(session.user) else { return false }
         let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
 
@@ -1923,11 +2525,16 @@ extension MapViewModel {
             return await completePendingEmailFanSignupAfterConfirmation(session: session, draft: draft)
         }
 
-        if pendingEmailVerificationKind == .business,
-           let draft = pendingBusinessEmailSignupDraft,
+        if let draft = pendingBusinessEmailSignupDraft,
            OwnerBusinessEmail.normalized(draft.email) == sessionEmail {
-            print("[EmailConfirmDebug] creatingProfileAfterConfirmation=true")
-            return await completePendingBusinessSignupAfterConfirmation(session: session, draft: draft)
+            if draft.isVenueSubmissionReady {
+                print("[EmailConfirmDebug] creatingProfileAfterConfirmation=true")
+                return await completePendingBusinessSignupAfterConfirmation(session: session, draft: draft)
+            }
+            await MainActor.run {
+                markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
+            }
+            return false
         }
 
         return false
@@ -2179,6 +2786,10 @@ extension MapViewModel {
 #if DEBUG
         print("[AuthRestore] restoredFanUser email=\(sessionEmail)")
 #endif
+        // Session restore does not hydrate favorite teams; force a server reload after auth id is set.
+        Task {
+            await loadFavoriteTeamsFromSupabase(forceRefresh: true)
+        }
     }
 
     private func bootstrapAuthSessionResultWithRetry() async -> SupabaseAuthSessionResolution {
@@ -2581,11 +3192,18 @@ extension MapViewModel {
 
     // Fetches the row for the current user by `auth.uid` when a session exists; otherwise falls back to email (e.g. venue-owner context without fan session).
     func loadUserProfile() async {
+        if let ownedTask = await MainActor.run(body: { profileLoadTask }) {
+            await ownedTask.value
+            return
+        }
+
         let sessionResolution = await supabaseResolvedAuthSessionResult()
         if case .refreshFailed(let error) = sessionResolution {
+            let generation = await MainActor.run { accountProfileGeneration }
+            let userId = await MainActor.run { currentUserAuthId }
             await MainActor.run {
                 markAuthRefreshFailed(error, reason: "loadUserProfile")
-                finishProfilePresentationLoad(profileExists: false)
+                finishProfilePresentationLoad(profileExists: false, userId: userId, generation: generation)
             }
 #if DEBUG
             print("[ProfilePersistenceDebug] profileLoadSkipped reason=authRefreshFailed")
@@ -2594,89 +3212,36 @@ extension MapViewModel {
         }
 
         if case .active(let session) = sessionResolution {
-            guard await checkCurrentUserAdminStatus() else {
+            let generation = await MainActor.run { accountProfileGeneration }
+            let applied = await performProfileLoad(
+                userId: session.user.id,
+                generation: generation,
+                reason: "loadUserProfile",
+                isRetry: false
+            )
+            if !applied {
                 await MainActor.run {
-                    finishProfilePresentationLoad(profileExists: false)
+                    cancelProfilePresentationLoadIfOwned(userId: session.user.id, generation: generation)
                 }
-                return
-            }
-
-            let authId = session.user.id
-#if DEBUG
-            print("[ProfilePersistenceDebug] loadingProfileForUserId=\(authId.uuidString.lowercased())")
-#endif
-            do {
-                let rows: [UserProfileRow] = try await supabase
-                    .from("user_profiles")
-                    .select(Self.userProfileSelectColumns)
-                    .eq("id", value: authId)
-                    .limit(1)
-                    .execute()
-                    .value
-
-                if let profile = rows.first {
-#if DEBUG
-                    print("[ProfilePersistenceDebug] existingProfileFound=true")
-#endif
-                    if profile.isDeletedAccount {
-                        if await shouldSuppressDeletedProfileBlockForBusinessSession(
-                            session: session,
-                            context: "loadUserProfile"
-                        ) {
-                            await MainActor.run {
-                                finishProfilePresentationLoad(profileExists: false)
-                            }
-                            return
-                        }
-                        await handleDeletedCurrentUser()
-                        await MainActor.run {
-                            finishProfilePresentationLoad(profileExists: false)
-                        }
-                        return
-                    }
-                    await MainActor.run {
-                        if applyLoadedUserProfileRow(profile, authId: authId) {
-                            finishProfilePresentationLoad(profileExists: true)
-                        }
-                    }
-#if DEBUG
-                    print("[ProfileDiscoverabilityDebug] loaded=\(profile.discoverableByFans)")
-#endif
-
-                    print("USER PROFILE LOADED")
-                } else {
-#if DEBUG
-                    print("[ProfilePersistenceDebug] existingProfileFound=false")
-#endif
-                    await MainActor.run {
-                        finishProfilePresentationLoad(profileExists: false)
-                    }
-                    print("NO USER PROFILE FOUND")
-                }
-
-            } catch {
-#if DEBUG
-                print("[ProfilePersistenceDebug] profileDecodeFailed=\(error.localizedDescription)")
-#endif
-                await MainActor.run {
-                    finishProfilePresentationLoad(profileExists: false)
-                }
-                print("ERROR LOADING USER PROFILE:", error)
             }
             return
         }
 
-        let email = !currentUserEmail.isEmpty ? currentUserEmail : venueOwnerEmail
+        let email = await MainActor.run {
+            !currentUserEmail.isEmpty ? currentUserEmail : venueOwnerEmail
+        }
+        let generation = await MainActor.run { accountProfileGeneration }
 
         guard !email.isEmpty else {
             await MainActor.run {
-                finishProfilePresentationLoad(profileExists: false)
+                finishProfilePresentationLoad(profileExists: false, generation: generation)
             }
             print("NO USER EMAIL FOR PROFILE LOAD")
             return
         }
 
         do {
+            try Task.checkCancellation()
             let rows: [UserProfileRow] = try await supabase
                 .from("user_profiles")
                 .select(Self.userProfileSelectColumns)
@@ -2695,17 +3260,17 @@ extension MapViewModel {
                     print("[AuthStateDebug] deletedAccountConfirmed=false reason=noSessionProfileFallbackDeletedRow")
 #endif
                     await MainActor.run {
-                        finishProfilePresentationLoad(profileExists: false)
+                        finishProfilePresentationLoad(profileExists: false, generation: generation)
                     }
                     return
                 }
                 await MainActor.run {
                     guard let profileAuthId = profile.id else {
-                        finishProfilePresentationLoad(profileExists: false)
+                        finishProfilePresentationLoad(profileExists: false, generation: generation)
                         return
                     }
-                    if applyLoadedUserProfileRow(profile, authId: profileAuthId) {
-                        finishProfilePresentationLoad(profileExists: true)
+                    if applyLoadedUserProfileRow(profile, authId: profileAuthId, generation: generation) {
+                        finishProfilePresentationLoad(profileExists: true, userId: profileAuthId, generation: generation)
                     }
                 }
 #if DEBUG
@@ -2718,17 +3283,23 @@ extension MapViewModel {
                 print("[ProfilePersistenceDebug] existingProfileFound=false")
 #endif
                 await MainActor.run {
-                    finishProfilePresentationLoad(profileExists: false)
+                    finishProfilePresentationLoad(profileExists: false, generation: generation)
                 }
                 print("NO USER PROFILE FOUND")
             }
 
         } catch {
+            if isProfileLoadCancellation(error) {
+#if DEBUG
+                print("[ProfilePersistenceDebug] profileDecodeFailed=\(error.localizedDescription)")
+#endif
+                return
+            }
 #if DEBUG
             print("[ProfilePersistenceDebug] profileDecodeFailed=\(error.localizedDescription)")
 #endif
             await MainActor.run {
-                finishProfilePresentationLoad(profileExists: false)
+                finishProfilePresentationLoad(profileExists: false, generation: generation)
             }
             print("ERROR LOADING USER PROFILE:", error)
         }

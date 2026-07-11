@@ -238,22 +238,19 @@ extension MapViewModel {
         }
 
         await MainActor.run {
-            clearAuthenticatedSessionCaches()
-            resetProfilePresentationLoadStateForNewAuth()
-            currentUserEmail = sessionEmail
-            currentUserDisplayName = Self.appleDisplayName(from: fullName)
-            currentUserUsername = ""
-            currentUserBio = ""
-            currentUserIsBusinessAccount = false
-            currentUserAvatarURL = ""
-            currentUserAvatarThumbnailURL = ""
-            isLoggedIn = true
-            isVenueOwnerLoggedIn = false
-            venueOwnerMode = false
-            currentUserAuthId = session.user.id
-            authSessionState = .signedIn
-            authErrorMessage = ""
-            bumpCurrentUserAvatarDisplayRefresh()
+            beginFanLoginSession(
+                userId: session.user.id,
+                reason: "appleFanSignIn",
+                email: sessionEmail,
+                displayName: Self.appleDisplayName(from: fullName)
+            ) {
+                isLoggedIn = true
+                isVenueOwnerLoggedIn = false
+                venueOwnerMode = false
+                authSessionState = .signedIn
+                authErrorMessage = ""
+                bumpCurrentUserAvatarDisplayRefresh()
+            }
         }
 
         guard await checkCurrentUserAdminStatus() else {
@@ -264,7 +261,10 @@ extension MapViewModel {
         await persistAccountModeForActiveAuthSession(.fanUser)
         clearExplicitLogoutMarkerAfterManualAuthSucceeded()
         await registerFanActiveSessionOnLogin()
-        Task { await refreshUserPersonalizationInBackground() }
+        Task {
+            await loadFavoriteTeamsFromSupabase(forceRefresh: true)
+            await refreshUserPersonalizationInBackground()
+        }
     }
 
     private func finishAppleBusinessSignIn(

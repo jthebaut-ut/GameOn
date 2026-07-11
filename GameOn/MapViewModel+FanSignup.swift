@@ -259,25 +259,21 @@ extension MapViewModel {
         }
 
         await MainActor.run {
-            clearAuthenticatedSessionCaches()
-            currentUserEmail = fanEmail
-            currentUserDisplayName = ""
-            currentUserUsername = ""
-            currentUserBio = ""
-            currentUserIsBusinessAccount = false
-            currentUserAvatarURL = ""
-            currentUserAvatarThumbnailURL = ""
-            isLoggedIn = true
-            isVenueOwnerLoggedIn = false
-            venueOwnerMode = false
-            authSessionState = .signedIn
+            beginFanLoginSession(
+                userId: session.user.id,
+                reason: "registerFanAccountWithProfile",
+                email: fanEmail
+            ) {
+                isLoggedIn = true
+                isVenueOwnerLoggedIn = false
+                venueOwnerMode = false
+                authSessionState = .signedIn
 #if DEBUG
-            print("[AuthStateDebug] authStateTransition=fanSignup->signedIn")
+                print("[AuthStateDebug] authStateTransition=fanSignup->signedIn")
 #endif
-            bumpCurrentUserAvatarDisplayRefresh()
+                bumpCurrentUserAvatarDisplayRefresh()
+            }
         }
-
-        await MainActor.run { currentUserAuthId = session.user.id }
 
         await persistAccountModeForActiveAuthSession(.fanUser)
 
