@@ -3,7 +3,10 @@
 
 build/
 
+.derivedData/
 DerivedData/
+
+backups/
 
 *.xcuserstate
 
