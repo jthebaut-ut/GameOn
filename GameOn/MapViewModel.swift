@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import MapKit
 import Combine
 import CoreLocation
@@ -100,7 +101,15 @@ final class MapViewModel: ObservableObject {
     /// Short-lived local not-going confirmations so reloads cannot re-add a deleted row before read replicas catch up.
     var recentlyConfirmedVenueEventNotGoingAt: [UUID: Date] = [:]
     let venueEventInterestLocalReconcileTTL: TimeInterval = 15
-    @Published var selectedTimeZone: TimeZoneOption = .mountain
+    @Published var selectedTimeZone: FanGeoTimeZonePreference = FanGeoTimeZoneStore.load() {
+        didSet {
+            guard oldValue != selectedTimeZone else { return }
+            FanGeoTimeZoneStore.save(selectedTimeZone)
+        }
+    }
+    /// Bumped when the device time zone may have changed while Automatic is selected.
+    @Published private(set) var automaticTimeZonePresentationToken = UUID()
+    var automaticTimeZoneChangeObserver: AutomaticTimeZoneChangeObserver?
     @Published var isLoggedIn: Bool = false
     @Published var authSessionState: FanGeoAuthSessionState = .signedOut
     @Published var currentUserEmail: String = ""
@@ -1315,4 +1324,39 @@ final class MapViewModel: ObservableObject {
     var lastVenueCalendarDotBoundsBucket: String?
     /// Debounced refresh of Discover venue calendar dots after map viewport / bar set changes.
     var discoverVenueCalendarDotPreloadTask: Task<Void, Never>?
+
+    func refreshAutomaticTimeZonePresentationIfNeeded() {
+        guard selectedTimeZone.isAutomatic else { return }
+        automaticTimeZonePresentationToken = UUID()
+        let zone = TimeZone.autoupdatingCurrent
+        TimeZoneDebug.automaticZone(zone.identifier)
+        TimeZoneDebug.displayedOffset(utcOffsetLabel(for: zone, at: Date()))
+    }
+
+    func startAutomaticTimeZoneChangeMonitoringIfNeeded() {
+        guard automaticTimeZoneChangeObserver == nil else { return }
+        let center = NotificationCenter.default
+        let systemTimeZone = center.addObserver(
+            forName: .NSSystemTimeZoneDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor [weak self] in
+                self?.refreshAutomaticTimeZonePresentationIfNeeded()
+            }
+        }
+        let significantTimeChange = center.addObserver(
+            forName: UIApplication.significantTimeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor [weak self] in
+                self?.refreshAutomaticTimeZonePresentationIfNeeded()
+            }
+        }
+        automaticTimeZoneChangeObserver = AutomaticTimeZoneChangeObserver(
+            systemTimeZone: systemTimeZone,
+            significantTimeChange: significantTimeChange
+        )
+    }
 }

@@ -227,9 +227,7 @@ struct LiveScreen: View {
 
     private var liveUserCalendar: Calendar {
         var calendar = Calendar.current
-        if let timeZone = TimeZone(identifier: viewModel.selectedTimeZone.identifier) {
-            calendar.timeZone = timeZone
-        }
+        calendar.timeZone = viewModel.selectedTimeZone.resolvedTimeZone()
         return calendar
     }
 
@@ -418,7 +416,7 @@ struct LiveScreen: View {
     }
 
     private var userSelectedTimeZone: TimeZone {
-        TimeZone(identifier: viewModel.selectedTimeZone.identifier) ?? .current
+        viewModel.selectedTimeZone.resolvedTimeZone()
     }
 
     private func formattedLocalGameStartTime(_ startTime: Date, includeLocalPrefix: Bool = false) -> String {

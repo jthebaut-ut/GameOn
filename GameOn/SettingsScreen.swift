@@ -1180,12 +1180,13 @@ struct SettingsScreen: View {
             .navigationBarTitleDisplayMode(.inline)
 
         case .timeZone:
-            Form { SettingsTimeZoneCard(viewModel: viewModel) }
+            FanGeoTimeZoneSettingsView(
+                selection: $viewModel.selectedTimeZone,
+                automaticPresentationToken: viewModel.automaticTimeZonePresentationToken
+            )
                 .safeAreaInset(edge: .bottom, spacing: 0) {
                     Color.clear.frame(height: SettingsScrollBottomLayout.sheetScrollComfortInset)
                 }
-                .navigationTitle(L10n.t("time_zone", languageCode: appLanguageRaw))
-                .navigationBarTitleDisplayMode(.inline)
 
         case .language:
             FanGeoLanguageSelectionView(selectionRaw: $appLanguageRaw)
@@ -2450,9 +2451,10 @@ struct SettingsScreen: View {
                 Button {
                     profileSettingsPath.append(ProfileSettingsRoute.timeZone)
                 } label: {
-                    settingsRow(title: L10n.t("time_zone", languageCode: appLanguageRaw), subtitle: viewModel.selectedTimeZone.rawValue, systemImage: "clock", showsChevron: true)
+                    settingsRow(title: L10n.t("time_zone", languageCode: appLanguageRaw), subtitle: viewModel.selectedTimeZone.settingsRowSubtitle, systemImage: "clock", showsChevron: true)
                 }
                 .buttonStyle(.plain)
+                .id(viewModel.automaticTimeZonePresentationToken)
 
                 settingsRowDivider()
 
@@ -6637,7 +6639,7 @@ private struct SettingsGeneralSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             
-            SettingsTimeZoneCard(viewModel: viewModel)
+            SettingsTimeZoneSummaryCard(viewModel: viewModel)
                 .padding()
                 .background(Color.white.opacity(0.95))
                 .clipShape(RoundedRectangle(cornerRadius: 22))
@@ -6655,7 +6657,7 @@ private struct SettingsGeneralSection: View {
     }
 }
 
-private struct SettingsTimeZoneCard: View {
+private struct SettingsTimeZoneSummaryCard: View {
     @ObservedObject var viewModel: MapViewModel
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
@@ -6669,17 +6671,40 @@ private struct SettingsTimeZoneCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            Picker(L10n.t("time_zone", languageCode: appLanguageRaw), selection: $viewModel.selectedTimeZone) {
-                ForEach(TimeZoneOption.allCases) { option in
-                    Text("\(option.rawValue) (\(option.abbreviation))")
-                        .tag(option)
+            NavigationLink {
+                FanGeoTimeZoneSettingsView(
+                    selection: $viewModel.selectedTimeZone,
+                    automaticPresentationToken: viewModel.automaticTimeZonePresentationToken
+                )
+            } label: {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(viewModel.selectedTimeZone.settingsRowSubtitle)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+
+                        let zone = viewModel.selectedTimeZone.resolvedTimeZone()
+                        Text("\(viewModel.selectedTimeZone.identifier) · \(utcOffsetLabel(for: zone, at: Date()))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.leading)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
                 }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.black.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            .pickerStyle(.menu)
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.black.opacity(0.05))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .buttonStyle(.plain)
+            .accessibilityLabel("Time zone, \(viewModel.selectedTimeZone.settingsRowSubtitle)")
+            .accessibilityHint("Opens time zone selection")
         }
     }
 }

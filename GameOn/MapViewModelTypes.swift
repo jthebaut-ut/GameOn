@@ -1,46 +1,23 @@
 import Foundation
 import CoreLocation
 
-enum TimeZoneOption: String, CaseIterable, Identifiable {
-    case mountain = "Mountain Time"
-    case pacific = "Pacific Time"
-    case central = "Central Time"
-    case eastern = "Eastern Time"
-    case utc = "UTC"
-
-    var id: String { rawValue }
-
-    var abbreviation: String {
-        switch self {
-        case .mountain: return "MT"
-        case .pacific: return "PT"
-        case .central: return "CT"
-        case .eastern: return "ET"
-        case .utc: return "UTC"
-        }
-    }
-
-    var identifier: String {
-        switch self {
-        case .mountain: return "America/Denver"
-        case .pacific: return "America/Los_Angeles"
-        case .central: return "America/Chicago"
-        case .eastern: return "America/New_York"
-        case .utc: return "UTC"
-        }
-    }
-}
-
 enum CompactGameTimeFormatter {
-    static func timeWithZone(for date: Date, timeZoneOption: TimeZoneOption) -> String {
+    static func timeWithZone(for date: Date, timeZoneOption: FanGeoTimeZonePreference) -> String {
+        let zone = timeZone(for: timeZoneOption)
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = timeZone(for: timeZoneOption)
+        formatter.timeZone = zone
         formatter.dateFormat = "h:mm a"
-        return "\(formatter.string(from: date)) \(timeZoneOption.abbreviation)"
+        let displayed = "\(formatter.string(from: date)) \(timeZoneOption.shortAbbreviation(at: date))"
+        TimeZoneDebug.gameDateConverted(
+            identifier: timeZoneOption.identifier,
+            offset: utcOffsetLabel(for: zone, at: date),
+            displayed: displayed
+        )
+        return displayed
     }
 
-    static func timeWithZone(rawTime: String?, timeZoneOption: TimeZoneOption) -> String {
+    static func timeWithZone(rawTime: String?, timeZoneOption: FanGeoTimeZonePreference) -> String {
         let raw = rawTime?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !raw.isEmpty else { return "Time TBD" }
 
@@ -55,8 +32,8 @@ enum CompactGameTimeFormatter {
         return "\(cleaned) \(timeZoneOption.abbreviation)"
     }
 
-    static func timeZone(for option: TimeZoneOption) -> TimeZone {
-        TimeZone(identifier: option.identifier) ?? .current
+    static func timeZone(for option: FanGeoTimeZonePreference) -> TimeZone {
+        option.resolvedTimeZone()
     }
 
     private static func compactTimeText(_ raw: String) -> String {
@@ -88,13 +65,17 @@ enum CompactGameTimeFormatter {
         return knownZoneAbbreviations.contains { uppercased.hasSuffix(" \($0)") }
     }
 
-    private static let knownZoneAbbreviations = ["MT", "PT", "ET", "CT"]
+    private static let knownZoneAbbreviations = [
+        "MT", "PT", "ET", "CT", "UTC", "GMT",
+        "MST", "MDT", "PST", "PDT", "EST", "EDT", "CST", "CDT",
+        "BST", "CET", "CEST", "IST", "JST", "AEST", "AEDT", "NZST", "NZDT"
+    ]
 
     private static let verboseTimezoneReplacements = [
-        "(MT)", "(PT)", "(ET)", "(CT)",
+        "(MT)", "(PT)", "(ET)", "(CT)", "(UTC)",
         "Local MT", "Local PT", "Local ET", "Local CT",
         "MST", "MDT", "PST", "PDT", "EST", "EDT", "CST", "CDT",
-        "Mountain Time", "Pacific Time", "Eastern Time", "Central Time"
+        "Mountain Time", "Pacific Time", "Eastern Time", "Central Time", "UTC"
     ]
 }
 

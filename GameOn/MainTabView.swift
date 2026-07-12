@@ -212,6 +212,7 @@ struct MainTabView: View {
             }
 #endif
             viewModel.isCalendarTabSelected = selectedTab == .calendar
+            viewModel.startAutomaticTimeZoneChangeMonitoringIfNeeded()
             viewModel.isLiveTabSelected = selectedTab == .live
             if !Self.hasForcedDiscoverTabThisProcess {
                 Self.hasForcedDiscoverTabThisProcess = true
@@ -837,6 +838,7 @@ struct MainTabView: View {
             return
         }
         Task { await handleAppBecameActive() }
+        viewModel.refreshAutomaticTimeZonePresentationIfNeeded()
     }
 
     /// Scene restore: if the saved tab is Chat, require local auth or bounce away from private messages.
