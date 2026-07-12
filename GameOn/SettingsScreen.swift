@@ -1212,7 +1212,7 @@ struct SettingsScreen: View {
                         showUserAuthSheet = true
                     }
                 },
-                embedsInNavigationStack: false,
+                embedsInNavigationStack: true,
                 showsCloseButton: false
             )
 
@@ -3542,14 +3542,23 @@ struct SettingsScreen: View {
 
     private var settingsBusinessDashboardPendingVenueItems: [BusinessVenueDashboardPendingVenueItem] {
         viewModel.pendingVenueClaimsForSettings
-            .map { claim in
-                BusinessVenueDashboardPendingVenueItem(
-                    id: claim.id,
-                    name: settingsPendingClaimTitle(claim),
-                    submittedDateText: settingsPendingClaimSubmittedDateText(claim)
-                )
-            }
+            .map(settingsBusinessDashboardPendingVenueItem(for:))
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func settingsBusinessDashboardPendingVenueItem(
+        for claim: VenueClaimPendingSettingsRow
+    ) -> BusinessVenueDashboardPendingVenueItem {
+        let photoURL = claim.cover_photo_url?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return BusinessVenueDashboardPendingVenueItem(
+            id: claim.id,
+            name: settingsPendingClaimTitle(claim),
+            locationLine: settingsPendingClaimLocationLine(claim),
+            ownershipApprovalLine: "Business venue • Pending review",
+            submittedDateText: settingsPendingClaimSubmittedDateText(claim),
+            venuePhotoURL: photoURL?.isEmpty == false ? photoURL : nil,
+            venuePhotoThumbnailURL: nil
+        )
     }
 
     private var settingsBusinessDashboardVenueName: String {
@@ -4039,6 +4048,11 @@ struct SettingsScreen: View {
                 .padding(.bottom, FGSpacing.md)
             }
 
+            if pendingCount > 0 {
+                settingsBlockDivider()
+                settingsPendingVenueClaimsList()
+            }
+
             if rejectedCount > 0 {
                 settingsBlockDivider()
                 rejectedVenueClaimsList()
@@ -4154,8 +4168,12 @@ struct SettingsScreen: View {
         if viewModel.hasArchivedBusinessAccountForOwner() {
             return "Business account archived"
         }
+        if viewModel.hasPendingVerifiedBusinessVenueSetup,
+           viewModel.pendingBusinessDraftMatchesBusinessAuthEmail(viewModel.venueOwnerEmail) {
+            return "Finish setup — add your first venue for FanGeo review."
+        }
         guard viewModel.hasBusinessAccountForOwner() else {
-            return "Not set up — no businesses row for this email yet."
+            return "Not set up — create your business account to get started."
         }
         if let member = settingsBusinessMemberSinceLine() {
             return "Active • \(member)"
@@ -4234,6 +4252,108 @@ struct SettingsScreen: View {
         let country = claim.venue_country.map(BusinessLocationCountryPolicy.countryName(for:)) ?? ""
         let line = [city, st, country].filter { !$0.isEmpty }.joined(separator: ", ")
         return line.isEmpty ? nil : line
+    }
+
+    private func settingsPendingClaimLocationLine(_ claim: VenueClaimPendingSettingsRow) -> String {
+        if let cityState = settingsPendingClaimCityStateLine(claim) {
+            return cityState
+        }
+        let address = claim.venue_address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return address
+    }
+
+    @ViewBuilder
+    private func settingsPendingVenueClaimsList() -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Pending review")
+                .font(FGTypography.metadata.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.top, FGSpacing.md)
+                .padding(.bottom, FGSpacing.xs)
+
+            ForEach(Array(viewModel.pendingVenueClaimsForSettings.enumerated()), id: \.element.id) { index, claim in
+                if index > 0 {
+                    settingsRowDivider()
+                }
+                settingsPendingVenueClaimRow(claim)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func settingsPendingVenueClaimRow(_ claim: VenueClaimPendingSettingsRow) -> some View {
+        let photoURL = claim.cover_photo_url?.trimmingCharacters(in: .whitespacesAndNewlines)
+        HStack(alignment: .center, spacing: FGSpacing.md) {
+            settingsPendingVenueClaimThumbnail(photoURL: photoURL)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(settingsPendingClaimTitle(claim))
+                    .font(FGTypography.cardTitle)
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(1)
+                if let line = settingsPendingClaimCityStateLine(claim) {
+                    Text(line)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                } else if let address = claim.venue_address?.trimmingCharacters(in: .whitespacesAndNewlines), !address.isEmpty {
+                    Text(address)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
+                Text("Business venue • Pending review")
+                    .font(FGTypography.metadata.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(2)
+                Text(settingsPendingClaimSubmittedDateText(claim))
+                    .font(FGTypography.metadata)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            FGStatusPill(title: "Pending", kind: .pending)
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, FGSpacing.sm)
+    }
+
+    @ViewBuilder
+    private func settingsPendingVenueClaimThumbnail(photoURL: String?) -> some View {
+        let trimmed = photoURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ZStack {
+            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                .fill(Color.orange.opacity(colorScheme == .dark ? 0.18 : 0.10))
+            if !trimmed.isEmpty, let url = URL(string: trimmed) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    case .empty:
+                        ProgressView()
+                            .tint(.orange)
+                    @unknown default:
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } else {
+                Image(systemName: "building.2.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .frame(width: 54, height: 54)
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
     }
 
     private func settingsPendingClaimSubmittedDateText(_ claim: VenueClaimPendingSettingsRow) -> String {
@@ -4447,6 +4567,7 @@ private struct SettingsAccountDeletionSheet: View {
     @ObservedObject var viewModel: MapViewModel
     var onCloseAfterSuccess: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
     @State private var confirmationText: String = ""
     @State private var isDeleting: Bool = false
     @State private var errorMessage: String = ""
@@ -4460,56 +4581,27 @@ private struct SettingsAccountDeletionSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section {
-                    Text("Deleting your account removes or anonymizes your FanGeo profile and personal preferences. Favorites, saved venues, teams, and saved activity are removed. Existing chats and Fan Chat comments may remain as Deleted User to preserve conversation integrity, safety, and legal/compliance records. Deleted accounts cannot log back in unless FanGeo support restores or reactivates them. This action cannot be undone.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
+            ScrollView {
+                VStack(alignment: .leading, spacing: SettingsPremiumChrome.profileSectionListSpacing) {
+                    deletionHeader
 
-                Section("What happens") {
-                    deletionRow("Your profile identity and avatar are removed")
-                    deletionRow("Favorite teams and saved venues are removed")
-                    deletionRow("Going, Interested, and personal preference signals are removed")
-                    deletionRow("Direct messages and Fan Chat threads remain readable as Deleted User")
-                    deletionRow("Reports and moderation records stay available for safety review")
-                    deletionRow("This account cannot log back in unless support restores it")
-                }
+                    deletionPersonalInfoSection
+                    deletionActivitySection
+                    deletionPreservedInfoSection
+                    deletionPermanentWarningBanner
+                    deletionConfirmSection
 
-                Section("Confirm") {
-                    TextField("Type DELETE to confirm", text: $confirmationText)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                        .focused($confirmationFieldFocused)
-                        .disabled(isDeleting || didSucceed)
-
-                    Text("Type DELETE, then tap Delete Account Permanently. You will be signed out after deletion succeeds.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if !errorMessage.isEmpty {
-                    Section {
-                        Text(errorMessage)
-                            .font(.caption)
-                            .foregroundStyle(.red)
+                    if !errorMessage.isEmpty {
+                        deletionErrorBanner
                     }
-                }
 
-                Section {
-                    Button(role: .destructive) {
-                        Task { await runDelete() }
-                    } label: {
-                        HStack {
-                            Spacer()
-                            if isDeleting { ProgressView() }
-                            Text(isDeleting ? "Deleting..." : "Delete Account Permanently")
-                            Spacer()
-                        }
-                    }
-                    .disabled(!canDelete || isDeleting || didSucceed)
+                    deletionActionButtons
                 }
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.top, FGSpacing.sm)
+                .padding(.bottom, FGSpacing.lg)
             }
+            .background(Color(.systemGroupedBackground))
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 Color.clear.frame(height: SettingsScrollBottomLayout.sheetScrollComfortInset)
             }
@@ -4524,7 +4616,7 @@ private struct SettingsAccountDeletionSheet: View {
                             dismiss()
                         }
                     }
-                        .disabled(isDeleting)
+                    .disabled(isDeleting)
                 }
             }
             .alert("Your account has been deleted.", isPresented: $showDeletionSuccessConfirmation) {
@@ -4537,16 +4629,297 @@ private struct SettingsAccountDeletionSheet: View {
         }
     }
 
-    @ViewBuilder
-    private func deletionRow(_ text: String) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "minus.circle.fill")
+    private var deletionHeader: some View {
+        VStack(spacing: FGSpacing.md) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 44))
                 .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+
+            VStack(spacing: FGSpacing.xs) {
+                Text("Delete Your FanGeo Account")
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+
+                Text("Deleting your FanGeo account is permanent and cannot be undone.")
+                    .font(.subheadline)
+                    .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, FGSpacing.sm)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var deletionPersonalInfoSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ProfileSettingsSectionHeader(title: "Your personal information will be removed")
+            ProfileSettingsSectionCard {
+                VStack(alignment: .leading, spacing: 0) {
+                    deletionCheckmarkRow("Your FanGeo profile will be anonymized and displayed as \"Deleted User\"")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your profile photo and avatar will be permanently removed")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your favorite teams and saved venues will be removed")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your saved professional games and predictions will be removed")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your notification preferences and device push notifications will be removed")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your profile interactions (likes, props, pokes, blocks, etc.) will be removed")
+                    deletionSectionDivider
+                    deletionCheckmarkRow("Your personal FanGeo settings and preferences will be removed")
+                }
+                .padding(.vertical, FGSpacing.xs)
+            }
+        }
+    }
+
+    private var deletionActivitySection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ProfileSettingsSectionHeader(title: "Your FanGeo activity will end")
+            ProfileSettingsSectionCard {
+                VStack(alignment: .leading, spacing: 0) {
+                    deletionNeutralRow(
+                        systemImage: "sportscourt.fill",
+                        tint: .orange,
+                        text: "Pickup games you created will be cancelled or hidden"
+                    )
+                    deletionSectionDivider
+                    deletionNeutralRow(
+                        systemImage: "person.2.slash.fill",
+                        tint: .orange,
+                        text: "Outstanding pickup game requests and invitations will be cancelled"
+                    )
+                    deletionSectionDivider
+                    deletionNeutralRow(
+                        systemImage: "person.crop.circle.badge.minus",
+                        tint: .orange,
+                        text: "Active friendships will be archived and removed from active use"
+                    )
+                }
+                .padding(.vertical, FGSpacing.xs)
+            }
+        }
+    }
+
+    private var deletionPreservedInfoSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ProfileSettingsSectionHeader(title: "Information that must remain")
+            ProfileSettingsSectionCard {
+                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    HStack(alignment: .top, spacing: FGSpacing.sm) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.body)
+                            .symbolRenderingMode(.hierarchical)
+                            .foregroundStyle(.blue)
+                            .padding(.top, 1)
+
+                        Text("To protect conversations, moderation history, and community integrity, some shared information must remain. It will no longer identify you.")
+                            .font(.subheadline)
+                            .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                        deletionInfoBullet("Direct Messages (shown as \"Deleted User\")")
+                        deletionInfoBullet("Public comments (shown as \"Deleted User\")")
+                        deletionInfoBullet("Reports submitted or received")
+                        deletionInfoBullet("Support conversations with FanGeo")
+                        deletionInfoBullet("Administrative and moderation records")
+                    }
+                    .padding(.leading, FGSpacing.lg + FGSpacing.xs)
+                }
+                .padding(.vertical, FGSpacing.sm)
+                .padding(.horizontal, FGSpacing.md)
+            }
+        }
+    }
+
+    private var deletionPermanentWarningBanner: some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.title3.weight(.semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(deletionWarningTint)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                Text("Permanent deletion")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+
+                Text("This account cannot be restored after deletion. Your profile and private FanGeo data will be removed or anonymized, while certain shared records may remain as “Deleted User.”")
+                    .font(.subheadline)
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("Your current email address will remain reserved and cannot be used to create another FanGeo account at this time.")
+                    .font(.subheadline)
+                    .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(FGSpacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                .fill(deletionWarningTint.opacity(colorScheme == .dark ? 0.14 : 0.10))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                .strokeBorder(deletionWarningTint.opacity(colorScheme == .dark ? 0.38 : 0.30), lineWidth: 0.75)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "Permanent deletion. This account cannot be restored after deletion. Your profile and private FanGeo data will be removed or anonymized, while certain shared records may remain as Deleted User. Your current email address will remain reserved and cannot be used to create another FanGeo account at this time."
+        )
+    }
+
+    private var deletionWarningTint: Color {
+        Color.orange
+    }
+
+    private var deletionConfirmSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ProfileSettingsSectionHeader(title: "Confirm")
+            ProfileSettingsSectionCard {
+                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    TextField("Type DELETE to confirm", text: $confirmationText)
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                        .focused($confirmationFieldFocused)
+                        .disabled(isDeleting || didSucceed)
+                        .font(.body)
+
+                    Text("Type DELETE, then tap Delete My Account. You will be signed out after deletion succeeds.")
+                        .font(.caption)
+                        .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(FGSpacing.md)
+            }
+        }
+    }
+
+    private var deletionErrorBanner: some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.red)
+            Text(errorMessage)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(FGSpacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: SettingsPremiumChrome.cardRadius, style: .continuous)
+                .fill(Color.red.opacity(colorScheme == .dark ? 0.16 : 0.08))
+        }
+    }
+
+    private var deletionActionButtons: some View {
+        VStack(spacing: FGSpacing.sm) {
+            Button(role: .destructive) {
+                Task { await runDelete() }
+            } label: {
+                HStack(spacing: FGSpacing.sm) {
+                    if isDeleting {
+                        ProgressView()
+                    }
+                    Text(isDeleting ? "Deleting..." : "Delete My Account")
+                        .fontWeight(.semibold)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, FGSpacing.md)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .disabled(!canDelete || isDeleting || didSucceed)
+
+            Button {
+                if didSucceed {
+                    completeSuccessClose()
+                } else {
+                    dismiss()
+                }
+            } label: {
+                Text("Cancel")
+                    .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, FGSpacing.md)
+            }
+            .buttonStyle(.bordered)
+            .disabled(isDeleting)
+        }
+        .padding(.top, FGSpacing.xs)
+    }
+
+    @ViewBuilder
+    private var deletionSectionDivider: some View {
+        Divider()
+            .overlay(SettingsPremiumChrome.divider(colorScheme))
+            .opacity(0.42)
+            .padding(.leading, 40)
+            .padding(.trailing, FGSpacing.md)
+    }
+
+    @ViewBuilder
+    private func deletionCheckmarkRow(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.body)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.green)
+                .padding(.top, 1)
+
             Text(text)
                 .font(.subheadline)
+                .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, FGSpacing.sm + 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func deletionNeutralRow(systemImage: String, tint: Color, text: String) -> some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: systemImage)
+                .font(.body)
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(tint)
+                .frame(width: 22)
+                .padding(.top, 1)
+
+            Text(text)
+                .font(.subheadline)
+                .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, FGSpacing.sm + 2)
+        .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func deletionInfoBullet(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: FGSpacing.xs) {
+            Text("•")
+                .font(.subheadline)
+                .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
+            Text(text)
+                .font(.subheadline)
+                .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     private func runDelete() async {
@@ -5364,7 +5737,7 @@ private enum DeletedAccountSupportContact {
     }
 
     static func isDeletedAccountBlockMessage(_ message: String) -> Bool {
-        message.localizedCaseInsensitiveContains("account has been deleted")
+        MapViewModel.isDeletedAccountLoginBlockMessage(message)
     }
 }
 
@@ -5690,7 +6063,7 @@ private struct SettingsUserAuthSheet: View {
                     .padding(.top, FGSpacing.lg)
                 }
                 .scrollIndicators(.hidden)
-            } else if showRegisterMode {
+            } else if showRegisterMode, !viewModel.isDeletedAccountLoginBlocked {
                 FanSignupView(
                     viewModel: viewModel,
                     prefilledEmail: email,
@@ -5722,22 +6095,43 @@ private struct SettingsUserAuthSheet: View {
         }
         .onAppear {
             Task {
+                if viewModel.isDeletedAccountLoginBlocked {
+                    await MainActor.run {
+                        showRegisterMode = false
+                    }
+                    return
+                }
                 await viewModel.syncAppleFanSignupOnboardingFromActiveSession()
                 await MainActor.run {
-                    if viewModel.isAppleFanSignupOnboardingActive {
+                    if viewModel.isDeletedAccountLoginBlocked {
+                        showRegisterMode = false
+                    } else if viewModel.isAppleFanSignupOnboardingActive {
                         showRegisterMode = true
                     }
                 }
             }
         }
         .onChange(of: viewModel.applePendingFanSignupEmail) { _, newEmail in
+            guard !viewModel.isDeletedAccountLoginBlocked else {
+                showRegisterMode = false
+                return
+            }
             if !OwnerBusinessEmail.normalized(newEmail).isEmpty {
                 showRegisterMode = true
             }
         }
         .onChange(of: viewModel.appleFanOnboardingPasswordBypassActive) { _, isActive in
+            guard !viewModel.isDeletedAccountLoginBlocked else {
+                showRegisterMode = false
+                return
+            }
             if isActive {
                 showRegisterMode = true
+            }
+        }
+        .onChange(of: viewModel.authSessionState) { _, newState in
+            if newState == .deletedAccountConfirmed {
+                showRegisterMode = false
             }
         }
     }
@@ -5862,7 +6256,7 @@ private struct SettingsVenueAuthSheet: View {
     @State private var authTermsAccepted = false
 
     private var showsBusinessAuthTermsAcceptance: Bool {
-        viewModel.pendingEmailVerificationKind != .business && !viewModel.isVenueOwnerLoggedIn
+        !viewModel.shouldShowPendingBusinessEmailVerificationUI && !viewModel.isVenueOwnerLoggedIn
     }
 
     var body: some View {
@@ -5893,7 +6287,7 @@ private struct SettingsVenueAuthSheet: View {
                     )
                 }
 
-                if viewModel.pendingEmailVerificationKind == .business {
+                if viewModel.shouldShowPendingBusinessEmailVerificationUI {
                     EmailVerificationPendingView(
                         viewModel: viewModel,
                         kind: .business,
@@ -5903,6 +6297,19 @@ private struct SettingsVenueAuthSheet: View {
                             viewModel.venueAuthErrorMessage = ""
                         }
                     )
+                } else if viewModel.shouldShowFullPendingVerifiedVenueSetupUI {
+                    SettingsSheetStatusBanner(
+                        title: "Email verified",
+                        message: viewModel.businessVerifiedVenueSetupBannerMessage,
+                        tint: FGColor.accentGreen,
+                        systemImage: "checkmark.seal.fill"
+                    )
+                    SettingsVenueOwnerCard(
+                        viewModel: viewModel,
+                        venuePassword: $venuePassword,
+                        showVenueRegisterMode: $showVenueRegisterMode,
+                        authTermsAccepted: $authTermsAccepted
+                    )
                 } else if viewModel.isVenueOwnerLoggedIn {
                     SettingsVenueAuthSheetSignedInBody(
                         viewModel: viewModel,
@@ -5910,12 +6317,51 @@ private struct SettingsVenueAuthSheet: View {
                         dismissAuthSheet: { dismiss() }
                     )
                 } else {
+                    if viewModel.shouldShowVerifiedPendingBusinessSignInPrompt {
+                        SettingsSheetStatusBanner(
+                            title: "Email verified",
+                            message: viewModel.businessVerifiedVenueSetupBannerMessage,
+                            tint: FGColor.accentGreen,
+                            systemImage: "checkmark.seal.fill"
+                        )
+                    }
+
+                    if viewModel.shouldShowPendingBusinessSignupMatchingEmailBanner {
+                        SettingsSheetStatusBanner(
+                            title: nil,
+                            message: viewModel.pendingBusinessSetupResumeBannerMessage,
+                            tint: FGColor.accentBlue,
+                            systemImage: "arrow.uturn.forward.circle"
+                        )
+                    }
+
                     SettingsVenueOwnerCard(
                         viewModel: viewModel,
                         venuePassword: $venuePassword,
                         showVenueRegisterMode: $showVenueRegisterMode,
                         authTermsAccepted: $authTermsAccepted
                     )
+
+                    if viewModel.hasPendingBusinessSetupDraftForOtherEmail {
+                        Button {
+                            viewModel.activateResumePendingBusinessSetupForDraft()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "arrow.uturn.forward.circle")
+                                    .font(.caption.weight(.bold))
+                                Text(viewModel.pendingBusinessSetupResumeBannerMessage)
+                                    .font(FGTypography.caption.weight(.bold))
+                                    .multilineTextAlignment(.leading)
+                            }
+                            .foregroundStyle(FGColor.accentBlue)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 11)
+                            .padding(.horizontal, FGSpacing.md)
+                            .background(FGAdaptiveSurface.controlFill)
+                            .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
             .padding(.horizontal, FGSpacing.lg)
@@ -9106,7 +9552,7 @@ private struct SettingsVenueOwnerCard: View {
             case .account:
                 return "Manage your venues, watch parties, and sports events on FanGeo."
             case .venue:
-                return "Businesses can add more venues later from the dashboard."
+                return "Now add your first venue for FanGeo review."
             case .experience:
                 return "Help fans understand the match-day experience before they arrive."
             case .review:
@@ -9188,25 +9634,117 @@ private struct SettingsVenueOwnerCard: View {
         !OwnerBusinessEmail.normalized(viewModel.applePendingBusinessSignupEmail).isEmpty
     }
 
+    private var isPostVerificationVenueSetup: Bool {
+        viewModel.businessEmailVerifiedNeedsVenueSetup
+    }
+
+    private var businessSignupVisibleSteps: [BusinessSignupStep] {
+        if isPostVerificationVenueSetup {
+            return [.venue, .experience, .review]
+        }
+        if isApplePendingBusinessSignup {
+            return [.account, .venue, .experience, .review]
+        }
+        if showVenueRegisterMode {
+            return [.account]
+        }
+        return []
+    }
+
+    private var businessSignupAccountOnlyMissingRequirementMessage: String? {
+        BusinessCreationFormValidation.businessAccountOnlyMissingRequirementMessage(
+            venueOwnerEmail: viewModel.venueOwnerEmail,
+            venuePassword: venuePassword,
+            authTermsAccepted: authTermsAccepted,
+            businessName: signupBusinessName,
+            businessHandle: signupBusinessHandle,
+            skipEmailPasswordAuthFields: isApplePendingBusinessSignup
+        )
+    }
+
+    private var businessSignupVenueReviewFields: (
+        locationName: String,
+        streetAddress: String,
+        country: String,
+        city: String,
+        state: String,
+        phoneDialISO: String,
+        phoneLocal: String,
+        description: String,
+        proofNote: String,
+        coverPhotoData: Data?
+    ) {
+        (
+            locationName: signupLocationName,
+            streetAddress: signupStreet,
+            country: signupCountry,
+            city: signupCity,
+            state: signupState,
+            phoneDialISO: signupPhoneDialISO,
+            phoneLocal: signupPhoneLocal,
+            description: signupDescription,
+            proofNote: signupProof,
+            coverPhotoData: signupCoverData
+        )
+    }
+
     private var businessSignupMissingRequirementMessage: String? {
-        BusinessCreationFormValidation.businessCreationMissingRequirementMessage(
+        let venueFields = businessSignupVenueReviewFields
+        if isPostVerificationVenueSetup {
+            return BusinessCreationFormValidation.venueReviewSubmissionMissingRequirementMessage(
+                locationName: venueFields.locationName,
+                streetAddress: venueFields.streetAddress,
+                country: venueFields.country,
+                city: venueFields.city,
+                state: venueFields.state,
+                phoneDialISO: venueFields.phoneDialISO,
+                phoneLocal: venueFields.phoneLocal,
+                description: venueFields.description,
+                proofNote: venueFields.proofNote,
+                coverPhotoData: venueFields.coverPhotoData,
+                policiesAccepted: venueSignupPoliciesAccepted
+            )
+        }
+        if showVenueRegisterMode, businessSignupStep == .review {
+            return BusinessCreationFormValidation.businessCreationMissingRequirementMessage(
+                isRegisterMode: true,
+                venueOwnerEmail: viewModel.venueOwnerEmail,
+                venuePassword: venuePassword,
+                policiesAccepted: venueSignupPoliciesAccepted,
+                businessName: signupBusinessName,
+                businessHandle: signupBusinessHandle,
+                locationName: venueFields.locationName,
+                streetAddress: venueFields.streetAddress,
+                country: venueFields.country,
+                city: venueFields.city,
+                state: venueFields.state,
+                zip: signupZip,
+                phoneDialISO: venueFields.phoneDialISO,
+                phoneLocal: venueFields.phoneLocal,
+                description: venueFields.description,
+                proofNote: venueFields.proofNote,
+                coverPhotoData: venueFields.coverPhotoData,
+                skipEmailPasswordAuthFields: isApplePendingBusinessSignup
+            )
+        }
+        return BusinessCreationFormValidation.businessCreationMissingRequirementMessage(
             isRegisterMode: showVenueRegisterMode,
             venueOwnerEmail: viewModel.venueOwnerEmail,
             venuePassword: venuePassword,
             policiesAccepted: venueSignupPoliciesAccepted,
             businessName: signupBusinessName,
             businessHandle: signupBusinessHandle,
-            locationName: signupLocationName,
-            streetAddress: signupStreet,
-            country: signupCountry,
-            city: signupCity,
-            state: signupState,
+            locationName: venueFields.locationName,
+            streetAddress: venueFields.streetAddress,
+            country: venueFields.country,
+            city: venueFields.city,
+            state: venueFields.state,
             zip: signupZip,
-            phoneDialISO: signupPhoneDialISO,
-            phoneLocal: signupPhoneLocal,
-            description: signupDescription,
-            proofNote: signupProof,
-            coverPhotoData: signupCoverData,
+            phoneDialISO: venueFields.phoneDialISO,
+            phoneLocal: venueFields.phoneLocal,
+            description: venueFields.description,
+            proofNote: venueFields.proofNote,
+            coverPhotoData: venueFields.coverPhotoData,
             skipEmailPasswordAuthFields: isApplePendingBusinessSignup
         )
     }
@@ -9217,17 +9755,34 @@ private struct SettingsVenueOwnerCard: View {
     }
 
     private var signupPrimarySubmitDisabled: Bool {
-        isSignupSubmitting
-            || isCheckingBusinessSignupHandle
-            || (showVenueRegisterMode && businessSignupMissingRequirementMessage != nil)
-            || (showVenueRegisterMode && businessSignupStep == .account && !authTermsAccepted)
+        if isSignupSubmitting || isCheckingBusinessSignupHandle { return true }
+        if isPostVerificationVenueSetup || isApplePendingBusinessSignup {
+            if businessSignupStep == .review {
+                return businessSignupMissingRequirementMessage != nil
+            }
+            return false
+        }
+        if showVenueRegisterMode {
+            if businessSignupStep == .account {
+                if !authTermsAccepted { return true }
+                return businessSignupAccountOnlyMissingRequirementMessage != nil
+            }
+            if businessSignupStep == .review {
+                return businessSignupMissingRequirementMessage != nil
+            }
+            return false
+        }
+        return false
     }
 
     private var businessSignupPrimaryTitle: String {
         if isSignupSubmitting { return "Submitting..." }
         if businessSignupStep == .account, isCheckingBusinessSignupEmail { return "Checking email..." }
         if businessSignupStep == .account, isCheckingBusinessSignupHandle { return "Checking handle..." }
-        return businessSignupStep == .review ? "Create account & submit location" : "Continue"
+        if businessSignupStep == .account, !isApplePendingBusinessSignup, !isPostVerificationVenueSetup {
+            return "Create business account"
+        }
+        return businessSignupStep == .review ? "Submit venue for review" : "Continue"
     }
 
     private var signupAddressLabels: BusinessLocationAddressLabels {
@@ -9264,7 +9819,7 @@ private struct SettingsVenueOwnerCard: View {
 
     var body: some View {
         FGCard {
-            if showVenueRegisterMode {
+            if showVenueRegisterMode || isPostVerificationVenueSetup {
                 businessSignupWizard
             } else {
                 businessOwnerSignInContent
@@ -9311,8 +9866,8 @@ private struct SettingsVenueOwnerCard: View {
             }
             .buttonStyle(.plain)
             .padding(.top, showVenueRegisterMode ? 0 : 10)
-            .disabled(!authTermsAccepted && !showVenueRegisterMode)
-            .opacity((!authTermsAccepted && !showVenueRegisterMode) ? 0.55 : 1)
+            .disabled(isPostVerificationVenueSetup || (!authTermsAccepted && !showVenueRegisterMode))
+            .opacity((isPostVerificationVenueSetup || (!authTermsAccepted && !showVenueRegisterMode)) ? 0.55 : 1)
 
             if !viewModel.venueAuthErrorMessage.isEmpty {
                 SettingsSheetStatusBanner(
@@ -9396,6 +9951,7 @@ private struct SettingsVenueOwnerCard: View {
             applyApplePendingBusinessSignupState()
         }
         .onChange(of: viewModel.venueOwnerEmail) { _, _ in
+            viewModel.clearResumePendingBusinessSetupIfLoginEmailChanged()
             viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailEdited")
         }
         .onChange(of: venuePassword) { _, _ in
@@ -9566,24 +10122,30 @@ private struct SettingsVenueOwnerCard: View {
         }
         .onAppear {
             applyBusinessSignupDefaultsFromEmail()
+            restorePendingBusinessSignupDraftIntoFormIfNeeded()
+            if isPostVerificationVenueSetup, businessSignupVisibleSteps.contains(.venue) {
+                businessSignupStep = .venue
+            }
         }
     }
 
     private var businessSignupProgressHeader: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline) {
-                Text("Step \(businessSignupStep.rawValue) of \(BusinessSignupStep.allCases.count)")
-                    .font(FGTypography.metadata.weight(.bold))
-                    .foregroundStyle(FGColor.accentBlue)
+                if let stepIndex = businessSignupVisibleSteps.firstIndex(of: businessSignupStep) {
+                    Text("Step \(stepIndex + 1) of \(businessSignupVisibleSteps.count)")
+                        .font(FGTypography.metadata.weight(.bold))
+                        .foregroundStyle(FGColor.accentBlue)
+                }
                 Spacer(minLength: 0)
                 FGStatusPill(title: "Review required", kind: .custom(tint: FGColor.accentYellow))
             }
 
             HStack(spacing: 7) {
-                ForEach(BusinessSignupStep.allCases, id: \.rawValue) { step in
+                ForEach(Array(businessSignupVisibleSteps.enumerated()), id: \.offset) { index, step in
                     Capsule(style: .continuous)
                         .fill(
-                            step.rawValue <= businessSignupStep.rawValue
+                            (businessSignupVisibleSteps.firstIndex(of: businessSignupStep) ?? 0) >= index
                                 ? AnyShapeStyle(FGColor.brandGradient)
                                 : AnyShapeStyle(FGColor.divider(colorScheme).opacity(0.9))
                         )
@@ -9842,9 +10404,11 @@ private struct SettingsVenueOwnerCard: View {
     private var businessSignupNavigation: some View {
         VStack(spacing: FGSpacing.sm) {
             HStack(spacing: FGSpacing.sm) {
-                if businessSignupStep != .account {
+                if businessSignupStep != businessSignupVisibleSteps.first {
                     Button {
-                        guard let previous = businessSignupStep.previous else { return }
+                        guard let currentIndex = businessSignupVisibleSteps.firstIndex(of: businessSignupStep),
+                              currentIndex > businessSignupVisibleSteps.startIndex else { return }
+                        let previous = businessSignupVisibleSteps[businessSignupVisibleSteps.index(before: currentIndex)]
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                             businessSignupStep = previous
                             businessSignupStepMessage = nil
@@ -9863,7 +10427,7 @@ private struct SettingsVenueOwnerCard: View {
 
                 FGPrimaryButton(
                     title: businessSignupPrimaryTitle,
-                    isDisabled: isSignupSubmitting || isCheckingBusinessSignupEmail
+                    isDisabled: signupPrimarySubmitDisabled || isCheckingBusinessSignupEmail
                 ) {
                     Task { await advanceBusinessSignupWizard() }
                 }
@@ -9874,6 +10438,29 @@ private struct SettingsVenueOwnerCard: View {
                     .font(FGTypography.caption)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if isPostVerificationVenueSetup {
+                Button {
+                    Task {
+                        await viewModel.deferBusinessVenueSetupUntilLater()
+                        showVenueRegisterMode = false
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.left")
+                            .font(.caption.weight(.bold))
+                        Text("Back to Sign In")
+                            .font(FGTypography.caption.weight(.bold))
+                    }
+                    .foregroundStyle(FGColor.accentBlue)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 11)
+                    .background(FGAdaptiveSurface.controlFill)
+                    .clipShape(Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(isSignupSubmitting)
             }
         }
     }
@@ -9952,13 +10539,115 @@ private struct SettingsVenueOwnerCard: View {
                 return
             }
         }
-        if let next = businessSignupStep.next {
+        if businessSignupVisibleSteps == [.account] {
+            await submitBusinessAccountOnly()
+            return
+        }
+        if let currentIndex = businessSignupVisibleSteps.firstIndex(of: businessSignupStep),
+           businessSignupVisibleSteps.index(after: currentIndex) < businessSignupVisibleSteps.endIndex {
+            let next = businessSignupVisibleSteps[businessSignupVisibleSteps.index(after: currentIndex)]
             withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                 businessSignupStep = next
             }
             return
         }
         await submitBusinessSignup()
+    }
+
+    @MainActor
+    private func submitBusinessAccountOnly() async {
+        guard businessSignupAccountOnlyMissingRequirementMessage == nil else {
+            businessSignupStepMessage = businessSignupAccountOnlyMissingRequirementMessage
+            return
+        }
+
+        viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailPasswordSignUp")
+        isSignupSubmitting = true
+        defer { isSignupSubmitting = false }
+
+        await viewModel.registerBusinessAccountOnly(
+            email: viewModel.venueOwnerEmail,
+            password: venuePassword,
+            businessDisplayName: signupBusinessName,
+            businessHandle: signupBusinessHandle
+        )
+
+        if viewModel.shouldShowPendingBusinessEmailVerificationUI {
+            showVenueRegisterMode = false
+            return
+        }
+        if viewModel.businessEmailVerifiedNeedsVenueSetup {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                businessSignupStep = .venue
+            }
+        }
+    }
+
+    @MainActor
+    private func restorePendingBusinessSignupDraftIntoFormIfNeeded() {
+        guard let draft = viewModel.pendingBusinessEmailSignupDraft else { return }
+        let shouldRestoreForm =
+            viewModel.businessEmailVerifiedNeedsVenueSetup
+            || viewModel.resumePendingBusinessSetupForDraftEmail
+            || (viewModel.hasPendingVerifiedBusinessVenueSetup && viewModel.pendingBusinessDraftMatchesTypedLoginEmail)
+        guard shouldRestoreForm else { return }
+
+        if signupBusinessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signupBusinessName = draft.signup.businessDisplayName
+        }
+        if signupBusinessHandle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signupBusinessHandle = draft.signup.businessHandle
+        }
+        if viewModel.businessEmailVerifiedNeedsVenueSetup || viewModel.resumePendingBusinessSetupForDraftEmail,
+           viewModel.venueOwnerEmail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            viewModel.venueOwnerEmail = draft.email
+        }
+
+        let loc = draft.signup.firstLocation
+        if signupLocationName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !loc.venueName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            signupLocationName = loc.venueName
+            signupStreet = loc.address
+            signupAddressLine2 = loc.addressLine2
+            signupCity = loc.city
+            signupState = loc.state
+            signupCountry = loc.country
+            signupZip = loc.zip
+            signupPhoneDialISO = BusinessPhoneFields.defaultISO
+            signupPhoneLocal = loc.phone
+            signupWebsite = loc.website
+            signupDescription = loc.description
+            signupProof = loc.proofNote
+            signupScreenCount = loc.screenCount
+            signupServesFood = loc.servesFood
+            signupHasWifi = loc.hasWifi
+            signupHasGarden = loc.hasGarden
+            signupHasProjector = loc.hasProjector
+            signupPetFriendly = loc.petFriendly
+            signupFamilyFriendly = loc.familyFriendly
+            signupParking = loc.parkingAvailable
+            signupEasyParking = loc.easyParking
+            signupHandicapParking = loc.handicapParking
+            signupLiveMusic = loc.liveMusic
+            signupPoolTables = loc.poolTables
+            signupRooftop = loc.rooftop
+            signupDJNights = loc.djNights
+            signupKaraoke = loc.karaoke
+            signupCocktails = loc.cocktails
+            signupCraftBeer = loc.craftBeer
+            signupLatitude = loc.latitude
+            signupLongitude = loc.longitude
+            signupFormattedAddress = loc.formattedAddress ?? ""
+        }
+        if signupCoverData == nil {
+            signupCoverData = draft.coverPhotoJPEGData
+        }
+        if signupMenuData == nil {
+            signupMenuData = draft.menuPhotoJPEGData
+        }
+        if draft.recordVenueGuidelinesAcceptance {
+            venueSignupPoliciesAccepted = true
+        }
     }
 
     @MainActor
@@ -10119,6 +10808,13 @@ private struct SettingsVenueOwnerCard: View {
                 menuPhotoJPEGData: signupMenuData,
                 recordVenueGuidelinesAcceptance: venueSignupPoliciesAccepted
             )
+        } else if viewModel.hasPendingBusinessEmailSignupDraft || viewModel.businessEmailVerifiedNeedsVenueSetup {
+            await submitPendingBusinessVenueSetup(
+                payload: payload,
+                coverPhotoJPEGData: signupCoverData,
+                menuPhotoJPEGData: signupMenuData,
+                recordVenueGuidelinesAcceptance: venueSignupPoliciesAccepted
+            )
         } else {
             await viewModel.registerVenueOwner(
                 email: viewModel.venueOwnerEmail,
@@ -10136,6 +10832,27 @@ private struct SettingsVenueOwnerCard: View {
         venuePassword = ""
         confirmVenuePassword = ""
         businessSignupPasswordInlineError = nil
+    }
+
+    @MainActor
+    private func submitPendingBusinessVenueSetup(
+        payload: BusinessOwnerSignupPayload,
+        coverPhotoJPEGData: Data?,
+        menuPhotoJPEGData: Data?,
+        recordVenueGuidelinesAcceptance: Bool
+    ) async {
+        let ownerEmail = OwnerBusinessEmail.normalized(viewModel.venueOwnerEmail)
+        let draft = PendingBusinessEmailSignupDraft(
+            email: ownerEmail,
+            signup: payload,
+            coverPhotoJPEGData: coverPhotoJPEGData,
+            menuPhotoJPEGData: menuPhotoJPEGData,
+            recordVenueGuidelinesAcceptance: recordVenueGuidelinesAcceptance
+        )
+        if await viewModel.submitPendingBusinessVenueSetup(draft: draft) == false,
+           viewModel.venueAuthErrorMessage.isEmpty {
+            businessSignupStepMessage = "Sign in to submit your venue for FanGeo review."
+        }
     }
 
     @ViewBuilder
@@ -10906,6 +11623,16 @@ struct BusinessLocationVenuePicker: View {
         return claim.venue_address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    private func pendingClaimSubmittedDateText(_ claim: VenueClaimPendingSettingsRow) -> String {
+        guard let raw = claim.created_at?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return "Submitted date unavailable"
+        }
+        guard let date = SupabaseTimestampParsing.parseTimestamptz(raw) else {
+            return "Submitted \(String(raw.prefix(10)))"
+        }
+        return "Submitted \(date.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+
     private func managedVenueSelectorClaimRow(
         _ claim: VenueClaimPendingSettingsRow,
         status: ManagedVenueSelectorStatus
@@ -10919,8 +11646,8 @@ struct BusinessLocationVenuePicker: View {
             claimID: claim.id,
             title: title,
             subtitle: location.isEmpty ? "Business location" : location,
-            ownershipApprovalLine: nil,
-            statusNote: status == .pending ? "Waiting for admin approval" : "Review rejected",
+            ownershipApprovalLine: status == .pending ? "Business venue • Pending review" : nil,
+            statusNote: status == .pending ? pendingClaimSubmittedDateText(claim) : "Review rejected",
             status: status,
             venueRow: nil
         )

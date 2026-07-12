@@ -10,10 +10,23 @@ private struct AppleExistingFanProfileRow: Decodable {
 
 extension MapViewModel {
     var isAppleFanSignupOnboardingActive: Bool {
+        if isDeletedAccountLoginBlocked {
+            return false
+        }
         if !OwnerBusinessEmail.normalized(applePendingFanSignupEmail).isEmpty {
             return true
         }
         return appleFanOnboardingPasswordBypassActive
+    }
+
+    @MainActor
+    func clearPendingAppleFanSignupState(reason: String) {
+        applePendingFanSignupEmail = ""
+        applePendingFanSignupDisplayName = ""
+        appleFanOnboardingPasswordBypassActive = false
+#if DEBUG
+        print("[DeletedAccountLoginDebug] pendingAppleSignupCleared reason=\(reason)")
+#endif
     }
 
     static func authUserIsAppleOnly(_ user: User) -> Bool {
@@ -31,14 +44,42 @@ extension MapViewModel {
     }
 
     func syncAppleFanSignupOnboardingFromActiveSession() async {
+        guard !isDeletedAccountLoginBlocked else { return }
         guard !isLoggedIn else { return }
         do {
             let session = try await supabase.auth.session
             guard Self.authUserIsAppleOnly(session.user) else { return }
 
+            let lifecycle = await resolveFanProfileLifecycleState(userId: session.user.id)
+            switch lifecycle {
+            case .deleted:
+#if DEBUG
+                print("[DeletedAccountLoginDebug] onboardingRoutePrevented reason=deleted_account source=syncAppleFanSignupOnboardingFromActiveSession")
+#endif
+                _ = await enforceDeletedFanAccountLoginGate(
+                    userId: session.user.id,
+                    sessionEmail: OwnerBusinessEmail.normalized(session.user.email ?? ""),
+                    source: "syncAppleFanSignupOnboardingFromActiveSession"
+                )
+                return
+            case .disabled:
+                await handleDisabledCurrentUser()
+                return
+            case .missing:
+                break
+            case .active, .suspended, .business, .unknown:
+                await MainActor.run {
+                    clearPendingAppleFanSignupState(reason: "activeProfileNoOnboarding")
+                }
+                return
+            }
+
             let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
             guard OwnerBusinessEmail.isValidStrict(sessionEmail) else { return }
 
+#if DEBUG
+            print("[DeletedAccountLoginDebug] missingProfileOnboardingAllowed userId=\(session.user.id.uuidString.lowercased())")
+#endif
             await MainActor.run {
                 appleFanOnboardingPasswordBypassActive = true
                 if applePendingFanSignupEmail.isEmpty {
@@ -204,31 +245,69 @@ extension MapViewModel {
             return
         }
 
-        if !(await appleCurrentFanProfileExists(session: session)) {
-            let displayName = Self.appleDisplayName(from: fullName)
-            await MainActor.run {
-                applePendingFanSignupEmail = sessionEmail
-                applePendingFanSignupDisplayName = displayName
-                appleFanOnboardingPasswordBypassActive = true
-                currentUserAuthId = session.user.id
-                currentUserEmail = sessionEmail
-                authErrorMessage = ""
+#if DEBUG
+        print("[DeletedAccountLoginDebug] appleCredentialReceived userId=\(session.user.id.uuidString.lowercased())")
+#endif
+
+        let lifecycle = await resolveFanProfileLifecycleState(userId: session.user.id)
+        switch lifecycle {
+        case .deleted:
+#if DEBUG
+            print("[DeletedAccountLoginDebug] lifecycleState=deleted")
+            print("[DeletedAccountLoginDebug] onboardingRoutePrevented reason=deleted_account")
+#endif
+            _ = await enforceDeletedFanAccountLoginGate(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: "appleFanSignIn"
+            )
+            return
+
+        case .disabled:
+            await handleDisabledCurrentUser()
+            return
+
+        case .missing:
+            await routeAppleFanMissingProfileOnboarding(
+                session: session,
+                sessionEmail: sessionEmail,
+                fullName: fullName
+            )
+            return
+
+        case .active:
+            break
+
+        case .unknown:
+            if await enforceDeletedFanAccountLoginGate(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: "appleFanSignInUnknownLifecycle"
+            ) {
+                return
             }
-            print("[AppleAuthDebug] appleFanOnboardingPasswordBypassActive=true source=pendingProfileCreation")
-            print("[AppleAuthDebug] profileMissing=true")
-            print("[AppleAuthDebug] enteringPendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased())")
-            print("[AppleAuthDebug] routedToOnboarding=true")
-            print("[FanSignupDebug] applePendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased()) displayNameProvided=\(!displayName.isEmpty)")
             presentAppleAuthMessage(
-                "Signed in with Apple. Finish setting up your FanGeo profile.",
+                "Could not verify your FanGeo profile. Please try again.",
                 accountMode: .fan,
-                isError: false,
-                autoClearAfterSeconds: nil
+                isError: true,
+                autoClearAfterSeconds: 8
+            )
+            return
+
+        case .suspended, .business:
+            presentAppleAuthMessage(
+                "This Apple account cannot be used for fan sign-in.",
+                accountMode: .fan,
+                isError: true,
+                autoClearAfterSeconds: 8
             )
             return
         }
 
         guard await appleEnsureFanProfileExists(session: session, email: sessionEmail, fullName: fullName) else {
+            if await MainActor.run(body: { isDeletedAccountLoginBlocked }) {
+                return
+            }
             return
         }
 
@@ -405,29 +484,78 @@ extension MapViewModel {
         }
     }
 
+    private func routeAppleFanMissingProfileOnboarding(
+        session: Session,
+        sessionEmail: String,
+        fullName: PersonNameComponents?
+    ) async {
+#if DEBUG
+        print("[DeletedAccountLoginDebug] missingProfileOnboardingAllowed userId=\(session.user.id.uuidString.lowercased())")
+        print("[DeletedAccountLoginDebug] lifecycleState=missing")
+#endif
+        let displayName = Self.appleDisplayName(from: fullName)
+        await MainActor.run {
+            applePendingFanSignupEmail = sessionEmail
+            applePendingFanSignupDisplayName = displayName
+            appleFanOnboardingPasswordBypassActive = true
+            currentUserAuthId = session.user.id
+            currentUserEmail = sessionEmail
+            authErrorMessage = ""
+        }
+        print("[AppleAuthDebug] appleFanOnboardingPasswordBypassActive=true source=pendingProfileCreation")
+        print("[AppleAuthDebug] profileMissing=true")
+        print("[AppleAuthDebug] enteringPendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased())")
+        print("[AppleAuthDebug] routedToOnboarding=true")
+        print("[FanSignupDebug] applePendingProfileCreation=true email=\(sessionEmail) userId=\(session.user.id.uuidString.lowercased()) displayNameProvided=\(!displayName.isEmpty)")
+        presentAppleAuthMessage(
+            "Signed in with Apple. Finish setting up your FanGeo profile.",
+            accountMode: .fan,
+            isError: false,
+            autoClearAfterSeconds: nil
+        )
+    }
+
     private func appleEnsureFanProfileExists(
         session: Session,
         email: String,
         fullName: PersonNameComponents?
     ) async -> Bool {
-        do {
-            let rows: [AppleExistingFanProfileRow] = try await supabase
-                .from("user_profiles")
-                .select("id,is_deleted,admin_status")
-                .eq("id", value: session.user.id)
-                .limit(1)
-                .execute()
-                .value
-
-            if rows.first != nil {
-                print("[AppleAuthDebug] existingProfileFound=true")
-                return true
+        let lifecycle = await resolveFanProfileLifecycleState(userId: session.user.id)
+        switch lifecycle {
+        case .active:
+            print("[AppleAuthDebug] existingProfileFound=true")
+            return true
+        case .deleted:
+            print("[AppleAuthDebug] accountBlockedDeleted=true")
+            _ = await enforceDeletedFanAccountLoginGate(
+                userId: session.user.id,
+                sessionEmail: email,
+                source: "appleEnsureFanProfileExists"
+            )
+            return false
+        case .disabled:
+            await handleDisabledCurrentUser()
+            return false
+        case .missing:
+            break
+        case .unknown:
+            if await enforceDeletedFanAccountLoginGate(
+                userId: session.user.id,
+                sessionEmail: email,
+                source: "appleEnsureFanProfileExistsUnknownLifecycle"
+            ) {
+                return false
             }
+            return false
+        case .suspended, .business:
+            return false
+        }
 
-            print("[AppleAuthDebug] existingProfileFound=false")
-            print("[AppleAuthDebug] profileMissing=true")
-            print("[AppleAuthDebug] creatingNewProfile=true")
+        print("[AppleAuthDebug] existingProfileFound=false")
+        print("[AppleAuthDebug] profileMissing=true")
+        print("[AppleAuthDebug] creatingNewProfile=true")
 
+        do {
             let row = UserProfileBootstrapInsert(
                 id: session.user.id,
                 email: email,
@@ -461,37 +589,6 @@ extension MapViewModel {
                 isError: false,
                 autoClearAfterSeconds: nil
             )
-            return false
-        }
-    }
-
-    private func appleCurrentFanProfileExists(session: Session) async -> Bool {
-        do {
-            let rows: [AppleExistingFanProfileRow] = try await supabase
-                .from("user_profiles")
-                .select("id,is_deleted,admin_status")
-                .eq("id", value: session.user.id)
-                .limit(1)
-                .execute()
-                .value
-
-            guard let row = rows.first else {
-                print("[AppleAuthDebug] existingProfileFound=false")
-                return false
-            }
-
-            print("[AppleAuthDebug] existingProfileFound=true")
-            if row.is_deleted == true {
-                await forceLogout(reason: "appleFanSignupDeletedProfile", source: "MapViewModel.appleCurrentFanProfileExists")
-                await MainActor.run {
-                    authErrorMessage = "This account has been deleted.\nContact support if you believe this was a mistake."
-                }
-                print("[AppleAuthDebug] accountBlockedDeleted=true")
-                return true
-            }
-            return true
-        } catch {
-            print("[AppleAuthDebug] authError=\(error.localizedDescription)")
             return false
         }
     }
@@ -630,10 +727,11 @@ extension MapViewModel {
                 guard row.id != currentUserId else { continue }
 
                 if row.is_deleted == true {
-                    await forceLogout(reason: "appleFanEmailMatchesDeletedProfile", source: "MapViewModel.appleFanProfileConflictExists")
-                    await MainActor.run {
-                        authErrorMessage = "This account has been deleted.\nContact support if you believe this was a mistake."
-                    }
+                    _ = await enforceDeletedFanAccountLoginGate(
+                        userId: currentUserId,
+                        sessionEmail: email,
+                        source: "appleFanProfileConflictExists"
+                    )
                     print("[AppleAuthDebug] accountBlockedDeleted=true")
                     return true
                 }

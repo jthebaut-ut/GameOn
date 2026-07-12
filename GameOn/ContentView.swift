@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var queuedSupportDeepLinkRequest: SupportReplyNotificationDeepLinkRequest?
     @State private var supportNotificationPresentation: SupportNotificationPresentation?
     @State private var lastPresentedSupportDeepLinkRequestID: UUID?
+    @State private var lastPresentedSupportConversationID: UUID?
     #if DEBUG
     @State private var debugSplashMinimumElapsed = false
     #endif
@@ -22,6 +23,14 @@ struct ContentView: View {
             if shouldShowSplash {
                 FanGeoSplashView(statusMessage: bootstrapCoordinator.splashStatusMessage)
                     .zIndex(1)
+            } else if viewModel.authSessionState == .deletedAccountConfirmed {
+                DeletedAccountLoginGateView(viewModel: viewModel)
+                    .zIndex(2)
+                    .onAppear {
+#if DEBUG
+                        print("[DeletedAccountLoginDebug] contentRoute=deletedAccountBlock")
+#endif
+                    }
             } else if let ban = viewModel.activeAccountBan {
                 AccountSuspensionGateView(viewModel: viewModel, ban: ban, kind: .user)
                     .zIndex(2)
@@ -52,6 +61,8 @@ struct ContentView: View {
             ProGameNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             SupportReplyNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            FanGeoPlusAwardNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            BusinessProAwardNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             #if DEBUG
             print("[LaunchPathDebug] ContentViewMounted=true")
             print("[LaunchPathDebug] isBootstrapping=\(bootstrapCoordinator.isBootstrapping)")
@@ -71,17 +82,23 @@ struct ContentView: View {
             guard !isBootstrapping else { return }
             presentQueuedSupportDeepLinkIfReady()
         }
-        .sheet(item: $supportNotificationPresentation) { presentation in
-            NavigationStack {
-                ContactGameOnSupportSheet(
-                    viewModel: viewModel,
-                    onRequestSignIn: {},
-                    embedsInNavigationStack: false,
-                    showsCloseButton: true,
-                    initialTicketID: presentation.initialTicketID
-                )
-                .environmentObject(chatViewModel)
-            }
+        .sheet(item: $supportNotificationPresentation, onDismiss: {
+#if DEBUG
+            print("[SupportNotificationRoute] support center sheet dismissed")
+#endif
+            // Allow a later push for the same conversation after the sheet is closed.
+            lastPresentedSupportDeepLinkRequestID = nil
+            lastPresentedSupportConversationID = nil
+        }) { presentation in
+            // Hub owns its NavigationStack — do not wrap another stack here.
+            ContactGameOnSupportSheet(
+                viewModel: viewModel,
+                onRequestSignIn: {},
+                embedsInNavigationStack: true,
+                showsCloseButton: true,
+                initialTicketID: presentation.initialTicketID
+            )
+            .environmentObject(chatViewModel)
         }
         .onChange(of: bootstrapCoordinator.isBootstrapping) {
             #if DEBUG
@@ -146,14 +163,32 @@ struct ContentView: View {
     }
 
     private func queueSupportDeepLinkRequest(_ request: SupportReplyNotificationDeepLinkRequest) {
+#if DEBUG
+        print("[SupportNotificationRoute] current route state sheetPresented=\(supportNotificationPresentation != nil) queued=\(queuedSupportDeepLinkRequest != nil) lastRequest=\(lastPresentedSupportDeepLinkRequestID?.uuidString.lowercased() ?? "nil")")
+#endif
         if lastPresentedSupportDeepLinkRequestID == request.id {
 #if DEBUG
+            print("[SupportNotificationRoute] duplicate presentation prevented requestId=\(request.id.uuidString.lowercased())")
             print("[SupportDeepLink] ignored duplicate requestId=\(request.id.uuidString.lowercased())")
+#endif
+            return
+        }
+        if supportNotificationPresentation != nil,
+           lastPresentedSupportConversationID == request.conversationID {
+#if DEBUG
+            print("[SupportNotificationRoute] duplicate presentation prevented conversationId=\(request.conversationID.uuidString.lowercased()) support center already open")
+#endif
+            // Consume without stacking another sheet.
+            lastPresentedSupportDeepLinkRequestID = request.id
+            queuedSupportDeepLinkRequest = nil
+#if DEBUG
+            print("[SupportNotificationRoute] pending route consumed/cleared conversationId=\(request.conversationID.uuidString.lowercased())")
 #endif
             return
         }
         queuedSupportDeepLinkRequest = request
 #if DEBUG
+        print("[SupportNotificationRoute] pending route queued conversationId=\(request.conversationID.uuidString.lowercased())")
         print("[SupportDeepLink] queued conversationId=\(request.conversationID.uuidString.lowercased())")
 #endif
         presentQueuedSupportDeepLinkIfReady()
@@ -163,25 +198,31 @@ struct ContentView: View {
         guard let request = queuedSupportDeepLinkRequest else { return }
         guard !shouldShowSplash else {
 #if DEBUG
+            print("[SupportNotificationRoute] pending route waiting for splash conversationId=\(request.conversationID.uuidString.lowercased())")
             print("[SupportDeepLink] queued waitingForSplash conversationId=\(request.conversationID.uuidString.lowercased())")
 #endif
             return
         }
         guard supportNotificationPresentation == nil else {
 #if DEBUG
+            print("[SupportNotificationRoute] pending route waiting for sheet dismiss conversationId=\(request.conversationID.uuidString.lowercased())")
             print("[SupportDeepLink] queued waitingForDismissedSheet conversationId=\(request.conversationID.uuidString.lowercased())")
 #endif
             return
         }
 
+        // Consume exactly once.
         queuedSupportDeepLinkRequest = nil
         lastPresentedSupportDeepLinkRequestID = request.id
+        lastPresentedSupportConversationID = request.conversationID
 
         let opensTicket = SupportReplyNotificationDeepLinkConfiguration.opensTicketDirectly
             && (viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn)
         let initialTicketID = opensTicket ? request.conversationID : nil
 
 #if DEBUG
+        print("[SupportNotificationRoute] support center opened opensTicketDirectly=\(opensTicket) conversationId=\(request.conversationID.uuidString.lowercased())")
+        print("[SupportNotificationRoute] pending route consumed/cleared conversationId=\(request.conversationID.uuidString.lowercased())")
         print("[SupportDeepLink] presenting Support Center opensTicketDirectly=\(opensTicket) conversationId=\(request.conversationID.uuidString.lowercased())")
 #endif
 
@@ -191,6 +232,155 @@ struct ContentView: View {
         )
     }
 }
+
+private struct DeletedAccountLoginGateView: View {
+    @ObservedObject var viewModel: MapViewModel
+    @State private var showMailComposer = false
+    @State private var fallbackMessage = ""
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var attemptedLoginEmail: String {
+        let blocked = viewModel.blockedDeletedAccountAttemptEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !blocked.isEmpty { return blocked }
+        return viewModel.currentUserEmail
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer(minLength: 32)
+
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 46, weight: .bold))
+                .foregroundStyle(FGColor.dangerRed)
+
+            VStack(spacing: 10) {
+                Text(MapViewModel.deletedAccountLoginBlockedTitle)
+                    .font(.system(size: 28, weight: .black, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+
+                Text(MapViewModel.deletedAccountLoginBlockedMessage)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(22)
+            .frame(maxWidth: 420)
+            .background(FGAdaptiveSurface.cardElevated, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(0.45), lineWidth: 1)
+            }
+
+            VStack(spacing: 12) {
+                Button(action: contactSupport) {
+                    Text("Contact Support")
+                        .font(.headline.weight(.bold))
+                        .frame(maxWidth: 260)
+                        .padding(.vertical, 14)
+                        .background(FGColor.accentBlue, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    viewModel.acknowledgeDeletedAccountLoginBlock()
+                } label: {
+                    Text("Close")
+                        .font(.headline.weight(.semibold))
+                        .frame(maxWidth: 260)
+                        .padding(.vertical, 14)
+                        .background(FGColor.divider(colorScheme).opacity(0.18), in: Capsule())
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                }
+                .buttonStyle(.plain)
+            }
+
+            if !fallbackMessage.isEmpty {
+                Text(fallbackMessage)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
+
+            Spacer(minLength: 32)
+        }
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .fanGeoScreenBackground()
+#if canImport(MessageUI)
+        .sheet(isPresented: $showMailComposer) {
+            DeletedAccountLoginMailComposer(attemptedLoginEmail: attemptedLoginEmail)
+        }
+#endif
+    }
+
+    private func contactSupport() {
+        fallbackMessage = ""
+#if canImport(MessageUI)
+        if MFMailComposeViewController.canSendMail() {
+            showMailComposer = true
+            return
+        }
+#endif
+#if canImport(UIKit)
+        UIPasteboard.general.string = "support@fangeosports.com"
+        fallbackMessage = "Support email copied: support@fangeosports.com"
+#else
+        fallbackMessage = "Contact support at support@fangeosports.com"
+#endif
+    }
+}
+
+#if canImport(MessageUI)
+import MessageUI
+
+private struct DeletedAccountLoginMailComposer: UIViewControllerRepresentable {
+    let attemptedLoginEmail: String
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> MFMailComposeViewController {
+        let composer = MFMailComposeViewController()
+        composer.mailComposeDelegate = context.coordinator
+        composer.setToRecipients(["support@fangeosports.com"])
+        composer.setSubject("Deleted account support request")
+        let normalized = OwnerBusinessEmail.normalized(attemptedLoginEmail)
+        let emailLine = normalized.isEmpty ? "<enter your account email>" : normalized
+        composer.setMessageBody(
+            """
+            Email: \(emailLine)
+            Reason: I believe my account was deleted by mistake.
+            """,
+            isHTML: false
+        )
+        return composer
+    }
+
+    func updateUIViewController(_ uiViewController: MFMailComposeViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFinish: { dismiss() })
+    }
+
+    final class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
+        let onFinish: () -> Void
+
+        init(onFinish: @escaping () -> Void) {
+            self.onFinish = onFinish
+        }
+
+        func mailComposeController(
+            _ controller: MFMailComposeViewController,
+            didFinishWith result: MFMailComposeResult,
+            error: Error?
+        ) {
+            onFinish()
+        }
+    }
+}
+#endif
 
 private struct SupportNotificationPresentation: Identifiable {
     let requestID: UUID

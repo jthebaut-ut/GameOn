@@ -154,9 +154,21 @@ struct FanSignupView: View {
         .fanGeoScreenBackground()
         .onAppear {
             print("[SignupUX] render mode=create")
+            if viewModel.isDeletedAccountLoginBlocked {
+                onSwitchToSignIn()
+                return
+            }
             Task {
+                if await MainActor.run(body: { viewModel.isDeletedAccountLoginBlocked }) {
+                    await MainActor.run { onSwitchToSignIn() }
+                    return
+                }
                 await viewModel.syncAppleFanSignupOnboardingFromActiveSession()
                 await MainActor.run {
+                    guard !viewModel.isDeletedAccountLoginBlocked else {
+                        onSwitchToSignIn()
+                        return
+                    }
                     applyApplePendingSignupState()
                 }
             }
@@ -168,6 +180,10 @@ struct FanSignupView: View {
 #endif
         }
         .onChange(of: viewModel.appleFanOnboardingPasswordBypassActive) { _, _ in
+            guard !viewModel.isDeletedAccountLoginBlocked else {
+                onSwitchToSignIn()
+                return
+            }
             applyApplePendingSignupState()
         }
         .onChange(of: handleDraft) { _, newValue in

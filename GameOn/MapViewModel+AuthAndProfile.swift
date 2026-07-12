@@ -415,7 +415,7 @@ extension MapViewModel {
     }
 
     private static func isDeletedAccountBlockMessage(_ message: String) -> Bool {
-        message.localizedCaseInsensitiveContains("account has been deleted")
+        MapViewModel.isDeletedAccountLoginBlockMessage(message)
     }
 
     private func hasStoredAccountModeForRestore() -> Bool {
@@ -991,6 +991,12 @@ extension MapViewModel {
         displayName: String = "",
         configure: () -> Void
     ) {
+        guard !isDeletedAccountLoginBlocked else {
+#if DEBUG
+            print("[DeletedAccountLoginDebug] profileCreationPrevented reason=deleted_account_blockedSession")
+#endif
+            return
+        }
         let generation = bumpAccountProfileGeneration(reason: reason, accountId: userId)
         AccountSwitchDebug.loginStarted(accountId: userId, generation: generation)
         clearAuthenticatedSessionCaches()
@@ -1739,6 +1745,12 @@ extension MapViewModel {
 
     @MainActor
     private func markAuthSignedIn(reason: String) {
+        guard !isDeletedAccountLoginBlocked else {
+#if DEBUG
+            print("[DeletedAccountLoginDebug] mainAppEntryBlocked reason=deleted_account_staleSignedInTask")
+#endif
+            return
+        }
         transitionAuthSessionState(.signedIn, reason: reason)
     }
 
@@ -1973,6 +1985,8 @@ extension MapViewModel {
         if let generation {
             guard accountProfileGeneration == generation else { return false }
         }
+        guard !isDeletedAccountLoginBlocked else { return false }
+        guard !profile.isDeletedAccount else { return false }
         guard shouldApplyLoadedUserProfile(authId: authId) else { return false }
 
         if let em = profile.email?.trimmingCharacters(in: .whitespacesAndNewlines), !em.isEmpty {
@@ -2273,6 +2287,14 @@ extension MapViewModel {
                 return
             }
 
+            if await enforceDeletedFanAccountLoginGate(
+                userId: activeSession.user.id,
+                sessionEmail: fanEmail,
+                source: "registerUser"
+            ) {
+                return
+            }
+
             await MainActor.run {
                 beginFanLoginSession(
                     userId: activeSession.user.id,
@@ -2352,6 +2374,14 @@ extension MapViewModel {
             }
 
             guard await claimAccountIdentity(.fan, context: "loginUser") else {
+                return
+            }
+
+            if await enforceDeletedFanAccountLoginGate(
+                userId: session.user.id,
+                sessionEmail: fanEmail,
+                source: "loginUser"
+            ) {
                 return
             }
 
@@ -2626,14 +2656,14 @@ extension MapViewModel {
         }
     }
 
-    private func handleDeletedCurrentUser() async {
+    func handleDeletedCurrentUser() async {
         logDeletedAccountRestoreDebug("blockedStateSetBy=handleDeletedCurrentUser")
         logDeletedAccountRestoreDebug("dbConfirmedDeleted=true source=user_profiles")
         await forceLogout(reason: "deletedAccountConfirmed", source: "MapViewModel.handleDeletedCurrentUser")
         await MainActor.run {
             resetProfilePresentationLoadStateForNewAuth()
             transitionAuthSessionState(.deletedAccountConfirmed, reason: "profileVerifiedDeleted")
-            authErrorMessage = "This account has been deleted.\nContact support if you believe this was a mistake."
+            authErrorMessage = Self.deletedAccountLoginBlockedMessage
         }
 #if DEBUG
         print("[AuthStateDebug] deletedAccountConfirmed=true")
@@ -2641,13 +2671,20 @@ extension MapViewModel {
 
     }
 
-    private func handleDisabledCurrentUser() async {
+    func handleDisabledCurrentUser() async {
         logDeletedAccountRestoreDebug("blockedStateSetBy=handleDisabledCurrentUser")
         logDeletedAccountRestoreDebug("dbConfirmedDeleted=true source=user_profiles_disabled")
         await forceLogout(reason: "disabledAccountConfirmed", source: "MapViewModel.handleDisabledCurrentUser")
         await MainActor.run {
             authErrorMessage = "This account has been disabled by FanGeo support."
         }
+    }
+
+    @MainActor
+    func acknowledgeDeletedAccountLoginBlock() {
+        blockedDeletedAccountAttemptEmail = ""
+        authErrorMessage = ""
+        transitionAuthSessionState(.signedOut, reason: "deletedAccountGateDismissed")
     }
 
     @discardableResult
@@ -2743,6 +2780,14 @@ extension MapViewModel {
         clearVenueOwnerCaches: Bool
     ) async {
         guard await claimAccountIdentity(.fan, context: "fanSessionRestore") else {
+            return
+        }
+
+        if await enforceDeletedFanAccountLoginGate(
+            userId: session.user.id,
+            sessionEmail: sessionEmail,
+            source: "fanSessionRestore"
+        ) {
             return
         }
 
@@ -3256,9 +3301,7 @@ extension MapViewModel {
                 print("[ProfilePersistenceDebug] existingProfileFound=true")
 #endif
                 if profile.isDeletedAccount {
-#if DEBUG
-                    print("[AuthStateDebug] deletedAccountConfirmed=false reason=noSessionProfileFallbackDeletedRow")
-#endif
+                    await handleDeletedCurrentUser()
                     await MainActor.run {
                         finishProfilePresentationLoad(profileExists: false, generation: generation)
                     }

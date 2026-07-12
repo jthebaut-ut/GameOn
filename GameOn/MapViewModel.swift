@@ -112,6 +112,8 @@ final class MapViewModel: ObservableObject {
     var automaticTimeZoneChangeObserver: AutomaticTimeZoneChangeObserver?
     @Published var isLoggedIn: Bool = false
     @Published var authSessionState: FanGeoAuthSessionState = .signedOut
+    /// Last fan login email used when a deleted tombstone profile blocked entry (support contact UI).
+    @Published var blockedDeletedAccountAttemptEmail: String = ""
     @Published var currentUserEmail: String = ""
     /// Supabase Auth user id; mirrors ``supabase.auth.session.user.id`` when signed in (fan session).
     @Published var currentUserAuthId: UUID? {

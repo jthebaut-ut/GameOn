@@ -258,6 +258,20 @@ extension MapViewModel {
             )
         }
 
+        if await enforceDeletedFanAccountLoginGate(
+            userId: session.user.id,
+            sessionEmail: fanEmail,
+            source: "registerFanAccountWithProfile"
+        ) {
+            let message = Self.deletedAccountLoginBlockedMessage
+            return FanSignupSubmitOutcome(
+                succeeded: false,
+                failureStep: .auth,
+                errorMessage: message,
+                authSucceeded: false
+            )
+        }
+
         await MainActor.run {
             beginFanLoginSession(
                 userId: session.user.id,
@@ -396,6 +410,20 @@ extension MapViewModel {
             )
         }
 
+        if await enforceDeletedFanAccountLoginGate(
+            userId: session.user.id,
+            sessionEmail: fanEmail,
+            source: "completeAppleFanSignupProfile"
+        ) {
+            let message = Self.deletedAccountLoginBlockedMessage
+            return FanSignupSubmitOutcome(
+                succeeded: false,
+                failureStep: .auth,
+                errorMessage: message,
+                authSucceeded: false
+            )
+        }
+
         await MainActor.run {
             currentUserAuthId = session.user.id
             currentUserEmail = fanEmail
@@ -464,6 +492,14 @@ extension MapViewModel {
 
         guard await claimAccountIdentity(.fan, context: "completePendingEmailFanSignupAfterConfirmation") else {
             await MainActor.run { emailVerificationError = authErrorMessage }
+            return true
+        }
+
+        if await enforceDeletedFanAccountLoginGate(
+            userId: session.user.id,
+            sessionEmail: fanEmail,
+            source: "completePendingEmailFanSignupAfterConfirmation"
+        ) {
             return true
         }
 
