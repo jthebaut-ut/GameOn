@@ -3460,6 +3460,7 @@ struct VenueOwnerDashboardView: View {
             storeKitBusinessProActive: businessProEntitlement.businessProActive
         )
         businessMembershipStatus = status
+        viewModel.effectiveBusinessMembershipStatus = status
         lastBusinessPlanRefreshAt = Date()
         lastBusinessPlanRefreshBusinessID = businessId
 
@@ -3542,6 +3543,7 @@ struct VenueOwnerDashboardView: View {
             }
             if let status = snapshot.entitlementStatus {
                 businessMembershipStatus = status
+                viewModel.effectiveBusinessMembershipStatus = status
                 lastBusinessPlanRefreshAt = Date()
                 lastBusinessPlanRefreshBusinessID = snapshot.businessId
                 logBusinessStatisticsGateDebug(status)

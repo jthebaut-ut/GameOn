@@ -327,6 +327,16 @@ struct BusinessVenueGamePostingStatus: Equatable {
         BusinessPlanLimitPresentation.hostedGamesFeatureText(for: self)
     }
 
+    /// Effective unlimited venue capacity (Pro, promo Pro, paid Pro, manual Pro, or admin unlimited override).
+    var hasUnlimitedVenueCapacity: Bool {
+        computedIsPro || unlimitedVenues
+    }
+
+    /// When false, approved venues beyond the Regular cap may remain backend `plan_locked`.
+    var shouldApplyRegularVenueCap: Bool {
+        !hasUnlimitedVenueCapacity
+    }
+
     private var normalizedPlanStatusForDisplay: String {
         let value = planStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value.isEmpty ? "active" : value

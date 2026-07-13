@@ -32,17 +32,22 @@ extension MapViewModel {
         storeKitBusinessProActive: Bool,
         businessId explicitBusinessId: UUID? = nil,
         now: Date = Date(),
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        skipPlanLockSync: Bool = false
     ) async -> BusinessVenueGamePostingStatus {
         _ = storeKitBusinessProActive
 
         guard let businessId = explicitBusinessId ?? currentBusinessIdForAddLocation() else {
+            let fallback = BusinessVenueGamePostingStatus.freeFallback(businessId: nil)
+            await MainActor.run {
+                effectiveBusinessMembershipStatus = fallback
+            }
             logBusinessEntitlementDebug(
                 businessId: nil,
                 source: "missingBusinessId",
-                status: .freeFallback(businessId: nil)
+                status: fallback
             )
-            return .freeFallback(businessId: nil)
+            return fallback
         }
 
         guard let entitlement = await loadBusinessEntitlements(businessId: businessId) else {
@@ -51,6 +56,9 @@ extension MapViewModel {
                 businessId: businessId,
                 venuesUsed: activeVenueCount
             )
+            await MainActor.run {
+                effectiveBusinessMembershipStatus = fallback
+            }
             logBusinessVenueAddGate(
                 businessId: businessId,
                 status: fallback,
@@ -61,6 +69,9 @@ extension MapViewModel {
                 source: "rpcFallbackFree",
                 status: fallback
             )
+            if !skipPlanLockSync {
+                await syncBusinessVenuePlanLocksWithEffectiveEntitlement(reason: "rpcFallbackFree", status: fallback)
+            }
             return fallback
         }
 
@@ -69,6 +80,10 @@ extension MapViewModel {
             entitlement,
             activeVenueCount: activeVenueCount
         )
+        await MainActor.run {
+            effectiveBusinessMembershipStatus = status
+            logBusinessVenueEntitlementClassification(reason: "business_entitlements", status: status)
+        }
         logBusinessVenueAddGate(
             businessId: businessId,
             status: status,
@@ -79,7 +94,60 @@ extension MapViewModel {
             source: "business_entitlements",
             status: status
         )
+        if !skipPlanLockSync {
+            await syncBusinessVenuePlanLocksWithEffectiveEntitlement(reason: "business_entitlements", status: status)
+        }
         return status
+    }
+
+    func syncBusinessVenuePlanLocksWithEffectiveEntitlement(
+        reason: String,
+        status: BusinessVenueGamePostingStatus
+    ) async {
+        guard status.hasUnlimitedVenueCapacity else { return }
+        let hasBackendPlanLocked = await MainActor.run { managedVenuesContainBackendPlanLocked() }
+        guard hasBackendPlanLocked else { return }
+
+        let shouldSync = await MainActor.run { () -> Bool in
+            if businessVenuePlanLockSyncInFlight { return false }
+            if let last = lastBusinessVenuePlanLockSyncAt,
+               Date().timeIntervalSince(last) < 15 {
+                return false
+            }
+            businessVenuePlanLockSyncInFlight = true
+            return true
+        }
+        guard shouldSync else { return }
+        defer {
+            Task { @MainActor in
+                businessVenuePlanLockSyncInFlight = false
+                lastBusinessVenuePlanLockSyncAt = Date()
+            }
+        }
+
+#if DEBUG
+        let backendPlanLockedCount = await MainActor.run {
+            managedVenuesForOwner().filter { MapViewModel.venueIsBackendPlanLocked($0) }.count
+        }
+        print("[BusinessVenueEntitlementDebug] planLockSyncStarted reason=\(reason) businessId=\(status.businessId?.uuidString.lowercased() ?? "nil") hasUnlimitedVenueCapacity=true backendPlanLockedCount=\(backendPlanLockedCount)")
+#endif
+        await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
+        let resolvedBusinessId: UUID?
+        if let statusBusinessId = status.businessId {
+            resolvedBusinessId = statusBusinessId
+        } else {
+            resolvedBusinessId = await MainActor.run { currentBusinessIdForAddLocation() }
+        }
+        if let businessId = resolvedBusinessId {
+            let refreshedStatus = await businessVenueGamePostingStatus(
+                storeKitBusinessProActive: false,
+                businessId: businessId,
+                skipPlanLockSync: true
+            )
+            await MainActor.run {
+                logBusinessVenueEntitlementClassification(reason: "planLockSyncCompleted:\(reason)", status: refreshedStatus)
+            }
+        }
     }
 
     func loadBusinessEntitlements(businessId: UUID) async -> BusinessEntitlementSnapshot? {

@@ -206,6 +206,128 @@ extension MapViewModel {
         return false
     }
 
+    /// Creates Supabase Auth user and stores business identity for post-verification venue setup.
+    func registerBusinessAccountOnly(
+        email: String,
+        password: String,
+        businessDisplayName: String,
+        businessHandle: String
+    ) async {
+        print("[EmailConfirmDebug] signupButtonTapped=true businessAccountOnly=true")
+        await MainActor.run { venueAuthErrorMessage = "" }
+
+        let ownerEmail = OwnerBusinessEmail.normalized(email)
+        let businessName = businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedHandle = FanGeoHandleRules.normalizeForStorage(businessHandle)
+
+        guard OwnerBusinessEmail.isValidStrict(ownerEmail) else {
+            await MainActor.run { venueAuthErrorMessage = OwnerBusinessEmail.invalidOwnerEmailUserMessage }
+            return
+        }
+        guard !businessName.isEmpty else {
+            await MainActor.run { venueAuthErrorMessage = "Please enter your business name." }
+            return
+        }
+        if let identityError = Self.validationErrorForBusinessIdentity(displayName: businessName, handle: normalizedHandle) {
+            await MainActor.run { venueAuthErrorMessage = identityError }
+            return
+        }
+        guard let handleAvailable = await checkBusinessHandleAvailableForSignup(normalizedHandle) else {
+            await MainActor.run { venueAuthErrorMessage = "Unable to verify business handle availability. Please try again." }
+            return
+        }
+        guard handleAvailable else {
+            await MainActor.run { venueAuthErrorMessage = "This business handle is already taken. Choose another." }
+            return
+        }
+        if await blockBusinessSignupIfEmailAlreadyReserved(ownerEmail) {
+            return
+        }
+
+        let signup = BusinessOwnerSignupPayload(
+            businessDisplayName: businessName,
+            businessHandle: normalizedHandle,
+            firstLocation: AddLocationClaimForm.pendingBusinessVenuePlaceholder()
+        )
+
+        let signUpResponse: AuthResponse
+        do {
+            signUpResponse = try await supabase.auth.signUp(
+                email: ownerEmail,
+                password: password,
+                redirectTo: Self.emailVerificationRedirectURL
+            )
+        } catch {
+            await MainActor.run {
+                let message = error.localizedDescription.lowercased()
+                if Self.isVenueOwnerSignupDuplicateEmailError(message) {
+                    venueAuthErrorMessage = "An account already exists for this email. Try signing in instead."
+                } else if message.contains("email rate limit") {
+                    venueAuthErrorMessage = "Email signup rate limit reached. Try again later or disable email confirmation during development."
+                } else if message.contains("email signups are disabled") {
+                    venueAuthErrorMessage = "Email signups are disabled in Supabase. Enable the Email provider."
+                } else {
+                    venueAuthErrorMessage = "Could not create business account. Please check your information and try again."
+                }
+            }
+            return
+        }
+
+        let signUpSession = signUpResponse.session
+        let restoredSession = try? await supabase.auth.session
+        guard let session = signUpSession ?? restoredSession,
+              Self.userEmailConfirmed(session.user) else {
+            await forceLogout(reason: "businessSignupNeedsEmailConfirmation", source: "MapViewModel.registerBusinessAccountOnly")
+            await MainActor.run {
+                let draft = PendingBusinessEmailSignupDraft(
+                    email: ownerEmail,
+                    signup: signup,
+                    coverPhotoJPEGData: nil,
+                    menuPhotoJPEGData: nil,
+                    recordVenueGuidelinesAcceptance: false
+                )
+                pendingBusinessEmailSignupDraft = draft
+                persistPendingBusinessEmailSignupDraft(draft)
+                markEmailVerificationPending(
+                    email: ownerEmail,
+                    kind: .business,
+                    verificationEmailConfirmedAsSent: Self.userConfirmationEmailConfirmedAsSent(signUpResponse.user),
+                    includeEmailDeliveryGuidance: true
+                )
+            }
+            return
+        }
+
+        await MainActor.run {
+            let draft = PendingBusinessEmailSignupDraft(
+                email: ownerEmail,
+                signup: signup,
+                coverPhotoJPEGData: nil,
+                menuPhotoJPEGData: nil,
+                recordVenueGuidelinesAcceptance: false,
+                emailVerified: true
+            )
+            pendingBusinessEmailSignupDraft = draft
+            persistPendingBusinessEmailSignupDraft(draft)
+            markBusinessEmailVerifiedAwaitingVenueSetup(email: ownerEmail)
+            currentUserAuthId = session.user.id
+            venueOwnerEmail = ownerEmail
+        }
+
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        guard businessOnboardingAllowed(for: lifecycle) else {
+#if DEBUG
+            print("[DeletedBusinessLoginDebug] signupPrevented reason=\(lifecycle.rawValue) source=registerBusinessAccountOnly")
+#endif
+            _ = await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: ownerEmail,
+                source: "registerBusinessAccountOnly"
+            )
+            return
+        }
+    }
+
     /// Creates Supabase Auth user, `businesses` row, and first `venue_claims` row (no public `venues` insert). Rolls back auth if `businesses` insert is blocked (e.g. RLS).
     func registerVenueOwner(
         email: String,
@@ -387,7 +509,7 @@ extension MapViewModel {
             return
         }
 
-        if await activeFanUserProfileExistsForEmail(ownerEmail) {
+        if await activeFanUserProfileExistsForEmail(ownerEmail, userId: session.user.id) {
 #if DEBUG
             print("[AuthAccountTypeGate] business registration blocked fanEmail=\(ownerEmail)")
 #endif
@@ -397,6 +519,14 @@ extension MapViewModel {
         }
 
         guard await claimAccountIdentity(.business, context: "registerVenueOwner") else {
+            return
+        }
+
+        guard await enforceBusinessCreationAllowed(
+            userId: ownerUserId,
+            sessionEmail: ownerEmail,
+            source: "registerVenueOwner"
+        ) else {
             return
         }
 
@@ -480,13 +610,21 @@ extension MapViewModel {
             return
         }
 
-        if await activeFanUserProfileExistsForEmail(ownerEmail) {
+        if await activeFanUserProfileExistsForEmail(ownerEmail, userId: session.user.id) {
             await undoPartialSupabaseSessionAfterAccountTypeMismatch()
             await MainActor.run { venueAuthErrorMessage = Self.businessSignupBlockedBecauseFanMessage }
             return
         }
 
         guard await claimAccountIdentity(.business, context: "completeApplePendingBusinessRegistration") else {
+            return
+        }
+
+        guard await enforceBusinessCreationAllowed(
+            userId: session.user.id,
+            sessionEmail: ownerEmail,
+            source: "completeApplePendingBusinessRegistration"
+        ) else {
             return
         }
 
@@ -514,6 +652,14 @@ extension MapViewModel {
         menuPhotoJPEGData: Data?,
         recordVenueGuidelinesAcceptance: Bool
     ) async {
+        guard await enforceBusinessCreationAllowed(
+            userId: ownerUserId,
+            sessionEmail: ownerEmail,
+            source: "registerVenueOwnerAfterEstablishedSession"
+        ) else {
+            return
+        }
+
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
         guard let coverData = coverPhotoJPEGData, !coverData.isEmpty else {
@@ -733,8 +879,7 @@ extension MapViewModel {
                 venueClaimSubmittedDate = inserted.created_at ?? ""
                 venueAuthErrorMessage = ""
                 venueOwnerJustCompletedRegistration = true
-                pendingBusinessEmailSignupDraft = nil
-                clearPersistedPendingBusinessEmailSignupDraft()
+                clearPendingBusinessEmailSignupState()
             }
 
 #if DEBUG
@@ -791,8 +936,14 @@ extension MapViewModel {
         draft: PendingBusinessEmailSignupDraft
     ) async -> Bool {
         let ownerEmail = OwnerBusinessEmail.normalized(session.user.email ?? draft.email)
+#if DEBUG
+        print("[PendingBusinessSignupTrace] enter completePendingBusinessSignupAfterConfirmation sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) userEmailConfirmed=\(Self.userEmailConfirmed(session.user))")
+#endif
         guard OwnerBusinessEmail.isValidStrict(ownerEmail),
               Self.userEmailConfirmed(session.user) else {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN invalid_or_unconfirmed_email sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) emailValid=\(OwnerBusinessEmail.isValidStrict(ownerEmail)) userEmailConfirmed=\(Self.userEmailConfirmed(session.user))")
+#endif
             return false
         }
 
@@ -800,6 +951,9 @@ extension MapViewModel {
         let businessName = signup.businessDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let businessHandle = FanGeoHandleRules.normalizeForStorage(signup.businessHandle)
         guard let coverData = draft.coverPhotoJPEGData, !coverData.isEmpty else {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN missing_cover_photo sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
             await MainActor.run {
                 venueAuthErrorMessage = "Main venue photo is required."
                 emailVerificationError = venueAuthErrorMessage
@@ -807,18 +961,62 @@ extension MapViewModel {
             return true
         }
 
-        if await activeFanUserProfileExistsForEmail(ownerEmail) {
+#if DEBUG
+        let bypassBeforeFanCheck = await pendingBusinessVenueSetupFanConflictBypass(email: ownerEmail, userId: session.user.id)
+        print("[PendingBusinessSignupTrace] before activeFanUserProfileExistsForEmail sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) pendingDraftOverride=\(bypassBeforeFanCheck.override)")
+#endif
+        let fanProfileExists = await activeFanUserProfileExistsForEmail(ownerEmail, userId: session.user.id)
+#if DEBUG
+        print("[PendingBusinessSignupTrace] activeFanUserProfileExistsForEmail returned=\(fanProfileExists) sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) pendingDraftOverride=\(bypassBeforeFanCheck.override)")
+#endif
+        if fanProfileExists {
+#if DEBUG
+            await MainActor.run {
+                logBusinessAuthFanConflictGate(
+                    context: "completePendingBusinessSignupAfterConfirmation",
+                    email: ownerEmail,
+                    userId: session.user.id,
+                    userProfileExists: true,
+                    blockingReason: "fan_account",
+                    pendingDraftOverride: bypassBeforeFanCheck.override,
+                    message: Self.businessSignupBlockedBecauseFanMessage,
+                    willSignOut: true,
+                    sessionEmailConfirmed: bypassBeforeFanCheck.sessionConfirmed
+                )
+            }
+            print("[PendingBusinessSignupTrace] EARLY RETURN fan_profile_block sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) pendingDraftOverride=\(bypassBeforeFanCheck.override)")
+            print("[AuthAccountTypeGate] completePendingBusinessSignup blocked fanEmail=\(ownerEmail)")
+#endif
             await undoPartialSupabaseSessionAfterAccountTypeMismatch()
             await MainActor.run { venueAuthErrorMessage = Self.businessSignupBlockedBecauseFanMessage }
             return true
         }
 
-        guard await claimAccountIdentity(.business, context: "completePendingBusinessSignupAfterConfirmation") else {
+#if DEBUG
+        print("[PendingBusinessSignupTrace] Reached claimAccountIdentity sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
+        let claimAccountIdentitySucceeded = await claimAccountIdentity(.business, context: "completePendingBusinessSignupAfterConfirmation")
+#if DEBUG
+        print("[PendingBusinessSignupTrace] claimAccountIdentity returned=\(claimAccountIdentitySucceeded) sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased())")
+#endif
+        guard claimAccountIdentitySucceeded else {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN claimAccountIdentity_failed sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
             await MainActor.run { emailVerificationError = venueAuthErrorMessage }
             return true
         }
 
         let ownerUserId = session.user.id
+
+        guard await enforceBusinessCreationAllowed(
+            userId: ownerUserId,
+            sessionEmail: ownerEmail,
+            source: "completePendingBusinessSignupAfterConfirmation"
+        ) else {
+            return true
+        }
+
         await MainActor.run {
             clearAuthenticatedSessionCaches()
             venueOwnerEmail = ownerEmail
@@ -837,10 +1035,16 @@ extension MapViewModel {
         }
 
         if await businessBanGuardBlocks(path: "businessSignup", action: "completePendingBusinessSignupAfterConfirmation") {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN business_ban_guard sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
             return true
         }
 
         guard let coverURL = await uploadVenuePhoto(data: coverData, fileName: "cover.jpg", assignToCurrentVenueProfile: false) else {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN cover_upload_failed sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
             await forceLogout(reason: "businessSignupCoverUploadFailedAfterEmailConfirmation", source: "MapViewModel.completePendingBusinessSignupAfterConfirmation")
             await MainActor.run {
                 venueAuthErrorMessage = VenueOwnerPhotoPickerCopy.pickFailureUserHint()
@@ -901,6 +1105,9 @@ extension MapViewModel {
 
         let businessId: UUID
         do {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] About to insert businesses row sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) displayName=\(businessName)")
+#endif
             let inserted: InsertedBusinessIdRow = try await supabase
                 .from("businesses")
                 .insert(businessPayload)
@@ -909,7 +1116,13 @@ extension MapViewModel {
                 .execute()
                 .value
             businessId = inserted.id
+#if DEBUG
+            print("[PendingBusinessSignupTrace] businesses insert succeeded businessId=\(businessId.uuidString.lowercased()) sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
         } catch {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN businesses_insert_failed sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) error=\(error.localizedDescription)")
+#endif
             await forceLogout(reason: "businessSignupBusinessInsertFailedAfterEmailConfirmation", source: "MapViewModel.completePendingBusinessSignupAfterConfirmation")
             await MainActor.run {
                 venueAuthErrorMessage =
@@ -930,6 +1143,9 @@ extension MapViewModel {
             venueState: mergedLocationForm.state.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
             venueZip: mergedLocationForm.zip.trimmingCharacters(in: .whitespacesAndNewlines)
         ) {
+#if DEBUG
+            print("[PendingBusinessSignupTrace] EARLY RETURN venue_claim_duplicate_preflight sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) businessId=\(businessId.uuidString.lowercased())")
+#endif
             await MainActor.run { venueAuthErrorMessage = dupMsg }
             await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
             await refreshPendingVenueClaimsForSettings()
@@ -945,6 +1161,9 @@ extension MapViewModel {
 
         do {
             let rpcParams = CreateBusinessVenueClaimRPCParams(claim: claim, businessId: businessId)
+#if DEBUG
+            print("[PendingBusinessSignupTrace] About to create_business_venue_claim businessId=\(businessId.uuidString.lowercased()) sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased())")
+#endif
 #if DEBUG
             print("[BusinessLocationRPCParams] orderedKeys=\(rpcParams.debugKeys)")
 #endif
@@ -965,6 +1184,7 @@ extension MapViewModel {
 
 #if DEBUG
             print("[BusinessEntitlementGate] businessId=\(businessId.uuidString.lowercased()) operation=createVenue allowed=true reason=emailConfirmationSignupRpcInserted")
+            print("[PendingBusinessSignupTrace] create_business_venue_claim succeeded businessId=\(businessId.uuidString.lowercased()) claimId=\(inserted.id.uuidString.lowercased()) sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased())")
 #endif
 
             await MainActor.run {
@@ -988,12 +1208,8 @@ extension MapViewModel {
                 venueClaimSubmittedDate = inserted.created_at ?? ""
                 venueAuthErrorMessage = ""
                 venueOwnerJustCompletedRegistration = true
-                pendingBusinessEmailSignupDraft = nil
-                clearPersistedPendingBusinessEmailSignupDraft()
-                pendingEmailVerificationEmail = ""
-                pendingEmailVerificationKind = nil
-                emailVerificationError = ""
-                emailVerificationMessage = "Email verified. Your business account was created."
+                clearPendingBusinessEmailSignupState()
+                emailVerificationMessage = "Email verified. Your business and venue were submitted for review."
             }
 
             let notifyPayload = venueClaimAdminNotifyPayloadFromInsert(
@@ -1017,6 +1233,7 @@ extension MapViewModel {
         } catch {
             print("VENUE CLAIM INSERT ERROR (signup after confirmation):", error)
 #if DEBUG
+            print("[PendingBusinessSignupTrace] create_business_venue_claim failed businessId=\(businessId.uuidString.lowercased()) sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) error=\(error.localizedDescription)")
             Self.logVenueSubmissionRPCDebug(
                 rpcName: "create_business_venue_claim",
                 failingQuerySection: "emailConfirmationVenueClaimInsert",
@@ -1036,7 +1253,61 @@ extension MapViewModel {
             checkVenueApprovalStatus()
         }
 
+#if DEBUG
+        print("[PendingBusinessSignupTrace] exit completePendingBusinessSignupAfterConfirmation returned=true sessionEmail=\(ownerEmail) authUserId=\(ownerUserId.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified)")
+#endif
         return true
+    }
+
+    /// Finishes a deferred business signup after the owner signs in with a verified email.
+    func resumePendingBusinessSignupAfterOwnerSignInIfNeeded(session: Session) async -> Bool {
+        guard Self.userEmailConfirmed(session.user) else { return false }
+        let ownerEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+        guard OwnerBusinessEmail.isValidStrict(ownerEmail) else { return false }
+
+        await MainActor.run {
+            restorePendingBusinessEmailSignupDraftIfNeeded()
+        }
+
+        guard let draft = pendingBusinessEmailSignupDraft,
+              OwnerBusinessEmail.normalized(draft.email) == ownerEmail else {
+            return false
+        }
+
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        switch lifecycle {
+        case .missing:
+            break
+        case .active:
+            await MainActor.run { clearPendingBusinessEmailSignupState() }
+            return false
+        case .deleted, .archived, .disabled, .unknown:
+#if DEBUG
+            print("[DeletedBusinessLoginDebug] signupPrevented reason=\(lifecycle.rawValue) source=resumePendingBusinessSignupAfterOwnerSignInIfNeeded")
+#endif
+            _ = await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: ownerEmail,
+                source: "resumePendingBusinessSignupAfterOwnerSignInIfNeeded"
+            )
+            return true
+        }
+
+        guard draft.isVenueSubmissionReady else {
+            return false
+        }
+        return await completePendingBusinessSignupAfterConfirmation(session: session, draft: draft)
+    }
+
+    /// Submits the first-venue claim after business email verification (business row + venue_claim RPC).
+    func submitPendingBusinessVenueSetup(draft: PendingBusinessEmailSignupDraft) async -> Bool {
+        guard let session = try? await supabase.auth.session else {
+            await MainActor.run {
+                venueAuthErrorMessage = "Sign in to submit your venue for FanGeo review."
+            }
+            return false
+        }
+        return await completePendingBusinessSignupAfterConfirmation(session: session, draft: draft)
     }
 
     // Signs in as venue owner and refreshes claim approval UI via `checkVenueApprovalStatus`.
@@ -1097,8 +1368,59 @@ extension MapViewModel {
                 return
             }
 
+            if await applyVerifiedBusinessSignupSessionIfAllowed(session: session) {
+                clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                return
+            }
+
+            if await resumePendingBusinessSignupAfterOwnerSignInIfNeeded(session: session) {
+                return
+            }
+
+            let ownerEmailForSetup = OwnerBusinessEmail.normalized(session.user.email ?? "")
+            if !pendingBusinessDraftMatchesBusinessAuthEmail(ownerEmailForSetup) {
+                await MainActor.run {
+                    resumePendingBusinessSetupForDraftEmail = false
+                }
+            }
+
+            if await MainActor.run(body: { businessEmailVerifiedNeedsVenueSetup }),
+               OwnerBusinessEmail.normalized(pendingBusinessEmailSignupDraft?.email ?? "") == ownerEmailForSetup {
+                let lifecycle = await resolveBusinessProfileLifecycleState()
+                guard businessOnboardingAllowed(for: lifecycle) else {
+#if DEBUG
+                    print("[DeletedBusinessLoginDebug] signupPrevented reason=\(lifecycle.rawValue) source=loginVenueOwner_pendingVenueSetup")
+#endif
+                    _ = await enforceBusinessLifecycleGate(
+                        userId: session.user.id,
+                        sessionEmail: ownerEmailForSetup,
+                        source: "loginVenueOwner_pendingVenueSetup"
+                    )
+                    return
+                }
+                await MainActor.run {
+                    venueAuthErrorMessage = ""
+                }
+                clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                return
+            }
+
             if await shouldBlockBusinessOwnerLogin(sessionEmail: ownerEmail, userId: session.user.id) {
 #if DEBUG
+                let bypass = await pendingBusinessVenueSetupFanConflictBypass(email: ownerEmail, userId: session.user.id)
+                await MainActor.run {
+                    logBusinessAuthFanConflictGate(
+                        context: "loginVenueOwner",
+                        email: ownerEmail,
+                        userId: session.user.id,
+                        userProfileExists: true,
+                        blockingReason: "fan_account",
+                        pendingDraftOverride: bypass.override,
+                        message: Self.businessLoginBlockedBecauseFanMessage,
+                        willSignOut: true,
+                        sessionEmailConfirmed: bypass.sessionConfirmed
+                    )
+                }
                 print("[AuthAccountTypeGate] business login blocked fanEmail=\(ownerEmail)")
 #endif
                 await undoPartialSupabaseSessionAfterAccountTypeMismatch()
@@ -1107,6 +1429,14 @@ extension MapViewModel {
             }
 
             guard await claimAccountIdentity(.business, context: "loginVenueOwner") else {
+                return
+            }
+
+            if await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: ownerEmail,
+                source: "loginVenueOwner"
+            ) {
                 return
             }
 
@@ -1213,8 +1543,43 @@ extension MapViewModel {
         raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
     }
 
-    static func venueIsPlanLocked(_ row: VenueProfileRow?) -> Bool {
+    static func venueIsBackendPlanLocked(_ row: VenueProfileRow?) -> Bool {
         venueAdminStatus(row?.admin_status) == "plan_locked"
+    }
+
+    static func venueIsPlanLocked(_ row: VenueProfileRow?) -> Bool {
+        venueIsBackendPlanLocked(row)
+    }
+
+    static func venueDisplaysAsPlanLocked(
+        _ row: VenueProfileRow?,
+        effectiveMembership: BusinessVenueGamePostingStatus?
+    ) -> Bool {
+        guard venueIsBackendPlanLocked(row) else { return false }
+        guard let effectiveMembership else { return true }
+        return effectiveMembership.shouldApplyRegularVenueCap
+    }
+
+    static func venueDisplaysAsPlanLocked(
+        _ row: VenueProfileRow?,
+        effectiveMembership: BusinessVenueGamePostingStatus?,
+        inactiveReason: inout String
+    ) -> Bool {
+        let backendStatus = venueAdminStatus(row?.admin_status)
+        if !(backendStatus.isEmpty || backendStatus == "active" || backendStatus == "plan_locked") {
+            inactiveReason = backendStatus
+            return true
+        }
+        guard venueIsBackendPlanLocked(row) else {
+            inactiveReason = "active"
+            return false
+        }
+        if let effectiveMembership, effectiveMembership.hasUnlimitedVenueCapacity {
+            inactiveReason = "backend_plan_locked_effective_unlimited"
+            return false
+        }
+        inactiveReason = "plan_locked_regular_cap"
+        return true
     }
 
     static func venueIsActiveForBusinessLimit(_ row: VenueProfileRow) -> Bool {
@@ -1229,11 +1594,37 @@ extension MapViewModel {
 
     func selectedManagedVenueIsPlanLocked() -> Bool {
         guard let selectedVenueID = ownerVenueDatabaseId else { return false }
-        return Self.venueIsPlanLocked(managedVenuesForOwner().first(where: { $0.id == selectedVenueID }))
+        let row = managedVenuesForOwner().first(where: { $0.id == selectedVenueID })
+        return Self.venueDisplaysAsPlanLocked(row, effectiveMembership: effectiveBusinessMembershipStatus)
+    }
+
+    func managedVenuesContainBackendPlanLocked() -> Bool {
+        managedVenuesForOwner().contains { Self.venueIsBackendPlanLocked($0) }
+    }
+
+    func managedVenuesDisplayPlanLocked() -> Bool {
+        managedVenuesForOwner().contains {
+            Self.venueDisplaysAsPlanLocked($0, effectiveMembership: effectiveBusinessMembershipStatus)
+        }
     }
 
     func managedVenuesContainPlanLocked() -> Bool {
-        managedVenuesForOwner().contains { Self.venueIsPlanLocked($0) }
+        managedVenuesDisplayPlanLocked()
+    }
+
+    func logBusinessVenueEntitlementClassification(reason: String, status: BusinessVenueGamePostingStatus) {
+#if DEBUG
+        let businessId = status.businessId?.uuidString.lowercased() ?? "nil"
+        let approvedCount = managedVenuesForOwner().count
+        print("[BusinessVenueEntitlementDebug] reason=\(reason) businessId=\(businessId) basePlan=\(status.planType) computedIsPro=\(status.computedIsPro) isBusinessProPromo=\(status.isBusinessProPromo) entitlementSource=\(status.entitlementSource ?? "nil") hasUnlimitedVenueCapacity=\(status.hasUnlimitedVenueCapacity) shouldApplyRegularVenueCap=\(status.shouldApplyRegularVenueCap) unlimitedVenues=\(status.unlimitedVenues) venueLimit=\(status.venueLimit) approvedVenueCount=\(approvedCount)")
+        for row in managedVenuesForOwner() {
+            guard let venueId = row.id else { continue }
+            var inactiveReason = "active"
+            let displaysLocked = Self.venueDisplaysAsPlanLocked(row, effectiveMembership: status, inactiveReason: &inactiveReason)
+            let backendStatus = Self.venueAdminStatus(row.admin_status)
+            print("[BusinessVenueEntitlementDebug] venueId=\(venueId.uuidString.lowercased()) backendStatus=\(backendStatus.isEmpty ? "active" : backendStatus) uiActive=\(!displaysLocked) uiInactiveReason=\(inactiveReason)")
+        }
+#endif
     }
 
     /// True only when at least one ``public.businesses`` row is loaded for this owner (do not infer from claim approval alone).
@@ -1580,6 +1971,22 @@ extension MapViewModel {
         }
     }
 
+    /// Business id for venue-scoped Chat: prefer `venues.business_id`, else approved `venue_claims.business_id`.
+    /// Pending/rejected/unclaimed claims never contribute an id (only `approval_status = approved` is cached).
+    func effectiveBusinessIdForVenueChat(for bar: BarVenue) -> UUID? {
+        if let businessId = bar.businessId {
+            return businessId
+        }
+        return approvedVenueOwnershipByVenueID[bar.id]?.businessId
+    }
+
+    /// Presentation/chat copy that carries the effective business id without mutating Discover/Live caches.
+    func barVenueForVenueChat(_ bar: BarVenue) -> BarVenue {
+        guard let effective = effectiveBusinessIdForVenueChat(for: bar) else { return bar }
+        if bar.businessId == effective { return bar }
+        return bar.replacingBusinessId(effective)
+    }
+
     private func discoverVenueClaimInsert(
         bar: BarVenue,
         venueRow: VenueRow?,
@@ -1730,7 +2137,8 @@ extension MapViewModel {
                     venue_country: claim.venue_country,
                     approval_status: inserted.approval_status,
                     rejection_acknowledged_at: nil,
-                    created_at: inserted.created_at
+                    created_at: inserted.created_at,
+                    cover_photo_url: claim.cover_photo_url.isEmpty ? nil : claim.cover_photo_url
                 )
 
                 pendingVenueClaimsForSettings.removeAll { existing in
@@ -1879,7 +2287,7 @@ extension MapViewModel {
         do {
             let rows: [VenueClaimPendingSettingsRow] = try await supabase
                 .from("venue_claims")
-                .select("id,business_id,venue_id,venue_name,venue_address,venue_address_line2,venue_city,venue_state,venue_country,approval_status,rejection_acknowledged_at,created_at")
+                .select("id,business_id,venue_id,venue_name,venue_address,venue_address_line2,venue_city,venue_state,venue_country,approval_status,rejection_acknowledged_at,created_at,cover_photo_url")
                 .eq("owner_email", value: email)
                 .order("created_at", ascending: false)
                 .limit(80)
@@ -3387,12 +3795,13 @@ extension MapViewModel {
                 businessId: business.id,
                 venuesUsed: activeCountBefore
             )
-            let venueLimit = max(0, status.venueLimit)
+            let venueLimit = BusinessPlanLimitPresentation.resolvedActiveVenueCap(for: status)
+                ?? max(0, min(status.venueLimit, BusinessMembershipPolicy.freeVenueListingLimit))
             let sortedRows = businessVenueLimitSortedRows(uniqueRows, approvedMetadata: approvedMetadata)
             let targetActiveIds: Set<UUID>
             let reason: String
 
-            if status.computedIsPro || status.unlimitedVenues {
+            if status.hasUnlimitedVenueCapacity {
                 targetActiveIds = Set(sortedRows.compactMap(\.id))
                 reason = "pro_reactivation"
             } else if approvedCount > venueLimit {
@@ -5552,7 +5961,8 @@ extension MapViewModel {
                         venue_country: trimmedCountry,
                         approval_status: inserted.approval_status,
                         rejection_acknowledged_at: nil,
-                        created_at: inserted.created_at
+                        created_at: inserted.created_at,
+                        cover_photo_url: nil
                     )
                     pendingVenueClaimsForSettings.removeAll { existing in
                         existing.venue_id == linkedVenueId

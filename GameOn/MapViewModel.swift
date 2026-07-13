@@ -12,6 +12,7 @@ enum FanGeoAuthSessionState: String {
     case signedOut
     case signedIn
     case deletedAccountConfirmed
+    case deletedBusinessAccountConfirmed
     case authRefreshFailed
 }
 
@@ -114,6 +115,12 @@ final class MapViewModel: ObservableObject {
     @Published var authSessionState: FanGeoAuthSessionState = .signedOut
     /// Last fan login email used when a deleted tombstone profile blocked entry (support contact UI).
     @Published var blockedDeletedAccountAttemptEmail: String = ""
+    /// Last business login email used when a deleted business tombstone blocked entry (support contact UI).
+    @Published var blockedDeletedBusinessAttemptEmail: String = ""
+    /// Last deleted business id captured when login was blocked (support contact UI).
+    @Published var blockedDeletedBusinessAttemptBusinessId: UUID? = nil
+    /// Last resolved business lifecycle snapshot (support prefill + deleted-business gate).
+    var lastResolvedBusinessLifecycleSnapshot: BusinessLifecycleSnapshot?
     @Published var currentUserEmail: String = ""
     /// Supabase Auth user id; mirrors ``supabase.auth.session.user.id`` when signed in (fan session).
     @Published var currentUserAuthId: UUID? {
@@ -173,6 +180,10 @@ final class MapViewModel: ObservableObject {
     @Published var archivedOwnedBusinesses: [BusinessRow] = []
     /// `public.venues` rows linked via `business_id` to ``ownedBusinesses``.
     @Published var ownedBusinessVenues: [VenueProfileRow] = []
+    /// Latest effective business entitlement used for venue plan-lock UI and gates.
+    @Published var effectiveBusinessMembershipStatus: BusinessVenueGamePostingStatus?
+    var businessVenuePlanLockSyncInFlight = false
+    var lastBusinessVenuePlanLockSyncAt: Date?
     /// Last successful lightweight Business Dashboard preload, kept in memory for fast first paint.
     @Published var businessDashboardPreloadSnapshot: BusinessDashboardPreloadSnapshot?
     var businessDashboardPreloadInFlightKey: String?

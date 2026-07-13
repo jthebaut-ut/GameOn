@@ -3482,7 +3482,10 @@ struct SettingsScreen: View {
                         ),
                         venuePhotoURL: row.cover_photo_url?.trimmingCharacters(in: .whitespacesAndNewlines),
                         venuePhotoThumbnailURL: row.cover_photo_thumbnail_url?.trimmingCharacters(in: .whitespacesAndNewlines),
-                        isPlanLocked: MapViewModel.venueIsPlanLocked(row)
+                        isPlanLocked: MapViewModel.venueDisplaysAsPlanLocked(
+                            row,
+                            effectiveMembership: settingsBusinessMembershipStatus ?? viewModel.effectiveBusinessMembershipStatus
+                        )
                     ),
                     approvedDate.sortDate,
                     approvedDate.debugRaw
@@ -3782,6 +3785,7 @@ struct SettingsScreen: View {
                 return
             }
             settingsBusinessMembershipStatus = status
+            viewModel.effectiveBusinessMembershipStatus = status
             settingsBusinessProfileLastEntitlementSignature = settingsBusinessEntitlementSignature
         }
         logSettingsInlineBusinessDashboardDebug()
@@ -3928,6 +3932,7 @@ struct SettingsScreen: View {
 
         if settingsBusinessMembershipStatus != status {
             settingsBusinessMembershipStatus = status
+            viewModel.effectiveBusinessMembershipStatus = status
         }
         settingsBusinessProfileLastEntitlementSignature = settingsBusinessEntitlementSignature
         logBusinessStatisticsGateDebug(status)
@@ -11444,13 +11449,22 @@ struct BusinessLocationVenuePicker: View {
                 venueID: id,
                 claimID: nil,
                 title: venueDisplayName(for: row),
-                subtitle: MapViewModel.venueIsPlanLocked(row)
+                subtitle: MapViewModel.venueDisplaysAsPlanLocked(
+                    row,
+                    effectiveMembership: viewModel.effectiveBusinessMembershipStatus
+                )
                     ? BusinessLimitCopy.planLockedVenueSubtitle
                     : (venueLocationSubtitle(for: row).isEmpty ? "Approved location for listings, games, and analytics." : venueLocationSubtitle(for: row)),
-                ownershipApprovalLine: MapViewModel.venueIsPlanLocked(row)
+                ownershipApprovalLine: MapViewModel.venueDisplaysAsPlanLocked(
+                    row,
+                    effectiveMembership: viewModel.effectiveBusinessMembershipStatus
+                )
                     ? nil
                     : managedVenueOwnershipApprovalLine(for: row),
-                statusNote: MapViewModel.venueIsPlanLocked(row) ? BusinessLimitCopy.planLockedVenueSubtitle : nil,
+                statusNote: MapViewModel.venueDisplaysAsPlanLocked(
+                    row,
+                    effectiveMembership: viewModel.effectiveBusinessMembershipStatus
+                ) ? BusinessLimitCopy.planLockedVenueSubtitle : nil,
                 status: managedVenueStatus(for: row),
                 venueRow: row
             )
@@ -11574,6 +11588,12 @@ struct BusinessLocationVenuePicker: View {
     }()
 
     private func managedVenueStatus(for row: VenueProfileRow) -> ManagedVenueSelectorStatus {
+        if MapViewModel.venueDisplaysAsPlanLocked(
+            row,
+            effectiveMembership: viewModel.effectiveBusinessMembershipStatus
+        ) {
+            return .locked
+        }
         let raw = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if raw.isEmpty || raw == "active" { return .approved }
         if raw == "plan_locked" { return .locked }
@@ -12073,7 +12093,7 @@ struct BusinessLocationVenuePicker: View {
                     if let venueSelectorNotice {
                         managedVenueSelectorStatusBanner(venueSelectorNotice)
                     }
-                    if viewModel.managedVenuesContainPlanLocked() {
+                    if viewModel.managedVenuesDisplayPlanLocked() {
                         managedVenueSelectorStatusBanner(BusinessLimitCopy.planLockedVenueBanner)
                     }
 
