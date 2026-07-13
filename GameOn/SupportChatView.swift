@@ -438,13 +438,19 @@ struct SupportChatView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
-            chatViewModel.hidesFloatingTabBarForDirectChat = true
+            // Do not mutate MainTabView's floating tab bar from Support Center sheets —
+            // that re-layout under an active sheet crashed after support-reply push → ticket tap.
+#if DEBUG
+            print("[SupportNotificationRoute] ticket detail presented conversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
+#endif
             Task {
                 await presenter.reloadOnAppear()
             }
         }
         .onDisappear {
-            chatViewModel.hidesFloatingTabBarForDirectChat = false
+#if DEBUG
+            print("[SupportNotificationRoute] ticket detail dismissed conversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
+#endif
             Task { await presenter.stopRealtime() }
         }
     }

@@ -813,6 +813,22 @@ nonisolated struct LiveFirstScoringEvent: Equatable {
     let teamName: String
     let minute: Int?
     let minuteText: String?
+    let scorer: String?
+    let teamId: String?
+
+    init(
+        teamName: String,
+        minute: Int?,
+        minuteText: String?,
+        scorer: String? = nil,
+        teamId: String? = nil
+    ) {
+        self.teamName = teamName
+        self.minute = minute
+        self.minuteText = minuteText
+        self.scorer = scorer
+        self.teamId = teamId
+    }
 }
 
 nonisolated struct LiveScoringTimelineSummary: Equatable {
@@ -972,14 +988,20 @@ nonisolated enum LiveScoringTimelineBuilder {
         if effectiveSportType == .soccer || effectiveSportType == .hockey {
             let sortedEvents = sortedTimelineEvents(timelineEvents)
             for event in sortedEvents {
-                guard isScoringEvent(event, sportType: effectiveSportType) else { continue }
-                guard let teamName = scoringTeamName(for: event, homeTeam: homeTeam, awayTeam: awayTeam) else {
+                guard isValidFirstGoalEvent(event, sportType: effectiveSportType) else { continue }
+                guard let teamName = resolvedScoringTeamName(
+                    for: event,
+                    homeTeam: homeTeam,
+                    awayTeam: awayTeam
+                ) else {
                     continue
                 }
                 return LiveFirstScoringEvent(
                     teamName: teamName,
                     minute: event.minuteValue,
-                    minuteText: scoringClock(for: event, sportType: effectiveSportType)
+                    minuteText: scoringClock(for: event, sportType: effectiveSportType),
+                    scorer: clean(event.playerDisplayName),
+                    teamId: clean(event.idTeam)
                 )
             }
         }
@@ -989,6 +1011,73 @@ nonisolated enum LiveScoringTimelineBuilder {
             awayTeam: awayTeam,
             homeTeam: homeTeam
         )
+    }
+
+    /// Canonical home/away team for first-goal grading when a stable side can be resolved.
+    static func canonicalFirstGoalTeam(
+        predictedOrActual: String,
+        homeTeam: String,
+        awayTeam: String,
+        teamId: String? = nil,
+        homeTeamId: String? = nil,
+        awayTeamId: String? = nil
+    ) -> String? {
+        if let teamId = clean(teamId) {
+            if let homeTeamId = clean(homeTeamId),
+               teamId.caseInsensitiveCompare(homeTeamId) == .orderedSame {
+                return homeTeam
+            }
+            if let awayTeamId = clean(awayTeamId),
+               teamId.caseInsensitiveCompare(awayTeamId) == .orderedSame {
+                return awayTeam
+            }
+        }
+
+        let normalized = LiveMatchFilters.normalizedSearchText(predictedOrActual)
+        guard !normalized.isEmpty else { return nil }
+        let homeNormalized = LiveMatchFilters.normalizedSearchText(homeTeam)
+        let awayNormalized = LiveMatchFilters.normalizedSearchText(awayTeam)
+        if !homeNormalized.isEmpty, normalized == homeNormalized { return homeTeam }
+        if !awayNormalized.isEmpty, normalized == awayNormalized { return awayTeam }
+        if !homeNormalized.isEmpty,
+           normalized.contains(homeNormalized) || homeNormalized.contains(normalized) {
+            return homeTeam
+        }
+        if !awayNormalized.isEmpty,
+           normalized.contains(awayNormalized) || awayNormalized.contains(normalized) {
+            return awayTeam
+        }
+        return nil
+    }
+
+    static func firstGoalPredictionMatches(
+        predicted: String,
+        actualTeamName: String,
+        homeTeam: String,
+        awayTeam: String,
+        actualTeamId: String? = nil,
+        homeTeamId: String? = nil,
+        awayTeamId: String? = nil
+    ) -> Bool {
+        if let predictedCanonical = canonicalFirstGoalTeam(
+            predictedOrActual: predicted,
+            homeTeam: homeTeam,
+            awayTeam: awayTeam
+        ),
+           let actualCanonical = canonicalFirstGoalTeam(
+            predictedOrActual: actualTeamName,
+            homeTeam: homeTeam,
+            awayTeam: awayTeam,
+            teamId: actualTeamId,
+            homeTeamId: homeTeamId,
+            awayTeamId: awayTeamId
+           ) {
+            return LiveMatchFilters.normalizedSearchText(predictedCanonical)
+                == LiveMatchFilters.normalizedSearchText(actualCanonical)
+        }
+
+        return LiveMatchFilters.normalizedSearchText(predicted)
+            == LiveMatchFilters.normalizedSearchText(actualTeamName)
     }
 
     static func buildForGoalScorersCard(
@@ -1243,14 +1332,15 @@ nonisolated enum LiveScoringTimelineBuilder {
         awayTeam: String,
         homeTeam: String
     ) -> LiveFirstScoringEvent? {
-        guard scoreAway + scoreHome == 1 else { return nil }
-        if scoreAway == 1 {
-            return LiveFirstScoringEvent(teamName: awayTeam, minute: nil, minuteText: nil)
+        // Only infer a first-scoring side when exactly one team has scored and the
+        // other has zero — otherwise earliest goal side is ambiguous from the board.
+        guard scoreAway > 0, scoreHome == 0 else {
+            if scoreHome > 0, scoreAway == 0 {
+                return LiveFirstScoringEvent(teamName: homeTeam, minute: nil, minuteText: nil)
+            }
+            return nil
         }
-        if scoreHome == 1 {
-            return LiveFirstScoringEvent(teamName: homeTeam, minute: nil, minuteText: nil)
-        }
-        return nil
+        return LiveFirstScoringEvent(teamName: awayTeam, minute: nil, minuteText: nil)
     }
 
     static func deduplicatedScoringEntries(_ entries: [LiveScoringTimelineEntry]) -> [LiveScoringTimelineEntry] {
@@ -1339,6 +1429,35 @@ nonisolated enum LiveScoringTimelineBuilder {
         default:
             return false
         }
+    }
+
+    /// First-goal events exclude non-scoring noise; own goals still count for the credited side.
+    private static func isValidFirstGoalEvent(_ event: LiveTimelineEvent, sportType: LiveSportVisualType) -> Bool {
+        guard isScoringEvent(event, sportType: sportType) else { return false }
+        let text = searchableText(for: event)
+        if text.contains("disallowed") || text.contains("var cancels") || text.contains("cancelled") {
+            return false
+        }
+        return true
+    }
+
+    private static func resolvedScoringTeamName(
+        for event: LiveTimelineEvent,
+        homeTeam: String,
+        awayTeam: String
+    ) -> String? {
+        if let team = scoringTeamName(for: event, homeTeam: homeTeam, awayTeam: awayTeam) {
+            if let canonical = canonicalFirstGoalTeam(
+                predictedOrActual: team,
+                homeTeam: homeTeam,
+                awayTeam: awayTeam,
+                teamId: event.idTeam
+            ) {
+                return canonical
+            }
+            return team
+        }
+        return inferredTeamName(for: event, homeTeam: homeTeam, awayTeam: awayTeam)
     }
 
     private static func scoringTeamName(

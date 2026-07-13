@@ -28,7 +28,33 @@ struct UserAvatarView: View {
             full: avatarURL,
             refreshToken: avatarDisplayRefreshToken
         ),
-              let url = URL(string: urlString) else { return nil }
+              let url = URL(string: urlString) else {
+#if DEBUG
+            let displayCandidate = ImageDisplayURL.forListDisplay(
+                thumbnail: avatarThumbnailURL,
+                full: avatarURL,
+                refreshToken: avatarDisplayRefreshToken
+            )
+            let reason: String
+            if (avatarThumbnailURL?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+                && avatarURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                reason = "no_thumbnail_or_full_url_in_view_model"
+            } else if displayCandidate == nil {
+                reason = "forListDisplay_returned_nil"
+            } else {
+                reason = "url_string_parse_failed"
+            }
+            ProfileAvatarDebug.avatarViewResolved(
+                context: "UserAvatarView.resolvedListURL",
+                thumbnailInput: avatarThumbnailURL,
+                fullInput: avatarURL,
+                displayURLString: displayCandidate,
+                urlParseSucceeded: false,
+                fallbackReason: reason
+            )
+#endif
+            return nil
+        }
         return url
     }
 
@@ -52,6 +78,15 @@ struct UserAvatarView: View {
 #if DEBUG
             if localPreviewImage == nil, resolvedListURL == nil {
                 ProfileAvatarDebug.avatarRenderSource("initials")
+            } else if let url = resolvedListURL {
+                ProfileAvatarDebug.avatarViewResolved(
+                    context: "UserAvatarView.onAppear",
+                    thumbnailInput: avatarThumbnailURL,
+                    fullInput: avatarURL,
+                    displayURLString: url.absoluteString,
+                    urlParseSucceeded: true,
+                    fallbackReason: "image_load_pending_or_failed_underneath"
+                )
             }
 #endif
         }
@@ -132,15 +167,27 @@ private struct SmoothCachedAvatarImage: View {
                 imageOpacity = 1
 #if DEBUG
                 ProfileAvatarDebug.avatarRenderSource("cache")
+                ProfileAvatarDebug.avatarImageLoadFinished(url: url, succeeded: true, detail: "memory_cache_hit")
 #endif
                 return
             }
 
             guard let loaded = await DiscoverMapImageCache.shared.image(for: url, bucket: .avatar),
-                  !Task.isCancelled else { return }
+                  !Task.isCancelled else {
+#if DEBUG
+                ProfileAvatarDebug.avatarImageLoadFinished(
+                    url: url,
+                    succeeded: false,
+                    detail: Task.isCancelled ? "task_cancelled" : "discover_map_image_cache_returned_nil"
+                )
+                ProfileAvatarDebug.avatarRenderSource("initials_visible_under_failed_load")
+#endif
+                return
+            }
             uiImage = loaded
 #if DEBUG
             ProfileAvatarDebug.avatarRenderSource("server")
+            ProfileAvatarDebug.avatarImageLoadFinished(url: url, succeeded: true, detail: "network_or_disk_decode_ok")
 #endif
             withAnimation(.easeOut(duration: 0.22)) {
                 imageOpacity = 1

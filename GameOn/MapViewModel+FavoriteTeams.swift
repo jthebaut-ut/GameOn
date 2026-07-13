@@ -15,6 +15,7 @@ extension MapViewModel {
            Date().timeIntervalSince(lastFavoriteTeamsLoadAt) < 180 {
 #if DEBUG
             print("[StartupPrefetchDebug] favoriteTeams cacheHit=true")
+            print("[FavoriteTeamsHydration] skipped cacheHit authUserId=\(currentUserAuthId?.uuidString.lowercased() ?? "nil")")
 #endif
             return
         }
@@ -25,14 +26,40 @@ extension MapViewModel {
         }
         favoriteTeamsLoadTask = task
         await task.value
-        favoriteTeamsLoadTask = nil
+        if favoriteTeamsLoadTask == task {
+            favoriteTeamsLoadTask = nil
+        }
     }
 
     private func loadFavoriteTeamsFromSupabaseNow() async {
-        guard let uid = await MainActor.run(body: { currentUserAuthId }) else { return }
+        let uid = await MainActor.run(body: { currentUserAuthId })
+        guard let uid else {
+#if DEBUG
+            print("[FavoriteTeamsHydration] load failed authUserId=nil reason=no_auth_user")
+#endif
+            return
+        }
 
-        var remoteSelection = await FavoriteTeamsSyncService.fetchTeamSelection(userId: uid)
+#if DEBUG
+        print("[FavoriteTeamsHydration] loading started authUserId=\(uid.uuidString.lowercased())")
+#endif
+
+        let fetchResult = await FavoriteTeamsSyncService.fetchTeamSelectionResult(userId: uid)
+        let remoteSelection: FavoriteTeamsSyncService.FavoriteTeamSelection
+        switch fetchResult {
+        case .success(let selection):
+            remoteSelection = selection
+        case .failure(let error):
+#if DEBUG
+            print(
+                "[FavoriteTeamsHydration] load failed authUserId=\(uid.uuidString.lowercased()) error=\(error.localizedDescription)"
+            )
+#endif
+            return
+        }
+
         var remote = remoteSelection.teamIDs
+        var resolvedSelection = remoteSelection
 
         if remote.isEmpty {
             let localRaw = UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
@@ -51,7 +78,7 @@ extension MapViewModel {
                     primaryTeamID: FavoriteTeamsStore.normalizedPrimaryTeamID(localPrimary, within: local)
                 )
                 remote = local
-                remoteSelection = FavoriteTeamsSyncService.FavoriteTeamSelection(
+                resolvedSelection = FavoriteTeamsSyncService.FavoriteTeamSelection(
                     teamIDs: local,
                     primaryTeamID: FavoriteTeamsStore.normalizedPrimaryTeamID(localPrimary, within: local)
                 )
@@ -59,14 +86,30 @@ extension MapViewModel {
         }
 
         let applied = remote
-        let primary = FavoriteTeamsStore.normalizedPrimaryTeamID(remoteSelection.primaryTeamID, within: applied)
-        await MainActor.run {
+        let primary = FavoriteTeamsStore.normalizedPrimaryTeamID(resolvedSelection.primaryTeamID, within: applied)
+        let didApply = await MainActor.run { () -> Bool in
+            guard currentUserAuthId == uid else {
+#if DEBUG
+                print(
+                    "[FavoriteTeamsHydration] skipped due to auth mismatch fetchedAuthId=\(uid.uuidString.lowercased()) activeAuthId=\(currentUserAuthId?.uuidString.lowercased() ?? "nil")"
+                )
+#endif
+                return false
+            }
             FavoriteTeamsStore.writeToAppStorage(applied)
             FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(primary)
             lastFavoriteTeamsLoadAt = Date()
+            favoriteTeamsHydrationGeneration &+= 1
+            return true
         }
+
 #if DEBUG
-        print("[FavoriteTeamsSyncDebug] applied_local_cache userId=\(uid.uuidString.lowercased()) count=\(applied.count)")
+        if didApply {
+            print(
+                "[FavoriteTeamsHydration] teams applied authUserId=\(uid.uuidString.lowercased()) count=\(applied.count) primary=\(primary ?? "nil")"
+            )
+            print("[FavoriteTeamsSyncDebug] applied_local_cache userId=\(uid.uuidString.lowercased()) count=\(applied.count)")
+        }
 #endif
     }
 
@@ -76,6 +119,7 @@ extension MapViewModel {
         guard let uid = await MainActor.run(body: { currentUserAuthId }) else {
 #if DEBUG
             print("[FavoriteTeamsSyncDebug] sync_skipped reason=no_auth_user")
+            print("[FavoriteTeamsHydration] load failed authUserId=nil reason=sync_no_auth_user")
 #endif
             return false
         }

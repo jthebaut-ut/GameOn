@@ -191,18 +191,59 @@ function announcementActiveReason(row: AnnouncementRow, now = new Date()): strin
   return null
 }
 
-function announcementPushBody(row: AnnouncementRow): string {
-  const subtitle = row.subtitle?.trim()
-  if (subtitle) return subtitle
-  const description = row.description?.trim()
-  if (description) return description
-  return "Open FanGeo for details."
+const ANNOUNCEMENT_PUSH_BODY_MAX_CHARS = 200
+const ANNOUNCEMENT_PUSH_BODY_FALLBACK = "Open FanGeo to see the latest announcement."
+const ANNOUNCEMENT_PUSH_TITLE_FALLBACK = "FanGeo Announcement"
+
+type AnnouncementPushCopy = {
+  title: string
+  body: string
+  bodySource: "description" | "subtitle" | "fallback"
 }
 
-function tokenPrefixForDebug(token: string): string {
-  const trimmed = token.trim()
-  if (!trimmed) return "<empty>"
-  return trimmed.slice(0, 12)
+function normalizePushText(value: string | null | undefined): string {
+  return (value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function truncatePushBody(value: string, maxChars = ANNOUNCEMENT_PUSH_BODY_MAX_CHARS): string {
+  if (value.length <= maxChars) {
+    return value
+  }
+
+  const slice = value.slice(0, maxChars + 1)
+  const lastSpace = slice.lastIndexOf(" ")
+  const truncated = (lastSpace > Math.floor(maxChars * 0.6) ? slice.slice(0, lastSpace) : value.slice(0, maxChars))
+    .trimEnd()
+  return `${truncated}…`
+}
+
+function announcementPushCopy(row: AnnouncementRow): AnnouncementPushCopy {
+  const title = normalizePushText(row.title) || ANNOUNCEMENT_PUSH_TITLE_FALLBACK
+  const description = normalizePushText(row.description)
+  if (description) {
+    return {
+      title,
+      body: truncatePushBody(description),
+      bodySource: "description",
+    }
+  }
+
+  const subtitle = normalizePushText(row.subtitle)
+  if (subtitle) {
+    return {
+      title,
+      body: truncatePushBody(subtitle),
+      bodySource: "subtitle",
+    }
+  }
+
+  return {
+    title,
+    body: ANNOUNCEMENT_PUSH_BODY_FALLBACK,
+    bodySource: "fallback",
+  }
 }
 
 Deno.serve(async (req) => {
@@ -268,16 +309,18 @@ Deno.serve(async (req) => {
     return json({ ok: true, skipped: true, reason: inactiveReason })
   }
 
-  const title = row.title?.trim()
-  if (!title) {
-    return json({ ok: true, skipped: true, reason: "missing_title" })
-  }
-
   const includeFans = row.audience_fans !== false
   const includeBusinesses = row.audience_businesses === true
   if (!includeFans && !includeBusinesses) {
     return json({ ok: true, skipped: true, reason: "no_audience_selected" })
   }
+
+  const pushCopy = announcementPushCopy(row)
+  console.log(
+    `[FanGeoAnnouncementPush] announcementId=${announcementId} ` +
+      `bodySource=${pushCopy.bodySource} ` +
+      `titleLength=${pushCopy.title.length} bodyLength=${pushCopy.body.length}`,
+  )
 
   const { data: recipients, error: recipientError } = await supabase.rpc(
     "list_fangeo_announcement_push_tokens",
@@ -299,8 +342,7 @@ Deno.serve(async (req) => {
   for (const recipient of tokens) {
     console.log(
       `[FanGeoAnnouncementPushDebug] recipient userId=${recipient.user_id} ` +
-        `environment=${recipient.environment} tokenPrefix=${tokenPrefixForDebug(recipient.token)} ` +
-        `tokenId=${recipient.token_id}`,
+        `environment=${recipient.environment} tokenId=${recipient.token_id}`,
     )
   }
 
@@ -316,7 +358,6 @@ Deno.serve(async (req) => {
     return json({ error: "apns_misconfigured" }, 500)
   }
 
-  const alertBody = announcementPushBody(row)
   const customData = {
     source: ANNOUNCEMENT_PUSH_SOURCE,
     announcement_id: announcementId,
@@ -333,11 +374,11 @@ Deno.serve(async (req) => {
     }
     console.log(
       `[FanGeoAnnouncementPushDebug] apnsSendAttempted tokenId=${token.id} userId=${token.user_id} ` +
-        `environment=${token.environment} tokenPrefix=${tokenPrefixForDebug(token.token)}`,
+        `environment=${token.environment}`,
     )
     const result = await apns.send(
       token,
-      { title, body: alertBody },
+      { title: pushCopy.title, body: pushCopy.body },
       customData,
     )
     if (result.ok) {

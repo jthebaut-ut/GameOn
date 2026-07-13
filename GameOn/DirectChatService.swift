@@ -40,6 +40,48 @@ final class DirectChatService {
         return try Self.decodeUUIDFromRPCData(data)
     }
 
+    /// Fan-initiated venue-scoped business DM (no friendship row).
+    func startBusinessVenueConversation(businessId: UUID, venueId: UUID) async throws -> UUID {
+        struct Params: Encodable {
+            let p_business_id: UUID
+            let p_venue_id: UUID
+        }
+
+        let data = try await client
+            .rpc(
+                "start_business_venue_conversation",
+                params: Params(p_business_id: businessId, p_venue_id: venueId)
+            )
+            .execute()
+            .data
+
+        return try Self.decodeUUIDFromRPCData(data)
+    }
+
+    func fetchExistingBusinessVenueConversationId(
+        businessId: UUID,
+        venueId: UUID,
+        ownerUserId: UUID,
+        userId me: UUID
+    ) async throws -> UUID? {
+        let meId = me.uuidString.lowercased()
+        let ownerId = ownerUserId.uuidString.lowercased()
+        let participantFilter =
+            "and(user_a_id.eq.\(meId),user_b_id.eq.\(ownerId))," +
+            "and(user_a_id.eq.\(ownerId),user_b_id.eq.\(meId))"
+        let rows: [DirectConversationIdRow] = try await client
+            .from("direct_conversations")
+            .select("id")
+            .eq("business_id", value: businessId.uuidString.lowercased())
+            .eq("venue_id", value: venueId.uuidString.lowercased())
+            .eq("fan_initiated", value: true)
+            .or(participantFilter)
+            .limit(1)
+            .execute()
+            .value
+        return rows.first?.id
+    }
+
     /// Looks up an existing 1:1 conversation without creating a new one. This keeps old DMs readable
     /// when the friendship row is no longer accepted, such as after account deletion cleanup.
     func fetchExistingConversationId(peerUserId: UUID) async throws -> UUID? {

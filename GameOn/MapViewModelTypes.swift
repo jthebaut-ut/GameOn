@@ -893,6 +893,83 @@ struct PendingBusinessEmailSignupDraft: Codable, Sendable {
     let coverPhotoJPEGData: Data?
     let menuPhotoJPEGData: Data?
     let recordVenueGuidelinesAcceptance: Bool
+    let emailVerified: Bool
+
+    init(
+        email: String,
+        signup: BusinessOwnerSignupPayload,
+        coverPhotoJPEGData: Data?,
+        menuPhotoJPEGData: Data?,
+        recordVenueGuidelinesAcceptance: Bool,
+        emailVerified: Bool = false
+    ) {
+        self.email = email
+        self.signup = signup
+        self.coverPhotoJPEGData = coverPhotoJPEGData
+        self.menuPhotoJPEGData = menuPhotoJPEGData
+        self.recordVenueGuidelinesAcceptance = recordVenueGuidelinesAcceptance
+        self.emailVerified = emailVerified
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        email = try container.decode(String.self, forKey: .email)
+        signup = try container.decode(BusinessOwnerSignupPayload.self, forKey: .signup)
+        coverPhotoJPEGData = try container.decodeIfPresent(Data.self, forKey: .coverPhotoJPEGData)
+        menuPhotoJPEGData = try container.decodeIfPresent(Data.self, forKey: .menuPhotoJPEGData)
+        recordVenueGuidelinesAcceptance = try container.decode(Bool.self, forKey: .recordVenueGuidelinesAcceptance)
+        emailVerified = try container.decodeIfPresent(Bool.self, forKey: .emailVerified) ?? false
+    }
+
+    func markingEmailVerified() -> PendingBusinessEmailSignupDraft {
+        PendingBusinessEmailSignupDraft(
+            email: email,
+            signup: signup,
+            coverPhotoJPEGData: coverPhotoJPEGData,
+            menuPhotoJPEGData: menuPhotoJPEGData,
+            recordVenueGuidelinesAcceptance: recordVenueGuidelinesAcceptance,
+            emailVerified: true
+        )
+    }
+
+    /// True when the draft includes enough venue data to submit for FanGeo review (legacy drafts or completed venue wizard).
+    var isVenueSubmissionReady: Bool {
+        let venueName = signup.firstLocation.venueName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !venueName.isEmpty else { return false }
+        guard let coverPhotoJPEGData, !coverPhotoJPEGData.isEmpty else { return false }
+        guard !signup.firstLocation.description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard !signup.firstLocation.proofNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return true
+    }
+}
+
+extension AddLocationClaimForm {
+    /// Placeholder first-location row stored with business identity before venue setup begins.
+    static func pendingBusinessVenuePlaceholder() -> AddLocationClaimForm {
+        AddLocationClaimForm(
+            venueName: "",
+            address: "",
+            addressLine2: "",
+            city: "",
+            state: "",
+            country: BusinessLocationCountryPolicy.defaultCountryCode,
+            zip: "",
+            phone: "",
+            website: "",
+            description: "",
+            proofNote: "",
+            screenCount: 1,
+            servesFood: false,
+            hasWifi: false,
+            hasGarden: false,
+            hasProjector: false,
+            petFriendly: false,
+            familyFriendly: false,
+            parkingAvailable: false,
+            coverPhotoURL: "",
+            menuPhotoURL: ""
+        )
+    }
 }
 
 struct VenueClaimInsert: Encodable {
@@ -983,6 +1060,7 @@ struct VenueClaimPendingSettingsRow: Decodable, Identifiable, Equatable {
     let approval_status: String?
     let rejection_acknowledged_at: String?
     let created_at: String?
+    let cover_photo_url: String?
 }
 
 struct ApprovedVenueOwnershipSummary: Equatable {

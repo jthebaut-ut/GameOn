@@ -276,7 +276,7 @@ private final class DirectChatPresenter: ObservableObject {
 
     init(friend: UserPreview) {
         self.friend = friend
-        self.peerIsDeleted = friend.isDeleted
+        self.peerIsDeleted = friend.isBusinessVenueConversation ? false : friend.isDeleted
     }
 
     private func dmDebugMilliseconds(from start: CFAbsoluteTime?, to end: CFAbsoluteTime? = nil) -> String {
@@ -385,7 +385,25 @@ private final class DirectChatPresenter: ObservableObject {
             currentUserId = me
 
             if conversationId == nil {
-                if let existingId = try await service.fetchExistingConversationId(peerUserId: friend.id) {
+                if friend.isBusinessVenueConversation {
+                    if let presetConversationId = friend.dmConversationId {
+                        conversationId = presetConversationId
+                    } else if let businessId = friend.businessVenueBusinessId,
+                              let venueId = friend.businessVenueId {
+                        conversationId = try await service.startBusinessVenueConversation(
+                            businessId: businessId,
+                            venueId: venueId
+                        )
+                    } else {
+                        throw NSError(
+                            domain: "DirectChatPresenter",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Couldn't open venue chat."]
+                        )
+                    }
+                } else if let presetConversationId = friend.dmConversationId {
+                    conversationId = presetConversationId
+                } else if let existingId = try await service.fetchExistingConversationId(peerUserId: friend.id) {
                     conversationId = existingId
                 } else {
                     conversationId = try await service.startDirectConversation(friendUserId: friend.id)
@@ -1602,7 +1620,7 @@ private final class DirectChatPresenter: ObservableObject {
         guard trimmed.count <= maxBodyLength else { return }
         guard let conversationId, let me = currentUserId else { return }
 
-        if peerIsDeleted {
+        if peerIsDeleted, !friend.isBusinessVenueConversation {
             sendError = DirectChatView.deletedPeerNoticeText
             return
         }
@@ -1689,7 +1707,7 @@ private final class DirectChatPresenter: ObservableObject {
         guard !trimmed.isEmpty, trimmed.count <= maxBodyLength else { return }
         guard let conversationId, let me = currentUserId else { return }
 
-        if peerIsDeleted {
+        if peerIsDeleted, !friend.isBusinessVenueConversation {
             sendError = DirectChatView.deletedPeerNoticeText
             return
         }
@@ -1904,8 +1922,12 @@ struct DirectChatView: View {
         chatViewModel.isEitherDirectionBlocked(with: presenter.friend.id)
     }
 
+    private var isBusinessVenueThread: Bool {
+        resolvedFriendPreview.isBusinessVenueConversation
+    }
+
     private var isDeletedPeer: Bool {
-        resolvedFriendPreview.isDeleted || presenter.peerIsDeleted
+        !isBusinessVenueThread && (resolvedFriendPreview.isDeleted || presenter.peerIsDeleted)
     }
 
     private var sendingDisabled: Bool {
@@ -1913,7 +1935,10 @@ struct DirectChatView: View {
     }
 
     private var resolvedFriendPreview: UserPreview {
-        chatViewModel.previewForLoadedDmParticipant(userId: presenter.friend.id)
+        chatViewModel.previewForLoadedDmParticipant(
+            userId: presenter.friend.id,
+            conversationId: presenter.conversationId ?? presenter.friend.dmConversationId
+        )
             ?? resolvedFriendOverride
             ?? presenter.friend
     }
@@ -2025,16 +2050,19 @@ struct DirectChatView: View {
                 dismissChatOverflow()
             }
         }
-        .task(id: presenter.friend.id) {
+        .task(id: directChatThreadTaskIdentity) {
             presenter.bindChatViewModel(chatViewModel)
             await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
             resolvedFriendOverride = await chatViewModel.resolveDmParticipantPreview(
                 userId: presenter.friend.id,
                 fallback: presenter.friend,
-                surface: "dm_thread_header"
+                surface: "dm_thread_header",
+                conversationId: presenter.friend.dmConversationId
             )
             directChatPresenceLoaded = true
-            presenter.updatePeerDeletedState(resolvedFriendOverride?.isDeleted == true)
+            if !presenter.friend.isBusinessVenueConversation {
+                presenter.updatePeerDeletedState(resolvedFriendOverride?.isDeleted == true)
+            }
             await presenter.onAppear()
 
             if presenter.loadError == nil {
@@ -2221,6 +2249,29 @@ struct DirectChatView: View {
     private var hasVisibleThreadBanner: Bool {
         (presenter.sendError?.isEmpty == false)
             || (presenter.menuBanner?.isEmpty == false)
+            || showVenueChatIntroBanner
+    }
+
+    private var directChatThreadTaskIdentity: String {
+        if let conversationId = presenter.friend.dmConversationId {
+            return "conversation-\(conversationId.uuidString.lowercased())"
+        }
+        if let venueId = presenter.friend.businessVenueId {
+            return "venue-\(venueId.uuidString.lowercased())"
+        }
+        return presenter.friend.id.uuidString.lowercased()
+    }
+
+    private var resolvedVenueChatConversationId: UUID? {
+        presenter.conversationId ?? presenter.friend.dmConversationId
+    }
+
+    private var showVenueChatIntroBanner: Bool {
+        guard isBusinessVenueThread,
+              let conversationId = resolvedVenueChatConversationId else {
+            return false
+        }
+        return chatViewModel.shouldShowVenueChatIntroBanner(conversationId: conversationId)
     }
 
     private var chatHeaderSubtitle: String {
@@ -2230,11 +2281,19 @@ struct DirectChatView: View {
         if messagingBlocked {
             return "Messaging unavailable"
         }
+        if let businessName = resolvedFriendPreview.businessVenueBusinessName,
+           !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return businessName
+        }
+        if isBusinessVenueThread {
+            return "Business"
+        }
         let chatType = resolvedFriendPreview.isBusinessAccount ? "Business chat" : "Direct chat"
         return "\(chatType) · \(directChatPresenceText)"
     }
 
     private func refreshDirectChatPresence(source: String) async {
+        guard !resolvedFriendPreview.isBusinessVenueConversation else { return }
         let friendId = presenter.friend.id
         let cachedRaw = resolvedFriendPreview.lastSeenAtRaw
         print("[PresenceDebug] directChatPresenceRefresh=true")
@@ -2298,6 +2357,19 @@ struct DirectChatView: View {
                     systemImage: Self.isPositiveReportBanner(banner) ? "checkmark.circle.fill" : "info.circle.fill",
                     tint: Self.isPositiveReportBanner(banner) ? FGColor.accentGreen : FGColor.accentBlue
                 )
+            }
+
+            if showVenueChatIntroBanner {
+                threadStatusBanner(
+                    text: "You're messaging this venue. Messages are received by the venue's management team.",
+                    systemImage: "info.circle.fill",
+                    tint: FGColor.accentBlue
+                )
+                .onAppear {
+                    if let conversationId = resolvedVenueChatConversationId {
+                        chatViewModel.markVenueChatIntroBannerConsumed(conversationId: conversationId)
+                    }
+                }
             }
         }
         .padding(.horizontal, FGSpacing.lg)

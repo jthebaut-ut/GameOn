@@ -426,7 +426,7 @@ struct FGPrimaryButton: View {
                 Text(title)
                     .font(FGTypography.cardTitle)
             }
-            .foregroundStyle(.white)
+            .foregroundStyle(isDisabled ? Color.gray : Color.white)
             .frame(maxWidth: .infinity)
             .padding(.vertical, FGSpacing.md)
             .background(

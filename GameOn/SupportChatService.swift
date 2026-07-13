@@ -416,7 +416,11 @@ final class SupportChatService {
                 throw SupportChatRealtimeSubscribeTimeoutError()
             }
             defer { group.cancelAll() }
-            try await group.next()!
+            // Never force-unwrap: a cancelled/empty group returns nil and would crash ticket open.
+            guard let result = try await group.next() else {
+                throw SupportChatRealtimeSubscribeTimeoutError()
+            }
+            return result
         }
     }
 

@@ -462,3 +462,13 @@ entrypoint = "./functions/notify-support-reply/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/notify-fangeo-announcement/index.ts"
+
+[functions.notify-fangeo-plus-award]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/notify-fangeo-plus-award/index.ts"
+
+[functions.notify-business-pro-award]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/notify-business-pro-award/index.ts"

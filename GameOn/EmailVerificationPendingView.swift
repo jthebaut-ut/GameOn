@@ -11,7 +11,7 @@ struct EmailVerificationPendingView: View {
 
     private var title: String {
         kind == .business
-            ? "Verify your business email."
+            ? "Verify your business email"
             : "Check your email to verify your FanGeo account."
     }
 
@@ -64,7 +64,7 @@ struct EmailVerificationPendingView: View {
             }
 
             FGSecondaryButton(title: "Back to Sign In", systemImage: "arrow.left") {
-                viewModel.clearEmailVerificationPending()
+                viewModel.dismissBusinessEmailVerificationPendingUIForSignIn()
                 onBackToSignIn()
             }
         }

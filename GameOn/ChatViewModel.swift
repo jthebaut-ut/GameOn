@@ -46,6 +46,8 @@ final class ChatViewModel: ObservableObject {
         let lastMessageAt: Date?
         let unreadCount: Int
         let isConversationBacked: Bool
+        /// Stable server thread id when inbox row is venue-scoped or otherwise conversation-specific.
+        let conversationId: UUID?
     }
 
     struct IncomingRequestDisplay: Identifiable, Hashable {
@@ -68,6 +70,8 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var unreadDirectMessageCount: Int = 0
     /// When non-nil, ``MainTabView`` switches to Chat and ``FriendsTabView`` pushes ``DirectChatView`` for this peer.
     @Published var pendingDmOpenPreview: UserPreview?
+    /// Newly created venue-scoped DM threads that should show the one-time intro banner.
+    @Published private(set) var pendingVenueChatIntroConversationIds: Set<UUID> = []
     /// Lightweight in-app banner for an incoming DM while the thread is not open (local only).
     @Published private(set) var dmInAppNotification: DmInAppNotificationPayload?
     @Published var errorMessage: String?
@@ -167,6 +171,7 @@ final class ChatViewModel: ObservableObject {
     private var chatPresenceExpiryTask: Task<Void, Never>?
     /// Peers hidden from Recent Chats via swipe delete (persisted per auth user; restored on new inbound DM).
     private var hiddenInboxPeerUserIds: Set<UUID> = []
+    private var hiddenInboxConversationIds: Set<UUID> = []
 
     /// Supabase Realtime `IN` filters should stay small; above this we omit the client filter and rely on RLS.
     private let kMaxConversationIdsForInboxRealtimeClientFilter = 48
@@ -245,6 +250,7 @@ final class ChatViewModel: ObservableObject {
     private func noteAuthenticatedChatSession(userId: UUID, source: String) {
         currentUserAuthId = userId
         hiddenInboxPeerUserIds = DmInboxHiddenConversationsStore.hiddenPeerUserIds(authId: userId)
+        hiddenInboxConversationIds = DmInboxHiddenConversationsStore.hiddenConversationIds(authId: userId)
         requiresSignIn = false
 #if DEBUG
         let email = mapViewModel?.authenticatedSocialEmailForUI ?? ""
@@ -291,6 +297,7 @@ final class ChatViewModel: ObservableObject {
         friendshipChipByOtherUserId = [:]
         currentUserAuthId = nil
         hiddenInboxPeerUserIds = []
+        hiddenInboxConversationIds = []
         hidesFloatingTabBarForDirectChat = false
         blockedUserIds = []
         usersWhoBlockedMeIds = []
@@ -573,7 +580,8 @@ final class ChatViewModel: ObservableObject {
                 subtitle: display.subtitle,
                 lastMessageAt: display.lastMessageAt,
                 unreadCount: display.unreadCount,
-                isConversationBacked: display.isConversationBacked
+                isConversationBacked: display.isConversationBacked,
+                conversationId: display.conversationId
             )
         }
         if changed {
@@ -1176,7 +1184,8 @@ final class ChatViewModel: ObservableObject {
             subtitle: old.subtitle,
             lastMessageAt: old.lastMessageAt,
             unreadCount: 0,
-            isConversationBacked: old.isConversationBacked
+            isConversationBacked: old.isConversationBacked,
+            conversationId: old.conversationId
         )
         var next = friends
         next[idx] = updated
@@ -1294,7 +1303,8 @@ final class ChatViewModel: ObservableObject {
             subtitle: rawPreview,
             lastMessageAt: lastAt,
             unreadCount: newUnread,
-            isConversationBacked: true
+            isConversationBacked: true,
+            conversationId: old.conversationId
         )
         var next = friends
         next[idx] = updated
@@ -1788,16 +1798,17 @@ final class ChatViewModel: ObservableObject {
             let lastAt = Self.parseISO8601(row.last_message_created_at)
             let unread = max(0, row.unread_count ?? 0)
             return FriendDisplay(
-                id: row.friend_user_id,
+                id: row.conversation_id ?? preview.id,
                 preview: preview,
                 subtitle: rawPreview,
                 lastMessageAt: lastAt,
                 unreadCount: unread,
-                isConversationBacked: true
+                isConversationBacked: true,
+                conversationId: row.conversation_id
             )
         }
 
-        var visible = displays.filter { !isEitherDirectionBlocked(with: $0.id) }
+        var visible = displays.filter { !isEitherDirectionBlocked(with: $0.preview.id) }
         visible = applyHiddenInboxPeerFilter(visible)
         return visible
     }
@@ -1877,18 +1888,23 @@ final class ChatViewModel: ObservableObject {
 
     /// Swipe-delete from inbox: hides the thread for this user and best-effort clears server history when RPC exists.
     /// Does not remove the friendship; only clears/hides the thread per server rules when available.
-    func clearInboxConversation(withFriendUserId friendUserId: UUID) async {
+    func clearInboxConversation(peerUserId: UUID, conversationId: UUID? = nil) async {
 #if DEBUG
-        print("[DMDelete] delete tapped friendUserId=\(friendUserId.uuidString.lowercased())")
+        print("[DMDelete] delete tapped friendUserId=\(peerUserId.uuidString.lowercased()) conversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
 #endif
         inboxDeleteError = nil
-        hideInboxConversationLocally(peerUserId: friendUserId)
+        hideInboxConversationLocally(peerUserId: peerUserId, conversationId: conversationId)
 #if DEBUG
-        print("[DMDelete] local remove friendUserId=\(friendUserId.uuidString.lowercased())")
+        print("[DMDelete] local remove friendUserId=\(peerUserId.uuidString.lowercased())")
 #endif
 
         do {
-            let cid = try await directChatService.startDirectConversation(friendUserId: friendUserId)
+            let cid: UUID
+            if let conversationId {
+                cid = conversationId
+            } else {
+                cid = try await directChatService.startDirectConversation(friendUserId: peerUserId)
+            }
             try await directChatService.clearDirectConversation(conversationId: cid)
 #if DEBUG
             print("[DMDelete] server hide success conversationId=\(cid.uuidString.lowercased())")
@@ -1896,7 +1912,7 @@ final class ChatViewModel: ObservableObject {
         } catch {
 #if DEBUG
             print(
-                "[DMDelete] server hide error friendUserId=\(friendUserId.uuidString.lowercased()) " +
+                "[DMDelete] server hide error friendUserId=\(peerUserId.uuidString.lowercased()) " +
                 "error=\(error.localizedDescription)"
             )
 #endif
@@ -1904,19 +1920,39 @@ final class ChatViewModel: ObservableObject {
 
         await refreshInboxSummaries()
 #if DEBUG
-        print("[DMDelete] inbox refreshed friendUserId=\(friendUserId.uuidString.lowercased())")
+        print("[DMDelete] inbox refreshed friendUserId=\(peerUserId.uuidString.lowercased())")
 #endif
     }
 
-    func previewForLoadedDmParticipant(userId: UUID) -> UserPreview? {
-        friends.first(where: { $0.id == userId })?.preview
+    func previewForLoadedDmParticipant(userId: UUID, conversationId: UUID? = nil) -> UserPreview? {
+        if let conversationId,
+           let match = friends.first(where: { $0.conversationId == conversationId }) {
+            return match.preview
+        }
+        if let conversationId,
+           let match = friends.first(where: { $0.preview.dmConversationId == conversationId }) {
+            return match.preview
+        }
+        if conversationId != nil {
+            // Venue threads share the owner auth id with fan DMs — never reuse a peer row by user id alone.
+            return nil
+        }
+        if let match = friends.first(where: { $0.preview.id == userId && $0.preview.isBusinessVenueConversation }) {
+            return match.preview
+        }
+        return friends.first(where: { $0.preview.id == userId && $0.conversationId == nil })?.preview
+            ?? friends.first(where: { $0.preview.id == userId && !$0.preview.isBusinessVenueConversation })?.preview
     }
 
     func resolveDmParticipantPreview(
         userId: UUID,
         fallback: UserPreview,
-        surface: String
+        surface: String,
+        conversationId: UUID? = nil
     ) async -> UserPreview {
+        if fallback.isBusinessVenueConversation {
+            return fallback
+        }
         if fallback.isDeleted {
             logDeletedUserRenderDebug(surface: surface, preview: fallback)
             return fallback
@@ -1925,7 +1961,7 @@ final class ChatViewModel: ObservableObject {
         do {
             if let resolved = try await socialIdentityService.fetchUserPreviews(for: [userId])[userId] {
                 logDeletedUserRenderDebug(surface: surface, preview: resolved)
-                patchLoadedDmParticipantPreview(resolved)
+                patchLoadedDmParticipantPreview(resolved, conversationId: conversationId ?? fallback.dmConversationId)
                 return resolved
             }
         } catch {
@@ -1934,7 +1970,7 @@ final class ChatViewModel: ObservableObject {
 
         let deleted = deletedUserPreview(userId: userId, email: fallback.email)
         logDeletedUserRenderDebug(surface: surface, preview: deleted)
-        patchLoadedDmParticipantPreview(deleted)
+        patchLoadedDmParticipantPreview(deleted, conversationId: conversationId ?? fallback.dmConversationId)
         return deleted
     }
 
@@ -1943,11 +1979,14 @@ final class ChatViewModel: ObservableObject {
         fallback: UserPreview,
         source: String
     ) async -> UserPreview? {
+        if fallback.isBusinessVenueConversation {
+            return nil
+        }
         do {
             guard let resolved = try await socialIdentityService.fetchUserPreviews(for: [userId])[userId] else {
                 return nil
             }
-            patchLoadedDmParticipantPreview(resolved)
+            patchLoadedDmParticipantPreview(resolved, conversationId: fallback.dmConversationId)
             return resolved
         } catch {
 #if DEBUG
@@ -2049,12 +2088,13 @@ final class ChatViewModel: ObservableObject {
                 let lastAt = Self.parseISO8601(row.last_message_created_at)
                 let unread = max(0, row.unread_count ?? 0)
                 return FriendDisplay(
-                    id: row.friend_user_id,
+                    id: row.conversation_id ?? preview.id,
                     preview: preview,
                     subtitle: rawPreview,
                     lastMessageAt: lastAt,
                     unreadCount: unread,
-                    isConversationBacked: true
+                    isConversationBacked: true,
+                    conversationId: row.conversation_id
                 )
             }
             friendDisplays = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: friendDisplays)
@@ -2331,16 +2371,17 @@ final class ChatViewModel: ObservableObject {
     /// Removes an accepted friendship from the Friends directory (`remove_friend` only — DM history is preserved).
     func unfriend(_ item: FriendDisplay) async {
         unfriendError = nil
+        let peerUserId = item.preview.id
         let snapshotFriends = friends
         let snapshotChips = friendshipChipByOtherUserId
 
-        friends.removeAll { $0.id == item.id }
+        friends.removeAll { $0.preview.id == peerUserId && !$0.isConversationBacked }
         var chips = friendshipChipByOtherUserId
-        chips.removeValue(forKey: item.id)
+        chips.removeValue(forKey: peerUserId)
         friendshipChipByOtherUserId = chips
 
         do {
-            try await service.removeFriend(friendUserId: item.id)
+            try await service.removeFriend(friendUserId: peerUserId)
             await refreshInboxSummaries()
             await refreshFriendRequestListsOnly()
         } catch {
@@ -2394,11 +2435,14 @@ final class ChatViewModel: ObservableObject {
         addFriendSearchIsLoading = false
     }
 
-    /// Add friend to a selected search hit (fan user or ``businesses`` row by id).
+    /// Add friend to a selected search hit (fan user only; businesses are discovery-only).
     func sendFriendRequest(to target: AddFriendSearchTarget) async -> AddFriendLookupOutcome {
 #if DEBUG
         print("[FriendSearchDebug] send entity_type=\(target.entityType.rawValue) entity_id=\(target.entityId.uuidString)")
 #endif
+        guard target.entityType == .user else {
+            return .informational("Businesses can't be added as friends, but you can message one of their venues.")
+        }
         do {
             let me = try await service.currentUserId()
             if target.entityType == .user, me == target.entityId {
@@ -2423,12 +2467,7 @@ final class ChatViewModel: ObservableObject {
             )
 #endif
 
-            switch target.entityType {
-            case .user:
-                try await service.sendFriendRequest(requesterId: me, addresseeId: target.entityId)
-            case .business:
-                try await service.sendFriendRequestToBusiness(requesterId: me, businessId: target.entityId)
-            }
+            try await service.sendFriendRequest(requesterId: me, addresseeId: target.entityId)
             await refreshAfterFriendLookupAttempt()
             logFriendRequestVisibilityDebug(
                 lookupResult: "created",
@@ -2455,6 +2494,225 @@ final class ChatViewModel: ObservableObject {
         return .informational("No FanGeo account found with that email or display name.")
     }
 
+    /// Lists active venues for a business before opening a venue-scoped DM.
+    func prepareBusinessVenueMessage(from target: AddFriendSearchTarget) async -> AddFriendBusinessMessageOutcome {
+        guard target.entityType == .business else {
+            return .informational("Only businesses can be messaged from here.")
+        }
+
+        do {
+            let venues = try await service.fetchActiveVenuesForBusinessMessaging(businessId: target.entityId)
+            if venues.isEmpty {
+                return .informational("No active venues available for this business.")
+            }
+            if venues.count == 1, let venue = venues.first {
+                return await openBusinessVenueConversation(target: target, venue: venue)
+            }
+            return .needsVenuePicker(venues)
+        } catch {
+            return .informational("No active venues available for this business.")
+        }
+    }
+
+    /// Opens or creates a fan-initiated venue-scoped business DM.
+    func openBusinessVenueConversation(
+        target: AddFriendSearchTarget,
+        venue: BusinessVenueMessageTarget
+    ) async -> AddFriendBusinessMessageOutcome {
+        guard target.entityType == .business else {
+            return .informational("Only businesses can be messaged from here.")
+        }
+
+        return await openBusinessVenueConversation(
+            businessId: target.entityId,
+            businessDisplayName: target.displayName,
+            venue: venue,
+            ownerUserId: target.ownerUserId,
+            businessUsername: target.username,
+            businessEmail: target.matchedEmail
+        )
+    }
+
+    /// Opens or creates a venue-scoped DM from Venue Detail (no venue picker).
+    func openBusinessVenueConversationFromVenueDetail(bar: BarVenue) async -> AddFriendBusinessMessageOutcome {
+        guard let businessId = bar.businessId else {
+            return .informational("This venue isn't available for messaging yet.")
+        }
+
+        let context = await service.fetchBusinessMessagingContext(businessId: businessId)
+        let venue = BusinessVenueMessageTarget(
+            id: bar.id,
+            venueName: bar.name,
+            locationLine: bar.address,
+            coverPhotoURL: bar.coverPhotoURL,
+            coverPhotoThumbnailURL: bar.coverPhotoThumbnailURL
+        )
+        return await openBusinessVenueConversation(
+            businessId: businessId,
+            businessDisplayName: context.displayName,
+            venue: venue,
+            ownerUserId: context.ownerUserId,
+            businessUsername: nil,
+            businessEmail: bar.ownerEmail
+        )
+    }
+
+    func shouldShowVenueChatIntroBanner(conversationId: UUID) -> Bool {
+        guard let authId = currentUserAuthId else { return false }
+        guard pendingVenueChatIntroConversationIds.contains(conversationId) else { return false }
+        return !Self.hasConsumedVenueChatIntroBanner(authId: authId, conversationId: conversationId)
+    }
+
+    @MainActor
+    func markVenueChatIntroBannerConsumed(conversationId: UUID) {
+        pendingVenueChatIntroConversationIds.remove(conversationId)
+        guard let authId = currentUserAuthId else { return }
+        Self.setVenueChatIntroBannerConsumed(authId: authId, conversationId: conversationId)
+    }
+
+    private static func venueChatIntroBannerDefaultsKey(authId: UUID, conversationId: UUID) -> String {
+        "venueChatIntroShown.\(authId.uuidString.lowercased()).\(conversationId.uuidString.lowercased())"
+    }
+
+    private static func hasConsumedVenueChatIntroBanner(authId: UUID, conversationId: UUID) -> Bool {
+        UserDefaults.standard.bool(
+            forKey: venueChatIntroBannerDefaultsKey(authId: authId, conversationId: conversationId)
+        )
+    }
+
+    private static func setVenueChatIntroBannerConsumed(authId: UUID, conversationId: UUID) {
+        UserDefaults.standard.set(
+            true,
+            forKey: venueChatIntroBannerDefaultsKey(authId: authId, conversationId: conversationId)
+        )
+    }
+
+    @MainActor
+    private func noteNewVenueChatIntroIfNeeded(conversationId: UUID, isNewConversation: Bool) {
+        guard isNewConversation else { return }
+        guard let authId = currentUserAuthId else { return }
+        guard !Self.hasConsumedVenueChatIntroBanner(authId: authId, conversationId: conversationId) else { return }
+        pendingVenueChatIntroConversationIds.insert(conversationId)
+    }
+
+    private func openBusinessVenueConversation(
+        businessId: UUID,
+        businessDisplayName: String,
+        venue: BusinessVenueMessageTarget,
+        ownerUserId: UUID?,
+        businessUsername: String?,
+        businessEmail: String?
+    ) async -> AddFriendBusinessMessageOutcome {
+        guard currentUserAuthId != nil else {
+            return .informational("Sign in to message this venue.")
+        }
+
+        if let ownerId = ownerUserId, isEitherDirectionBlocked(with: ownerId) {
+            return .informational("You can't message this business right now.")
+        }
+
+        let preview = userPreviewForBusinessVenueChat(
+            businessId: businessId,
+            businessDisplayName: businessDisplayName,
+            venue: venue,
+            ownerUserId: ownerUserId,
+            businessUsername: businessUsername,
+            businessEmail: businessEmail
+        )
+
+        do {
+            guard let me = currentUserAuthId else {
+                return .informational("Sign in to message this venue.")
+            }
+
+            let conversationId: UUID
+            let isNewConversation: Bool
+            guard let ownerId = ownerUserId else {
+                return .informational("This venue isn't available for messaging yet.")
+            }
+
+            if let existing = try await directChatService.fetchExistingBusinessVenueConversationId(
+                businessId: businessId,
+                venueId: venue.id,
+                ownerUserId: ownerId,
+                userId: me
+            ) {
+                conversationId = existing
+                isNewConversation = false
+            } else {
+                conversationId = try await directChatService.startBusinessVenueConversation(
+                    businessId: businessId,
+                    venueId: venue.id
+                )
+                isNewConversation = true
+            }
+
+            let threadPreview = UserPreview(
+                id: preview.id,
+                displayName: preview.displayName,
+                username: preview.username,
+                email: preview.email,
+                avatarURL: preview.avatarURL,
+                avatarThumbnailURL: preview.avatarThumbnailURL,
+                isBusinessAccount: preview.isBusinessAccount,
+                lastSeenAtRaw: preview.lastSeenAtRaw,
+                dmConversationId: conversationId,
+                businessVenueId: venue.id,
+                businessVenueBusinessId: businessId,
+                businessVenueBusinessName: preview.businessVenueBusinessName
+            )
+            await MainActor.run {
+                upsertBusinessVenueInboxDisplay(preview: threadPreview, conversationId: conversationId)
+                noteNewVenueChatIntroIfNeeded(conversationId: conversationId, isNewConversation: isNewConversation)
+            }
+            await refreshInboxSummaries()
+            await ensureSignedInSocialRealtimeIfNeeded()
+            await MainActor.run {
+                pendingDmOpenPreview = threadPreview
+            }
+            return .openedChat
+        } catch {
+            return .informational("Couldn't open chat. Try again.")
+        }
+    }
+
+    private func userPreviewForBusinessVenueChat(
+        target: AddFriendSearchTarget,
+        venue: BusinessVenueMessageTarget
+    ) -> UserPreview {
+        userPreviewForBusinessVenueChat(
+            businessId: target.entityId,
+            businessDisplayName: target.displayName,
+            venue: venue,
+            ownerUserId: target.ownerUserId,
+            businessUsername: target.username,
+            businessEmail: target.matchedEmail
+        )
+    }
+
+    private func userPreviewForBusinessVenueChat(
+        businessId: UUID,
+        businessDisplayName: String,
+        venue: BusinessVenueMessageTarget,
+        ownerUserId: UUID?,
+        businessUsername: String?,
+        businessEmail: String?
+    ) -> UserPreview {
+        let peerId = ownerUserId ?? businessId
+        return UserPreview(
+            id: peerId,
+            displayName: venue.venueName,
+            username: businessUsername,
+            email: businessEmail,
+            avatarURL: nil,
+            avatarThumbnailURL: nil,
+            isBusinessAccount: true,
+            businessVenueId: venue.id,
+            businessVenueBusinessId: businessId,
+            businessVenueBusinessName: businessDisplayName
+        )
+    }
+
     /// Refreshes Chat lists so pending/accepted rows appear immediately after Add Friend (including duplicate path).
     private func refreshAfterFriendLookupAttempt() async {
         await refreshFriendRequestListsOnly()
@@ -2463,20 +2721,39 @@ final class ChatViewModel: ObservableObject {
 
     /// Accepted friends without a DM thread yet still appear in the Friends directory (presentation only; inbox RPC unchanged).
     private func applyHiddenInboxPeerFilter(_ displays: [FriendDisplay]) -> [FriendDisplay] {
-        guard !hiddenInboxPeerUserIds.isEmpty else { return displays }
+        guard !hiddenInboxPeerUserIds.isEmpty || !hiddenInboxConversationIds.isEmpty else { return displays }
         return displays.filter { display in
             guard display.isConversationBacked else { return true }
-            return !hiddenInboxPeerUserIds.contains(display.id)
+            if let conversationId = display.conversationId,
+               hiddenInboxConversationIds.contains(conversationId) {
+                return false
+            }
+            if display.conversationId == nil,
+               hiddenInboxPeerUserIds.contains(display.preview.id) {
+                return false
+            }
+            return true
         }
     }
 
     @MainActor
-    private func hideInboxConversationLocally(peerUserId: UUID) {
+    private func hideInboxConversationLocally(peerUserId: UUID, conversationId: UUID? = nil) {
         if let authId = currentUserAuthId {
-            DmInboxHiddenConversationsStore.hide(peerUserId: peerUserId, authId: authId)
-            hiddenInboxPeerUserIds.insert(peerUserId)
+            if let conversationId {
+                DmInboxHiddenConversationsStore.hide(conversationId: conversationId, authId: authId)
+                hiddenInboxConversationIds.insert(conversationId)
+            } else {
+                DmInboxHiddenConversationsStore.hide(peerUserId: peerUserId, authId: authId)
+                hiddenInboxPeerUserIds.insert(peerUserId)
+            }
         }
-        friends.removeAll { $0.id == peerUserId && $0.isConversationBacked }
+        friends.removeAll {
+            guard $0.isConversationBacked else { return false }
+            if let conversationId {
+                return $0.conversationId == conversationId
+            }
+            return $0.preview.id == peerUserId && $0.conversationId == nil
+        }
         let totalUnread = friends.reduce(0) { $0 + $1.unreadCount }
         Task { await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "clear_inbox_conversation_local") }
     }
@@ -2493,19 +2770,67 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
+    @MainActor
+    private func revealInboxConversationIfHidden(conversationId: UUID, peerUserId: UUID? = nil, reason: String) {
+        if hiddenInboxConversationIds.contains(conversationId) {
+            hiddenInboxConversationIds.remove(conversationId)
+            if let authId = currentUserAuthId {
+                DmInboxHiddenConversationsStore.unhide(conversationId: conversationId, authId: authId)
+            }
+#if DEBUG
+            print("[DMDelete] revealed conversationId=\(conversationId.uuidString.lowercased()) reason=\(reason)")
+#endif
+        }
+        if let peerUserId {
+            revealInboxConversationIfHidden(peerUserId: peerUserId, reason: reason)
+        }
+    }
+
+    @MainActor
+    private func upsertBusinessVenueInboxDisplay(preview: UserPreview, conversationId: UUID) {
+        let display = FriendDisplay(
+            id: conversationId,
+            preview: preview,
+            subtitle: "Say hi",
+            lastMessageAt: nil,
+            unreadCount: 0,
+            isConversationBacked: true,
+            conversationId: conversationId
+        )
+        if let index = friends.firstIndex(where: { $0.conversationId == conversationId }) {
+            let existing = friends[index]
+            friends[index] = FriendDisplay(
+                id: conversationId,
+                preview: preview,
+                subtitle: existing.subtitle,
+                lastMessageAt: existing.lastMessageAt,
+                unreadCount: existing.unreadCount,
+                isConversationBacked: true,
+                conversationId: conversationId
+            )
+        } else {
+            friends.insert(display, at: 0)
+        }
+        revealInboxConversationIfHidden(
+            conversationId: conversationId,
+            peerUserId: preview.id,
+            reason: "business_venue_dm_opened"
+        )
+    }
+
     private func mergeAcceptedFriendsMissingFromInbox(
         me: UUID,
         inboxDisplays: [FriendDisplay]
     ) async throws -> [FriendDisplay] {
         let accepted = try await service.fetchAcceptedFriendships(for: me)
-        let inboxIds = Set(inboxDisplays.map(\.id))
+        let inboxPeerUserIds = Set(inboxDisplays.map(\.preview.id))
         let missingIds: [UUID] = accepted.compactMap { row in
             guard (row.requester_entity_type ?? "user").lowercased() == "user",
                   (row.addressee_entity_type ?? "user").lowercased() == "user" else {
                 return nil
             }
             let other = row.requester_id == me ? row.addressee_id : row.requester_id
-            guard !inboxIds.contains(other) else { return nil }
+            guard !inboxPeerUserIds.contains(other) else { return nil }
             guard !isEitherDirectionBlocked(with: other) else { return nil }
             return other
         }
@@ -2523,7 +2848,8 @@ final class ChatViewModel: ObservableObject {
                     subtitle: "Say hi",
                     lastMessageAt: nil,
                     unreadCount: 0,
-                    isConversationBacked: false
+                    isConversationBacked: false,
+                    conversationId: nil
                 )
             )
         }
@@ -2746,8 +3072,26 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
-    private func patchLoadedDmParticipantPreview(_ preview: UserPreview) {
-        guard let index = friends.firstIndex(where: { $0.id == preview.id }) else { return }
+    private func patchLoadedDmParticipantPreview(_ preview: UserPreview, conversationId: UUID? = nil) {
+        if preview.isBusinessVenueConversation {
+            return
+        }
+        if let conversationId,
+           let index = friends.firstIndex(where: { $0.conversationId == conversationId }) {
+            let existing = friends[index]
+            guard !existing.preview.isBusinessVenueConversation else { return }
+            friends[index] = FriendDisplay(
+                id: existing.id,
+                preview: preview,
+                subtitle: existing.subtitle,
+                lastMessageAt: existing.lastMessageAt,
+                unreadCount: existing.unreadCount,
+                isConversationBacked: existing.isConversationBacked,
+                conversationId: existing.conversationId
+            )
+            return
+        }
+        guard let index = friends.firstIndex(where: { $0.preview.id == preview.id && !$0.preview.isBusinessVenueConversation }) else { return }
         let existing = friends[index]
         friends[index] = FriendDisplay(
             id: existing.id,
@@ -2755,7 +3099,8 @@ final class ChatViewModel: ObservableObject {
             subtitle: existing.subtitle,
             lastMessageAt: existing.lastMessageAt,
             unreadCount: existing.unreadCount,
-            isConversationBacked: existing.isConversationBacked
+            isConversationBacked: existing.isConversationBacked,
+            conversationId: existing.conversationId
         )
     }
 
@@ -2793,6 +3138,26 @@ final class ChatViewModel: ObservableObject {
         resolvedPreview: UserPreview? = nil,
         profileLookupAttempted: Bool = false
     ) -> UserPreview {
+        if row.venue_id != nil {
+            let venueName = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let businessName = row.friend_business_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let fallbackName = row.friend_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let resolvedVenue = !venueName.isEmpty ? venueName : (!fallbackName.isEmpty ? fallbackName : "Venue")
+            let resolvedBusiness = !businessName.isEmpty ? businessName : "Business"
+            return UserPreview(
+                id: row.friend_user_id,
+                displayName: resolvedVenue,
+                email: row.friend_email,
+                avatarURL: nil,
+                avatarThumbnailURL: nil,
+                isBusinessAccount: true,
+                lastSeenAtRaw: resolvedPreview?.lastSeenAtRaw,
+                dmConversationId: row.conversation_id,
+                businessVenueId: row.venue_id,
+                businessVenueBusinessName: resolvedBusiness
+            )
+        }
+
         let isDeleted = row.friend_is_deleted == true
             || OwnerBusinessEmail.normalized(row.friend_email ?? "").hasSuffix("@deleted.fangeo.local")
             || row.friend_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) == "Deleted User"

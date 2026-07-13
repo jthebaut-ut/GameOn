@@ -26,7 +26,8 @@ enum SupportReplyNotificationDeepLinkPayload {
     }
 }
 
-/// Build 10: open Support Center only. Re-enable ticket drill-in after stability validation.
+/// Open Support Center from push. Ticket drill-in stays off until validated stable;
+/// list taps after push must still work without crashing.
 enum SupportReplyNotificationDeepLinkConfiguration {
     static let opensTicketDirectly = false
 }
@@ -62,21 +63,25 @@ final class SupportReplyNotificationDeepLinkBridge {
 
     func deliver(userInfo: [AnyHashable: Any]) {
 #if DEBUG
+        print("[SupportNotificationRoute] notification received payload=\(SupportReplyNotificationDeepLinkPayload.debugPayloadSummary(userInfo))")
         print("[SupportDeepLink] received payload=\(SupportReplyNotificationDeepLinkPayload.debugPayloadSummary(userInfo))")
 #endif
         guard let conversationID = SupportReplyNotificationDeepLinkPayload.conversationID(from: userInfo) else {
 #if DEBUG
+            print("[SupportNotificationRoute] parsed conversation/ticket id=nil (invalid or missing)")
             print("[SupportDeepLink] invalid or missing conversationId; ignoring")
 #endif
             return
         }
 
 #if DEBUG
+        print("[SupportNotificationRoute] parsed conversation/ticket id=\(conversationID.uuidString.lowercased())")
         print("[SupportDeepLink] valid conversationId=\(conversationID.uuidString.lowercased())")
 #endif
 
         if isDuplicate(conversationID: conversationID) {
 #if DEBUG
+            print("[SupportNotificationRoute] duplicate presentation prevented conversationId=\(conversationID.uuidString.lowercased()) source=bridge")
             print("[SupportDeepLink] ignored duplicate conversationId=\(conversationID.uuidString.lowercased())")
 #endif
             return
@@ -94,6 +99,7 @@ final class SupportReplyNotificationDeepLinkBridge {
             viewModel.enqueueSupportReplyNotificationDeepLink(request)
         } else {
 #if DEBUG
+            print("[SupportNotificationRoute] current route state viewModel=nil; queuing payload")
             print("[SupportDeepLink] queued conversationId=\(conversationID.uuidString.lowercased()) viewModel=nil")
 #endif
             pendingUserInfo = userInfo

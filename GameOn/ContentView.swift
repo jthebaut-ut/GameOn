@@ -31,6 +31,14 @@ struct ContentView: View {
                         print("[DeletedAccountLoginDebug] contentRoute=deletedAccountBlock")
 #endif
                     }
+            } else if viewModel.isDeletedBusinessLoginBlocked {
+                DeletedBusinessLoginGateView(viewModel: viewModel)
+                    .zIndex(2)
+                    .onAppear {
+#if DEBUG
+                        print("[DeletedBusinessLoginDebug] contentRoute=deletedBusinessBlock")
+#endif
+                    }
             } else if let ban = viewModel.activeAccountBan {
                 AccountSuspensionGateView(viewModel: viewModel, ban: ban, kind: .user)
                     .zIndex(2)
@@ -333,6 +341,174 @@ private struct DeletedAccountLoginGateView: View {
 #endif
     }
 }
+
+private struct DeletedBusinessLoginGateView: View {
+    @ObservedObject var viewModel: MapViewModel
+    @State private var showMailComposer = false
+    @State private var fallbackMessage = ""
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var attemptedLoginEmail: String {
+        let blocked = viewModel.blockedDeletedBusinessAttemptEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !blocked.isEmpty { return blocked }
+        return OwnerBusinessEmail.normalized(viewModel.venueOwnerEmail)
+    }
+
+    private var attemptedBusinessId: UUID? {
+        viewModel.blockedDeletedBusinessAttemptBusinessId
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer(minLength: 32)
+
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 46, weight: .bold))
+                .foregroundStyle(FGColor.dangerRed)
+                .accessibilityHidden(true)
+
+            VStack(spacing: 10) {
+                Text(MapViewModel.deletedBusinessLoginBlockedTitle)
+                    .font(.system(size: 28, weight: .black, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+
+                Text(MapViewModel.deletedBusinessLoginBlockedMessage)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(22)
+            .frame(maxWidth: 420)
+            .background(FGAdaptiveSurface.cardElevated, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(0.45), lineWidth: 1)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(MapViewModel.deletedBusinessLoginBlockedTitle). \(MapViewModel.deletedBusinessLoginBlockedMessage)")
+
+            VStack(spacing: 12) {
+                Button(action: contactSupport) {
+                    Text("Contact Support")
+                        .font(.headline.weight(.bold))
+                        .frame(maxWidth: 260)
+                        .padding(.vertical, 14)
+                        .background(FGColor.accentBlue, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Contact Support")
+                .accessibilityHint("Opens support contact for deleted business account reactivation")
+
+                Button {
+                    viewModel.acknowledgeDeletedBusinessLoginBlock()
+                } label: {
+                    Text("Close")
+                        .font(.headline.weight(.semibold))
+                        .frame(maxWidth: 260)
+                        .padding(.vertical, 14)
+                        .background(FGColor.divider(colorScheme).opacity(0.18), in: Capsule())
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close")
+                .accessibilityHint("Dismisses this screen and returns to sign in")
+            }
+
+            if !fallbackMessage.isEmpty {
+                Text(fallbackMessage)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+                    .accessibilityLabel(fallbackMessage)
+            }
+
+            Spacer(minLength: 32)
+        }
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .fanGeoScreenBackground()
+        .dynamicTypeSize(...DynamicTypeSize.accessibility5)
+#if canImport(MessageUI)
+        .sheet(isPresented: $showMailComposer) {
+            DeletedBusinessLoginMailComposer(
+                attemptedLoginEmail: attemptedLoginEmail,
+                businessId: attemptedBusinessId
+            )
+        }
+#endif
+    }
+
+    private func contactSupport() {
+        fallbackMessage = ""
+#if DEBUG
+        print("[DeletedBusinessLoginDebug] supportOpened email=\(attemptedLoginEmail) businessId=\(attemptedBusinessId?.uuidString.lowercased() ?? "nil")")
+#endif
+#if canImport(MessageUI)
+        if MFMailComposeViewController.canSendMail() {
+            showMailComposer = true
+            return
+        }
+#endif
+#if canImport(UIKit)
+        UIPasteboard.general.string = MapViewModel.deletedBusinessSupportRecipient
+        fallbackMessage = "Support email copied: \(MapViewModel.deletedBusinessSupportRecipient)"
+#else
+        fallbackMessage = "Contact support at \(MapViewModel.deletedBusinessSupportRecipient)"
+#endif
+    }
+}
+
+#if canImport(MessageUI)
+import MessageUI
+
+private struct DeletedBusinessLoginMailComposer: UIViewControllerRepresentable {
+    let attemptedLoginEmail: String
+    let businessId: UUID?
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> MFMailComposeViewController {
+        let composer = MFMailComposeViewController()
+        composer.mailComposeDelegate = context.coordinator
+        composer.setToRecipients([MapViewModel.deletedBusinessSupportRecipient])
+        composer.setSubject(MapViewModel.deletedBusinessSupportSubject)
+        composer.setMessageBody(
+            MapViewModel.deletedBusinessSupportMessageBody(
+                attemptedLoginEmail: attemptedLoginEmail,
+                businessId: businessId
+            ),
+            isHTML: false
+        )
+        return composer
+    }
+
+    func updateUIViewController(_ uiViewController: MFMailComposeViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFinish: { dismiss() })
+    }
+
+    final class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
+        let onFinish: () -> Void
+
+        init(onFinish: @escaping () -> Void) {
+            self.onFinish = onFinish
+        }
+
+        func mailComposeController(
+            _ controller: MFMailComposeViewController,
+            didFinishWith result: MFMailComposeResult,
+            error: Error?
+        ) {
+            onFinish()
+        }
+    }
+}
+#endif
 
 #if canImport(MessageUI)
 import MessageUI

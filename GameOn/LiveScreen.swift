@@ -3300,6 +3300,29 @@ struct LiveScreen: View {
         }
     }
 
+    private func openVenueChatFromDetail(for bar: BarVenue) async {
+        guard viewModel.isAuthenticatedForSocialFeatures else {
+            viewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
+            return
+        }
+        guard viewModel.canUseFanSocialFeatures else {
+            viewModel.logBusinessUserGateBlocked(action: "venueChat")
+            fanFeatureGateAlertMessage = BusinessFanGateCopy.actionTapBlocked
+            return
+        }
+
+        let chatBar = viewModel.barVenueForVenueChat(bar)
+        let outcome = await chatViewModel.openBusinessVenueConversationFromVenueDetail(bar: chatBar)
+        switch outcome {
+        case .openedChat:
+            activeSheet = nil
+        case .needsVenuePicker:
+            fanFeatureGateAlertMessage = "Choose a venue to continue."
+        case .informational(let message):
+            fanFeatureGateAlertMessage = message
+        }
+    }
+
     @ViewBuilder
     private func liveScreenSheetContent(for sheet: LiveScreenActiveSheet) -> some View {
         switch sheet {
@@ -3352,6 +3375,11 @@ struct LiveScreen: View {
                 friendUserIDs: acceptedFriendUserIDs
             )
             let displayedLiveEnergy = liveEnergy.map(liveEnergyForCurrentAudience)
+            let effectiveBusinessId = viewModel.effectiveBusinessIdForVenueChat(for: selectedBar)
+            let openVenueChatAction: (() async -> Void)? = {
+                guard effectiveBusinessId != nil else { return nil }
+                return { await openVenueChatFromDetail(for: selectedBar) }
+            }()
 
             VenueDetailView(
                 bar: selectedBar,
@@ -3457,7 +3485,9 @@ struct LiveScreen: View {
                 isHomeCrowdVenue: viewModel.isHomeCrowdVenue(selectedBar.id),
                 onToggleHomeCrowd: {
                     await viewModel.toggleHomeCrowd(for: selectedBar)
-                }
+                },
+                onOpenVenueChat: openVenueChatAction,
+                effectiveBusinessId: effectiveBusinessId
             )
             .task {
                 await viewModel.refreshApprovedVenueOwnershipState(for: selectedBar)
@@ -3479,7 +3509,8 @@ struct LiveScreen: View {
     }
 
     private func venueIsBusinessConfirmed(bar: BarVenue, claimStatus: VenueOwnershipClaimStatus) -> Bool {
-        guard bar.businessId != nil || bar.ownerEmail != nil else { return false }
+        let hasBusinessLink = viewModel.effectiveBusinessIdForVenueChat(for: bar) != nil || bar.ownerEmail != nil
+        guard hasBusinessLink else { return false }
         switch claimStatus {
         case .approved, .alreadyClaimedByOtherBusiness:
             return true

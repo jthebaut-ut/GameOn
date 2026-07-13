@@ -16,6 +16,85 @@ private enum ChatRowTimeFormatters {
     }()
 }
 
+private func friendsDirectoryCardSubtitle(for item: ChatViewModel.FriendDisplay) -> String {
+    if item.preview.isBusinessVenueConversation {
+        return "Venue chat"
+    }
+    if item.preview.isBusinessAccount && item.isConversationBacked {
+        return "Business chat"
+    }
+    let handle = item.preview.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !handle.isEmpty {
+        return FanGeoHandleRules.displayHandle(stored: handle)
+    }
+    return "FanGeo friend"
+}
+
+private func isFriendsDirectoryEligible(_ item: ChatViewModel.FriendDisplay) -> Bool {
+    guard !item.preview.isDeleted else { return false }
+    guard !item.preview.isBusinessVenueConversation else { return false }
+    if item.preview.isBusinessAccount && item.isConversationBacked { return false }
+    return true
+}
+
+nonisolated private func chatFansLiveNowCandidate(_ preview: UserPreview) -> Bool {
+    guard !preview.isDeleted else { return false }
+    guard preview.businessVenueId == nil else { return false }
+    guard !preview.isBusinessAccount else { return false }
+    guard let lastSeen = chatFansLiveNowParsedLastSeen(preview.lastSeenAtRaw) else { return false }
+    return Date().timeIntervalSince(lastSeen) <= 120
+}
+
+nonisolated private func chatFansLiveNowParsedLastSeen(_ raw: String?) -> Date? {
+    let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmed.isEmpty else { return nil }
+
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: trimmed) { return date }
+
+    let plain = ISO8601DateFormatter()
+    plain.formatOptions = [.withInternetDateTime]
+    return plain.date(from: trimmed)
+}
+
+private func friendsDirectoryDedupeKey(for item: ChatViewModel.FriendDisplay) -> String {
+    "user:\(item.preview.id.uuidString.lowercased())"
+}
+
+private func preferredFriendsDirectoryEntry(
+    existing: ChatViewModel.FriendDisplay,
+    candidate: ChatViewModel.FriendDisplay
+) -> ChatViewModel.FriendDisplay {
+    switch (existing.isConversationBacked, candidate.isConversationBacked) {
+    case (false, true):
+        return existing
+    case (true, false):
+        return candidate
+    default:
+        return existing
+    }
+}
+
+private func deduplicatedFriendsDirectory(
+    from friends: [ChatViewModel.FriendDisplay],
+    isAcceptedFriend: (UUID) -> Bool
+) -> [ChatViewModel.FriendDisplay] {
+    var byKey: [String: ChatViewModel.FriendDisplay] = [:]
+    for item in friends where isFriendsDirectoryEligible(item) && isAcceptedFriend(item.preview.id) {
+        let key = friendsDirectoryDedupeKey(for: item)
+        if let existing = byKey[key] {
+            byKey[key] = preferredFriendsDirectoryEntry(existing: existing, candidate: item)
+        } else {
+            byKey[key] = item
+        }
+    }
+    return Array(byKey.values)
+        .sorted {
+            $0.preview.displayName.localizedCaseInsensitiveCompare($1.preview.displayName) == .orderedAscending
+        }
+}
+
 // MARK: - Avatar (toolbar / rows / bubbles)
 
 struct ProfileAvatarView: View {
@@ -204,6 +283,10 @@ struct FriendsTabView: View {
             || mapViewModel.hasAuthenticatedVenueOwnerSession
     }
 
+    private var shouldShowFansLiveNowStrip: Bool {
+        !isBusinessChatAccount && !fansLiveNowEntries.isEmpty
+    }
+
     private var hasChatAuthSession: Bool {
         mapViewModel.canUsePrivateChat || viewModel.currentUserAuthId != nil
     }
@@ -245,6 +328,9 @@ struct FriendsTabView: View {
                     logFriendsDirectoryLoadedCount()
                     refreshFansLiveNowAfterFirstPaint(reason: "friendsPresenceChanged")
                 },
+                onFriendshipChipsChange: {
+                    rebuildFriendDisplaySnapshots(reason: "friendshipChipsChanged")
+                },
                 onSearchChange: { query in
                     rebuildFriendDisplaySnapshots(reason: "searchChanged")
                     logFriendsDirectorySearchQuery(query)
@@ -257,7 +343,11 @@ struct FriendsTabView: View {
                     fansLiveNowEntries = []
                     ChatFansLiveNowSessionCache.clear(authId: nil)
                 },
-                onBusinessAccountChange: { logChatAuthGate(reason: "businessAccountChanged") }
+                onBusinessAccountChange: {
+                    logChatAuthGate(reason: "businessAccountChanged")
+                    fansLiveNowEntries = []
+                    ChatFansLiveNowSessionCache.clear(authId: mapViewModel.currentUserAuthId)
+                }
             ))
             .modifier(ChatErrorAlertsModifier(viewModel: viewModel))
             .alert(
@@ -306,7 +396,7 @@ struct FriendsTabView: View {
                     FanGeoSupportHubView(
                         mapViewModel: mapViewModel,
                         chatViewModel: viewModel,
-                        embedsInNavigationStack: false,
+                        embedsInNavigationStack: true,
                         showsCloseButton: false,
                         screenTitle: "Support Center"
                     )
@@ -417,11 +507,9 @@ struct FriendsTabView: View {
 #endif
         let friends = viewModel.friends
         let conversations = friends.filter(\.isConversationBacked)
-        let directory = friends
-            .filter { !$0.preview.isDeleted }
-            .sorted {
-                $0.preview.displayName.localizedCaseInsensitiveCompare($1.preview.displayName) == .orderedAscending
-            }
+        let directory = deduplicatedFriendsDirectory(from: friends) { userId in
+            viewModel.chipKind(forOtherUserId: userId) == .friends
+        }
         let query = friendDirectorySearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered: [ChatViewModel.FriendDisplay]
         if query.isEmpty {
@@ -750,6 +838,10 @@ struct FriendsTabView: View {
 
     private func refreshFansLiveNowAfterFirstPaint(reason: String) {
         guard selectedSection == .chats, !shouldShowChatSignInRequired else { return }
+        guard !isBusinessChatAccount else {
+            fansLiveNowEntries = []
+            return
+        }
         Task { @MainActor in
             await Task.yield()
             let authId = mapViewModel.currentUserAuthId
@@ -825,7 +917,7 @@ struct FriendsTabView: View {
             } else if shouldShowChatInboxEmptyState {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
-                        if !fansLiveNowEntries.isEmpty {
+                        if shouldShowFansLiveNowStrip {
                             fansLiveNowStrip
                         }
                         chatEmptyState
@@ -841,7 +933,7 @@ struct FriendsTabView: View {
                         if viewModel.isInboxBackgroundRefreshInFlight {
                             chatInboxUpdatingIndicator
                         }
-                        if !fansLiveNowEntries.isEmpty {
+                        if shouldShowFansLiveNowStrip {
                             fansLiveNowStrip
                                 .padding(.horizontal, 16)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1011,7 +1103,10 @@ struct FriendsTabView: View {
             .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                 Button(role: .destructive) {
                     Task {
-                        await viewModel.clearInboxConversation(withFriendUserId: friend.id)
+                        await viewModel.clearInboxConversation(
+                            peerUserId: friend.preview.id,
+                            conversationId: friend.conversationId
+                        )
                     }
                 } label: {
                     Label("Delete", systemImage: "trash")
@@ -1222,11 +1317,7 @@ struct FriendsTabView: View {
     }
 
     private func friendDirectorySubtitle(for item: ChatViewModel.FriendDisplay) -> String {
-        let handle = item.preview.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !handle.isEmpty {
-            return FanGeoHandleRules.displayHandle(stored: handle)
-        }
-        return "FanGeo friend"
+        friendsDirectoryCardSubtitle(for: item)
     }
 
     private func openMessage(from item: ChatViewModel.FriendDisplay) {
@@ -1429,6 +1520,18 @@ private struct ChatSectionPendingRequestBadge: View {
     }
 }
 
+private struct ChatInboxBusinessConversationAvatar: View {
+    let size: CGFloat
+
+    var body: some View {
+        Image(systemName: "building.2.fill")
+            .font(.system(size: size * 0.46, weight: .semibold))
+            .foregroundStyle(FGColor.accentGreen)
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
+    }
+}
+
 private struct ChatFriendInboxRow: View, Equatable {
     let item: ChatViewModel.FriendDisplay
     let timeLabel: String
@@ -1443,7 +1546,7 @@ private struct ChatFriendInboxRow: View, Equatable {
 
     var body: some View {
         HStack(spacing: 12) {
-            ProfileAvatarView(preview: item.preview, size: 52)
+            inboxAvatar
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -1460,6 +1563,15 @@ private struct ChatFriendInboxRow: View, Equatable {
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                             .lineLimit(1)
                     }
+                }
+
+                if let businessName = item.preview.businessVenueBusinessName,
+                   !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(businessName)
+                        .font(.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 Text(chatPreviewLine)
@@ -1492,6 +1604,19 @@ private struct ChatFriendInboxRow: View, Equatable {
         }
         .softCardShadow()
         .animation(.spring(response: 0.26, dampingFraction: 0.86), value: isUnread)
+    }
+
+    @ViewBuilder
+    private var inboxAvatar: some View {
+        let fanAvatarSize: CGFloat = 52
+        let businessIconSize: CGFloat = 44
+
+        if item.preview.isBusinessVenueConversation || item.preview.isBusinessAccount {
+            ChatInboxBusinessConversationAvatar(size: businessIconSize)
+                .frame(width: fanAvatarSize, height: fanAvatarSize, alignment: .center)
+        } else {
+            ProfileAvatarView(preview: item.preview, size: fanAvatarSize)
+        }
     }
 
     private var chatPreviewLine: String {
@@ -1607,11 +1732,7 @@ private struct FriendDirectoryCard: View, Equatable {
     }
 
     private var subtitle: String {
-        let handle = item.preview.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !handle.isEmpty {
-            return FanGeoHandleRules.displayHandle(stored: handle)
-        }
-        return "FanGeo friend"
+        friendsDirectoryCardSubtitle(for: item)
     }
 
     private var cardBackground: AnyShapeStyle {
@@ -1805,6 +1926,7 @@ private struct FriendsTabLifecycleModifier: ViewModifier {
     let onTabSelectedChange: (Bool) -> Void
     let onAppear: () -> Void
     let onFriendsChange: () -> Void
+    let onFriendshipChipsChange: () -> Void
     let onSearchChange: (String) -> Void
     let onPendingDmOpen: () -> Void
     let onRequiresSignInChange: () -> Void
@@ -1820,6 +1942,9 @@ private struct FriendsTabLifecycleModifier: ViewModifier {
             .onAppear(perform: onAppear)
             .onChange(of: viewModel.friends) { _, _ in
                 onFriendsChange()
+            }
+            .onChange(of: viewModel.friendshipChipByOtherUserId) { _, _ in
+                onFriendshipChipsChange()
             }
             .onChange(of: friendDirectorySearchText) { _, query in
                 onSearchChange(query)
@@ -1923,6 +2048,83 @@ private struct AddFriendSearchResultRow: View {
     }
 }
 
+private struct BusinessVenuePickerSheet: View {
+    let businessName: String
+    let venues: [BusinessVenueMessageTarget]
+    let onSelect: (BusinessVenueMessageTarget) -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List(venues) { venue in
+                Button {
+                    onSelect(venue)
+                } label: {
+                    HStack(spacing: 12) {
+                        BusinessVenuePickerThumbnail(venue: venue)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(venue.venueName)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                            if !venue.locationLine.isEmpty {
+                                Text(venue.locationLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            .navigationTitle("Choose a venue")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close", action: onClose)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+}
+
+private struct BusinessVenuePickerThumbnail: View {
+    let venue: BusinessVenueMessageTarget
+
+    private let size: CGFloat = 48
+
+    var body: some View {
+        Group {
+            if let urlString = ImageDisplayURL.forList(
+                thumbnail: venue.coverPhotoThumbnailURL,
+                full: venue.coverPhotoURL
+            ),
+               let url = URL(string: urlString) {
+                DiscoverCachedRemoteImage(url: url, contentMode: .fill) {
+                    fallbackBackground
+                }
+            } else {
+                fallbackBackground
+                    .overlay {
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: size * 0.4, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var fallbackBackground: some View {
+        RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .fill(Color(.secondarySystemGroupedBackground))
+    }
+}
+
 private struct AddFriendGlassSheet: View {
     @Binding var lookupDraft: String
     @ObservedObject var viewModel: ChatViewModel
@@ -1934,13 +2136,20 @@ private struct AddFriendGlassSheet: View {
     @State private var isSending = false
     @State private var selectedTarget: AddFriendSearchTarget?
     @State private var searchTask: Task<Void, Never>?
+    @State private var venuePickerTarget: AddFriendSearchTarget?
+    @State private var venuePickerOptions: [BusinessVenueMessageTarget] = []
 
     private var normalizedDraft: String {
         FriendshipService.normalizedFriendLookupQuery(lookupDraft)
     }
 
-    private var canSend: Bool {
+    private var canPerformPrimaryAction: Bool {
         selectedTarget != nil && !isSending
+    }
+
+    private var primaryActionTitle: String {
+        guard let target = selectedTarget else { return "Send" }
+        return target.entityType == .business ? "Message" : "Send"
     }
 
     var body: some View {
@@ -1962,7 +2171,7 @@ private struct AddFriendGlassSheet: View {
                             .fill(Color(.secondarySystemGroupedBackground).opacity(0.7))
                     )
 
-                Text("Results show User vs Business. Pick one, then Send.")
+                Text("Send a friend request to fans, or message a business.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -2012,10 +2221,44 @@ private struct AddFriendGlassSheet: View {
                 selectedTarget = results.first
             }
         }
+        .onChange(of: selectedTarget) { _, newValue in
+            inlineError = nil
+            successMessage = nil
+            if newValue?.entityType == .business {
+                inlineWarning = "Businesses can't be added as friends, but you can message one of their venues."
+            } else if inlineWarning == "Businesses can't be added as friends, but you can message one of their venues." {
+                inlineWarning = nil
+            }
+        }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(34)
         .presentationBackground(.ultraThinMaterial)
+        .sheet(item: $venuePickerTarget) { target in
+            BusinessVenuePickerSheet(
+                businessName: target.displayName,
+                venues: venuePickerOptions,
+                onSelect: { venue in
+                    venuePickerTarget = nil
+                    Task {
+                        isSending = true
+                        let outcome = await viewModel.openBusinessVenueConversation(target: target, venue: venue)
+                        isSending = false
+                        switch outcome {
+                        case .openedChat:
+                            onClose()
+                        case .needsVenuePicker:
+                            inlineWarning = "Choose a venue to continue."
+                        case .informational(let msg):
+                            inlineWarning = msg
+                        }
+                    }
+                },
+                onClose: {
+                    venuePickerTarget = nil
+                }
+            )
+        }
     }
 
     @ViewBuilder
@@ -2053,35 +2296,48 @@ private struct AddFriendGlassSheet: View {
 
             Spacer()
 
-            Text("Add friend")
+            Text("Find People & Businesses")
                 .font(.headline.weight(.semibold))
 
             Spacer()
 
-            Button("Send") {
+            Button(primaryActionTitle) {
                 guard let target = selectedTarget else { return }
                 Task {
                     isSending = true
                     inlineError = nil
                     inlineWarning = nil
                     successMessage = nil
-                    let outcome = await viewModel.sendFriendRequest(to: target)
-                    switch outcome {
-                    case .success:
-                        successMessage = "Friend request sent."
-                    case .informational(let msg):
-                        inlineWarning = msg
-                    case .error(let msg):
-                        inlineError = msg
+                    if target.entityType == .user {
+                        let outcome = await viewModel.sendFriendRequest(to: target)
+                        switch outcome {
+                        case .success:
+                            successMessage = "Friend request sent."
+                        case .informational(let msg):
+                            inlineWarning = msg
+                        case .error(let msg):
+                            inlineError = msg
+                        }
+                    } else {
+                        let outcome = await viewModel.prepareBusinessVenueMessage(from: target)
+                        switch outcome {
+                        case .openedChat:
+                            onClose()
+                        case .needsVenuePicker(let venues):
+                            venuePickerOptions = venues
+                            venuePickerTarget = target
+                        case .informational(let msg):
+                            inlineWarning = msg
+                        }
                     }
                     isSending = false
                 }
             }
             .buttonStyle(.plain)
             .font(.headline.weight(.semibold))
-            .foregroundStyle(canSend ? Color.accentColor : Color.secondary)
-            .disabled(!canSend)
-            .frame(width: 68, alignment: .trailing)
+            .foregroundStyle(canPerformPrimaryAction ? Color.accentColor : Color.secondary)
+            .disabled(!canPerformPrimaryAction)
+            .frame(minWidth: 68, alignment: .trailing)
         }
         .padding(.horizontal, 18)
     }
@@ -2148,7 +2404,7 @@ enum ChatFansLiveNowSessionCache {
 
     private static func onlinePresenceSignature(_ friends: [ChatViewModel.FriendDisplay]) -> String {
         friends
-            .filter { !$0.preview.isDeleted && $0.preview.isOnlineNow }
+            .filter { chatFansLiveNowCandidate($0.preview) }
             .map { "\($0.id.uuidString.lowercased()):\($0.preview.lastSeenAtRaw ?? "")" }
             .sorted()
             .joined(separator: "|")
@@ -2162,7 +2418,7 @@ enum ChatFansLiveNowSessionCache {
         var seen = Set<UUID>()
 
         let onlineFriends = friends
-            .filter { !$0.preview.isDeleted && $0.preview.isOnlineNow }
+            .filter { chatFansLiveNowCandidate($0.preview) }
             .sorted { lhs, rhs in
                 let left = PresenceOnlineStatus.parse(lhs.preview.lastSeenAtRaw) ?? .distantPast
                 let right = PresenceOnlineStatus.parse(rhs.preview.lastSeenAtRaw) ?? .distantPast
@@ -2188,7 +2444,6 @@ enum ChatFansLiveNowSessionCache {
     }
 
     private static func subtitle(for preview: UserPreview, suggestion: FriendSuggestionProfile?) -> String {
-        if preview.isBusinessAccount { return "Venue" }
         if let suggestion {
             if let label = suggestion.reasonLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
                !label.isEmpty {

@@ -65,8 +65,13 @@ struct VenueDetailView: View {
     var onToggleHomeCrowd: (() async -> Void)? = nil
     /// Signed-in fans can report abusive or misleading venue listings.
     var showsVenueReportAction: Bool = false
+    /// Opens a venue-scoped business DM for this venue (Discover/Live when a business id is known).
+    var onOpenVenueChat: (() async -> Void)? = nil
+    /// Prefer this over ``bar.businessId`` for Chat visibility (approved claim ownership when venues.business_id is nil).
+    var effectiveBusinessId: UUID? = nil
 
     @State private var isHomeCrowdActionInFlight = false
+    @State private var isVenueChatOpening = false
 
     private static let sqlDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -144,9 +149,22 @@ struct VenueDetailView: View {
     }
 
     private var quickActionsSectionSubtitle: String {
-        venueBusinessContactEmail != nil
+        if showsVenueChatQuickAction {
+            return venueBusinessContactEmail != nil
+                ? "Message, get there, call, email, save, or share this venue"
+                : "Message, get there, call, save, or share this venue"
+        }
+        return venueBusinessContactEmail != nil
             ? "Get there, call, email, save, or share this venue"
             : "Get there, call, save, or share this venue"
+    }
+
+    private var resolvedBusinessIdForChat: UUID? {
+        effectiveBusinessId ?? bar.businessId
+    }
+
+    private var showsVenueChatQuickAction: Bool {
+        resolvedBusinessIdForChat != nil && onOpenVenueChat != nil
     }
 
     private func openVenueBusinessMail() {
@@ -655,6 +673,14 @@ struct VenueDetailView: View {
         await onToggleHomeCrowd?()
     }
 
+    @MainActor
+    private func runVenueChatQuickAction() async {
+        guard let onOpenVenueChat, !isVenueChatOpening else { return }
+        isVenueChatOpening = true
+        defer { isVenueChatOpening = false }
+        await onOpenVenueChat()
+    }
+
     private var venueActionSection: some View {
         FGCard {
             FGSectionHeader("Quick actions", subtitle: quickActionsSectionSubtitle)
@@ -665,6 +691,21 @@ struct VenueDetailView: View {
                 ],
                 spacing: FGSpacing.sm
             ) {
+                if showsVenueChatQuickAction {
+                    Button {
+                        Task { await runVenueChatQuickAction() }
+                    } label: {
+                        actionCardContent(
+                            title: isVenueChatOpening ? "Opening..." : "Chat",
+                            subtitle: "Message this venue",
+                            icon: "message.fill",
+                            tint: FGColor.accentGreen
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isVenueChatOpening)
+                }
+
                 Button(action: onDirections) {
                     actionCardContent(
                         title: "Directions",
@@ -1793,9 +1834,12 @@ struct VenueDetailView: View {
 #if DEBUG
         print("[VenueDetailDebug] isBusinessConfirmed=\(isBusinessConfirmed)")
         print("[VenueDetailDebug] selected venue business_id=\(bar.businessId?.uuidString ?? "nil")")
+        print("[VenueDetailDebug] effectiveBusinessId=\(effectiveBusinessId?.uuidString ?? "nil")")
+        print("[VenueDetailDebug] resolvedBusinessIdForChat=\(resolvedBusinessIdForChat?.uuidString ?? "nil")")
         print("[VenueDetailDebug] selected venue owner_email=\(bar.ownerEmail ?? "nil")")
         print("[VenueDetailDebug] selected venue sports_supported=\(sportsSupported)")
         print("[VenueDetailDebug] selected venue ratingCount=\(ratingCount)")
+        print("[VenueDetailDebug] showsVenueChatQuickAction=\(showsVenueChatQuickAction)")
         let hero = venueDetailsHeroURLString ?? ""
         let second = venueDetailsSecondPhotoURLString ?? ""
         print("[VenuePhotoDebug] venueId=\(bar.id.uuidString.lowercased())")

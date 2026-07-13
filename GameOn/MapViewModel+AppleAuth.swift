@@ -393,8 +393,22 @@ extension MapViewModel {
             return
         }
 
+        let businessLifecycle = await resolveBusinessProfileLifecycleState()
+        switch businessLifecycle {
+        case .deleted, .archived, .disabled, .unknown:
+            _ = await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: "finishAppleBusinessSignIn"
+            )
+            clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+            return
+        case .active, .missing:
+            break
+        }
+
         if entryPoint == .businessSignup,
-           !(await appleCurrentBusinessProfileExists(session: session)) {
+           businessLifecycle == .missing {
             let businessDisplayName = Self.appleBusinessDisplayName(email: sessionEmail, fullName: fullName)
             await MainActor.run {
                 applePendingBusinessSignupEmail = sessionEmail
@@ -594,45 +608,10 @@ extension MapViewModel {
     }
 
     private func appleCurrentBusinessProfileExists(session: Session) async -> Bool {
-        do {
-            let rowsByUser: [BusinessRow] = try await supabase
-                .from("businesses")
-                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
-                .eq("owner_user_id", value: session.user.id)
-                .eq("admin_status", value: "active")
-                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
-                .limit(1)
-                .execute()
-                .value
-
-            if rowsByUser.first != nil {
-                print("[AppleAuthDebug] existingProfileFound=true")
-                return true
-            }
-
-            let email = OwnerBusinessEmail.normalized(session.user.email ?? "")
-            guard OwnerBusinessEmail.isValidStrict(email) else {
-                print("[AppleAuthDebug] existingProfileFound=false")
-                return false
-            }
-
-            let rowsByEmail: [BusinessRow] = try await supabase
-                .from("businesses")
-                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
-                .eq("owner_email", value: email)
-                .eq("admin_status", value: "active")
-                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
-                .limit(1)
-                .execute()
-                .value
-
-            let exists = rowsByEmail.first != nil
-            print("[AppleAuthDebug] existingProfileFound=\(exists)")
-            return exists
-        } catch {
-            print("[AppleAuthDebug] authError=\(error.localizedDescription)")
-            return false
-        }
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        let exists = lifecycle == .active
+        print("[AppleAuthDebug] existingProfileFound=\(exists) lifecycle=\(lifecycle.rawValue)")
+        return exists
     }
 
     private func appleEnsureBusinessProfileExists(
@@ -640,41 +619,36 @@ extension MapViewModel {
         email: String,
         fullName: PersonNameComponents?
     ) async -> Bool {
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        switch lifecycle {
+        case .active:
+            print("[AppleAuthDebug] existingProfileFound=true")
+            return true
+        case .deleted, .archived, .disabled, .unknown:
+            print("[AppleAuthDebug] businessProfileCreationBlocked=true lifecycle=\(lifecycle.rawValue)")
+            _ = await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: email,
+                source: "appleEnsureBusinessProfileExists"
+            )
+            return false
+        case .missing:
+            break
+        }
+
+        guard await enforceBusinessCreationAllowed(
+            userId: session.user.id,
+            sessionEmail: email,
+            source: "appleEnsureBusinessProfileExists"
+        ) else {
+            return false
+        }
+
+        print("[AppleAuthDebug] existingProfileFound=false")
+        print("[AppleAuthDebug] profileMissing=true")
+        print("[AppleAuthDebug] creatingNewProfile=true")
+
         do {
-            let rowsByUser: [BusinessRow] = try await supabase
-                .from("businesses")
-                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
-                .eq("owner_user_id", value: session.user.id)
-                .eq("admin_status", value: "active")
-                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
-                .limit(1)
-                .execute()
-                .value
-
-            if rowsByUser.first != nil {
-                print("[AppleAuthDebug] existingProfileFound=true")
-                return true
-            }
-
-            let rowsByEmail: [BusinessRow] = try await supabase
-                .from("businesses")
-                .select("id,display_name,owner_email,owner_user_id,admin_status,business_origin,created_at")
-                .eq("owner_email", value: email)
-                .eq("admin_status", value: "active")
-                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
-                .limit(1)
-                .execute()
-                .value
-
-            if rowsByEmail.first != nil {
-                print("[AppleAuthDebug] existingProfileFound=true")
-                return true
-            }
-
-            print("[AppleAuthDebug] existingProfileFound=false")
-            print("[AppleAuthDebug] profileMissing=true")
-            print("[AppleAuthDebug] creatingNewProfile=true")
-
             let payload = BusinessInsertPayload(
                 display_name: Self.appleBusinessDisplayName(email: email, fullName: fullName),
                 business_handle: nil,

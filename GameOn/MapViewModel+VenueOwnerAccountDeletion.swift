@@ -64,6 +64,8 @@ struct BusinessAccountDeletionPreviewEvent: Decodable, Identifiable, Equatable {
 
 struct BusinessAccountDeletionPreview: Decodable, Equatable {
     let ok: Bool
+    let blocked: Bool?
+    let blockReason: String?
     let businessId: UUID?
     let businessName: String?
     let businessVenuesToDelete: [BusinessAccountDeletionPreviewVenue]
@@ -79,6 +81,8 @@ struct BusinessAccountDeletionPreview: Decodable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case ok
+        case blocked
+        case blockReason = "block_reason"
         case businessId = "business_id"
         case businessName = "business_name"
         case businessVenuesToDelete = "business_venues_to_delete"
@@ -91,6 +95,25 @@ struct BusinessAccountDeletionPreview: Decodable, Equatable {
         case eventCount = "event_count"
         case photoCount = "photo_count"
         case pendingClaimCount = "pending_claim_count"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try container.decode(Bool.self, forKey: .ok)
+        blocked = try container.decodeIfPresent(Bool.self, forKey: .blocked)
+        blockReason = try container.decodeIfPresent(String.self, forKey: .blockReason)
+        businessId = try container.decodeIfPresent(UUID.self, forKey: .businessId)
+        businessName = try container.decodeIfPresent(String.self, forKey: .businessName)
+        businessVenuesToDelete = try container.decodeIfPresent([BusinessAccountDeletionPreviewVenue].self, forKey: .businessVenuesToDelete) ?? []
+        communityVenuesToRelease = try container.decodeIfPresent([BusinessAccountDeletionPreviewVenue].self, forKey: .communityVenuesToRelease) ?? []
+        pendingBusinessVenuesToDelete = try container.decodeIfPresent([BusinessAccountDeletionPreviewVenue].self, forKey: .pendingBusinessVenuesToDelete) ?? []
+        pendingCommunityClaimsToCancel = try container.decodeIfPresent([BusinessAccountDeletionPreviewVenue].self, forKey: .pendingCommunityClaimsToCancel) ?? []
+        gamesEventsToRemove = try container.decodeIfPresent([BusinessAccountDeletionPreviewEvent].self, forKey: .gamesEventsToRemove) ?? []
+        businessVenueCount = try container.decodeIfPresent(Int.self, forKey: .businessVenueCount) ?? 0
+        communityVenueCount = try container.decodeIfPresent(Int.self, forKey: .communityVenueCount) ?? 0
+        eventCount = try container.decodeIfPresent(Int.self, forKey: .eventCount) ?? 0
+        photoCount = try container.decodeIfPresent(Int.self, forKey: .photoCount) ?? 0
+        pendingClaimCount = try container.decodeIfPresent(Int.self, forKey: .pendingClaimCount) ?? 0
     }
 }
 

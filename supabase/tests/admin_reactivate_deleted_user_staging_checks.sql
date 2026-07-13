@@ -1,7 +1,10 @@
 -- Staging integrity checks for admin deleted-account reactivation.
--- Run manually on staging after applying 20260844_0001_admin_reactivate_deleted_user.sql.
-
-\set ON_ERROR_STOP on
+-- Run manually on staging after applying:
+--   20260844_0001_admin_reactivate_deleted_user.sql
+--   20260846_0001_fix_admin_reactivation_generated_column.sql
+--
+-- Supabase SQL Editor compatible (no psql meta-commands).
+-- Each block uses RAISE EXCEPTION on failure, which stops the run.
 
 DO $$
 BEGIN
@@ -219,6 +222,54 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION pg_temp.staging_reactivation_create_eligible_deleted_fan()
+RETURNS TABLE(subject_user_id uuid, deletion_job_id uuid, original_email text)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_user_id uuid;
+  v_job_id uuid;
+  v_original_email text;
+BEGIN
+  v_user_id := pg_temp.staging_reactivation_create_deleted_fan();
+
+  SELECT lower(btrim(ai.email))
+    INTO v_original_email
+  FROM public.account_identities ai
+  WHERE ai.account_id = v_user_id;
+
+  INSERT INTO public.account_deletion_jobs (
+    subject_user_id,
+    requested_by_user_id,
+    request_source,
+    deletion_mode,
+    status,
+    stage,
+    idempotency_key,
+    preview_snapshot,
+    created_at,
+    completed_at
+  ) VALUES (
+    v_user_id,
+    v_user_id,
+    'system',
+    'soft',
+    'completed',
+    'completed',
+    'reactivation-mutation-check-' || gen_random_uuid()::text,
+    jsonb_build_object('normalized_email', v_original_email),
+    now() - interval '1 hour',
+    now() - interval '1 hour'
+  )
+  RETURNING id INTO v_job_id;
+
+  subject_user_id := v_user_id;
+  deletion_job_id := v_job_id;
+  original_email := v_original_email;
+  RETURN NEXT;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pg_temp.staging_reactivation_teardown(p_user_id uuid)
 RETURNS void
 LANGUAGE plpgsql
@@ -233,6 +284,12 @@ BEGIN
 
   DELETE FROM public.account_reactivation_events
   WHERE subject_user_id = p_user_id;
+
+  IF to_regclass('public.admin_audit_logs') IS NOT NULL THEN
+    DELETE FROM public.admin_audit_logs
+    WHERE action = 'reactivate_deleted_user'
+      AND target_id = p_user_id::text;
+  END IF;
 
   DELETE FROM public.user_profiles
   WHERE id = p_user_id;
@@ -382,6 +439,138 @@ BEGIN
   END IF;
 
   RAISE NOTICE 'PASS: identity guard reactivation bypass present';
+END;
+$$;
+
+DO $$
+DECLARE
+  v_def text;
+BEGIN
+  v_def := pg_get_functiondef('public.admin_reactivate_deleted_user(uuid,text,text,text,text)'::regprocedure);
+  IF position('display_name_normalized =' IN v_def) > 0 THEN
+    RAISE EXCEPTION 'FAIL: admin_reactivate_deleted_user still assigns display_name_normalized directly';
+  END IF;
+
+  RAISE NOTICE 'PASS: reactivation mutation does not assign display_name_normalized';
+END;
+$$;
+
+-- End-to-end reactivation: generated display_name_normalized, profile shell restore, idempotency.
+DO $$
+DECLARE
+  v_fixture record;
+  v_user_id uuid;
+  v_job_id uuid;
+  v_original_email text;
+  v_admin_display_name text := 'Reactivated Staging Name';
+  v_result jsonb;
+  v_repeat jsonb;
+  v_profile public.user_profiles%ROWTYPE;
+  v_job_before public.account_deletion_jobs%ROWTYPE;
+  v_job_after public.account_deletion_jobs%ROWTYPE;
+  v_event_count integer;
+  v_expected_normalized text;
+BEGIN
+  SELECT *
+    INTO v_fixture
+  FROM pg_temp.staging_reactivation_create_eligible_deleted_fan();
+
+  v_user_id := v_fixture.subject_user_id;
+  v_job_id := v_fixture.deletion_job_id;
+  v_original_email := v_fixture.original_email;
+  v_expected_normalized := nullif(lower(btrim(v_admin_display_name)), '');
+
+  SELECT * INTO v_job_before
+  FROM public.account_deletion_jobs j
+  WHERE j.id = v_job_id;
+
+  BEGIN
+    v_result := public.admin_reactivate_deleted_user(
+      v_user_id,
+      v_admin_display_name,
+      'staging reactivation mutation check',
+      NULL,
+      'staging-admin@reactivation.test'
+    );
+
+    IF coalesce(v_result ->> 'ok', 'false') <> 'true' THEN
+      RAISE EXCEPTION 'FAIL: eligible deleted fan reactivation failed: %', v_result;
+    END IF;
+
+    IF coalesce(v_result ->> 'idempotent', 'true') = 'true' THEN
+      RAISE EXCEPTION 'FAIL: first reactivation should not be idempotent: %', v_result;
+    END IF;
+
+    SELECT * INTO v_profile
+    FROM public.user_profiles up
+    WHERE up.id = v_user_id;
+
+    IF coalesce(v_profile.is_deleted, false) <> false THEN
+      RAISE EXCEPTION 'FAIL: is_deleted should be false after reactivation';
+    END IF;
+
+    IF v_profile.deleted_at IS NOT NULL OR v_profile.anonymized_at IS NOT NULL THEN
+      RAISE EXCEPTION 'FAIL: deleted_at/anonymized_at should be cleared after reactivation';
+    END IF;
+
+    IF lower(btrim(v_profile.email)) <> v_original_email THEN
+      RAISE EXCEPTION 'FAIL: profile email not restored. expected %, got %', v_original_email, v_profile.email;
+    END IF;
+
+    IF btrim(v_profile.display_name) <> v_admin_display_name THEN
+      RAISE EXCEPTION 'FAIL: display_name not set to admin value';
+    END IF;
+
+    IF v_profile.display_name_normalized IS DISTINCT FROM v_expected_normalized THEN
+      RAISE EXCEPTION 'FAIL: display_name_normalized not derived from display_name. expected %, got %',
+        v_expected_normalized, v_profile.display_name_normalized;
+    END IF;
+
+    SELECT count(*) INTO v_event_count
+    FROM public.account_reactivation_events e
+    WHERE e.subject_user_id = v_user_id;
+
+    IF v_event_count <> 1 THEN
+      RAISE EXCEPTION 'FAIL: expected exactly one reactivation event, got %', v_event_count;
+    END IF;
+
+    v_repeat := public.admin_reactivate_deleted_user(
+      v_user_id,
+      v_admin_display_name,
+      'staging reactivation idempotency check',
+      NULL,
+      'staging-admin@reactivation.test'
+    );
+
+    IF coalesce(v_repeat ->> 'ok', 'false') <> 'true'
+       OR coalesce(v_repeat ->> 'idempotent', 'false') <> 'true' THEN
+      RAISE EXCEPTION 'FAIL: repeat reactivation should be idempotent: %', v_repeat;
+    END IF;
+
+    SELECT count(*) INTO v_event_count
+    FROM public.account_reactivation_events e
+    WHERE e.subject_user_id = v_user_id;
+
+    IF v_event_count <> 1 THEN
+      RAISE EXCEPTION 'FAIL: repeat submit created duplicate reactivation event, count=%', v_event_count;
+    END IF;
+
+    SELECT * INTO v_job_after
+    FROM public.account_deletion_jobs j
+    WHERE j.id = v_job_id;
+
+    IF v_job_after IS DISTINCT FROM v_job_before THEN
+      RAISE EXCEPTION 'FAIL: completed deletion job changed after reactivation';
+    END IF;
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM pg_temp.staging_reactivation_teardown(v_user_id);
+      RAISE;
+  END;
+
+  PERFORM pg_temp.staging_reactivation_teardown(v_user_id);
+
+  RAISE NOTICE 'PASS: eligible deleted fan reactivation succeeds with derived display_name_normalized';
 END;
 $$;
 

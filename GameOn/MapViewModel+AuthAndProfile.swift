@@ -161,6 +161,38 @@ extension MapViewModel {
         return !draft.isVenueSubmissionReady
     }
 
+    /// Lifecycle-gated wrapper for pending business venue setup after sign-in.
+    func applyVerifiedBusinessSignupSessionIfAllowed(session: Session) async -> Bool {
+        let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+        guard Self.userEmailConfirmed(session.user),
+              OwnerBusinessEmail.isValidStrict(sessionEmail) else {
+            return false
+        }
+
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        switch lifecycle {
+        case .missing:
+            break
+        case .active:
+            await MainActor.run { clearPendingBusinessEmailSignupState() }
+            return false
+        case .deleted, .archived, .disabled, .unknown:
+#if DEBUG
+            print("[DeletedBusinessLoginDebug] signupPrevented reason=\(lifecycle.rawValue) source=applyVerifiedBusinessSignupSessionIfAllowed")
+#endif
+            _ = await enforceBusinessLifecycleGate(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: "applyVerifiedBusinessSignupSessionIfAllowed"
+            )
+            return true
+        }
+
+        return await MainActor.run {
+            applyVerifiedBusinessSignupSessionIfNeeded(session: session)
+        }
+    }
+
     /// Signs out after post-verification venue setup while preserving the pending business draft for resume.
     func deferBusinessVenueSetupUntilLater() async {
         let draftEmail = await MainActor.run {
@@ -393,7 +425,7 @@ extension MapViewModel {
 #endif
     }
 
-    private func logDeletedAccountRestoreDebug(_ message: String) {
+    func logDeletedAccountRestoreDebug(_ message: String) {
 #if DEBUG
         print("[DeletedAccountRestoreDebug] \(message)")
 #endif
@@ -402,11 +434,13 @@ extension MapViewModel {
     @MainActor
     private func clearStaleDeletedAccountBlockIfNeeded(context: String) {
         let staleDeletedBlock = authSessionState == .deletedAccountConfirmed
+            || authSessionState == .deletedBusinessAccountConfirmed
             || Self.isDeletedAccountBlockMessage(authErrorMessage)
             || Self.isDeletedAccountBlockMessage(venueAuthErrorMessage)
         guard staleDeletedBlock else { return }
 
-        if authSessionState == .deletedAccountConfirmed {
+        if authSessionState == .deletedAccountConfirmed
+            || authSessionState == .deletedBusinessAccountConfirmed {
             transitionAuthSessionState(.loadingSession, reason: "\(context)_staleDeletedBlockCleared")
         }
         authErrorMessage = ""
@@ -464,6 +498,7 @@ extension MapViewModel {
         if reasonKey.contains("explicitlogoutbootstrap") { return true }
         if sourceKey.contains("logoutuser") { return true }
         if reasonKey.contains("deletedaccountconfirmed") { return true }
+        if reasonKey.contains("deletedbusinessaccountconfirmed") { return true }
         if reasonKey.contains("disabledaccountconfirmed") { return true }
         if reasonKey.contains("accountdeletion") { return true }
         if reasonKey.contains("accounttypemismatch") { return true }
@@ -595,18 +630,34 @@ extension MapViewModel {
         sessionEmail: String,
         context: String
     ) async -> Bool {
-        let validation = await validateBusinessAdminStatus(ownerEmail: sessionEmail, ownerUserId: session.user.id)
-        switch validation {
+        let lifecycle = await resolveBusinessProfileLifecycleState()
+        switch lifecycle {
         case .active:
             await MainActor.run {
                 clearStaleDeletedAccountBlockIfNeeded(context: context)
             }
             return true
-        case .blocked(let status):
-            await handleBlockedBusinessAccount(status: status, context: context)
+        case .deleted:
+            if Self.shouldAllowDualFanFallbackAfterDeletedBusiness(source: context),
+               await resolveFanProfileLifecycleState(userId: session.user.id) == .active {
+                await routeDualFanModeAfterDeletedBusiness(context: context)
+                return false
+            }
+            await blockDeletedBusinessLogin(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: context
+            )
             return false
-        case .noBusiness, .inconclusive:
+        case .archived, .disabled:
+            await handleAdminLifecycleBlockedBusiness(status: lifecycle.rawValue, context: context)
+            return false
+        case .missing:
+            logDeletedAccountRestoreDebug("businessLifecycle=missing context=\(context)")
             return true
+        case .unknown:
+            logDeletedAccountRestoreDebug("businessLifecycle=unknown context=\(context)")
+            return false
         }
     }
 
@@ -626,19 +677,18 @@ extension MapViewModel {
         userId: UUID,
         context: String
     ) async -> Bool {
-        let validation = await validateBusinessAdminStatus(ownerEmail: ownerEmail, ownerUserId: userId)
-        switch validation {
-        case .active:
-            await MainActor.run {
-                clearStaleDeletedAccountBlockIfNeeded(context: context)
-            }
-            return true
-        case .blocked(let status):
-            await handleBlockedBusinessAccount(status: status, context: context)
+        if await enforceBusinessLifecycleGate(
+            userId: userId,
+            sessionEmail: ownerEmail,
+            source: context,
+            allowDualFanFallback: false
+        ) {
             return false
-        case .noBusiness, .inconclusive:
-            return true
         }
+        await MainActor.run {
+            clearStaleDeletedAccountBlockIfNeeded(context: context)
+        }
+        return true
     }
 
     private func shouldSuppressDeletedProfileBlockForBusinessSession(
@@ -703,14 +753,18 @@ extension MapViewModel {
             return false
         }
 
-        let businessAdminStatus = await validateBusinessAdminStatus(ownerEmail: normalizedOwnerEmail, ownerUserId: authId)
+        let businessAdminStatus = await resolveBusinessProfileLifecycleState()
         switch businessAdminStatus {
         case .active:
             clearStaleDeletedAccountBlockIfNeeded(context: context)
-        case .blocked(let status):
-            await handleBlockedBusinessAccount(status: status, context: context)
+        case .deleted, .archived, .disabled, .unknown:
+            _ = await enforceBusinessLifecycleGate(
+                userId: authId,
+                sessionEmail: normalizedOwnerEmail,
+                source: context
+            )
             return false
-        case .noBusiness, .inconclusive:
+        case .missing:
             break
         }
 
@@ -791,22 +845,40 @@ extension MapViewModel {
         await MainActor.run {
             restorePendingBusinessEmailSignupDraftIfNeeded()
         }
-        let pendingVerifiedVenueSetup = await MainActor.run { () -> Bool in
-            guard hasPendingVerifiedBusinessVenueSetup,
-                  let draft = pendingBusinessEmailSignupDraft,
-                  OwnerBusinessEmail.normalized(draft.email) == sessionEmail else {
-                return false
+        let pendingVerifiedVenueSetup: Bool
+        let lifecycleForPending = await resolveBusinessProfileLifecycleState()
+        if lifecycleForPending == .missing {
+            pendingVerifiedVenueSetup = await MainActor.run { () -> Bool in
+                guard hasPendingVerifiedBusinessVenueSetup,
+                      let draft = pendingBusinessEmailSignupDraft,
+                      OwnerBusinessEmail.normalized(draft.email) == sessionEmail else {
+                    return false
+                }
+                markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
+                currentUserAuthId = session.user.id
+                venueOwnerEmail = sessionEmail
+                isLoggedIn = false
+                isVenueOwnerLoggedIn = false
+                venueOwnerMode = false
+                isAdminLoggedIn = false
+                markAuthSignedIn(reason: "\(context)_pendingBusinessVenueSetup")
+                isBusinessOwnerSessionRestorePending = false
+                return true
             }
-            markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
-            currentUserAuthId = session.user.id
-            venueOwnerEmail = sessionEmail
-            isLoggedIn = false
-            isVenueOwnerLoggedIn = false
-            venueOwnerMode = false
-            isAdminLoggedIn = false
-            markAuthSignedIn(reason: "\(context)_pendingBusinessVenueSetup")
-            isBusinessOwnerSessionRestorePending = false
-            return true
+        } else {
+            if lifecycleForPending != .active {
+#if DEBUG
+                print("[DeletedBusinessLoginDebug] deletedSessionBlocked reason=\(lifecycleForPending.rawValue) source=\(context)_pendingBusinessVenueSetup")
+#endif
+                _ = await enforceBusinessLifecycleGate(
+                    userId: session.user.id,
+                    sessionEmail: sessionEmail,
+                    source: "\(context)_pendingBusinessVenueSetup"
+                )
+            } else {
+                await MainActor.run { clearPendingBusinessEmailSignupState() }
+            }
+            pendingVerifiedVenueSetup = false
         }
         if pendingVerifiedVenueSetup {
             logBusinessOwnerSessionFlags(context: "\(context)_pending_business_venue_setup")
@@ -816,7 +888,12 @@ extension MapViewModel {
         let validation = await validateActiveBusinessAccount(ownerEmail: sessionEmail, ownerUserId: session.user.id)
         logBusinessSessionRestoreDebug("activeBusinessValidation=\(validation.debugValue)")
         guard case .active = validation else {
-            logBusinessOwnerSessionFlags(context: "\(context)_no_business_account")
+            let lifecycle = await resolveBusinessProfileLifecycleState()
+            if lifecycle == .deleted,
+               await resolveFanProfileLifecycleState(userId: session.user.id) == .active {
+                await routeDualFanModeAfterDeletedBusiness(context: context)
+            }
+            logBusinessOwnerSessionFlags(context: "\(context)_no_business_account lifecycle=\(lifecycle.rawValue)")
             return false
         }
 
@@ -1724,7 +1801,7 @@ extension MapViewModel {
     }
 
     @MainActor
-    private func transitionAuthSessionState(_ newState: FanGeoAuthSessionState, reason: String) {
+    func transitionAuthSessionState(_ newState: FanGeoAuthSessionState, reason: String) {
         let oldState = authSessionState
         guard oldState != newState else {
 #if DEBUG
@@ -1748,6 +1825,12 @@ extension MapViewModel {
         guard !isDeletedAccountLoginBlocked else {
 #if DEBUG
             print("[DeletedAccountLoginDebug] mainAppEntryBlocked reason=deleted_account_staleSignedInTask")
+#endif
+            return
+        }
+        guard !isDeletedBusinessLoginBlocked else {
+#if DEBUG
+            print("[DeletedBusinessLoginDebug] dashboardEntryBlocked reason=deleted_business_staleSignedInTask")
 #endif
             return
         }
@@ -2507,6 +2590,13 @@ extension MapViewModel {
             if Self.userEmailConfirmed(session.user),
                let draft = pendingBusinessEmailSignupDraft,
                OwnerBusinessEmail.normalized(draft.email) == sessionEmail {
+                guard await enforceBusinessCreationAllowed(
+                    userId: session.user.id,
+                    sessionEmail: sessionEmail,
+                    source: "handleEmailVerificationDeepLink"
+                ) else {
+                    return
+                }
                 await forceLogout(reason: "businessSignupResumeAfterEmailVerification", source: "MapViewModel.handleEmailVerificationDeepLink")
                 await MainActor.run {
                     markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
@@ -2560,6 +2650,13 @@ extension MapViewModel {
             if draft.isVenueSubmissionReady {
                 print("[EmailConfirmDebug] creatingProfileAfterConfirmation=true")
                 return await completePendingBusinessSignupAfterConfirmation(session: session, draft: draft)
+            }
+            guard await enforceBusinessCreationAllowed(
+                userId: session.user.id,
+                sessionEmail: sessionEmail,
+                source: "completePendingEmailSignupAfterConfirmationIfPossible"
+            ) else {
+                return true
             }
             await MainActor.run {
                 markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
@@ -2871,12 +2968,11 @@ extension MapViewModel {
             currentUserEmail = sessionEmail
             venueOwnerEmail = sessionEmail
             currentUserIsBusinessAccount = true
-            isVenueOwnerLoggedIn = true
-            venueOwnerMode = true
+            isVenueOwnerLoggedIn = false
+            venueOwnerMode = false
             isLoggedIn = false
             isAdminLoggedIn = false
             isBusinessOwnerSessionRestorePending = true
-            markAuthSignedIn(reason: reason)
             restorePersistedSelectedVenueForBusinessLaunch()
         }
         await persistAccountModeForActiveAuthSession(.businessOwner)
@@ -2933,7 +3029,18 @@ extension MapViewModel {
             }
 
         case .inactive:
-            if await sessionUserIsDefinitelyFanProfile(userId: session.user.id) {
+            let lifecycle = await resolveBusinessProfileLifecycleState()
+            if lifecycle == .deleted,
+               await sessionUserIsDefinitelyFanProfile(userId: session.user.id) {
+                await MainActor.run { isBusinessOwnerSessionRestorePending = false }
+                await persistAccountModeForActiveAuthSession(.fanUser)
+                await applyFanUserSessionRestoreAfterBootstrap(
+                    session: session,
+                    sessionEmail: sessionEmail,
+                    clearVenueOwnerCaches: true
+                )
+                logBusinessSessionRestoreDebug("restoreCompleted=fan_deletedBusinessDualMode")
+            } else if await sessionUserIsDefinitelyFanProfile(userId: session.user.id) {
                 await MainActor.run { isBusinessOwnerSessionRestorePending = false }
                 await persistAccountModeForActiveAuthSession(.fanUser)
                 await applyFanUserSessionRestoreAfterBootstrap(
@@ -2942,6 +3049,13 @@ extension MapViewModel {
                     clearVenueOwnerCaches: true
                 )
                 logBusinessSessionRestoreDebug("restoreCompleted=fan")
+            } else if lifecycle == .deleted {
+                _ = await enforceBusinessLifecycleGate(
+                    userId: session.user.id,
+                    sessionEmail: sessionEmail,
+                    source: "bootstrapInactiveDeletedBusiness",
+                    allowDualFanFallback: false
+                )
             } else {
                 logBusinessSessionRestoreDebug("restorePending=true reason=inactiveBusinessWithoutFanProfile")
             }

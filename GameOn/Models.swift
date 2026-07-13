@@ -196,6 +196,45 @@ nonisolated struct BarVenue: Identifiable, Equatable {
     var isPickupPlayPlace: Bool {
         communityType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "play"
     }
+
+    /// Returns a copy with a different ``businessId`` without mutating Discover/Live venue caches.
+    func replacingBusinessId(_ businessId: UUID?) -> BarVenue {
+        BarVenue(
+            id: id,
+            name: name,
+            address: address,
+            phone: phone,
+            primarySport: primarySport,
+            distance: distance,
+            rating: rating,
+            tags: tags,
+            games: games,
+            coordinate: coordinate,
+            goingCounts: goingCounts,
+            screenCount: screenCount,
+            servesFood: servesFood,
+            hasWifi: hasWifi,
+            hasGarden: hasGarden,
+            hasProjector: hasProjector,
+            petFriendly: petFriendly,
+            rawVenueFeatures: rawVenueFeatures,
+            coverPhotoURL: coverPhotoURL,
+            menuPhotoURL: menuPhotoURL,
+            coverPhotoThumbnailURL: coverPhotoThumbnailURL,
+            menuPhotoThumbnailURL: menuPhotoThumbnailURL,
+            ownerEmail: ownerEmail,
+            businessId: businessId,
+            adminStatus: adminStatus,
+            communityType: communityType,
+            placeType: placeType,
+            sportTags: sportTags,
+            venueOwnerEmailRaw: venueOwnerEmailRaw,
+            businessOwnerEmailRaw: businessOwnerEmailRaw,
+            contactEmailRaw: contactEmailRaw,
+            supporterCountry: supporterCountry,
+            originType: originType
+        )
+    }
 }
 
 nonisolated struct PickupPlaceRow: Identifiable, Equatable {

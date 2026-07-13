@@ -22,13 +22,33 @@ enum FavoriteTeamsSyncService {
         let primaryTeamID: String?
     }
 
+    enum FetchResult {
+        case success(FavoriteTeamSelection)
+        case failure(Error)
+    }
+
     /// Loads catalog-valid team IDs for a user (any authenticated reader).
     static func fetchTeamIDs(userId: UUID) async -> [String] {
-        await fetchTeamSelection(userId: userId).teamIDs
+        switch await fetchTeamSelectionResult(userId: userId) {
+        case .success(let selection):
+            return selection.teamIDs
+        case .failure:
+            return []
+        }
     }
 
     /// Loads catalog-valid team IDs plus the single primary Trophy Team if present.
     static func fetchTeamSelection(userId: UUID) async -> FavoriteTeamSelection {
+        switch await fetchTeamSelectionResult(userId: userId) {
+        case .success(let selection):
+            return selection
+        case .failure:
+            return FavoriteTeamSelection(teamIDs: [], primaryTeamID: nil)
+        }
+    }
+
+    /// Same as ``fetchTeamSelection`` but preserves fetch failures so callers do not treat errors as empty selections.
+    static func fetchTeamSelectionResult(userId: UUID) async -> FetchResult {
         do {
             let rows: [TeamRow] = try await supabase
                 .from(table)
@@ -51,15 +71,21 @@ enum FavoriteTeamsSyncService {
             print(
                 "[FavoriteTeamsSyncDebug] fetch userId=\(userId.uuidString.lowercased()) raw=\(rows.count) valid=\(ids.count)"
             )
+            print("[FavoriteTeamsHydration] rows returned authUserId=\(userId.uuidString.lowercased()) raw=\(rows.count) valid=\(ids.count)")
 #endif
-            return FavoriteTeamSelection(teamIDs: ids, primaryTeamID: primary)
+            return .success(FavoriteTeamSelection(teamIDs: ids, primaryTeamID: primary))
         } catch {
 #if DEBUG
             print(
                 "[FavoriteTeamsSyncDebug] fetch_failed userId=\(userId.uuidString.lowercased()) error=\(error.localizedDescription)"
             )
 #endif
-            return await fetchLegacyTeamSelection(userId: userId)
+            switch await fetchLegacyTeamSelectionResult(userId: userId) {
+            case .success(let selection):
+                return .success(selection)
+            case .failure(let legacyError):
+                return .failure(legacyError)
+            }
         }
     }
 
@@ -117,7 +143,7 @@ enum FavoriteTeamsSyncService {
         }
     }
 
-    private static func fetchLegacyTeamSelection(userId: UUID) async -> FavoriteTeamSelection {
+    private static func fetchLegacyTeamSelectionResult(userId: UUID) async -> FetchResult {
         do {
             struct LegacyTeamRow: Decodable {
                 let team_id: String
@@ -135,9 +161,12 @@ enum FavoriteTeamsSyncService {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
                 .filter { FavoriteTeamCatalog.team(id: $0) != nil }
-            return FavoriteTeamSelection(teamIDs: ids, primaryTeamID: nil)
+#if DEBUG
+            print("[FavoriteTeamsHydration] rows returned authUserId=\(userId.uuidString.lowercased()) raw=\(rows.count) valid=\(ids.count) source=legacy")
+#endif
+            return .success(FavoriteTeamSelection(teamIDs: ids, primaryTeamID: nil))
         } catch {
-            return FavoriteTeamSelection(teamIDs: [], primaryTeamID: nil)
+            return .failure(error)
         }
     }
 

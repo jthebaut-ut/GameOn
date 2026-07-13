@@ -98,6 +98,8 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             SupportReplyNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanGeoPlusAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            BusinessProAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }
     }
 }

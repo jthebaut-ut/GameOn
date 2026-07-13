@@ -13,6 +13,8 @@ struct FanGeoSupportHubView: View {
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var chatViewModel: ChatViewModel
     var onRequestSignIn: (() -> Void)?
+    /// Kept for call-site compatibility. Ticket presentation always uses a single `NavigationPath`
+    /// so Settings / notification sheets never stack competing `navigationDestination` modifiers.
     var embedsInNavigationStack = true
     var showsCloseButton = true
     var screenTitle: String = "Support Center"
@@ -21,42 +23,54 @@ struct FanGeoSupportHubView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var presenter = FanGeoSupportCenterPresenter()
     @State private var navigationPath = NavigationPath()
-    @State private var showCreateRequest = false
-    @State private var selectedTicketId: UUID?
-    @State private var selectedReportKey: SupportReportItemKey?
+    @State private var presentedTicketDetailID: UUID?
+    @State private var pendingDeepLinkTicketID: UUID?
+    @State private var didConsumeInitialTicketDeepLink = false
+    @State private var ticketNotFoundMessage: String?
 
     private var hasAuthSession: Bool {
         mapViewModel.isLoggedIn || mapViewModel.isVenueOwnerLoggedIn
     }
 
     var body: some View {
-        Group {
-            if embedsInNavigationStack {
-                NavigationStack(path: $navigationPath) {
-                    centerListContent
-                        .navigationDestination(for: SupportCenterRoute.self) { route in
-                            destinationView(for: route)
-                        }
+        // Always own a single NavigationStack for ticket/report/create destinations.
+        // Avoids competing item/isPresented destinations and keeps Settings + push sheets consistent.
+        NavigationStack(path: $navigationPath) {
+            centerListContent
+                .navigationDestination(for: SupportCenterRoute.self) { route in
+                    destinationView(for: route)
                 }
-            } else {
-                centerListContent
-                    .navigationDestination(isPresented: $showCreateRequest) {
-                        createRequestDestination
-                    }
-                    .navigationDestination(item: $selectedTicketId) { ticketId in
-                        ticketDetailDestination(ticketId)
-                    }
-                    .navigationDestination(item: $selectedReportKey) { reportKey in
-                        reportDetailDestination(reportKey)
-                    }
-            }
         }
-        .task(id: initialTicketID) {
+        .alert(
+            "Ticket unavailable",
+            isPresented: Binding(
+                get: { ticketNotFoundMessage != nil },
+                set: { if !$0 { ticketNotFoundMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { ticketNotFoundMessage = nil }
+        } message: {
+            Text(ticketNotFoundMessage ?? "This support request could not be found.")
+        }
+        .task(id: initialTicketID?.uuidString ?? "none") {
+#if DEBUG
+            print("[SupportNotificationRoute] support center opened initialTicketID=\(initialTicketID?.uuidString.lowercased() ?? "nil")")
+#endif
             await presenter.loadRequests()
 #if DEBUG
+            print("[SupportNotificationRoute] tickets loaded count=\(presenter.requests.count)")
             print("[SupportDeepLink] tickets loaded count=\(presenter.requests.count)")
 #endif
             await openInitialTicketIfNeeded()
+            await consumePendingDeepLinkTicketIfNeeded()
+        }
+        .onChange(of: navigationPath.count) { _, count in
+            if count == 0 {
+                presentedTicketDetailID = nil
+            }
+#if DEBUG
+            print("[SupportNotificationRoute] current route state pathCount=\(count) presentedTicket=\(presentedTicketDetailID?.uuidString.lowercased() ?? "nil")")
+#endif
         }
     }
 
@@ -66,16 +80,33 @@ struct FanGeoSupportHubView: View {
               let initialTicketID else {
             return
         }
-        guard presenter.request(for: initialTicketID) != nil else {
+        guard !didConsumeInitialTicketDeepLink else {
 #if DEBUG
-            print("[SupportDeepLink] ticket not found; showing Support Center only conversationId=\(initialTicketID.uuidString.lowercased())")
+            print("[SupportNotificationRoute] pending route already consumed conversationId=\(initialTicketID.uuidString.lowercased())")
 #endif
             return
         }
+        didConsumeInitialTicketDeepLink = true
 #if DEBUG
-        print("[SupportDeepLink] opening ticket=\(initialTicketID.uuidString.lowercased())")
+        print("[SupportNotificationRoute] ticket detail requested conversationId=\(initialTicketID.uuidString.lowercased()) source=initialTicketID")
 #endif
-        openTicketDetailFromDeepLink(initialTicketID)
+        openTicketDetailSafely(conversationId: initialTicketID, source: "initialTicketID")
+#if DEBUG
+        print("[SupportNotificationRoute] pending route consumed/cleared conversationId=\(initialTicketID.uuidString.lowercased())")
+#endif
+    }
+
+    @MainActor
+    private func consumePendingDeepLinkTicketIfNeeded() async {
+        guard let pendingDeepLinkTicketID else { return }
+        self.pendingDeepLinkTicketID = nil
+#if DEBUG
+        print("[SupportNotificationRoute] ticket detail requested conversationId=\(pendingDeepLinkTicketID.uuidString.lowercased()) source=pendingDeepLink")
+#endif
+        openTicketDetailSafely(conversationId: pendingDeepLinkTicketID, source: "pendingDeepLink")
+#if DEBUG
+        print("[SupportNotificationRoute] pending route consumed/cleared conversationId=\(pendingDeepLinkTicketID.uuidString.lowercased())")
+#endif
     }
 
     private var centerListContent: some View {
@@ -128,63 +159,74 @@ struct FanGeoSupportHubView: View {
             chatViewModel: chatViewModel,
             onCreateFollowUp: openCreateRequest
         )
+        .onAppear {
+#if DEBUG
+            print("[SupportNotificationRoute] ticket detail presented conversationId=\(conversationId.uuidString.lowercased())")
+#endif
+        }
     }
 
     private func openCreateRequest() {
 #if DEBUG
         print("[SupportCenter] create new request tapped")
 #endif
-        if embedsInNavigationStack {
-            navigationPath.append(SupportCenterRoute.createRequest)
-        } else {
-            selectedTicketId = nil
-            showCreateRequest = true
-        }
+        replaceNavigation(with: .createRequest)
     }
 
     private func openTicketDetail(_ request: SupportRequestSummary) {
 #if DEBUG
         print("[SupportCenter] selected ticket id=\(request.id.uuidString.lowercased())")
+        print("[SupportNotificationRoute] ticket detail requested conversationId=\(request.id.uuidString.lowercased()) source=listTap")
 #endif
-        if embedsInNavigationStack {
-            navigationPath.append(SupportCenterRoute.ticketDetail(request.id))
-        } else {
-            showCreateRequest = false
-            selectedReportKey = nil
-            selectedTicketId = request.id
-        }
+        openTicketDetailSafely(conversationId: request.id, source: "listTap")
     }
 
     private func openTicketDetailFromDeepLink(_ conversationId: UUID) {
 #if DEBUG
         print("[SupportCenter] deep link ticket id=\(conversationId.uuidString.lowercased())")
+        print("[SupportNotificationRoute] ticket detail requested conversationId=\(conversationId.uuidString.lowercased()) source=deepLink")
 #endif
-        guard presenter.request(for: conversationId) != nil else {
+        if presenter.isLoading && presenter.requests.isEmpty {
+            pendingDeepLinkTicketID = conversationId
 #if DEBUG
-            print("[SupportDeepLink] ticket not found; showing Support Center only conversationId=\(conversationId.uuidString.lowercased())")
+            print("[SupportNotificationRoute] ticket data not loaded yet; deferring conversationId=\(conversationId.uuidString.lowercased())")
 #endif
             return
         }
-        if embedsInNavigationStack {
-            navigationPath.append(SupportCenterRoute.ticketDetail(conversationId))
-        } else {
-            showCreateRequest = false
-            selectedReportKey = nil
-            selectedTicketId = conversationId
+        openTicketDetailSafely(conversationId: conversationId, source: "deepLink")
+    }
+
+    @MainActor
+    private func openTicketDetailSafely(conversationId: UUID, source: String) {
+        if presentedTicketDetailID == conversationId {
+#if DEBUG
+            print("[SupportNotificationRoute] duplicate presentation prevented conversationId=\(conversationId.uuidString.lowercased()) source=\(source)")
+#endif
+            return
         }
+
+        if presenter.request(for: conversationId) == nil {
+#if DEBUG
+            print("[SupportNotificationRoute] ticket not found conversationId=\(conversationId.uuidString.lowercased()) source=\(source)")
+            print("[SupportDeepLink] ticket not found; showing Support Center only conversationId=\(conversationId.uuidString.lowercased())")
+#endif
+            if source != "listTap" {
+                ticketNotFoundMessage = "We couldn’t find that support request. It may have been closed or removed."
+            }
+            return
+        }
+
+#if DEBUG
+        print("[SupportDeepLink] opening ticket=\(conversationId.uuidString.lowercased())")
+#endif
+        replaceNavigation(with: .ticketDetail(conversationId))
     }
 
     private func openReportDetail(_ report: SupportReportItemSummary) {
 #if DEBUG
         print("[SupportCenter] selected report type=\(report.report_type) id=\(report.id.uuidString.lowercased())")
 #endif
-        if embedsInNavigationStack {
-            navigationPath.append(SupportCenterRoute.reportDetail(report.itemKey))
-        } else {
-            showCreateRequest = false
-            selectedTicketId = nil
-            selectedReportKey = report.itemKey
-        }
+        replaceNavigation(with: .reportDetail(report.itemKey))
     }
 
     private func reportDetailDestination(_ reportKey: SupportReportItemKey) -> some View {
@@ -198,35 +240,35 @@ struct FanGeoSupportHubView: View {
 #if DEBUG
         print("[SupportCenter] submit completed conversationId=\(conversationId.uuidString.lowercased())")
 #endif
-        if embedsInNavigationStack {
-            if !navigationPath.isEmpty {
-                navigationPath.removeLast()
-            }
-            navigationPath.append(SupportCenterRoute.ticketDetail(conversationId))
-        } else {
-            showCreateRequest = false
-            selectedTicketId = conversationId
-        }
+        replaceNavigation(with: .ticketDetail(conversationId))
     }
 
     private func completeSubmitEmailOnly() {
 #if DEBUG
         print("[SupportCenter] submit completed emailOnly=true")
 #endif
-        if embedsInNavigationStack {
-            if !navigationPath.isEmpty {
-                navigationPath.removeLast()
-            }
-        } else {
-            showCreateRequest = false
+        navigationPath = NavigationPath()
+        presentedTicketDetailID = nil
+    }
+
+    private func replaceNavigation(with route: SupportCenterRoute) {
+        switch route {
+        case .ticketDetail(let id):
+            presentedTicketDetailID = id
+        case .createRequest, .reportDetail:
+            presentedTicketDetailID = nil
         }
+        var next = NavigationPath()
+        next.append(route)
+        navigationPath = next
     }
 
     private func resetNavigationState() {
         navigationPath = NavigationPath()
-        showCreateRequest = false
-        selectedTicketId = nil
-        selectedReportKey = nil
+        presentedTicketDetailID = nil
+        pendingDeepLinkTicketID = nil
+        didConsumeInitialTicketDeepLink = false
+        ticketNotFoundMessage = nil
     }
 }
 

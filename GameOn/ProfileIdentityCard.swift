@@ -216,7 +216,9 @@ struct ProfileIdentityCard: View {
     }
 
     private var selectedTeams: [FavoriteTeam] {
-        FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
+        // Observe hydration generation so AppStorage writes from background login reload refresh this view.
+        _ = viewModel.favoriteTeamsHydrationGeneration
+        return FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
     }
 
     private var selectedIDSet: Set<String> {
@@ -615,6 +617,11 @@ struct ProfileIdentityCard: View {
                 primeSuggestedFansLoadingStateIfNeeded()
                 await refreshIncomingPokesLive(reason: "accountVisible")
                 await loadSuggestedFans()
+                // Ensure favorite teams hydrate even if warm preload raced ahead of auth id / cleared AppStorage.
+                let localEmpty = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).isEmpty
+                if localEmpty, viewModel.currentUserAuthId != nil {
+                    await viewModel.loadFavoriteTeamsFromSupabase(forceRefresh: true)
+                }
             }
             .task(id: pokesLiveRefreshLoopToken) {
                 guard isAccountTabActive else { return }
@@ -2095,6 +2102,12 @@ struct ProfileIdentityCard: View {
 
     private func sponsoredVenueDetailSheet(for venue: BarVenue) -> some View {
         NavigationStack {
+            let effectiveBusinessId = viewModel.effectiveBusinessIdForVenueChat(for: venue)
+            let canOpenVenueChat = viewModel.canUseFanSocialFeatures && effectiveBusinessId != nil
+            let openVenueChatAction: (() async -> Void)? = {
+                guard canOpenVenueChat else { return nil }
+                return { await openSponsoredVenueChat(for: venue) }
+            }()
             VenueDetailView(
                 bar: venue,
                 selectedEvent: nil,
@@ -2107,7 +2120,7 @@ struct ProfileIdentityCard: View {
                 sportsSupported: venue.sportTags.isEmpty ? [venue.primarySport].filter { !$0.isEmpty } : venue.sportTags,
                 selectedTimeZone: viewModel.selectedTimeZone,
                 hasGamesScheduledToday: !venue.games.isEmpty,
-                isBusinessConfirmed: venue.businessId != nil,
+                isBusinessConfirmed: effectiveBusinessId != nil,
                 onDirections: { viewModel.openDirections(to: venue) },
                 onCall: { viewModel.callVenue(venue) },
                 onFavorite: { viewModel.toggleFavorite(venue) },
@@ -2125,10 +2138,31 @@ struct ProfileIdentityCard: View {
                 isHomeCrowdVenue: viewModel.isHomeCrowdVenue(venue.id),
                 onToggleHomeCrowd: {
                     await viewModel.toggleHomeCrowd(for: venue)
-                }
+                },
+                onOpenVenueChat: openVenueChatAction,
+                effectiveBusinessId: effectiveBusinessId
             )
             .navigationTitle(venue.name)
             .navigationBarTitleDisplayMode(.inline)
+            .task {
+                await viewModel.refreshApprovedVenueOwnershipState(for: venue)
+            }
+        }
+    }
+
+    private func openSponsoredVenueChat(for venue: BarVenue) async {
+        guard viewModel.isAuthenticatedForSocialFeatures else { return }
+        guard viewModel.canUseFanSocialFeatures else {
+            viewModel.logBusinessUserGateBlocked(action: "venueChat")
+            return
+        }
+        let chatBar = viewModel.barVenueForVenueChat(venue)
+        let outcome = await chatViewModel.openBusinessVenueConversationFromVenueDetail(bar: chatBar)
+        switch outcome {
+        case .openedChat:
+            sponsoredVenueDetail = nil
+        case .needsVenuePicker, .informational:
+            break
         }
     }
 
@@ -2450,6 +2484,29 @@ struct ProfileIdentityCard: View {
             .background(Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.96)))
             .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.16), radius: 12, y: 5)
             .id(avatarPresentationIdentity)
+            .onAppear {
+#if DEBUG
+                ProfileAvatarDebug.avatarViewResolved(
+                    context: "ProfileIdentityCard.avatarStackCore",
+                    thumbnailInput: viewModel.currentUserAvatarThumbnailURL,
+                    fullInput: viewModel.currentUserAvatarURL,
+                    displayURLString: ImageDisplayURL.forListDisplay(
+                        thumbnail: viewModel.currentUserAvatarThumbnailURL,
+                        full: viewModel.currentUserAvatarURL,
+                        refreshToken: viewModel.currentUserAvatarDisplayRefreshToken
+                    ),
+                    urlParseSucceeded: ImageDisplayURL.forListDisplay(
+                        thumbnail: viewModel.currentUserAvatarThumbnailURL,
+                        full: viewModel.currentUserAvatarURL,
+                        refreshToken: viewModel.currentUserAvatarDisplayRefreshToken
+                    ).flatMap { URL(string: $0) } != nil,
+                    fallbackReason: viewModel.currentUserAvatarURL.isEmpty
+                        && viewModel.currentUserAvatarThumbnailURL.isEmpty
+                        ? "view_model_avatar_urls_empty"
+                        : "awaiting_UserAvatarView_image_layer"
+                )
+#endif
+            }
 
             Circle()
                 .fill(Color(.secondarySystemGroupedBackground))

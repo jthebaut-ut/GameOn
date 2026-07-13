@@ -1411,7 +1411,18 @@ struct ProGamePredictionSheet: View {
         guard isLocked else { return false }
         guard resolvedUserPredictions?.hasAnyPrediction == true else { return false }
         if displayGame.matchStatus.isHappeningNow || displayGame.isFinal { return true }
-        return displayGame.firstScoringTeam != nil
+        return resolvedFirstScoringEvent() != nil
+    }
+
+    private func resolvedFirstScoringEvent() -> LiveFirstScoringEvent? {
+        LiveScoringTimelineBuilder.resolveFirstScoringEvent(
+            sportType: displayGame.liveSportVisualType,
+            timelineEvents: predictionMergedTimelineEvents(),
+            homeTeam: displayGame.homeTeam,
+            awayTeam: displayGame.awayTeam,
+            scoreAway: displayGame.scoreAway,
+            scoreHome: displayGame.scoreHome
+        )
     }
 
     private var livePredictionStatusSection: some View {
@@ -1615,18 +1626,116 @@ struct ProGamePredictionSheet: View {
     }
 
     private func firstScorerPredictionStatus(predicted: String, game: SavedProGame) -> ProGamePredictionOutcomeStatus? {
-        if let firstGoalTeam = game.firstScoringTeam {
-            if predicted == "No goals" { return .incorrect }
-            return teamsMatch(predicted, firstGoalTeam) ? .correct : .incorrect
+        let mergedTimelineEvents = predictionMergedTimelineEvents()
+        let firstEvent = LiveScoringTimelineBuilder.resolveFirstScoringEvent(
+            sportType: game.liveSportVisualType,
+            timelineEvents: mergedTimelineEvents,
+            homeTeam: game.homeTeam,
+            awayTeam: game.awayTeam,
+            scoreAway: game.scoreAway,
+            scoreHome: game.scoreHome
+        )
+
+        if let firstEvent {
+            if predicted == "No goals" {
+                logFirstGoalGradingDebug(
+                    predicted: predicted,
+                    actualTeam: firstEvent.teamName,
+                    scorer: firstEvent.scorer,
+                    minute: firstEvent.minuteText ?? firstEvent.minute.map { "\($0)'" },
+                    comparisonResult: false,
+                    game: game
+                )
+                return .incorrect
+            }
+
+            let matches = LiveScoringTimelineBuilder.firstGoalPredictionMatches(
+                predicted: predicted,
+                actualTeamName: firstEvent.teamName,
+                homeTeam: game.homeTeam,
+                awayTeam: game.awayTeam,
+                actualTeamId: firstEvent.teamId
+            )
+            logFirstGoalGradingDebug(
+                predicted: predicted,
+                actualTeam: firstEvent.teamName,
+                scorer: firstEvent.scorer,
+                minute: firstEvent.minuteText ?? firstEvent.minute.map { "\($0)'" },
+                comparisonResult: matches,
+                game: game
+            )
+            return matches ? .correct : .incorrect
         }
+
         if game.scoreAway + game.scoreHome > 0, predicted == "No goals" {
+            logFirstGoalGradingDebug(
+                predicted: predicted,
+                actualTeam: nil,
+                scorer: nil,
+                minute: nil,
+                comparisonResult: false,
+                game: game
+            )
             return .incorrect
         }
         if game.isFinal {
-            if predicted == "No goals", game.scoreAway == 0, game.scoreHome == 0 { return .correct }
-            return predicted == "No goals" ? .incorrect : .incorrect
+            if predicted == "No goals", game.scoreAway == 0, game.scoreHome == 0 {
+                logFirstGoalGradingDebug(
+                    predicted: predicted,
+                    actualTeam: "No goals",
+                    scorer: nil,
+                    minute: nil,
+                    comparisonResult: true,
+                    game: game
+                )
+                return .correct
+            }
+            // Final with goals but unresolved first scorer: do not mark team picks incorrect.
+            logFirstGoalGradingDebug(
+                predicted: predicted,
+                actualTeam: nil,
+                scorer: nil,
+                minute: nil,
+                comparisonResult: nil,
+                game: game
+            )
+            return predicted == "No goals" ? .incorrect : .stillInPlay
         }
+        logFirstGoalGradingDebug(
+            predicted: predicted,
+            actualTeam: nil,
+            scorer: nil,
+            minute: nil,
+            comparisonResult: nil,
+            game: game
+        )
         return .stillInPlay
+    }
+
+    private func logFirstGoalGradingDebug(
+        predicted: String,
+        actualTeam: String?,
+        scorer: String?,
+        minute: String?,
+        comparisonResult: Bool?,
+        game: SavedProGame
+    ) {
+#if DEBUG
+        let comparisonText: String = {
+            guard let comparisonResult else { return "unresolved" }
+            return comparisonResult ? "match" : "mismatch"
+        }()
+        print(
+            "[FirstGoalGradingDebug] gameId=\(game.stableKey) " +
+            "predicted=\(predicted) " +
+            "actualTeam=\(actualTeam ?? "nil") " +
+            "scorer=\(scorer ?? "nil") " +
+            "minute=\(minute ?? "nil") " +
+            "home=\(game.homeTeam) away=\(game.awayTeam) " +
+            "score=\(game.scoreAway)-\(game.scoreHome) " +
+            "comparison=\(comparisonText)"
+        )
+#endif
     }
 
     private func exactScorePredictionStatus(

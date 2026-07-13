@@ -130,6 +130,13 @@ struct UserPreview: Identifiable, Hashable, Codable {
     let isDeleted: Bool
     /// ISO timestamp from user_profiles.last_seen_at; online state is computed, not stored.
     let lastSeenAtRaw: String?
+    /// When set, ``DirectChatView`` opens this thread without calling friend-only start RPCs.
+    let dmConversationId: UUID?
+    /// Fan-initiated business venue DM context.
+    let businessVenueId: UUID?
+    let businessVenueBusinessId: UUID?
+    /// Business display name shown under the venue title in inbox/DM header.
+    let businessVenueBusinessName: String?
 
     init(
         id: UUID,
@@ -140,7 +147,11 @@ struct UserPreview: Identifiable, Hashable, Codable {
         avatarThumbnailURL: String? = nil,
         isBusinessAccount: Bool = false,
         isDeleted: Bool = false,
-        lastSeenAtRaw: String? = nil
+        lastSeenAtRaw: String? = nil,
+        dmConversationId: UUID? = nil,
+        businessVenueId: UUID? = nil,
+        businessVenueBusinessId: UUID? = nil,
+        businessVenueBusinessName: String? = nil
     ) {
         self.id = id
         self.displayName = isDeleted ? "Deleted User" : displayName
@@ -151,6 +162,10 @@ struct UserPreview: Identifiable, Hashable, Codable {
         self.isBusinessAccount = isBusinessAccount
         self.isDeleted = isDeleted
         self.lastSeenAtRaw = isDeleted ? nil : lastSeenAtRaw
+        self.dmConversationId = dmConversationId
+        self.businessVenueId = businessVenueId
+        self.businessVenueBusinessId = businessVenueBusinessId
+        self.businessVenueBusinessName = businessVenueBusinessName
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -163,6 +178,10 @@ struct UserPreview: Identifiable, Hashable, Codable {
         case isBusinessAccount
         case isDeleted
         case lastSeenAtRaw
+        case dmConversationId
+        case businessVenueId
+        case businessVenueBusinessId
+        case businessVenueBusinessName
     }
 
     init(from decoder: Decoder) throws {
@@ -177,6 +196,10 @@ struct UserPreview: Identifiable, Hashable, Codable {
         isBusinessAccount = try container.decodeIfPresent(Bool.self, forKey: .isBusinessAccount) ?? false
         isDeleted = decodedDeleted
         lastSeenAtRaw = decodedDeleted ? nil : try container.decodeIfPresent(String.self, forKey: .lastSeenAtRaw)
+        dmConversationId = try container.decodeIfPresent(UUID.self, forKey: .dmConversationId)
+        businessVenueId = try container.decodeIfPresent(UUID.self, forKey: .businessVenueId)
+        businessVenueBusinessId = try container.decodeIfPresent(UUID.self, forKey: .businessVenueBusinessId)
+        businessVenueBusinessName = try container.decodeIfPresent(String.self, forKey: .businessVenueBusinessName)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -190,14 +213,23 @@ struct UserPreview: Identifiable, Hashable, Codable {
         try container.encode(isBusinessAccount, forKey: .isBusinessAccount)
         try container.encode(isDeleted, forKey: .isDeleted)
         try container.encodeIfPresent(lastSeenAtRaw, forKey: .lastSeenAtRaw)
+        try container.encodeIfPresent(dmConversationId, forKey: .dmConversationId)
+        try container.encodeIfPresent(businessVenueId, forKey: .businessVenueId)
+        try container.encodeIfPresent(businessVenueBusinessId, forKey: .businessVenueBusinessId)
+        try container.encodeIfPresent(businessVenueBusinessName, forKey: .businessVenueBusinessName)
     }
 
     var isBusinessIdentity: Bool {
         isBusinessAccount
     }
 
+    /// Fan-initiated thread with a specific business venue (not a fan peer DM).
+    var isBusinessVenueConversation: Bool {
+        businessVenueId != nil
+    }
+
     var canOpenPublicProfile: Bool {
-        !isDeleted
+        !isDeleted && !isBusinessVenueConversation
     }
 
     var isOnlineNow: Bool {
@@ -365,6 +397,7 @@ struct DirectMessageRow: Codable, Hashable, Identifiable {
 }
 
 struct DmInboxSummaryRow: Codable, Hashable {
+    let conversation_id: UUID?
     let friend_user_id: UUID
     let friend_display_name: String?
     let friend_avatar_url: String?
@@ -374,6 +407,9 @@ struct DmInboxSummaryRow: Codable, Hashable {
     let friend_is_business: Bool?
     let friend_is_deleted: Bool?
     let friend_business_display_name: String?
+    let venue_id: UUID?
+    let venue_name: String?
+    let venue_location_line: String?
     let last_message_body: String?
     let last_message_sender_id: UUID?
     let last_message_created_at: String?
@@ -387,6 +423,22 @@ enum AddFriendLookupOutcome: Equatable {
     case success
     case informational(String)
     case error(String)
+}
+
+/// Result of messaging a business from Add Friend (no friendship RPC).
+enum AddFriendBusinessMessageOutcome: Equatable {
+    case openedChat
+    case needsVenuePicker([BusinessVenueMessageTarget])
+    case informational(String)
+}
+
+/// Active venue row for fan→business venue DM picker.
+struct BusinessVenueMessageTarget: Identifiable, Hashable {
+    let id: UUID
+    let venueName: String
+    let locationLine: String
+    let coverPhotoURL: String?
+    let coverPhotoThumbnailURL: String?
 }
 
 /// Existing friendship row state for a lookup target (after refresh).
@@ -420,6 +472,8 @@ struct AddFriendSearchTarget: Identifiable, Hashable {
     let entityType: AddFriendEntityType
     /// `user_profiles.id` (user) or `businesses.id` (business).
     let entityId: UUID
+    /// Owner auth id for business hits (`businesses.owner_user_id`); nil for fan users.
+    let ownerUserId: UUID?
     let displayName: String
     let username: String?
     let avatarURL: String?
@@ -639,6 +693,85 @@ final class FriendshipService {
             .execute()
     }
 
+    /// Active approved venues for a business that fans may message.
+    func fetchBusinessMessagingContext(businessId: UUID) async -> (displayName: String, ownerUserId: UUID?) {
+        struct Row: Decodable {
+            let display_name: String?
+            let owner_user_id: UUID?
+        }
+
+        do {
+            let rows: [Row] = try await client
+                .from("businesses")
+                .select("display_name,owner_user_id")
+                .eq("id", value: businessId.uuidString.lowercased())
+                .eq("admin_status", value: "active")
+                .in("business_origin", values: BusinessOrigin.loginOwnedValues)
+                .limit(1)
+                .execute()
+                .value
+            guard let row = rows.first else { return ("Business", nil) }
+            let name = row.display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return (name.isEmpty ? "Business" : name, row.owner_user_id)
+        } catch {
+            return ("Business", nil)
+        }
+    }
+
+    func fetchActiveVenuesForBusinessMessaging(businessId: UUID) async throws -> [BusinessVenueMessageTarget] {
+        struct VenueRow: Decodable {
+            let id: UUID
+            let venue_name: String?
+            let city: String?
+            let state: String?
+            let address: String?
+            let formatted_address: String?
+            let cover_photo_url: String?
+            let cover_photo_thumbnail_url: String?
+        }
+
+        let rows: [VenueRow] = try await client
+            .from("venues")
+            .select("id,venue_name,city,state,address,formatted_address,cover_photo_url,cover_photo_thumbnail_url")
+            .eq("business_id", value: businessId.uuidString.lowercased())
+            .eq("admin_status", value: "active")
+            .order("venue_name", ascending: true)
+            .execute()
+            .value
+
+        return rows.map { row in
+            let name = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let location = Self.businessVenueLocationLine(
+                formattedAddress: row.formatted_address,
+                city: row.city,
+                state: row.state,
+                address: row.address
+            )
+            return BusinessVenueMessageTarget(
+                id: row.id,
+                venueName: name.isEmpty ? "Venue" : name,
+                locationLine: location,
+                coverPhotoURL: row.cover_photo_url,
+                coverPhotoThumbnailURL: row.cover_photo_thumbnail_url
+            )
+        }
+    }
+
+    private static func businessVenueLocationLine(
+        formattedAddress: String?,
+        city: String?,
+        state: String?,
+        address: String?
+    ) -> String {
+        let formatted = formattedAddress?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !formatted.isEmpty { return formatted }
+        let cityTrim = city?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let stateTrim = state?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cityState = [cityTrim, stateTrim].filter { !$0.isEmpty }.joined(separator: ", ")
+        if !cityState.isEmpty { return cityState }
+        return address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     /// Normalized add-friend lookup query: `lower(trim(raw))` (email or display name).
     static func normalizedFriendLookupQuery(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -835,6 +968,7 @@ final class FriendshipService {
                 AddFriendSearchTarget(
                     entityType: .user,
                     entityId: row.id,
+                    ownerUserId: nil,
                     displayName: name,
                     username: handleStored,
                     avatarURL: row.avatar_url,
@@ -864,6 +998,7 @@ final class FriendshipService {
                 AddFriendSearchTarget(
                     entityType: .business,
                     entityId: row.id,
+                    ownerUserId: row.owner_user_id,
                     displayName: name,
                     username: handleStored,
                     avatarURL: nil,
@@ -1295,6 +1430,7 @@ final class FriendshipService {
                 target: AddFriendSearchTarget(
                     entityType: .user,
                     entityId: row.id,
+                    ownerUserId: nil,
                     displayName: "",
                     username: nil,
                     avatarURL: nil,

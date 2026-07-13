@@ -1,4 +1,5 @@
 import Foundation
+import Supabase
 
 extension MapViewModel {
     @MainActor
@@ -129,6 +130,38 @@ extension MapViewModel {
     @MainActor
     func focusDiscoverOnVenue(_ venueId: UUID) {
         discoverFocusVenueId = venueId
+    }
+
+    /// Focus Discover on the first active venue for a business (in-memory bars, then Supabase). Used when fan→business DM is not available yet.
+    @MainActor
+    func focusDiscoverOnBusinessVenue(businessId: UUID) async -> Bool {
+        if let bar = bars.first(where: { $0.businessId == businessId }) {
+            focusDiscoverOnVenue(bar.id)
+            return true
+        }
+        if let bar = followingTabSavedVenues.first(where: { $0.businessId == businessId }) {
+            focusDiscoverOnVenue(bar.id)
+            return true
+        }
+
+        struct VenueIdRow: Decodable { let id: UUID? }
+        do {
+            let rows: [VenueIdRow] = try await supabase
+                .from("venues")
+                .select("id")
+                .eq("business_id", value: businessId.uuidString.lowercased())
+                .eq("admin_status", value: "active")
+                .limit(1)
+                .execute()
+                .value
+            if let venueId = rows.first?.id {
+                focusDiscoverOnVenue(venueId)
+                return true
+            }
+        } catch {
+            // Fall through to caller-friendly messaging.
+        }
+        return false
     }
 
     @MainActor

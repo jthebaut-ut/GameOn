@@ -4,6 +4,44 @@ import Foundation
 /// Drives submit enabled/disabled and the single-line “next missing field” hint so they never disagree.
 enum BusinessCreationFormValidation {
 
+    /// Business account step only (before email verification / venue setup).
+    static func businessAccountOnlyMissingRequirementMessage(
+        venueOwnerEmail: String,
+        venuePassword: String,
+        authTermsAccepted: Bool,
+        businessName: String,
+        businessHandle: String,
+        skipEmailPasswordAuthFields: Bool = false
+    ) -> String? {
+        if !skipEmailPasswordAuthFields {
+            let email = OwnerBusinessEmail.normalized(venueOwnerEmail)
+            guard email.contains("@") else {
+                return email.isEmpty ? "Business email missing" : "Enter a valid business email"
+            }
+            if venuePassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "Password missing"
+            }
+        }
+
+        if !authTermsAccepted {
+            return "Accept the Terms of Use and Community Guidelines to continue."
+        }
+
+        let biz = businessName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if biz.isEmpty { return "Business name missing" }
+        if BusinessIdentityValidation.validateBusinessName(biz) != nil {
+            return "Business name not allowed"
+        }
+
+        let handle = FanGeoHandleRules.normalizeForStorage(businessHandle)
+        if handle.isEmpty { return "Business handle missing" }
+        if BusinessIdentityValidation.validateBusinessHandle(businessHandle) != nil {
+            return "Business handle not allowed"
+        }
+
+        return nil
+    }
+
     /// First blocking issue in priority order. `nil` when all required fields and policies are satisfied (`isRegisterMode` must be true).
     static func businessCreationMissingRequirementMessage(
         isRegisterMode: Bool,
@@ -50,6 +88,35 @@ enum BusinessCreationFormValidation {
             return "Business handle not allowed"
         }
 
+        return venueReviewSubmissionMissingRequirementMessage(
+            locationName: locationName,
+            streetAddress: streetAddress,
+            country: country,
+            city: city,
+            state: state,
+            phoneDialISO: phoneDialISO,
+            phoneLocal: phoneLocal,
+            description: description,
+            proofNote: proofNote,
+            coverPhotoData: coverPhotoData,
+            policiesAccepted: policiesAccepted
+        )
+    }
+
+    /// Venue wizard review-step gate: location, description, proof, cover photo, and policies.
+    static func venueReviewSubmissionMissingRequirementMessage(
+        locationName: String,
+        streetAddress: String,
+        country: String,
+        city: String,
+        state: String,
+        phoneDialISO: String,
+        phoneLocal: String,
+        description: String,
+        proofNote: String,
+        coverPhotoData: Data?,
+        policiesAccepted: Bool
+    ) -> String? {
         let loc = locationName.trimmingCharacters(in: .whitespacesAndNewlines)
         if loc.isEmpty { return "Location name missing" }
 
