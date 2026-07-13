@@ -8,33 +8,19 @@ struct BusinessProSubscriptionView: View {
         self.businessStatus = businessStatus
     }
 
-    private let proFeatureListItems = [
-        "Unlimited venues",
-        "Unlimited hosted games",
+    private let proFeatureListItems = BusinessPlanLimitPresentation.proPlanFeatureBullets() + [
         "Analytics access"
     ]
 
     private var regularFeatureListItems: [String] {
-        [
-            "\(currentActiveVenueLimit) active venues",
-            "\(currentHostedGameLimit) hosted games/month"
+        guard let businessStatus else { return BusinessPlanLimitPresentation.regularPlanFeatureBullets() }
+        return [
+            businessStatus.displayActiveVenuesFeatureText,
+            businessStatus.displayHostedGamesFeatureText
         ]
     }
 
-    private var currentActiveVenueLimit: Int {
-        guard let businessStatus else { return BusinessMembershipPolicy.freeVenueListingLimit }
-        return max(1, businessStatus.activeVenueLimit ?? businessStatus.venueLimit)
-    }
-
-    private var currentHostedGameLimit: Int {
-        guard let businessStatus else { return BusinessMembershipPolicy.freeMonthlyVenueGameLimit }
-        return max(1, businessStatus.hostedGamesEffectiveMonthlyHostLimitForDisplay ?? businessStatus.monthlyHostLimit)
-    }
-
-    private let fallbackRegularFeatures = [
-        "5 active venues",
-        "5 hosted games/month"
-    ]
+    private let fallbackRegularFeatures = BusinessPlanLimitPresentation.regularPlanFeatureBullets()
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -133,7 +119,7 @@ struct BusinessProSubscriptionView: View {
     private var regularReferenceCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             planHeader(
-                title: "FanGeo Business",
+                title: "Business Regular",
                 subtitle: "Free business tools for sports venues",
                 badge: "FREE",
                 badgeColor: FGColor.accentBlue
@@ -237,33 +223,42 @@ struct BusinessProSubscriptionView: View {
     }
 
     private var entitlementBadge: String {
-        guard businessStatus != nil else { return "CHECKING" }
-        if isCurrentBusinessFreePromo { return "FREE" }
-        if isCurrentBusinessSubscriptionPro { return "PROMOTIONAL" }
+        guard let businessStatus else { return "CHECKING" }
+        if businessStatus.computedIsPro {
+            return businessStatus.isBusinessProPromo ? "PROMO" : "PRO"
+        }
         return "REGULAR"
     }
 
     private var entitlementBadgeColor: Color {
-        if isCurrentBusinessFreePromo { return FGColor.accentYellow }
-        if isCurrentBusinessSubscriptionPro { return FGColor.accentGreen }
+        guard let businessStatus else { return FGColor.accentBlue }
+        if businessStatus.computedIsPro {
+            return businessStatus.isBusinessProPromo ? FGColor.accentYellow : FGColor.accentGreen
+        }
         return FGColor.accentBlue
     }
 
     private var entitlementFeatureTint: Color {
-        isCurrentBusinessRegular ? FGColor.accentBlue : FGColor.accentGreen
+        businessStatus?.computedIsPro == true ? FGColor.accentGreen : FGColor.accentBlue
     }
 
     private var entitlementFeatures: [String] {
-        guard businessStatus != nil else { return fallbackRegularFeatures }
-        return isCurrentBusinessRegular ? regularFeatureListItems : proFeatureListItems
+        guard let businessStatus else { return fallbackRegularFeatures }
+        return businessStatus.computedIsPro ? proFeatureListItems : regularFeatureListItems
     }
 
     private var entitlementDetailText: String {
-        guard businessStatus != nil else {
+        guard let businessStatus else {
             return "Business Pro details are refreshing from your business account."
         }
-        if businessStatus?.computedIsPro == true {
-            if let formatted = BusinessProPromoDisplay.formattedExpiry(from: businessStatus?.proExpiresAt) {
+        if businessStatus.computedIsPro {
+            if businessStatus.isBusinessProPromo {
+                if let formatted = BusinessProPromoDisplay.formattedExpiry(from: businessStatus.proExpiresAt) {
+                    return "Complimentary launch promotion through \(formatted)."
+                }
+                return "Complimentary Business Pro access through the FanGeo launch promotion."
+            }
+            if let formatted = BusinessProPromoDisplay.formattedExpiry(from: businessStatus.proExpiresAt) {
                 return "Promotion ends on \(formatted)"
             }
             return "Promotion end date refreshes from your business account."
@@ -271,16 +266,8 @@ struct BusinessProSubscriptionView: View {
         return "Upgrade to Business Pro for unlimited venues and hosted games."
     }
 
-    private var isCurrentBusinessFreePromo: Bool {
-        businessStatus?.isBusinessProPromo == true
-    }
-
-    private var isCurrentBusinessSubscriptionPro: Bool {
-        businessStatus?.isBusinessSubscriptionPro == true
-    }
-
     private var isCurrentBusinessRegular: Bool {
-        businessStatus != nil && !isCurrentBusinessFreePromo && !isCurrentBusinessSubscriptionPro
+        businessStatus?.computedIsPro != true
     }
 
     private var background: some View {

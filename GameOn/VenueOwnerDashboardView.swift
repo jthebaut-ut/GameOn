@@ -1059,14 +1059,22 @@ struct BusinessUsageCenterView: View {
 
     private var hostedGameCycleSummaryText: String {
         let used = hostedGameCycleUsedCount
-        let unlimited = hostedGameCycleAudit?.isUnlimitedHosting ?? status.map { $0.unlimitedHosting || $0.isBusinessPro } ?? false
+        let unlimited = hostedGameCycleAudit?.isUnlimitedHosting ?? status.map { $0.computedIsPro } ?? false
         if unlimited {
             return "\(used) hosted games • Unlimited"
         }
-        let limit = status?.hostedGamesEffectiveMonthlyHostLimitForDisplay
-            ?? hostedGameCycleAudit?.monthlyHostLimit
-            ?? status.map { max(1, $0.monthlyHostedGameLimit ?? $0.monthlyHostLimit) }
-            ?? BusinessMembershipPolicy.freeMonthlyVenueGameLimit
+        let limit: Int = {
+            if let status,
+               let cap = BusinessPlanLimitPresentation.resolvedHostedGameCap(for: status) {
+                return cap
+            }
+            if let audit = hostedGameCycleAudit {
+                return BusinessPlanLimitPresentation.isSentinelLimit(audit.monthlyHostLimit)
+                    ? BusinessMembershipPolicy.freeMonthlyVenueGameLimit
+                    : audit.monthlyHostLimit
+            }
+            return BusinessMembershipPolicy.freeMonthlyVenueGameLimit
+        }()
         return "\(used) / \(limit) used"
     }
 
@@ -1208,16 +1216,16 @@ struct BusinessUsageCenterView: View {
         switch kind {
         case .activeVenues:
             value = status.activeVenueCount
-            limit = status.activeVenueLimit
+            limit = BusinessPlanLimitPresentation.resolvedActiveVenueCap(for: status) ?? status.activeVenueLimit
             title = "Active venues"
             unit = value == 1 ? "active venue" : "active venues"
-            unlimited = status.unlimitedVenues || status.isBusinessPro
+            unlimited = status.computedIsPro
         case .hostedGames:
             value = status.hostedGamesUsedForDisplay
-            limit = status.hostedGamesEffectiveMonthlyHostLimitForDisplay
+            limit = BusinessPlanLimitPresentation.resolvedHostedGameCap(for: status) ?? status.hostedGamesEffectiveMonthlyHostLimitForDisplay
             title = "Hosted games"
             unit = value == 1 ? "hosted game this cycle" : "hosted games this cycle"
-            unlimited = status.unlimitedHosting || status.isBusinessPro
+            unlimited = status.computedIsPro
         }
 
         if unlimited {
@@ -1267,10 +1275,14 @@ struct BusinessUsageCenterView: View {
             return nil
         }
         let bonus = max(0, status.hostedGameCycleBonusGames ?? 0)
-        guard bonus > 0 || effectiveLimit != status.monthlyHostLimit else {
+        guard bonus > 0 || effectiveLimit != status.monthlyHostLimit,
+              !BusinessPlanLimitPresentation.isSentinelLimit(status.monthlyHostLimit) else {
             return nil
         }
-        return "Base limit: \(status.monthlyHostLimit)\nBonus this cycle: +\(bonus)\nEffective limit: \(effectiveLimit)"
+        let baseLimit = BusinessPlanLimitPresentation.isSentinelLimit(status.monthlyHostLimit)
+            ? BusinessMembershipPolicy.freeMonthlyVenueGameLimit
+            : status.monthlyHostLimit
+        return "Base limit: \(baseLimit)\nBonus this cycle: +\(bonus)\nEffective limit: \(effectiveLimit)"
     }
 
     private func usageMetricRow(
@@ -2766,11 +2778,11 @@ struct VenueOwnerDashboardView: View {
     private func businessProStatusSubtitle(for status: BusinessVenueGamePostingStatus?) -> String {
         guard let status else { return "Checking plan status…" }
         guard status.computedIsPro else {
-            let activeVenueLimit = max(1, status.activeVenueLimit ?? status.venueLimit)
-            let hostedGameLimit = max(1, status.monthlyHostedGameLimit ?? status.monthlyHostLimit)
             var parts = [
-                "\(activeVenueLimit) active venues",
-                "\(hostedGameLimit) hosted games/cycle"
+                status.displayActiveVenuesFeatureText.replacingOccurrences(of: "Up to ", with: ""),
+                status.displayHostedGamesFeatureText
+                    .replacingOccurrences(of: "Up to ", with: "")
+                    .replacingOccurrences(of: "/month", with: "/cycle")
             ]
             if let resetText = BusinessHostedGameCycleDisplay.resetText(from: status.nextResetAt) {
                 parts.append(resetText)
@@ -2992,7 +3004,8 @@ struct VenueOwnerDashboardView: View {
     private var hostedGameCycleLimitReachedForRegularBusiness: Bool {
         guard let status = businessMembershipStatus else { return false }
         guard !status.computedIsPro && !status.unlimitedHosting else { return false }
-        let limit = max(1, status.monthlyHostedGameLimit ?? status.monthlyHostLimit)
+        let limit = BusinessPlanLimitPresentation.resolvedHostedGameCap(for: status)
+            ?? BusinessMembershipPolicy.freeMonthlyVenueGameLimit
         return status.hostedGamesUsedForDisplay >= limit
     }
 
@@ -3000,7 +3013,11 @@ struct VenueOwnerDashboardView: View {
         guard let status = businessMembershipStatus else {
             return "Checking hosted games usage..."
         }
-        let limit = max(1, status.monthlyHostedGameLimit ?? status.monthlyHostLimit)
+        if status.computedIsPro {
+            return "Unlimited hosted games this cycle."
+        }
+        let limit = BusinessPlanLimitPresentation.resolvedHostedGameCap(for: status)
+            ?? BusinessMembershipPolicy.freeMonthlyVenueGameLimit
         let base = "You’ve used \(status.hostedGamesUsedForDisplay) of \(limit) hosted games this cycle."
         guard let resetText = BusinessHostedGameCycleDisplay.resetText(from: status.nextResetAt) else {
             return base

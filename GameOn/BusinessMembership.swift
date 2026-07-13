@@ -25,6 +25,112 @@ enum BusinessLimitCopy {
     static let backendCompatibilityRequired = "FanGeo needs a quick update before this business feature can be used. Please update the app and try again."
 }
 
+/// User-facing plan limit copy. Backend may return sentinel values (e.g. 999999) for unlimited capacity;
+/// never surface those integers directly in business UI.
+enum BusinessPlanLimitPresentation {
+    static let sentinelThreshold = 10_000
+
+    enum DisplayLimit: Equatable {
+        case unlimited
+        case regular(limit: Int)
+    }
+
+    static func isSentinelLimit(_ value: Int?) -> Bool {
+        guard let value else { return false }
+        return value >= sentinelThreshold
+    }
+
+    static func activeVenueLimit(for status: BusinessVenueGamePostingStatus) -> DisplayLimit {
+        guard !status.computedIsPro else { return .unlimited }
+        if isSentinelLimit(status.venueLimit) || (status.unlimitedVenues && !status.computedIsPro) {
+            return .regular(limit: BusinessMembershipPolicy.freeVenueListingLimit)
+        }
+        return .regular(limit: max(1, min(status.venueLimit, BusinessMembershipPolicy.freeVenueListingLimit)))
+    }
+
+    static func hostedGameLimit(for status: BusinessVenueGamePostingStatus) -> DisplayLimit {
+        guard !status.computedIsPro else { return .unlimited }
+        let raw = status.hostedGamesEffectiveMonthlyHostLimitForDisplay ?? status.monthlyHostLimit
+        if isSentinelLimit(raw) || (status.unlimitedHosting && !status.computedIsPro) {
+            return .regular(limit: BusinessMembershipPolicy.freeMonthlyVenueGameLimit)
+        }
+        return .regular(limit: max(1, min(raw, BusinessMembershipPolicy.freeMonthlyVenueGameLimit)))
+    }
+
+    static func activeVenuesFeatureText(for status: BusinessVenueGamePostingStatus) -> String {
+        switch activeVenueLimit(for: status) {
+        case .unlimited:
+            return "Unlimited active venues"
+        case .regular(let limit):
+            return "Up to \(limit) active venues"
+        }
+    }
+
+    static func hostedGamesFeatureText(for status: BusinessVenueGamePostingStatus) -> String {
+        switch hostedGameLimit(for: status) {
+        case .unlimited:
+            return "Unlimited hosted games"
+        case .regular(let limit):
+            return "Up to \(limit) hosted games/month"
+        }
+    }
+
+    static func activeVenuesCountNounText(for status: BusinessVenueGamePostingStatus) -> String {
+        switch activeVenueLimit(for: status) {
+        case .unlimited:
+            return "Unlimited active venues"
+        case .regular(let limit):
+            return "\(limit) active venues"
+        }
+    }
+
+    static func hostedGamesCountNounText(for status: BusinessVenueGamePostingStatus) -> String {
+        switch hostedGameLimit(for: status) {
+        case .unlimited:
+            return "Unlimited hosted games"
+        case .regular(let limit):
+            return "\(limit) hosted games/month"
+        }
+    }
+
+    static func planLimitsSummarySubtitle(for status: BusinessVenueGamePostingStatus) -> String {
+        guard !status.computedIsPro else { return status.businessPlanDisplaySubtitle }
+        return "\(activeVenuesFeatureText(for: status)) • \(hostedGamesFeatureText(for: status))"
+    }
+
+    static func regularPlanFeatureBullets() -> [String] {
+        [
+            "Up to \(BusinessMembershipPolicy.freeVenueListingLimit) active venues",
+            "Up to \(BusinessMembershipPolicy.freeMonthlyVenueGameLimit) hosted games/month"
+        ]
+    }
+
+    static func proPlanFeatureBullets() -> [String] {
+        [
+            "Unlimited active venues",
+            "Unlimited hosted games"
+        ]
+    }
+
+    static func resolvedActiveVenueCap(for status: BusinessVenueGamePostingStatus) -> Int? {
+        switch activeVenueLimit(for: status) {
+        case .unlimited:
+            return nil
+        case .regular(let limit):
+            return limit
+        }
+    }
+
+    static func resolvedHostedGameCap(for status: BusinessVenueGamePostingStatus) -> Int? {
+        switch hostedGameLimit(for: status) {
+        case .unlimited:
+            return nil
+        case .regular(let limit):
+            return limit
+        }
+    }
+}
+
 enum BusinessProPromoDisplay {
     private static let expiryFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -111,7 +217,11 @@ struct BusinessVenueGamePostingStatus: Equatable {
     var statisticsAccessGranted: Bool { !isStatisticsLocked }
     var sponsoredPlacementAllowed: Bool { sponsoredEnabled || computedIsPro || planType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "free" }
     var activeVenueCount: Int { businessVenueCount }
-    var activeVenueLimit: Int? { unlimitedVenues || isBusinessPro ? nil : venueLimit }
+    var activeVenueLimit: Int? {
+        // Honor Free admin unlimited override (unlimitedVenues true while remaining Free).
+        if unlimitedVenues || isBusinessPro { return nil }
+        return venueLimit
+    }
     var monthlyHostedGameLimit: Int? { unlimitedHosting || isBusinessPro ? nil : monthlyHostLimit }
     var currentMonthHostedGameCount: Int { monthlyHostedGameCount }
     var hostedGamesUsedForDisplay: Int { hostedGamesUsedThisCycle ?? monthlyHostedGameCount }
@@ -204,6 +314,19 @@ struct BusinessVenueGamePostingStatus: Equatable {
         }
         return "Expires \(formatted)"
     }
+
+    var displayPlanLimitsSummarySubtitle: String {
+        BusinessPlanLimitPresentation.planLimitsSummarySubtitle(for: self)
+    }
+
+    var displayActiveVenuesFeatureText: String {
+        BusinessPlanLimitPresentation.activeVenuesFeatureText(for: self)
+    }
+
+    var displayHostedGamesFeatureText: String {
+        BusinessPlanLimitPresentation.hostedGamesFeatureText(for: self)
+    }
+
     private var normalizedPlanStatusForDisplay: String {
         let value = planStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return value.isEmpty ? "active" : value
@@ -319,6 +442,11 @@ struct BusinessVenueGamePostingStatus: Equatable {
             || activeProPlan
             || rawUnlimitedVenuesIsActive
             || rawUnlimitedHostingIsActive
+        // Free admin unlimited venue override returns venue_limit=999999 with unlimited_venues=false
+        // and is_pro_active=false. Honor the capacity without labeling the business Pro.
+        let freeAdminUnlimitedVenues = !normalizedBusinessProActive
+            && planType == "free"
+            && venueLimitIsUnlimited
         let venueLimitGrantsUnlimitedVenues = venueLimitIsUnlimited
             && planStatusAllowsProAccess
             && expirationAllowsProAccess
@@ -329,6 +457,7 @@ struct BusinessVenueGamePostingStatus: Equatable {
             && (normalizedBusinessProActive || planType != "free")
         let normalizedUnlimitedVenues = normalizedBusinessProActive
             || venueLimitGrantsUnlimitedVenues
+            || freeAdminUnlimitedVenues
         let normalizedUnlimitedHosting = normalizedBusinessProActive
             || monthlyLimitGrantsUnlimitedHosting
         let normalizedVenueLimit: Int

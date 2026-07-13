@@ -116,7 +116,11 @@ struct BusinessVenueDashboardApprovedVenueItem: Identifiable, Equatable {
 struct BusinessVenueDashboardPendingVenueItem: Identifiable, Equatable {
     let id: UUID
     let name: String
+    let locationLine: String
+    let ownershipApprovalLine: String
     let submittedDateText: String
+    let venuePhotoURL: String?
+    let venuePhotoThumbnailURL: String?
 }
 
 enum BusinessVenueDashboardGameDateTimeFormatter {
@@ -634,7 +638,7 @@ struct BusinessVenueDashboardOverviewView: View {
                     .overlay(FGColor.divider(colorScheme))
 
                 venueStatusGroup(
-                    title: "Pending venues",
+                    title: "Pending review",
                     emptyText: "No pending venues",
                     tint: .orange
                 ) {
@@ -713,11 +717,34 @@ struct BusinessVenueDashboardOverviewView: View {
             }
 
             if (title == "Approved venues" && data.approvedVenues.isEmpty)
-                || (title == "Pending venues" && data.pendingVenues.isEmpty) {
+                || (title == "Pending review" && data.pendingVenues.isEmpty) {
                 Text(emptyText)
                     .font(FGTypography.caption)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .padding(.vertical, 4)
+
+                if title == "Approved venues", data.approvedVenues.isEmpty {
+                    Text("Add your first venue for review, or claim an existing venue from Discover.")
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button(action: onAddVenue) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Add a Venue")
+                                .font(FGTypography.caption.weight(.bold))
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(FGColor.accentGreen)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
+                }
             } else {
                 content()
             }
@@ -824,22 +851,81 @@ struct BusinessVenueDashboardOverviewView: View {
     }
 
     private func pendingVenueRow(_ venue: BusinessVenueDashboardPendingVenueItem) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            statusIcon(systemName: "hourglass.circle.fill", tint: .orange)
-            VStack(alignment: .leading, spacing: 3) {
+        let tint = Color.orange
+        return HStack(alignment: .center, spacing: 12) {
+            pendingVenueThumbnail(venue)
+
+            VStack(alignment: .leading, spacing: 5) {
                 Text(venue.name)
-                    .font(FGTypography.caption.weight(.semibold))
+                    .font(FGTypography.caption.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                     .lineLimit(1)
-                Text("Pending approval • \(venue.submittedDateText)")
-                    .font(FGTypography.caption)
+                if !venue.locationLine.isEmpty {
+                    Text(venue.locationLine)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
+                Text(venue.ownershipApprovalLine)
+                    .font(FGTypography.metadata.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .lineLimit(2)
+                if !venue.submittedDateText.isEmpty {
+                    Text(venue.submittedDateText)
+                        .font(FGTypography.metadata)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 0)
-            statusPill("Pending", tint: .orange)
+            statusPill("Pending", tint: tint)
         }
-        .padding(.vertical, 4)
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(FGAdaptiveSurface.cardElevated)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(tint.opacity(colorScheme == .dark ? 0.28 : 0.22), lineWidth: 1)
+        }
+    }
+
+    private func pendingVenueThumbnail(_ venue: BusinessVenueDashboardPendingVenueItem) -> some View {
+        let rawURL = (venue.venuePhotoThumbnailURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (venue.venuePhotoURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        return ZStack {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .fill(Color.orange.opacity(colorScheme == .dark ? 0.18 : 0.10))
+
+            if let rawURL, let url = URL(string: rawURL) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    case .failure:
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(.orange)
+                    case .empty:
+                        ProgressView()
+                            .tint(.orange)
+                    @unknown default:
+                        Image(systemName: "building.2.fill")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } else {
+                Image(systemName: "building.2.fill")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(.orange)
+            }
+        }
+        .frame(width: 54, height: 54)
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
     }
 
     private func statusIcon(systemName: String, tint: Color) -> some View {
@@ -931,10 +1017,10 @@ private struct BusinessUsageQuickActionState {
             return
         }
 
-        let activeVenueLimit = max(1, status.activeVenueLimit ?? status.venueLimit)
-        let monthlyHostedGameLimit = max(1, status.monthlyHostedGameLimit ?? status.monthlyHostLimit)
-        let venueLimitReached = status.activeVenueCount >= activeVenueLimit
-        let hostedGameLimitReached = status.hostedGamesUsedForDisplay >= monthlyHostedGameLimit
+        let activeVenueLimit = BusinessPlanLimitPresentation.resolvedActiveVenueCap(for: status)
+        let monthlyHostedGameLimit = BusinessPlanLimitPresentation.resolvedHostedGameCap(for: status)
+        let venueLimitReached = activeVenueLimit.map { status.activeVenueCount >= $0 } ?? false
+        let hostedGameLimitReached = monthlyHostedGameLimit.map { status.hostedGamesUsedForDisplay >= $0 } ?? false
 
         if venueLimitReached || hostedGameLimitReached {
             tint = FGColor.dangerRed

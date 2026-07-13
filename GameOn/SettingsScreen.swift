@@ -3401,7 +3401,7 @@ struct SettingsScreen: View {
             return "Checking server-controlled access..."
         }
         guard status.computedIsPro else {
-            return "\(status.venueLimit) active venues • \(status.monthlyHostLimit) hosted games/month"
+            return status.displayPlanLimitsSummarySubtitle
         }
         return status.businessPlanDisplaySubtitle
     }
@@ -5270,6 +5270,26 @@ private struct SettingsVenueOwnerDeletionSheet: View {
         do {
             let loaded = try await viewModel.businessAccountDeletionPreview(businessId: businessId)
             await MainActor.run {
+                if loaded.blocked == true {
+                    let reason = loaded.blockReason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    switch reason {
+                    case "business_disabled":
+                        errorMessage = "This business account is disabled and cannot be deleted from the app. Contact FanGeo Support."
+                    case "already_deleted":
+                        errorMessage = "This business account has already been deleted."
+                    default:
+                        errorMessage = reason.isEmpty
+                            ? "Business account deletion is not available right now."
+                            : "Business account deletion is not available (\(reason))."
+                    }
+                    preview = nil
+                    return
+                }
+                guard loaded.ok else {
+                    errorMessage = "Deletion preview is unavailable for this business account."
+                    preview = nil
+                    return
+                }
                 preview = loaded
             }
         } catch {
@@ -11852,6 +11872,35 @@ struct BusinessLocationVenuePicker: View {
                 )
                 .opacity(0.88)
                 .allowsHitTesting(false)
+            } else if venuePairs.isEmpty {
+                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    settingsPickerRowLabel(
+                        title: "No approved venues yet",
+                        subtitle: "Add your first venue for review, or claim an existing venue from Discover.",
+                        systemImage: "mappin.and.ellipse",
+                        tint: FGColor.mutedText(colorScheme),
+                        showsApprovedBadge: false,
+                        chevronSystemName: "chevron.right"
+                    )
+                    .opacity(0.88)
+
+                    Button {
+                        onRequestAddNewLocation?()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Add a Venue")
+                                .font(FGTypography.caption.weight(.bold))
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                        .background(FGColor.accentGreen)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
             } else {
                 Menu {
                     settingsChromeMenuContent()
