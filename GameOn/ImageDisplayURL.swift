@@ -32,6 +32,17 @@ nonisolated enum ImageDisplayURL {
         nonEmpty(thumbnail) ?? nonEmpty(full)
     }
 
+    /// Discover cards and business venue headers: cover first, then menu photo.
+    static func forBusinessVenueCard(
+        coverThumbnail: String?,
+        coverFull: String?,
+        menuThumbnail: String?,
+        menuFull: String?
+    ) -> String? {
+        forList(thumbnail: coverThumbnail, full: coverFull)
+            ?? forList(thumbnail: menuThumbnail, full: menuFull)
+    }
+
     /// Full-bleed / owner verification: prefer full-size when present.
     static func forDetail(thumbnail: String?, full: String?) -> String? {
         nonEmpty(full) ?? nonEmpty(thumbnail)

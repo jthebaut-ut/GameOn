@@ -191,6 +191,8 @@ struct BusinessVenueDashboardOverviewView: View {
     let businessUsageStatus: BusinessVenueGamePostingStatus?
     var activeVenueSelectionNotice: String? = nil
     var activeVenueSelectionFootnote: String? = nil
+    /// Opens the one-time Regular active-venue selection sheet when eligible.
+    var onChooseActiveVenues: (() -> Void)? = nil
     let onNotifications: () -> Void
     let onMenu: () -> Void
     let onAddGame: () -> Void
@@ -253,7 +255,7 @@ struct BusinessVenueDashboardOverviewView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        LazyVStack(alignment: .leading, spacing: 16) {
             if needsBusinessVenueSetup {
                 completeBusinessSetupCard
             } else if hasPendingVenueSetupReview {
@@ -278,6 +280,34 @@ struct BusinessVenueDashboardOverviewView: View {
         }
         .onChange(of: businessId) { _, _ in
             logBusinessUsageStatusDebug()
+        }
+    }
+
+    private var previewGames: [BusinessVenueDashboardGameItem] {
+        Array(data.games.prefix(3))
+    }
+
+    private func prefetchManagedVenueThumbnails() {
+        let approvedURLs = data.approvedVenues.compactMap { venue -> URL? in
+            ImageDisplayURL.forBusinessVenueCard(
+                coverThumbnail: venue.venuePhotoThumbnailURL,
+                coverFull: venue.venuePhotoURL,
+                menuThumbnail: nil,
+                menuFull: nil
+            ).flatMap(URL.init(string:))
+        }
+        let pendingURLs = data.pendingVenues.compactMap { venue -> URL? in
+            ImageDisplayURL.forBusinessVenueCard(
+                coverThumbnail: venue.venuePhotoThumbnailURL,
+                coverFull: venue.venuePhotoURL,
+                menuThumbnail: nil,
+                menuFull: nil
+            ).flatMap(URL.init(string:))
+        }
+        let urls = approvedURLs + pendingURLs
+        guard !urls.isEmpty else { return }
+        Task(priority: .utility) {
+            await DiscoverMapImageCache.shared.prefetch(urls: urls)
         }
     }
 
@@ -397,6 +427,30 @@ struct BusinessVenueDashboardOverviewView: View {
                         isLimited: false,
                         action: { onBusinessIdentity?() }
                     )
+                    BusinessVenueDashboardActionCard(
+                        title: "Favorite Teams",
+                        subtitle: favoriteTeamsQuickActionSubtitle,
+                        systemImage: "star.circle.fill",
+                        tint: FGColor.accentBlue,
+                        badgeText: nil,
+                        isPremium: false,
+                        isLimited: false,
+                        action: onManageFavoriteTeams
+                    )
+                    if hasManagedVenues {
+                        BusinessVenueDashboardActionCard(
+                            title: L10n.t("manage_games", languageCode: appLanguageRaw),
+                            subtitle: isVenueHydrationReady ? "Scheduled games" : "Loading",
+                            systemImage: isVenueHydrationReady ? "sportscourt" : "hourglass",
+                            tint: isVenueHydrationReady ? FGColor.accentGreen : Color.gray,
+                            badgeText: nil,
+                            isPremium: false,
+                            isLimited: !isVenueHydrationReady,
+                            action: {
+                                performHydratedVenueAction("manageGames", action: onTonightGames)
+                            }
+                        )
+                    }
                     if showsManagedVenuesSection {
                         BusinessVenueDashboardActionCard(
                             title: "Manage Venues",
@@ -429,18 +483,6 @@ struct BusinessVenueDashboardOverviewView: View {
                             action: { performHydratedVenueAction("venueDetails", action: onAddGame) }
                         )
                         BusinessVenueDashboardActionCard(
-                            title: L10n.t("manage_games", languageCode: appLanguageRaw),
-                            subtitle: isVenueHydrationReady ? "Scheduled games" : "Loading",
-                            systemImage: isVenueHydrationReady ? "sportscourt" : "hourglass",
-                            tint: isVenueHydrationReady ? FGColor.accentGreen : Color.gray,
-                            badgeText: nil,
-                            isPremium: false,
-                            isLimited: !isVenueHydrationReady,
-                            action: {
-                                performHydratedVenueAction("manageGames", action: onTonightGames)
-                            }
-                        )
-                        BusinessVenueDashboardActionCard(
                             title: L10n.t("statistics", languageCode: appLanguageRaw),
                             subtitle: statisticsAccessGranted ? nil : "Pro",
                             systemImage: statisticsAccessGranted ? "chart.bar.xaxis" : "lock.fill",
@@ -451,16 +493,6 @@ struct BusinessVenueDashboardOverviewView: View {
                             action: onAnalytics
                         )
                     }
-                    BusinessVenueDashboardActionCard(
-                        title: "Favorite Teams",
-                        subtitle: favoriteTeamsQuickActionSubtitle,
-                        systemImage: "star.circle.fill",
-                        tint: FGColor.accentBlue,
-                        badgeText: nil,
-                        isPremium: false,
-                        isLimited: false,
-                        action: onManageFavoriteTeams
-                    )
                     BusinessVenueDashboardActionCard(
                         title: "Flagged Comments",
                         subtitle: "Review reports",
@@ -476,16 +508,26 @@ struct BusinessVenueDashboardOverviewView: View {
             }
 
             if let activeVenueSelectionNotice {
-                activeVenueSelectionInfoBanner(activeVenueSelectionNotice, tint: FGColor.accentBlue)
+                activeVenueSelectionInfoBanner(
+                    activeVenueSelectionNotice,
+                    tint: FGColor.accentBlue,
+                    actionTitle: nil,
+                    action: nil
+                )
             } else if let activeVenueSelectionFootnote {
-                activeVenueSelectionInfoBanner(activeVenueSelectionFootnote, tint: FGColor.accentGreen)
+                activeVenueSelectionInfoBanner(
+                    activeVenueSelectionFootnote,
+                    tint: FGColor.accentGreen,
+                    actionTitle: onChooseActiveVenues == nil ? nil : "Choose Active Venues",
+                    action: onChooseActiveVenues
+                )
             }
         }
     }
 
     private var addVenueAccessSubtitle: String? {
         guard businessUsageStatus != nil else { return "Checking access..." }
-        return isAddVenueAllowed ? nil : "Limit reached"
+        return isAddVenueAllowed ? nil : L10n.t("business_limit_reached", languageCode: appLanguageRaw)
     }
 
     private var favoriteTeamsQuickActionSubtitle: String {
@@ -494,16 +536,35 @@ struct BusinessVenueDashboardOverviewView: View {
         return "\(favoriteTeamsCount) teams"
     }
 
-    private func activeVenueSelectionInfoBanner(_ message: String, tint: Color) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle.fill")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(tint)
-            Text(message)
-                .font(FGTypography.caption.weight(.semibold))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+    private func activeVenueSelectionInfoBanner(
+        _ message: String,
+        tint: Color,
+        actionTitle: String?,
+        action: (() -> Void)?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(message)
+                    .font(FGTypography.caption.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            if let actionTitle, let action {
+                Button(action: action) {
+                    Text(actionTitle)
+                        .font(FGTypography.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(FGColor.brandGradient)
+                        .clipShape(Capsule(style: .continuous))
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -566,12 +627,12 @@ struct BusinessVenueDashboardOverviewView: View {
             }
 
             VStack(spacing: 0) {
-                if data.games.isEmpty {
+                if previewGames.isEmpty {
                     emptyTonightState
                 } else {
-                    ForEach(Array(data.games.prefix(3).enumerated()), id: \.element.id) { index, game in
+                    ForEach(Array(previewGames.enumerated()), id: \.element.id) { index, game in
                         BusinessVenueDashboardGameRow(game: game)
-                        if index < min(data.games.count, 3) - 1 {
+                        if index < previewGames.count - 1 {
                             Divider()
                                 .overlay(FGColor.divider(colorScheme))
                                 .padding(.leading, 54)
@@ -646,6 +707,9 @@ struct BusinessVenueDashboardOverviewView: View {
                         pendingVenueRow(venue)
                     }
                 }
+            }
+            .onAppear {
+                prefetchManagedVenueThumbnails()
             }
             .padding(12)
             .background(FGColor.cardBackground(colorScheme))
@@ -733,7 +797,7 @@ struct BusinessVenueDashboardOverviewView: View {
                         HStack(spacing: 8) {
                             Image(systemName: "plus.circle.fill")
                                 .font(.system(size: 16, weight: .semibold))
-                            Text("Add a Venue")
+                            Text(L10n.t("add_venue", languageCode: appLanguageRaw))
                                 .font(FGTypography.caption.weight(.bold))
                         }
                         .foregroundStyle(.white)
@@ -768,7 +832,7 @@ struct BusinessVenueDashboardOverviewView: View {
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .lineLimit(1)
                 }
-                Text(venue.isPlanLocked ? BusinessLimitCopy.planLockedVenueSubtitle : venue.ownershipApprovalLine)
+                Text(venue.isPlanLocked ? BusinessLimitCopy.planLockedVenueSubtitle(languageCode: appLanguageRaw) : venue.ownershipApprovalLine)
                     .font(FGTypography.metadata.weight(.semibold))
                     .foregroundStyle(venue.isPlanLocked ? Color.gray : FGColor.secondaryText(colorScheme))
                     .lineLimit(2)
@@ -814,37 +878,24 @@ struct BusinessVenueDashboardOverviewView: View {
     }
 
     private func venueThumbnail(_ venue: BusinessVenueDashboardApprovedVenueItem) -> some View {
-        let rawURL = (venue.venuePhotoThumbnailURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-            ?? (venue.venuePhotoURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let rawURL = ImageDisplayURL.forBusinessVenueCard(
+            coverThumbnail: venue.venuePhotoThumbnailURL,
+            coverFull: venue.venuePhotoURL,
+            menuThumbnail: nil,
+            menuFull: nil
+        )
+        let emptyIcon = venue.isPlanLocked ? "lock.fill" : "building.2.fill"
+        let emptyTint: Color = venue.isPlanLocked ? Color.gray : FGColor.accentBlue
         return ZStack {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.10))
 
-            if let rawURL, let url = URL(string: rawURL) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure:
-                        Image(systemName: "building.2.fill")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(FGColor.accentBlue)
-                    case .empty:
-                        ProgressView()
-                            .tint(FGColor.accentBlue)
-                    @unknown default:
-                        Image(systemName: "building.2.fill")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(FGColor.accentBlue)
-                    }
-                }
-            } else {
-                Image(systemName: venue.isPlanLocked ? "lock.fill" : "building.2.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(venue.isPlanLocked ? Color.gray : FGColor.accentBlue)
-            }
+            BusinessDashboardStableRemoteThumb(
+                url: rawURL.flatMap(URL.init(string:)),
+                placeholderTint: FGColor.accentBlue,
+                emptySystemName: emptyIcon,
+                emptyTint: emptyTint
+            )
         }
         .frame(width: 54, height: 54)
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -892,37 +943,22 @@ struct BusinessVenueDashboardOverviewView: View {
     }
 
     private func pendingVenueThumbnail(_ venue: BusinessVenueDashboardPendingVenueItem) -> some View {
-        let rawURL = (venue.venuePhotoThumbnailURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-            ?? (venue.venuePhotoURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        let rawURL = ImageDisplayURL.forBusinessVenueCard(
+            coverThumbnail: venue.venuePhotoThumbnailURL,
+            coverFull: venue.venuePhotoURL,
+            menuThumbnail: nil,
+            menuFull: nil
+        )
         return ZStack {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
                 .fill(Color.orange.opacity(colorScheme == .dark ? 0.18 : 0.10))
 
-            if let rawURL, let url = URL(string: rawURL) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .failure:
-                        Image(systemName: "building.2.fill")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(.orange)
-                    case .empty:
-                        ProgressView()
-                            .tint(.orange)
-                    @unknown default:
-                        Image(systemName: "building.2.fill")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(.orange)
-                    }
-                }
-            } else {
-                Image(systemName: "building.2.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.orange)
-            }
+            BusinessDashboardStableRemoteThumb(
+                url: rawURL.flatMap(URL.init(string:)),
+                placeholderTint: .orange,
+                emptySystemName: "building.2.fill",
+                emptyTint: .orange
+            )
         }
         .frame(width: 54, height: 54)
         .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -1047,6 +1083,7 @@ private struct BusinessUsageQuickActionState {
 
 private struct BusinessVenueDashboardActionCard: View {
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     let title: String
     var subtitle: String? = nil
@@ -1142,7 +1179,7 @@ private struct BusinessVenueDashboardActionCard: View {
             .opacity(isLimited ? 0.86 : 1)
         }
         .buttonStyle(.plain)
-        .accessibilityHint(isLimited ? (isPremium ? "Business Pro required" : "Limit reached or venue locked") : "")
+        .accessibilityHint(isLimited ? (isPremium ? L10n.t("business_pro_required", languageCode: appLanguageRaw) : L10n.t("business_limit_or_venue_locked", languageCode: appLanguageRaw)) : "")
     }
 
     private var actionCardBackground: some ShapeStyle {
@@ -1214,13 +1251,70 @@ private struct BusinessVenueDashboardGameRow: View {
                 Text(game.energyLabel)
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(game.energyTint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(game.energyTint.opacity(colorScheme == .dark ? 0.22 : 0.12))
                     .clipShape(Capsule())
+                    .fixedSize(horizontal: true, vertical: false)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 11)
+    }
+}
+
+/// Dashboard-only remote thumb: uses Discover RAM/disk cache and keeps the last decoded
+/// image across LazyVStack recycle / parent redraws for the same URL (no AsyncImage refetch).
+private struct BusinessDashboardStableRemoteThumb: View {
+    let url: URL?
+    var placeholderTint: Color
+    var emptySystemName: String
+    var emptyTint: Color
+
+    @State private var image: UIImage?
+    @State private var loadedURLString: String?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if url != nil {
+                ProgressView()
+                    .tint(placeholderTint)
+            } else {
+                Image(systemName: emptySystemName)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(emptyTint)
+            }
+        }
+        .task(id: url?.absoluteString) {
+            let key = url?.absoluteString
+            guard let url else {
+                image = nil
+                loadedURLString = nil
+                return
+            }
+            if loadedURLString == key, image != nil {
+                return
+            }
+            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: url) {
+                guard !Task.isCancelled else { return }
+                image = cached
+                loadedURLString = key
+                return
+            }
+            if loadedURLString != key {
+                image = nil
+            }
+            if let loaded = await DiscoverMapImageCache.shared.image(for: url) {
+                guard !Task.isCancelled else { return }
+                image = loaded
+                loadedURLString = key
+            }
+        }
     }
 }

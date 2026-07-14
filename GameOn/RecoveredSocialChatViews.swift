@@ -283,6 +283,11 @@ struct FriendsTabView: View {
             || mapViewModel.hasAuthenticatedVenueOwnerSession
     }
 
+    /// Fan social sections (Friends / Requests / Add Friend). Business accounts are Chats-only.
+    private var showsChatSocialSections: Bool {
+        !isBusinessChatAccount
+    }
+
     private var shouldShowFansLiveNowStrip: Bool {
         !isBusinessChatAccount && !fansLiveNowEntries.isEmpty
     }
@@ -347,8 +352,15 @@ struct FriendsTabView: View {
                     logChatAuthGate(reason: "businessAccountChanged")
                     fansLiveNowEntries = []
                     ChatFansLiveNowSessionCache.clear(authId: mapViewModel.currentUserAuthId)
+                    normalizeChatSectionForAccountType()
                 }
             ))
+            .onChange(of: mapViewModel.isVenueOwnerLoggedIn) { _, _ in
+                normalizeChatSectionForAccountType()
+            }
+            .onChange(of: mapViewModel.hasAuthenticatedVenueOwnerSession) { _, _ in
+                normalizeChatSectionForAccountType()
+            }
             .modifier(ChatErrorAlertsModifier(viewModel: viewModel))
             .alert(
                 unfriendConfirmationTitle,
@@ -457,6 +469,7 @@ struct FriendsTabView: View {
         }
         viewModel.mapViewModel = mapViewModel
         logChatAuthGate(reason: "appear")
+        normalizeChatSectionForAccountType()
         consumePendingDmOpenPreviewIfNeeded()
         if chatNeedsInboxBodyLoad {
             viewModel.prepareInboxLoadUIStateIfNeeded()
@@ -471,12 +484,27 @@ struct FriendsTabView: View {
             } else {
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear started")
                 await viewModel.refreshInboxSummariesIfNeeded()
-                Task { await viewModel.refreshFriendRequestListsOnly() }
+                if showsChatSocialSections {
+                    Task { await viewModel.refreshFriendRequestListsOnly() }
+                }
                 viewModel.noteChatTabSurfaceRefreshCompleted()
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear finished")
             }
             if isTabSelected {
                 await viewModel.ensureSignedInSocialRealtimeIfNeeded()
+            }
+        }
+    }
+
+    private func normalizeChatSectionForAccountType() {
+        if isBusinessChatAccount {
+            if selectedSection != .chats {
+                selectedSection = .chats
+            }
+            if showingAddFriendSheet {
+                showingAddFriendSheet = false
+                manualFriendLookupDraft = ""
+                viewModel.clearAddFriendSearch()
             }
         }
     }
@@ -566,7 +594,9 @@ struct FriendsTabView: View {
         } else {
             VStack(spacing: 10) {
                 chatHeader
-                chatSectionPicker
+                if showsChatSocialSections {
+                    chatSectionPicker
+                }
                 selectedChatSectionContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -605,7 +635,7 @@ struct FriendsTabView: View {
             Spacer(minLength: 0)
 
             HStack(spacing: 10) {
-                if mapViewModel.canUsePrivateChat {
+                if showsChatSocialSections, mapViewModel.canUsePrivateChat {
                     chatHeaderButton(systemImage: "person.badge.plus", accessibilityLabel: "Add friend") {
                         showingAddFriendSheet = true
                     }
@@ -816,13 +846,17 @@ struct FriendsTabView: View {
 
     @ViewBuilder
     private var selectedChatSectionContent: some View {
-        switch selectedSection {
-        case .chats:
+        if showsChatSocialSections {
+            switch selectedSection {
+            case .chats:
+                chatsList
+            case .friends:
+                friendsDirectoryList
+            case .requests:
+                requestsList
+            }
+        } else {
             chatsList
-        case .friends:
-            friendsDirectoryList
-        case .requests:
-            requestsList
         }
     }
 
@@ -1054,17 +1088,19 @@ struct FriendsTabView: View {
             }
 
             HStack(spacing: 10) {
-                Button {
-                    showingAddFriendSheet = true
-                } label: {
-                    Label("Find Fans", systemImage: "person.badge.plus")
-                        .font(.subheadline.weight(.bold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
+                if showsChatSocialSections {
+                    Button {
+                        showingAddFriendSheet = true
+                    } label: {
+                        Label("Find Fans", systemImage: "person.badge.plus")
+                            .font(.subheadline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.white)
+                    .background(FGColor.accentGreen, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(.white)
-                .background(FGColor.accentGreen, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
                 Button {
                     mapViewModel.requestDiscoverTabForHomeCrowd = true

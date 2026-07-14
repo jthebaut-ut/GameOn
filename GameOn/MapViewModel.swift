@@ -198,6 +198,8 @@ final class MapViewModel: ObservableObject {
     /// From ``refreshVenueClaimStatusLineFromDatabase()`` scan of recent ``venue_claims`` by owner email: any row is rejected and ``rejection_acknowledged_at`` is unset.
     @Published var hasUnackedRejectedVenueClaimForOwnerEmail: Bool = false
     @Published var approvedVenueClaimMetadataByVenueID: [UUID: BusinessApprovedVenueClaimMetadata] = [:]
+    /// Per-venue upcoming active game counts for the Managed Venues selector (batched `venue_events` fetch).
+    @Published var managedVenueUpcomingGamesByVenueId: [UUID: ManagedVenueUpcomingGamesSummary] = [:]
     /// Per-venue approved ownership resolved from `venue_claims.venue_id` for Venue Detail claim visibility.
     @Published var approvedVenueOwnershipByVenueID: [UUID: ApprovedVenueOwnershipSummary] = [:]
 

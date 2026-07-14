@@ -10,10 +10,12 @@ struct BusinessActiveVenueSelectionSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var selectedVenueIds: Set<UUID>
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var showConfirmDialog = false
 
     init(
         viewModel: MapViewModel,
@@ -36,8 +38,8 @@ struct BusinessActiveVenueSelectionSheet: View {
         orderedSelectedVenueIds.count
     }
 
-    private var canSave: Bool {
-        !isSaving && selectedCount > 0 && selectedCount <= venueLimit
+    private var canConfirm: Bool {
+        !isSaving && selectedCount == venueLimit
     }
 
     private var uniqueVenueRows: [VenueSelectionRow] {
@@ -65,14 +67,14 @@ struct BusinessActiveVenueSelectionSheet: View {
             List {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Choose active venues")
+                        Text("Choose \(venueLimit) venues to keep active")
                             .font(.headline.weight(.bold))
                         Text("Your Regular plan keeps up to \(venueLimit) approved venues active. Active venues stay visible on Discover and can host games.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         Text("\(selectedCount) of \(venueLimit) selected")
                             .font(.caption.weight(.bold))
-                            .foregroundStyle(selectedCount > venueLimit ? FGColor.dangerRed : FGColor.accentGreen)
+                            .foregroundStyle(selectedCount == venueLimit ? FGColor.accentGreen : FGColor.accentBlue)
                     }
                     .padding(.vertical, 4)
                 }
@@ -101,11 +103,23 @@ struct BusinessActiveVenueSelectionSheet: View {
                         .disabled(isSaving)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isSaving ? "Saving..." : "Save") {
-                        Task { await save() }
+                    Button(isSaving ? "Saving..." : "Confirm") {
+                        showConfirmDialog = true
                     }
-                    .disabled(!canSave)
+                    .disabled(!canConfirm)
                 }
+            }
+            .confirmationDialog(
+                "Confirm active venues?",
+                isPresented: $showConfirmDialog,
+                titleVisibility: .visible
+            ) {
+                Button("Confirm \(venueLimit) active venues", role: .none) {
+                    Task { await save() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Selected venues remain active. Unselected venues become locked by your plan. This choice can only be made once.")
             }
             .overlay {
                 if isSaving {
@@ -133,9 +147,7 @@ struct BusinessActiveVenueSelectionSheet: View {
             toggle(id)
         } label: {
             HStack(alignment: .center, spacing: 12) {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(isSelected ? FGColor.accentGreen : FGColor.mutedText(colorScheme))
+                SelectedVenueThumbnailView(venue: row, style: .managedVenueList)
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? row.venue_name! : "Approved venue")
@@ -147,12 +159,17 @@ struct BusinessActiveVenueSelectionSheet: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                     if isLocked && !isSelected {
-                        Text(BusinessLimitCopy.planLockedVenueBadge)
+                        Text(BusinessLimitCopy.planLockedVenueBadge(languageCode: appLanguageRaw))
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(.orange)
                     }
                 }
+
                 Spacer(minLength: 0)
+
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(isSelected ? FGColor.accentGreen : FGColor.mutedText(colorScheme))
             }
             .contentShape(Rectangle())
         }
@@ -170,7 +187,7 @@ struct BusinessActiveVenueSelectionSheet: View {
             return
         }
         guard orderedSelectedVenueIds.count < venueLimit else {
-            errorMessage = "Select up to \(venueLimit) active venues."
+            errorMessage = "Select exactly \(venueLimit) active venues."
             return
         }
         selectedVenueIds.insert(id)
@@ -181,10 +198,10 @@ struct BusinessActiveVenueSelectionSheet: View {
 
     @MainActor
     private func save() async {
-        guard canSave else { return }
+        guard canConfirm else { return }
         let payloadVenueIds = orderedSelectedVenueIds
-        guard payloadVenueIds.count == selectedCount, payloadVenueIds.count <= venueLimit else {
-            errorMessage = "Selection changed. Please review your active venues and try again."
+        guard payloadVenueIds.count == venueLimit else {
+            errorMessage = "Select exactly \(venueLimit) active venues."
             return
         }
         isSaving = true
@@ -225,7 +242,9 @@ struct BusinessActiveVenueSelectionSheet: View {
             return seen.insert(id).inserted
         }
         var selected = uniqueRows.filter { MapViewModel.venueIsActiveForBusinessLimit($0) }.compactMap(\.id)
-        if selected.count < venueLimit {
+        if selected.count > venueLimit {
+            selected = Array(selected.prefix(venueLimit))
+        } else if selected.count < venueLimit {
             let existing = Set(selected)
             selected.append(contentsOf: uniqueRows.compactMap(\.id).filter { !existing.contains($0) }.prefix(venueLimit - selected.count))
         }

@@ -600,6 +600,50 @@ struct VenueProfileRow: Decodable {
     let cover_photo_thumbnail_url: String?
     let menu_photo_thumbnail_url: String?
     let created_at: String?
+
+    /// Local cache sync helper — copies the row with an updated display name.
+    func withDisplayVenueName(_ venueName: String) -> VenueProfileRow {
+        VenueProfileRow(
+            id: id,
+            owner_email: owner_email,
+            business_id: business_id,
+            venue_identity_key: venue_identity_key,
+            origin_type: origin_type,
+            admin_status: admin_status,
+            community_type: community_type,
+            place_type: place_type,
+            sport_tags: sport_tags,
+            supporter_country: supporter_country,
+            venue_name: venueName,
+            address: address,
+            address_line1: address_line1,
+            address_line2: address_line2,
+            city: city,
+            state: state,
+            zip_code: zip_code,
+            region: region,
+            postal_code: postal_code,
+            country: country,
+            formatted_address: formatted_address,
+            phone: phone,
+            website: website,
+            description: description,
+            features: features,
+            screen_count: screen_count,
+            serves_food: serves_food,
+            has_wifi: has_wifi,
+            has_garden: has_garden,
+            has_projector: has_projector,
+            pet_friendly: pet_friendly,
+            latitude: latitude,
+            longitude: longitude,
+            cover_photo_url: cover_photo_url,
+            menu_photo_url: menu_photo_url,
+            cover_photo_thumbnail_url: cover_photo_thumbnail_url,
+            menu_photo_thumbnail_url: menu_photo_thumbnail_url,
+            created_at: created_at
+        )
+    }
 }
 
 /// Embedded `public.businesses` row from PostgREST when selecting `businesses!venues_business_id_fkey(...)` on `venues`.
@@ -1080,6 +1124,14 @@ struct BusinessDashboardPreloadSnapshot {
     let favoriteTeamCount: Int
     let scheduledGames: [VenueEventRow]
     let loadedAt: Date
+}
+
+/// Per-venue upcoming scheduled-game summary for the Managed Venues selector.
+struct ManagedVenueUpcomingGamesSummary: Equatable {
+    let count: Int
+    let nextStartAt: Date?
+
+    static let empty = ManagedVenueUpcomingGamesSummary(count: 0, nextStartAt: nil)
 }
 
 struct BusinessApprovedVenueClaimMetadata: Decodable, Equatable {

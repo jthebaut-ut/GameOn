@@ -210,7 +210,7 @@ struct SettingsScreen: View {
     @State private var showBusinessFavoriteTeamsSheet = false
     @State private var showBusinessIdentitySheet = false
     @State private var businessDashboardQuickActionNotice: String?
-    @State private var businessProfileManagedVenuesScrollToken: UInt = 0
+    @State private var businessProfileManagedVenuesSheetToken: UInt = 0
     @State private var settingsBusinessMembershipStatus: BusinessVenueGamePostingStatus?
     @State private var settingsBusinessHostedGameCycleAudit: BusinessHostedGameCycleAudit?
     @State private var settingsBusinessHostedGameCycleAuditLoading = false
@@ -229,6 +229,7 @@ struct SettingsScreen: View {
     @State private var showVenueOwnerPasswordResetSheet = false
     @State private var showAddLocationSheet = false
     @State private var inlineBusinessDashboardGames: [VenueEventRow] = []
+    @State private var settingsBusinessDashboardCachedData: BusinessVenueDashboardData?
     @State private var addLocationSubmitBanner: String?
     @State private var settingsBusinessProfileRefreshSequence = 0
     @State private var settingsBusinessProfileLatestRequestId = 0
@@ -455,7 +456,6 @@ struct SettingsScreen: View {
 
     private var accountTabNavigationStack: some View {
         NavigationStack {
-            ScrollViewReader { businessProfileScrollProxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     FanGeoPagePurposeHeader(
@@ -475,6 +475,7 @@ struct SettingsScreen: View {
                                 businessVenueSelectorIsHydrating: businessProfileVenueSelectorIsHydrating,
                                 businessVenueSelectorHydrationReason: businessProfileVenueHydrationState.reason,
                                 businessVenueSelectorOnBlockedEarlyTap: logBusinessProfileHydrationBlockedEarlyTap,
+                                managedVenuesSheetPresentationToken: businessProfileManagedVenuesSheetToken,
                                 venueOwnerOnNotifications: { showReportedCommentsSheet = true },
                                 venueOwnerOnResetPassword: {
                                     guard viewModel.canPresentPasswordResetRequestSheet() else {
@@ -771,16 +772,6 @@ struct SettingsScreen: View {
                 .padding(.bottom, SettingsScrollBottomLayout.accountTabScrollBottomInset)
             }
             .scrollIndicators(.hidden)
-            .onChange(of: businessProfileManagedVenuesScrollToken) { _, token in
-                guard token > 0 else { return }
-                withAnimation(.easeInOut(duration: 0.35)) {
-                    businessProfileScrollProxy.scrollTo(
-                        BusinessVenueDashboardScrollTarget.managedVenues,
-                        anchor: .top
-                    )
-                }
-            }
-            }
             .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
@@ -1045,7 +1036,11 @@ struct SettingsScreen: View {
                 venues: settingsBusinessActiveVenueSelectionRows,
                 approvedDateText: { row in settingsApprovedVenueDateInfo(for: row).displayText },
                 onSaved: {
-                    Task { await refreshSettingsBusinessProfile(trigger: "activeVenueSelectionSaved", refreshBusinessData: true, debounce: false) }
+                    settingsActiveVenueSelectionCacheKey = ""
+                    Task {
+                        await refreshSettingsBusinessProfile(trigger: "activeVenueSelectionSaved", refreshBusinessData: true, debounce: false)
+                        refreshSettingsActiveVenueSelectionCTAVisibility()
+                    }
                 }
             )
             .presentationDetents([.large])
@@ -1394,7 +1389,7 @@ struct SettingsScreen: View {
             }
         } label: {
             settingsRow(
-                title: settingsBusinessMembershipStatus?.businessPlanDisplayTitle ?? (isPro ? "Business Pro" : "Business Regular"),
+                title: settingsBusinessMembershipStatus?.businessPlanDisplayTitle(languageCode: appLanguageRaw) ?? (isPro ? L10n.t("business_pro", languageCode: appLanguageRaw) : L10n.t("business_regular", languageCode: appLanguageRaw)),
                 subtitle: settingsBusinessProRowSubtitle,
                 systemImage: isPro ? "crown.fill" : "lock.shield.fill",
                 tint: isPro ? SettingsPremiumChrome.proGold(colorScheme) : FGColor.accentGreen
@@ -1660,7 +1655,7 @@ struct SettingsScreen: View {
     }
 
     private var settingsActiveVenueSelectionQuickActionFootnote: String? {
-        guard settingsBusinessMembershipStatus?.computedIsPro != true else { return nil }
+        guard settingsShouldShowBusinessActiveVenueSelection else { return nil }
         return "Regular businesses can choose active venues once after moving from Pro to Regular."
     }
 
@@ -3285,11 +3280,14 @@ struct SettingsScreen: View {
 
     private var settingsInlineBusinessDashboard: some View {
         BusinessVenueDashboardOverviewView(
-            data: settingsBusinessDashboardData,
+            data: settingsBusinessDashboardResolvedData,
             businessId: viewModel.currentBusinessIdForAddLocation(),
             businessUsageStatus: settingsBusinessMembershipStatus,
             activeVenueSelectionNotice: businessDashboardQuickActionNotice,
             activeVenueSelectionFootnote: settingsActiveVenueSelectionQuickActionFootnote,
+            onChooseActiveVenues: settingsShouldShowBusinessActiveVenueSelection
+                ? { showBusinessActiveVenueSelectionSheet = true }
+                : nil,
             onNotifications: {
                 presentBusinessDashboardQuickAction(source: "notifications") {
                     showReportedCommentsSheet = true
@@ -3328,7 +3326,9 @@ struct SettingsScreen: View {
                 }
             },
             onManageVenues: {
-                businessProfileManagedVenuesScrollToken &+= 1
+                presentBusinessDashboardQuickAction(source: "manageVenuesQuickAction") {
+                    businessProfileManagedVenuesSheetToken &+= 1
+                }
             },
             onBusinessIdentity: {
                 presentBusinessDashboardQuickAction(source: "businessIdentityQuickAction") {
@@ -3364,14 +3364,44 @@ struct SettingsScreen: View {
             venueHydrationReason: businessProfileVenueHydrationState.reason
         )
         .onAppear {
+            refreshSettingsBusinessDashboardCache()
             logBusinessProfileHydrationState()
             logSettingsInlineBusinessDashboardDebug()
+        }
+        .onReceive(viewModel.$ownedBusinessVenues) { _ in
+            refreshSettingsBusinessDashboardCache()
+        }
+        .onReceive(viewModel.$pendingVenueClaimsForSettings) { _ in
+            refreshSettingsBusinessDashboardCache()
+        }
+        .onReceive(viewModel.$ownerVenueDatabaseId) { _ in
+            refreshSettingsBusinessDashboardCache()
+        }
+        .onChange(of: inlineBusinessDashboardGames.map(\.id)) { _, _ in
+            refreshSettingsBusinessDashboardCache()
+        }
+        .onChange(of: settingsBusinessMembershipStatus) { _, _ in
+            refreshSettingsBusinessDashboardCache()
+        }
+        .onChange(of: viewModel.selectedTimeZone) { _, _ in
+            refreshSettingsBusinessDashboardCache()
         }
         .onChange(of: businessProfileVenueHydrationLogToken) { _, _ in
             logBusinessProfileHydrationState()
         }
         .task(id: settingsInlineBusinessDashboardLoadToken) {
             await refreshSettingsInlineBusinessDashboardPreload()
+        }
+    }
+
+    private var settingsBusinessDashboardResolvedData: BusinessVenueDashboardData {
+        settingsBusinessDashboardCachedData ?? settingsBusinessDashboardData
+    }
+
+    private func refreshSettingsBusinessDashboardCache() {
+        let next = settingsBusinessDashboardData
+        if settingsBusinessDashboardCachedData != next {
+            settingsBusinessDashboardCachedData = next
         }
     }
 
@@ -3734,9 +3764,14 @@ struct SettingsScreen: View {
     }
 
     private func settingsBusinessDashboardEnergy(score: Int) -> (label: String, tint: Color) {
-        if score >= 30 { return ("High energy", FGColor.accentGreen) }
-        if score >= 8 { return ("Building", FGColor.accentYellow) }
-        return (L10n.t("normal", languageCode: appLanguageRaw), FGColor.accentBlue)
+        // Display-only labels for venueOwnerEngagementScore buckets (thresholds unchanged).
+        if score >= 30 {
+            return (L10n.t("game_activity_busy", languageCode: appLanguageRaw), FGColor.accentGreen)
+        }
+        if score >= 8 {
+            return (L10n.t("game_activity_building", languageCode: appLanguageRaw), FGColor.accentYellow)
+        }
+        return (L10n.t("game_activity_typical", languageCode: appLanguageRaw), FGColor.accentBlue)
     }
 
     private func refreshSettingsInlineBusinessDashboard(loadEngagementMetrics: Bool = false) async {
@@ -4505,7 +4540,7 @@ struct SettingsScreen: View {
 
             await MainActor.run {
                 guard settingsBusinessCanCreateVenueFromServer else {
-                    addLocationSubmitBanner = BusinessLimitCopy.venueLimitReached
+                    addLocationSubmitBanner = BusinessLimitCopy.Token.venueLimitReached
                     presentBusinessDashboardQuickAction(source: "\(action)LimitReached") {
                         showBusinessUsageSheet = true
                     }
@@ -4529,7 +4564,7 @@ struct SettingsScreen: View {
     }
 
     private func addLocationSubmitBannerForegroundStyle() -> Color {
-        if addLocationSubmitBanner == BusinessLimitCopy.venueLimitReached { return .red }
+        if addLocationSubmitBanner == BusinessLimitCopy.Token.venueLimitReached { return .red }
         if viewModel.hasActiveVenueClaimRejectionForBusinessUI { return .red }
         if viewModel.businessSettingsLocationChrome() == .rejected { return .red }
         return .green
@@ -4542,8 +4577,8 @@ struct SettingsScreen: View {
     /// After Add Location succeeds we set ``addLocationSubmitBanner``; copy tracks ``approval_status`` via pending rows + location chrome.
     private func addLocationSubmitBannerDisplayText() -> String? {
         guard addLocationSubmitBanner != nil else { return nil }
-        if addLocationSubmitBanner == BusinessLimitCopy.venueLimitReached {
-            return BusinessLimitCopy.venueLimitReached
+        if addLocationSubmitBanner == BusinessLimitCopy.Token.venueLimitReached {
+            return BusinessLimitCopy.venueLimitReached(languageCode: appLanguageRaw)
         }
         if !viewModel.pendingVenueClaimsForSettings.isEmpty {
             return "Location request submitted. FanGeo will review it before this location can manage games."
@@ -4971,6 +5006,7 @@ private struct SettingsAccountDeletionSheet: View {
 private struct SettingsVenueOwnerDeletionSheet: View {
     @ObservedObject var viewModel: MapViewModel
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @State private var confirmationText: String = ""
     @State private var preview: BusinessAccountDeletionPreview?
     @State private var isLoadingPreview: Bool = false
@@ -5318,7 +5354,7 @@ private struct SettingsVenueOwnerDeletionSheet: View {
         do {
             _ = try await viewModel.deleteBusinessAccountCascade(businessId: businessId)
             await MainActor.run {
-                successMessage = "Business account deleted."
+                successMessage = L10n.t("business_account_deleted_success", languageCode: appLanguageRaw)
                 didSucceed = true
                 confirmationText = ""
             }
@@ -6416,6 +6452,7 @@ private struct SettingsProfileHero: View {
     var businessVenueSelectorIsHydrating = false
     var businessVenueSelectorHydrationReason = "ready"
     var businessVenueSelectorOnBlockedEarlyTap: ((String, String) -> Void)?
+    var managedVenuesSheetPresentationToken: UInt = 0
     var venueOwnerOnNotifications: () -> Void
     var venueOwnerOnResetPassword: () -> Void
     var venueOwnerOnDismissSheetsAfterLogout: () -> Void
@@ -6453,19 +6490,29 @@ private struct SettingsProfileHero: View {
     private var businessHeaderHandleLine: String? {
         guard let stored = trimmedNonEmpty(currentBusinessRow?.business_handle) else { return nil }
         let display = FanGeoHandleRules.displayHandle(stored: stored)
-        return display.isEmpty ? nil : display
+        guard !display.isEmpty else { return nil }
+        return "\(L10n.t("handle", languageCode: appLanguageRaw)): \(display)"
     }
 
     private var businessHeaderLocation: String {
-        businessLocationLine ?? "Business dashboard"
+        if let line = businessLocationLine {
+            return "\(L10n.t("venue", languageCode: appLanguageRaw)): \(line)"
+        }
+        return "Business dashboard"
     }
 
     private var businessHeaderMemberSince: String {
         guard let raw = trimmedNonEmpty(currentBusinessRow?.created_at),
               let date = SupabaseTimestampParsing.parseTimestamptz(raw) else {
-            return "Member since FanGeo"
+            return String(
+                format: L10n.t("business_joined_format", languageCode: appLanguageRaw),
+                "FanGeo"
+            )
         }
-        return "Member since \(Self.businessHeaderMemberSinceFormatter.string(from: date))"
+        return String(
+            format: L10n.t("business_joined_format", languageCode: appLanguageRaw),
+            Self.businessHeaderMemberSinceFormatter.string(from: date)
+        )
     }
 
     private var businessHeaderIsPro: Bool {
@@ -6796,28 +6843,33 @@ private struct SettingsProfileHero: View {
 
             VStack(alignment: .leading, spacing: FGSpacing.md) {
                 HStack(alignment: .top, spacing: FGSpacing.md) {
-                    businessHeaderAvatar
+                    VStack(spacing: 6) {
+                        businessHeaderAvatar
+
+                        Text("Business Account")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(businessStatusIconColor)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.78)
+                            .frame(width: 72)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 8) {
-                            businessHeaderBadge(title: "Verified Business", systemImage: "shield.checkered", tint: businessStatusIconColor)
-                            if businessHeaderIsPro {
-                                businessHeaderBadge(title: "Pro Business", systemImage: "crown.fill", tint: SettingsPremiumChrome.proGold(colorScheme))
-                            }
+                        if businessHeaderIsPro {
+                            businessHeaderBadge(
+                                title: "Pro Business",
+                                systemImage: "crown.fill",
+                                tint: SettingsPremiumChrome.proGold(colorScheme)
+                            )
                         }
 
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(businessHeaderName.isEmpty ? "Business profile" : businessHeaderName)
-                                .font(.system(size: 26, weight: .black, design: .rounded))
-                                .foregroundStyle(.white)
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.82)
-
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.system(size: 15, weight: .bold))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(businessStatusIconColor)
-                        }
+                        Text(businessHeaderName.isEmpty ? "Business profile" : businessHeaderName)
+                            .font(.system(size: 26, weight: .black, design: .rounded))
+                            .foregroundStyle(.white)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.82)
 
                         if let businessHeaderHandleLine {
                             Text(businessHeaderHandleLine)
@@ -6826,11 +6878,14 @@ private struct SettingsProfileHero: View {
                                 .lineLimit(1)
                         }
 
-                        Text("Business Account")
-                            .font(FGTypography.caption.weight(.bold))
-                            .foregroundStyle(businessStatusIconColor)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.t("selected_venue", languageCode: appLanguageRaw))
+                                .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.70))
+                                .lineLimit(1)
 
-                        businessHeaderVenueSelector
+                            businessHeaderVenueSelector
+                        }
 
                         Text("We bring fans together with the best sports atmosphere.")
                             .font(FGTypography.caption)
@@ -6898,7 +6953,8 @@ private struct SettingsProfileHero: View {
             onRequestAddNewLocation: businessVenueSelectorOnAddLocation,
             isHydrating: businessVenueSelectorIsHydrating,
             hydrationReason: businessVenueSelectorHydrationReason,
-            onBlockedEarlyTap: businessVenueSelectorOnBlockedEarlyTap
+            onBlockedEarlyTap: businessVenueSelectorOnBlockedEarlyTap,
+            venueListPresentationToken: managedVenuesSheetPresentationToken
         )
         .padding(.top, 1)
     }
@@ -11361,6 +11417,46 @@ private struct LiveActivitySharingOptionsSheet: View {
 
 // MARK: - Phase B2 (managed venue location picker — Settings + VenueOwnerDashboard)
 
+/// Shared managed-venue display status for Selected Venue chrome and Managed Venues selector.
+fileprivate enum BusinessManagedVenueDisplayStatus {
+    case approved
+    case locked
+    case pending
+    case rejected
+
+    static func resolve(
+        for row: VenueProfileRow,
+        effectiveMembership: BusinessVenueGamePostingStatus?
+    ) -> BusinessManagedVenueDisplayStatus {
+        if MapViewModel.venueDisplaysAsPlanLocked(
+            row,
+            effectiveMembership: effectiveMembership
+        ) {
+            return .locked
+        }
+        let raw = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if raw.isEmpty || raw == "active" { return .approved }
+        if raw == "plan_locked" { return .locked }
+        if raw.contains("pending") || raw.contains("review") { return .pending }
+        if raw.contains("reject") || raw.contains("archive") { return .rejected }
+        return .approved
+    }
+
+    /// Compact labels for the Selected Venue picker row (hero / header chrome).
+    func compactPickerTitle(languageCode: String) -> String {
+        switch self {
+        case .approved:
+            return L10n.t("venue_status_verified", languageCode: languageCode)
+        case .pending:
+            return L10n.t("Pending", languageCode: languageCode)
+        case .locked:
+            return L10n.t("venue_plan_locked", languageCode: languageCode)
+        case .rejected:
+            return L10n.t("Rejected", languageCode: languageCode)
+        }
+    }
+}
+
 /// Dropdown for **approved** managed venues (see ``MapViewModel/managedVenuesForOwner()``). Settings may also offer **Add venue**, which opens the same submit-new-location flow as before (distinct from Discover → Claim this venue on an existing listing).
 struct BusinessLocationVenuePicker: View {
     enum Chrome {
@@ -11369,12 +11465,7 @@ struct BusinessLocationVenuePicker: View {
         case headerCompact
     }
 
-    private enum ManagedVenueSelectorStatus {
-        case approved
-        case locked
-        case pending
-        case rejected
-    }
+    private typealias ManagedVenueSelectorStatus = BusinessManagedVenueDisplayStatus
 
     private struct ManagedVenueSelectorRow: Identifiable {
         let id: String
@@ -11397,6 +11488,7 @@ struct BusinessLocationVenuePicker: View {
 
     @ObservedObject var viewModel: MapViewModel
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     var chrome: Chrome = .settings
     /// When set (Settings), shown as the last menu action to submit a new business location for review.
     var onRequestAddNewLocation: (() -> Void)?
@@ -11405,6 +11497,8 @@ struct BusinessLocationVenuePicker: View {
     var isHydrating = false
     var hydrationReason = "ready"
     var onBlockedEarlyTap: ((String, String) -> Void)?
+    /// When incremented by the Business Dashboard “Manage Venues” quick action, presents the same Managed Venues sheet as the venue selector.
+    var venueListPresentationToken: UInt = 0
     @State private var showVenueListSheet = false
     @State private var isRefreshingVenueSelector = false
     @State private var venueSelectorNotice: String?
@@ -11416,7 +11510,8 @@ struct BusinessLocationVenuePicker: View {
         onEditApprovedVenue: ((UUID) -> Void)? = nil,
         isHydrating: Bool = false,
         hydrationReason: String = "ready",
-        onBlockedEarlyTap: ((String, String) -> Void)? = nil
+        onBlockedEarlyTap: ((String, String) -> Void)? = nil,
+        venueListPresentationToken: UInt = 0
     ) {
         self.viewModel = viewModel
         self.chrome = chrome
@@ -11425,6 +11520,7 @@ struct BusinessLocationVenuePicker: View {
         self.isHydrating = isHydrating
         self.hydrationReason = hydrationReason
         self.onBlockedEarlyTap = onBlockedEarlyTap
+        self.venueListPresentationToken = venueListPresentationToken
     }
 
     private var venuePairs: [(UUID, String)] {
@@ -11453,7 +11549,7 @@ struct BusinessLocationVenuePicker: View {
                     row,
                     effectiveMembership: viewModel.effectiveBusinessMembershipStatus
                 )
-                    ? BusinessLimitCopy.planLockedVenueSubtitle
+                    ? BusinessLimitCopy.planLockedVenueSubtitle(languageCode: appLanguageRaw)
                     : (venueLocationSubtitle(for: row).isEmpty ? "Approved location for listings, games, and analytics." : venueLocationSubtitle(for: row)),
                 ownershipApprovalLine: MapViewModel.venueDisplaysAsPlanLocked(
                     row,
@@ -11464,12 +11560,13 @@ struct BusinessLocationVenuePicker: View {
                 statusNote: MapViewModel.venueDisplaysAsPlanLocked(
                     row,
                     effectiveMembership: viewModel.effectiveBusinessMembershipStatus
-                ) ? BusinessLimitCopy.planLockedVenueSubtitle : nil,
+                ) ? BusinessLimitCopy.planLockedVenueSubtitle(languageCode: appLanguageRaw) : nil,
                 status: managedVenueStatus(for: row),
                 venueRow: row
             )
         }
-        let approvedVenueIDs = Set(approvedRows.compactMap(\.venueID))
+        let sortedApprovedRows = sortedManagedVenueSelectorRows(approvedRows)
+        let approvedVenueIDs = Set(sortedApprovedRows.compactMap(\.venueID))
         var seenPendingVenueIDs = Set<UUID>()
         let pendingRows = viewModel.pendingVenueClaimsForSettings.compactMap { claim -> ManagedVenueSelectorRow? in
             if let venueID = claim.venue_id, approvedVenueIDs.contains(venueID) { return nil }
@@ -11480,7 +11577,30 @@ struct BusinessLocationVenuePicker: View {
             if let venueID = claim.venue_id, approvedVenueIDs.contains(venueID) { return nil }
             return managedVenueSelectorClaimRow(claim, status: .rejected)
         }
-        return approvedRows + pendingRows + rejectedRows
+        return sortedApprovedRows + pendingRows + rejectedRows
+    }
+
+    private func sortedManagedVenueSelectorRows(_ rows: [ManagedVenueSelectorRow]) -> [ManagedVenueSelectorRow] {
+        let summaries = viewModel.managedVenueUpcomingGamesByVenueId
+        return rows.sorted { lhs, rhs in
+            let lhsSummary = lhs.venueID.flatMap { summaries[$0] }
+            let rhsSummary = rhs.venueID.flatMap { summaries[$0] }
+            let lhsCount = lhsSummary?.count ?? 0
+            let rhsCount = rhsSummary?.count ?? 0
+            let lhsHasUpcoming = lhsCount > 0
+            let rhsHasUpcoming = rhsCount > 0
+            if lhsHasUpcoming != rhsHasUpcoming {
+                return lhsHasUpcoming && !rhsHasUpcoming
+            }
+            if lhsHasUpcoming, rhsHasUpcoming {
+                let lhsNext = lhsSummary?.nextStartAt ?? .distantFuture
+                let rhsNext = rhsSummary?.nextStartAt ?? .distantFuture
+                if lhsNext != rhsNext {
+                    return lhsNext < rhsNext
+                }
+            }
+            return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        }
     }
 
     private var selectedVenueRow: VenueProfileRow? {
@@ -11514,7 +11634,7 @@ struct BusinessLocationVenuePicker: View {
     }
 
     private var inactiveVenueSelectionNotice: String {
-        "This venue is inactive on the Regular plan and cannot be managed until activated by FanGeo or Business Pro."
+        L10n.t("business_inactive_venue_selection_notice", languageCode: appLanguageRaw)
     }
 
     private var selectedVenueSubtitle: String {
@@ -11588,18 +11708,10 @@ struct BusinessLocationVenuePicker: View {
     }()
 
     private func managedVenueStatus(for row: VenueProfileRow) -> ManagedVenueSelectorStatus {
-        if MapViewModel.venueDisplaysAsPlanLocked(
-            row,
+        BusinessManagedVenueDisplayStatus.resolve(
+            for: row,
             effectiveMembership: viewModel.effectiveBusinessMembershipStatus
-        ) {
-            return .locked
-        }
-        let raw = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-        if raw.isEmpty || raw == "active" { return .approved }
-        if raw == "plan_locked" { return .locked }
-        if raw.contains("pending") || raw.contains("review") { return .pending }
-        if raw.contains("reject") || raw.contains("archive") { return .rejected }
-        return .approved
+        )
     }
 
     private var managedVenueListingCounts: ManagedVenueListingCounts {
@@ -11696,7 +11808,7 @@ struct BusinessLocationVenuePicker: View {
     private func venueStatusTitle(for row: VenueProfileRow?) -> String? {
         let raw = row?.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if raw.isEmpty || raw == "active" { return "Approved" }
-        if raw == "plan_locked" { return BusinessLimitCopy.planLockedVenueBadge }
+        if raw == "plan_locked" { return BusinessLimitCopy.planLockedVenueBadge(languageCode: appLanguageRaw) }
         if raw.contains("pending") || raw.contains("review") { return "Pending" }
         return raw.capitalized
     }
@@ -11715,7 +11827,7 @@ struct BusinessLocationVenuePicker: View {
         case .approved:
             return "Approved"
         case .locked:
-            return BusinessLimitCopy.planLockedVenueBadge
+            return BusinessLimitCopy.planLockedVenueBadge(languageCode: appLanguageRaw)
         case .pending:
             return "Pending"
         case .rejected:
@@ -11910,7 +12022,7 @@ struct BusinessLocationVenuePicker: View {
                         HStack(spacing: 8) {
                             Image(systemName: "plus.circle.fill")
                                 .font(.system(size: 16, weight: .semibold))
-                            Text("Add a Venue")
+                            Text(L10n.t("add_venue", languageCode: appLanguageRaw))
                                 .font(FGTypography.caption.weight(.bold))
                         }
                         .foregroundStyle(.white)
@@ -11966,6 +12078,26 @@ struct BusinessLocationVenuePicker: View {
             .clipShape(Capsule(style: .continuous))
     }
 
+    private var viewingVenueHeaderThumbnail: some View {
+        SelectedVenueThumbnailView(
+            venue: selectedVenueRow,
+            style: .dashboardSelector,
+            showsHourglass: isHydrating
+        )
+        .id(selectedVenueRow?.id)
+        .animation(.snappy(duration: 0.24), value: viewModel.ownerVenueDatabaseId)
+    }
+
+    private var headerCompactVenueThumbnail: some View {
+        SelectedVenueThumbnailView(
+            venue: selectedVenueRow,
+            style: .compactHeader,
+            showsHourglass: isHydrating
+        )
+        .id(selectedVenueRow?.id)
+        .animation(.snappy(duration: 0.24), value: viewModel.ownerVenueDatabaseId)
+    }
+
     private var dashboardChromeSelectorButton: some View {
         Button {
             guard !blockHydratingTap(action: "viewingVenueSelector") else { return }
@@ -11975,15 +12107,7 @@ struct BusinessLocationVenuePicker: View {
             showVenueListSheet = true
         } label: {
             HStack(alignment: .center, spacing: FGSpacing.md) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.20 : 0.12))
-                    Image(systemName: "building.2.fill")
-                        .font(.system(size: 18, weight: .semibold))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(FGColor.accentBlue)
-                }
-                .frame(width: 46, height: 46)
+                viewingVenueHeaderThumbnail
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Viewing venue")
@@ -12048,22 +12172,26 @@ struct BusinessLocationVenuePicker: View {
 #endif
             showVenueListSheet = true
         } label: {
-            HStack(spacing: 7) {
-                Image(systemName: isHydrating ? "hourglass" : "building.2.fill")
-                    .font(.system(size: 11, weight: .bold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(.white.opacity(0.88))
+            HStack(spacing: 8) {
+                headerCompactVenueThumbnail
 
                 Text(selectedVenueLabel)
                     .font(.system(size: 12, weight: .heavy, design: .rounded))
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .layoutPriority(0)
+
+                if let status = selectedManagedVenueSelectorRow?.status, !isHydrating {
+                    headerCompactStatusBadge(status: status)
+                        .layoutPriority(1)
+                }
 
                 Image(systemName: isHydrating ? "chevron.right" : "chevron.down")
                     .font(.system(size: 9, weight: .black))
                     .foregroundStyle(.white.opacity(0.72))
             }
+            .animation(.snappy(duration: 0.24), value: viewModel.ownerVenueDatabaseId)
             .padding(.horizontal, 12)
             .padding(.vertical, 7)
             .background {
@@ -12086,6 +12214,20 @@ struct BusinessLocationVenuePicker: View {
         }
     }
 
+    private func headerCompactStatusBadge(status: ManagedVenueSelectorStatus) -> some View {
+        let tint = statusTint(for: status)
+        return Text(status.compactPickerTitle(languageCode: appLanguageRaw))
+            .font(.system(size: 9, weight: .heavy, design: .rounded))
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .minimumScaleFactor(0.82)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(tint.opacity(colorScheme == .dark ? 0.28 : 0.20))
+            .clipShape(Capsule(style: .continuous))
+            .accessibilityLabel(status.compactPickerTitle(languageCode: appLanguageRaw))
+    }
+
     private var dashboardVenueListSheet: some View {
         NavigationStack {
             ScrollView {
@@ -12094,7 +12236,9 @@ struct BusinessLocationVenuePicker: View {
                         managedVenueSelectorStatusBanner(venueSelectorNotice)
                     }
                     if viewModel.managedVenuesDisplayPlanLocked() {
-                        managedVenueSelectorStatusBanner(BusinessLimitCopy.planLockedVenueBanner)
+                        managedVenueSelectorStatusBanner(
+                            BusinessLimitCopy.planLockedVenueBanner(languageCode: appLanguageRaw)
+                        )
                     }
 
                     ForEach(managedVenueSelectorRows) { row in
@@ -12136,8 +12280,59 @@ struct BusinessLocationVenuePicker: View {
 #if DEBUG
                 print("[BusinessVenueSelectorDebug] pendingVenuesVisible count=\(viewModel.pendingVenueClaimsForSettings.count)")
 #endif
+                Task {
+                    await viewModel.refreshManagedVenueUpcomingGamesSummaries()
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private func managedVenueUpcomingGamesLine(_ summary: ManagedVenueUpcomingGamesSummary) -> some View {
+        if summary.count > 0 {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(managedVenueUpcomingCountLabel(summary.count))
+                    .font(FGTypography.metadata.weight(.bold))
+                    .foregroundStyle(FGColor.accentGreen)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                    .clipShape(Capsule(style: .continuous))
+
+                if let nextStart = summary.nextStartAt {
+                    Text(
+                        String(
+                            format: L10n.t("Next: %@", languageCode: appLanguageRaw),
+                            managedVenueUpcomingNextDateText(nextStart)
+                        )
+                    )
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                }
+            }
+        } else {
+            Text(L10n.t("No upcoming games", languageCode: appLanguageRaw))
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .lineLimit(1)
+        }
+    }
+
+    private func managedVenueUpcomingCountLabel(_ count: Int) -> String {
+        if count == 1 {
+            return L10n.t("1 upcoming", languageCode: appLanguageRaw)
+        }
+        return String(format: L10n.t("%lld upcoming", languageCode: appLanguageRaw), Int64(count))
+    }
+
+    private func managedVenueUpcomingNextDateText(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw))
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     private func managedVenueSelectorStatusBanner(_ message: String) -> some View {
@@ -12161,14 +12356,12 @@ struct BusinessLocationVenuePicker: View {
         let isSelected = row.status == .approved && row.venueID == viewModel.ownerVenueDatabaseId
         let tint = statusTint(for: row.status)
         return HStack(spacing: FGSpacing.md) {
-            ZStack {
-                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                    .fill(tint.opacity(colorScheme == .dark ? 0.18 : 0.12))
-                Image(systemName: "building.2")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(tint)
-            }
-            .frame(width: 42, height: 42)
+            SelectedVenueThumbnailView(
+                venue: row.venueRow,
+                style: .managedVenueList,
+                fallbackTint: tint
+            )
+            .id(row.id)
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -12189,6 +12382,12 @@ struct BusinessLocationVenuePicker: View {
                         .font(FGTypography.metadata.weight(.semibold))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .lineLimit(2)
+                }
+
+                if row.status == .approved,
+                   let venueID = row.venueID,
+                   let summary = viewModel.managedVenueUpcomingGamesByVenueId[venueID] {
+                    managedVenueUpcomingGamesLine(summary)
                 }
 
                 if let note = row.statusNote {
@@ -12318,6 +12517,7 @@ struct BusinessLocationVenuePicker: View {
         await viewModel.refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
         await viewModel.refreshPendingVenueClaimsForSettings()
         await viewModel.refreshVenueClaimStatusLineFromDatabase()
+        await viewModel.refreshManagedVenueUpcomingGamesSummaries()
 
         await MainActor.run {
             isRefreshingVenueSelector = false
@@ -12421,6 +12621,11 @@ struct BusinessLocationVenuePicker: View {
             if hydrating {
                 showVenueListSheet = false
             }
+        }
+        .onChange(of: venueListPresentationToken) { _, token in
+            guard token > 0 else { return }
+            guard !blockHydratingTap(action: "manageVenuesQuickAction") else { return }
+            showVenueListSheet = true
         }
     }
 }

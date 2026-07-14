@@ -1,0 +1,168 @@
+diff --git a/GameOn/VenueOwnerDashboardView.swift b/GameOn/VenueOwnerDashboardView.swift
+index c074b64..2eed891 100644
+--- a/GameOn/VenueOwnerDashboardView.swift
++++ b/GameOn/VenueOwnerDashboardView.swift
+@@ -878,6 +878,7 @@ private enum BusinessHostedGameCycleDisplay {
+ 
+ struct BusinessUsageCenterView: View {
+     @Environment(\.colorScheme) private var colorScheme
++    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+     let status: BusinessVenueGamePostingStatus?
+     var hostedGameCycleAudit: BusinessHostedGameCycleAudit? = nil
+     var isHostedGameCycleLoading = false
+@@ -942,7 +943,7 @@ struct BusinessUsageCenterView: View {
+                 .frame(width: 44, height: 44)
+ 
+                 VStack(alignment: .leading, spacing: 5) {
+-                    Text(status?.businessPlanDisplayTitle ?? "Checking plan status…")
++                    Text(status?.businessPlanDisplayTitle(languageCode: appLanguageRaw) ?? L10n.t("business_checking_plan_status", languageCode: appLanguageRaw))
+                         .font(.headline.weight(.black))
+                         .foregroundStyle(FGColor.primaryText(colorScheme))
+                     Text(planStateText)
+@@ -1443,9 +1444,9 @@ struct BusinessUsageCenterView: View {
+ 
+     private var limitReachedMessage: String {
+         if monthlyHostLimitReached {
+-            return BusinessLimitCopy.hostedGameLimitReached
++            return BusinessLimitCopy.hostedGameLimitReached()
+         }
+-        return BusinessLimitCopy.venueLimitReached
++        return BusinessLimitCopy.venueLimitReached()
+     }
+ 
+     private func normalizedPlanStatus(_ raw: String) -> String {
+@@ -2330,7 +2331,7 @@ struct VenueOwnerDashboardView: View {
+                 guard !selectedVenuePlanLocked else {
+                     await MainActor.run {
+                         selectedCoverPhoto = nil
+-                        profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle
++                        profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle()
+                     }
+                     return
+                 }
+@@ -2416,7 +2417,7 @@ struct VenueOwnerDashboardView: View {
+                 guard !selectedVenuePlanLocked else {
+                     await MainActor.run {
+                         selectedMenuPhoto = nil
+-                        profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle
++                        profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle()
+                     }
+                     return
+                 }
+@@ -3216,7 +3217,7 @@ struct VenueOwnerDashboardView: View {
+         clearManageGamesBanners()
+         guard tab != .add || !selectedVenuePlanLocked else {
+             manageGamesFeedback = ""
+-            manageGamesError = BusinessLimitCopy.planLockedVenueHostedGameBlocked
++            manageGamesError = BusinessLimitCopy.planLockedVenueHostedGameBlocked()
+             withAnimation(.spring()) {
+                 selectedSection = .games
+                 manageGamesListTab = .scheduled
+@@ -3225,7 +3226,7 @@ struct VenueOwnerDashboardView: View {
+         }
+         guard tab != .add || selectedVenueCanHostGames else {
+             manageGamesFeedback = ""
+-            manageGamesError = BusinessLimitCopy.hostedGameLimitReached
++            manageGamesError = BusinessLimitCopy.hostedGameLimitReached()
+             showBusinessUsageSheet = true
+             withAnimation(.spring()) {
+                 selectedSection = .games
+@@ -3598,7 +3599,7 @@ struct VenueOwnerDashboardView: View {
+             await refreshBusinessStatisticsProStatus(reason: "addVenueQuickAction")
+             await MainActor.run {
+                 guard businessCanCreateVenueFromServer else {
+-                    addLocationSubmitBanner = BusinessLimitCopy.venueLimitReached
++                    addLocationSubmitBanner = BusinessLimitCopy.Token.venueLimitReached
+                     showBusinessUsageSheet = true
+                     return
+                 }
+@@ -3827,7 +3828,7 @@ struct VenueOwnerDashboardView: View {
+             Text(profileSaveMessage)
+                 .font(.caption)
+                 .fontWeight(.bold)
+-                .foregroundStyle(profileSaveMessage == BusinessLimitCopy.planLockedVenueSubtitle ? .orange : .green)
++                .foregroundStyle(profileSaveMessage == BusinessLimitCopy.planLockedVenueSubtitle() ? .orange : .green)
+                 .frame(maxWidth: .infinity, alignment: .center)
+         }
+ 
+@@ -3846,7 +3847,7 @@ struct VenueOwnerDashboardView: View {
+     private func saveVenueProfileFromEditor() {
+         guard !isDeletingVenue else { return }
+         guard !selectedVenuePlanLocked else {
+-            profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle
++            profileSaveMessage = BusinessLimitCopy.planLockedVenueSubtitle()
+             return
+         }
+         let trimmedName = viewModel.ownerVenueName.trimmingCharacters(in: .whitespacesAndNewlines)
+@@ -4268,11 +4269,11 @@ struct VenueOwnerDashboardView: View {
+                 .foregroundStyle(.orange)
+                 .accessibilityHidden(true)
+             VStack(alignment: .leading, spacing: 8) {
+-                Text(BusinessLimitCopy.planLockedVenueBanner)
++                Text(BusinessLimitCopy.planLockedVenueBanner())
+                     .font(.subheadline.weight(.semibold))
+                     .foregroundStyle(.primary)
+                     .fixedSize(horizontal: false, vertical: true)
+-                Text(BusinessLimitCopy.planLockedVenueSubtitle)
++                Text(BusinessLimitCopy.planLockedVenueSubtitle())
+                     .font(.caption.weight(.bold))
+                     .foregroundStyle(.orange)
+             }
+@@ -7635,8 +7636,8 @@ struct VenueOwnerDashboardView: View {
+             guard !isLocked else {
+                 manageGamesFeedback = ""
+                 manageGamesError = selectedVenuePlanLocked
+-                    ? BusinessLimitCopy.planLockedVenueHostedGameBlocked
+-                    : BusinessLimitCopy.hostedGameLimitReached
++                    ? BusinessLimitCopy.planLockedVenueHostedGameBlocked()
++                    : BusinessLimitCopy.hostedGameLimitReached()
+                 if !selectedVenuePlanLocked {
+                     showBusinessUsageSheet = true
+                 }
+@@ -8637,7 +8638,7 @@ struct VenueOwnerDashboardView: View {
+             }
+ 
+             if !selectedVenueCanHostGames {
+-                Text(businessAccessStatusChecking ? "Checking access..." : (selectedVenuePlanLocked ? BusinessLimitCopy.planLockedVenueHostedGameBlocked : BusinessLimitCopy.hostedGameLimitReached))
++                Text(businessAccessStatusChecking ? L10n.t("business_checking_access", languageCode: appLanguageRaw) : (selectedVenuePlanLocked ? BusinessLimitCopy.planLockedVenueHostedGameBlocked(languageCode: appLanguageRaw) : BusinessLimitCopy.hostedGameLimitReached(languageCode: appLanguageRaw)))
+                     .font(.caption.weight(.semibold))
+                     .foregroundStyle(businessAccessStatusChecking ? FGColor.secondaryText(colorScheme) : FGColor.dangerRed)
+                     .padding(10)
+@@ -8772,8 +8773,8 @@ struct VenueOwnerDashboardView: View {
+             await MainActor.run {
+                 manageGamesFeedback = ""
+                 manageGamesError = selectedVenuePlanLocked
+-                    ? BusinessLimitCopy.planLockedVenueHostedGameBlocked
+-                    : BusinessLimitCopy.hostedGameLimitReached
++                    ? BusinessLimitCopy.planLockedVenueHostedGameBlocked()
++                    : BusinessLimitCopy.hostedGameLimitReached()
+                 if !selectedVenuePlanLocked {
+                     showBusinessUsageSheet = true
+                 }
+@@ -9450,7 +9451,7 @@ struct VenueOwnerDashboardView: View {
+ 
+             Button {
+                 manageGamesFeedback = ""
+-                manageGamesError = BusinessLimitCopy.hostedGameLimitReached
++                manageGamesError = BusinessLimitCopy.hostedGameLimitReached()
+                 showBusinessProSubscriptionSheet = true
+             } label: {
+                 HStack(spacing: 12) {
+@@ -10174,7 +10175,7 @@ struct VenueOwnerDashboardView: View {
+             await MainActor.run {
+                 isSavingNewGame = false
+                 manageGamesFeedback = ""
+-                manageGamesError = BusinessLimitCopy.planLockedVenueHostedGameBlocked
++                manageGamesError = BusinessLimitCopy.planLockedVenueHostedGameBlocked()
+             }
+             return
+         }
+@@ -10183,7 +10184,7 @@ struct VenueOwnerDashboardView: View {
+             await MainActor.run {
+                 isSavingNewGame = false
+                 manageGamesFeedback = ""
+-                manageGamesError = BusinessLimitCopy.hostedGameLimitReached
++                manageGamesError = BusinessLimitCopy.hostedGameLimitReached()
+             }
+             return
+         }

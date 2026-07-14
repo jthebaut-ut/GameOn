@@ -45,6 +45,13 @@ struct BusinessVenueReleaseOrDeleteResult: Decodable {
     }
 }
 
+/// Active venue listing already hosting an imported Pro game (same source of truth as import duplicate checks).
+struct VenueGameImportHostedVenueSummary: Identifiable, Equatable {
+    let venueId: UUID
+    let venueName: String
+    var id: UUID { venueId }
+}
+
 private struct BusinessVenueDeletionLocalSnapshot {
     let ownerVenueDatabaseId: UUID?
     let ownedBusinessVenues: [VenueProfileRow]
@@ -3629,7 +3636,7 @@ extension MapViewModel {
         print("[BusinessEntitlementGate] businessId=\(businessId.uuidString.lowercased()) operation=createVenue allowed=\(serverAllowsVenueClaim) reason=\(venueListingStatus.venueLimitReason)")
 #endif
         guard serverAllowsVenueClaim else {
-            return BusinessLimitCopy.venueLimitReached
+            return BusinessLimitCopy.venueLimitReached()
         }
 
         if let err = validationErrorForAddLocationClaimForm(form) {
@@ -3819,8 +3826,11 @@ extension MapViewModel {
                     targetActiveIds = Set(selected)
                     reason = "free_selection_persisted"
                 } else {
-                    targetActiveIds = Set(sortedRows.prefix(venueLimit).compactMap(\.id))
-                    reason = "free_downgrade_default_latest"
+                    // Await one-time selection — do not mutate venues before the owner confirms.
+#if DEBUG
+                    print("[BusinessVenueLimitDebug] businessId=\(business.id.uuidString.lowercased()) skipAutoLock reason=awaiting_free_active_venue_selection approvedCount=\(approvedCount) venueLimit=\(venueLimit)")
+#endif
+                    continue
                 }
             } else {
                 targetActiveIds = Set(sortedRows.compactMap(\.id))
@@ -3950,7 +3960,8 @@ extension MapViewModel {
     ) async -> Bool {
         var seenSelectedVenueIds = Set<UUID>()
         let selected = selectedVenueIds.filter { seenSelectedVenueIds.insert($0).inserted }
-        guard !selected.isEmpty, selected.count <= max(0, venueLimit) else { return false }
+        let limit = max(0, venueLimit)
+        guard !selected.isEmpty, selected.count == limit else { return false }
 #if DEBUG
         print("[BusinessActiveVenueSelectionDebug] saveStarted businessId=\(businessId.uuidString.lowercased()) selectedCount=\(selected.count) selectedIds=\(Self.businessActiveVenueSelectionDebugIdList(selected))")
         print("[BusinessActiveVenueSelectionDebug] rpcPayloadVenueIds count=\(selected.count) ids=\(Self.businessActiveVenueSelectionDebugIdList(selected))")
@@ -4163,7 +4174,9 @@ extension MapViewModel {
         if let id = saved.id {
             ownerVenueDatabaseId = id
         }
-        ownerVenueName = saved.venue_name ?? ""
+        // Venue name is always `venues.venue_name` — never state/region/locality fallbacks.
+        let resolvedName = saved.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        ownerVenueName = resolvedName
         ownerVenueAddress = saved.address ?? ""
         ownerVenueAddressLine2 = saved.address_line2 ?? ""
         ownerVenueCity = saved.city ?? ""
@@ -4172,6 +4185,12 @@ extension MapViewModel {
         ownerVenueCountry = saved.country ?? BusinessLocationCountryPolicy.defaultCountryCode
         ownerVenueSupporterCountry = saved.supporter_country ?? ""
 #if DEBUG
+        print("[VenueEditorDebug] selectedVenueID=\(ownerVenueDatabaseId?.uuidString.lowercased() ?? "nil")")
+        print("[VenueEditorDebug] loadedRow.id=\(saved.id?.uuidString.lowercased() ?? "nil")")
+        print("[VenueEditorDebug] loadedRow.venue_name=\(saved.venue_name ?? "nil")")
+        print("[VenueEditorDebug] loadedRow.state=\(saved.state ?? "nil")")
+        print("[VenueEditorDebug] draft.ownerVenueName=\(ownerVenueName)")
+        print("[VenueEditorDebug] draft.state=\(ownerVenueState)")
         print("[VenueSupporterIdentityDebug] load venueId=\(saved.id?.uuidString.lowercased() ?? "nil") supporterCountry=\(ownerVenueSupporterCountry.isEmpty ? "nil" : ownerVenueSupporterCountry)")
 #endif
         applyVenueOwnerPhoneFromCombined(saved.phone)
@@ -4248,6 +4267,33 @@ extension MapViewModel {
             updated = true
         }
         print("[VenuePhotoSaveDebug] cacheUpdatedPhotoURL=\(saved.cover_photo_url ?? "")")
+        return updated
+    }
+
+    /// Patches display name in managed-venue caches by stable venue ID (UI sync after profile save).
+    @discardableResult
+    func ensureManagedVenueDisplayName(venueId: UUID, venueName: String) -> Bool {
+        let trimmed = venueName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        var updated = false
+        ownedBusinessVenues = ownedBusinessVenues.map { row in
+            guard row.id == venueId else { return row }
+            let current = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard current != trimmed else { return row }
+            updated = true
+            return row.withDisplayVenueName(trimmed)
+        }
+        legacyOwnerVenuesForEmailFallback = legacyOwnerVenuesForEmailFallback.map { row in
+            guard row.id == venueId else { return row }
+            let current = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard current != trimmed else { return row }
+            updated = true
+            return row.withDisplayVenueName(trimmed)
+        }
+#if DEBUG
+        print("[VenueNameSyncDebug] venueId=\(venueId.uuidString.lowercased()) displayName=\(trimmed) cachePatched=\(updated)")
+#endif
         return updated
     }
 
@@ -4965,6 +5011,8 @@ extension MapViewModel {
 
         if let row = await loadVenueProfile() {
             await MainActor.run {
+                guard ownerVenueDatabaseId == id else { return }
+                guard row.id == id else { return }
                 applyVenueProfileRowToOwnerState(row)
             }
 #if DEBUG
@@ -5742,20 +5790,31 @@ extension MapViewModel {
             } ?? claims.first
 
             await MainActor.run {
+                // Only hydrate owner profile editor drafts from a claim when there is no selected
+                // managed venue yet. Once a venues-row is selected, Venue Details binds
+                // `ownerVenueName` from `venues.venue_name` — claim status must not clobber it
+                // (multi-venue: claim order is unrelated to the selected venue, and can leave a
+                // stale region like "Arizona" in the venue-name field).
+                let shouldHydrateOwnerProfileFromClaim =
+                    ownerVenueDatabaseId == nil && managedVenuesForOwner().isEmpty
+
                 guard let primary = primaryForDisplay else {
                     venueClaimSubmitted = false
                     venueClaimStatus = "Not Submitted"
                     venueIsApproved = false
                     venueClaimSubmittedDate = ""
                     hasUnackedRejectedVenueClaimForOwnerEmail = false
-                    ownerVenueName = ""
-                    ownerVenueAddress = ""
-                    ownerVenuePhoneDialISO = BusinessPhoneFields.defaultISO
-                    ownerVenuePhone = ""
-                    ownerVenueWebsite = ""
-                    venueProofNote = ""
+                    if shouldHydrateOwnerProfileFromClaim {
+                        ownerVenueName = ""
+                        ownerVenueAddress = ""
+                        ownerVenuePhoneDialISO = BusinessPhoneFields.defaultISO
+                        ownerVenuePhone = ""
+                        ownerVenueWebsite = ""
+                        venueProofNote = ""
+                    }
 #if DEBUG
                     print("[VenueOwnerLoginDebug] claim status result=submitted:false approved:false status=no_rows")
+                    print("[VenueEditorDebug] claimProfileHydrateSkipped=\(!shouldHydrateOwnerProfileFromClaim) selectedVenueID=\(ownerVenueDatabaseId?.uuidString.lowercased() ?? "nil")")
 #endif
                     return
                 }
@@ -5778,19 +5837,22 @@ extension MapViewModel {
                 }
 
                 venueClaimSubmittedDate = primary.created_at ?? ""
-                ownerVenueName = primary.venue_name ?? ""
-                ownerVenueAddress = primary.venue_address ?? ""
-                ownerVenueAddressLine2 = primary.venue_address_line2 ?? ""
-                ownerVenueCity = primary.venue_city ?? ""
-                ownerVenueState = primary.venue_state ?? ""
-                ownerVenueZipCode = primary.venue_zip_code ?? ""
-                ownerVenueCountry = primary.venue_country ?? BusinessLocationCountryPolicy.defaultCountryCode
-                applyVenueOwnerPhoneFromCombined(primary.venue_phone)
-                ownerVenueWebsite = primary.venue_website ?? ""
-                venueProofNote = primary.proof_note ?? ""
+                if shouldHydrateOwnerProfileFromClaim {
+                    ownerVenueName = primary.venue_name ?? ""
+                    ownerVenueAddress = primary.venue_address ?? ""
+                    ownerVenueAddressLine2 = primary.venue_address_line2 ?? ""
+                    ownerVenueCity = primary.venue_city ?? ""
+                    ownerVenueState = primary.venue_state ?? ""
+                    ownerVenueZipCode = primary.venue_zip_code ?? ""
+                    ownerVenueCountry = primary.venue_country ?? BusinessLocationCountryPolicy.defaultCountryCode
+                    applyVenueOwnerPhoneFromCombined(primary.venue_phone)
+                    ownerVenueWebsite = primary.venue_website ?? ""
+                    venueProofNote = primary.proof_note ?? ""
+                }
 #if DEBUG
                 let low = primary.approval_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
                 print("[VenueOwnerLoginDebug] claim status result=submitted:\(venueClaimSubmitted) status=\(venueClaimStatus) primary_status=\(low) claims_count=\(claims.count)")
+                print("[VenueEditorDebug] claimProfileHydrateApplied=\(shouldHydrateOwnerProfileFromClaim) claim.venue_name=\(primary.venue_name ?? "nil") claim.venue_state=\(primary.venue_state ?? "nil") selectedVenueID=\(ownerVenueDatabaseId?.uuidString.lowercased() ?? "nil") draft.ownerVenueName=\(ownerVenueName)")
 #endif
             }
         } catch {
@@ -6367,6 +6429,9 @@ extension MapViewModel {
                 print("[VenueFeatureDebug] businessSelectedFeatures=\(saved.features ?? "")")
 #endif
                 print("[VenuePhotoSaveDebug] savedDatabasePhotoURL=\(saved.cover_photo_url ?? "")")
+            } else if let venueId = ownerVenueDatabaseId {
+                // Persist succeeded; reload failed — keep selector/list names aligned by venue ID.
+                ensureManagedVenueDisplayName(venueId: venueId, venueName: ownerVenueName)
             }
             await loadVenuesFromSupabase(forceRefresh: true)
 #if DEBUG
@@ -6576,7 +6641,8 @@ extension MapViewModel {
         importedFromAPI: Bool = false,
         externalLeague: String? = nil,
         homeTeam: String? = nil,
-        awayTeam: String? = nil
+        awayTeam: String? = nil,
+        allowPastScheduleForLiveImport: Bool = false
     ) async -> Result<VenueEventRow, Error> {
         if await businessBanGuardBlocks(path: "venueGame", action: "saveVenueGameListingAsync") {
             return .failure(
@@ -6621,7 +6687,7 @@ extension MapViewModel {
                 NSError(
                     domain: "VenueGameListing",
                     code: 403,
-                    userInfo: [NSLocalizedDescriptionKey: BusinessLimitCopy.planLockedVenueHostedGameBlocked]
+                    userInfo: [NSLocalizedDescriptionKey: BusinessLimitCopy.planLockedVenueHostedGameBlocked()]
                 )
             )
         }
@@ -6644,12 +6710,13 @@ extension MapViewModel {
                 NSError(
                     domain: "VenueGameListing",
                     code: 403,
-                    userInfo: [NSLocalizedDescriptionKey: BusinessLimitCopy.hostedGameLimitReached]
+                    userInfo: [NSLocalizedDescriptionKey: BusinessLimitCopy.hostedGameLimitReached()]
                 )
             )
         }
 
-        if VenueOwnerGameScheduleValidation.isPastSchedule(gameDate: gameDate, gameStartTime: gameStartTime) {
+        if !allowPastScheduleForLiveImport,
+           VenueOwnerGameScheduleValidation.isPastSchedule(gameDate: gameDate, gameStartTime: gameStartTime) {
             return .failure(
                 NSError(
                     domain: "VenueGameListing",
@@ -6742,6 +6809,7 @@ extension MapViewModel {
             Task { [weak self] in
                 await self?.refreshDiscoverCoreInBackground(forceVenueRefresh: true)
             }
+            await refreshManagedVenueUpcomingGamesSummaries()
 
 #if DEBUG
             let vidStr = row.venue_id?.uuidString ?? "nil"
@@ -6972,24 +7040,24 @@ extension MapViewModel {
             || s.contains("free businesses can list 5 venues")
             || s.contains("venue listings")
             || s.contains("active venue") {
-            return BusinessLimitCopy.venueLimitReached
+            return BusinessLimitCopy.venueLimitReached()
         }
         if s.contains("free businesses can host 5 games")
             || s.contains("unlimited hosting")
             || s.contains("monthly host") {
-            return BusinessLimitCopy.hostedGameLimitReached
+            return BusinessLimitCopy.hostedGameLimitReached()
         }
         if s.contains("plan_locked")
             || s.contains("locked under the current business plan") {
-            return BusinessLimitCopy.planLockedVenueHostedGameBlocked
+            return BusinessLimitCopy.planLockedVenueHostedGameBlocked()
         }
         if s.contains("create_business_venue_claim"),
            businessEntitlementGateErrorIsMissingRpc(error) {
-            return BusinessLimitCopy.backendCompatibilityRequired
+            return BusinessLimitCopy.backendCompatibilityRequired()
         }
         if s.contains("create_business_hosted_game"),
            businessEntitlementGateErrorIsMissingRpc(error) {
-            return BusinessLimitCopy.backendCompatibilityRequired
+            return BusinessLimitCopy.backendCompatibilityRequired()
         }
         return nil
     }
@@ -7070,6 +7138,172 @@ extension MapViewModel {
             gameDate: gameDate
         )
         return count > 0
+    }
+
+    /// Venues where this imported Pro game already has an active listing (same filters as duplicate check, owner-scoped).
+    /// Display names resolve from managed ``venues`` (`managedVenuesForOwner`) by `venue_id` — never from denormalized
+    /// ``venue_events.venue_name`` / claim drafts / state-city fallbacks.
+    func venueGameImportHostedVenues(
+        externalGameID: String?,
+        externalSource: String?
+    ) async -> [VenueGameImportHostedVenueSummary] {
+        let trimmedExternalGameID = externalGameID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmedExternalGameID.isEmpty else { return [] }
+
+        let trimmedExternalSource = externalSource?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let ownerRowEmail = OwnerBusinessEmail.normalized(venueOwnerEmail)
+        guard OwnerBusinessEmail.isValidStrict(ownerRowEmail) else { return [] }
+
+        do {
+            var query = supabase
+                .from("venue_events")
+                .select("id,venue_id,venue_name")
+                .eq("external_game_id", value: trimmedExternalGameID)
+                .eq("admin_status", value: "active")
+                .eq("owner_email", value: ownerRowEmail)
+
+            if !trimmedExternalSource.isEmpty {
+                query = query.eq("external_source", value: trimmedExternalSource)
+            }
+
+            let rows: [VenueEventImportHostedVenueRow] = try await query.execute().value
+            let managedById = Dictionary(
+                uniqueKeysWithValues: await MainActor.run {
+                    managedVenuesForOwner().compactMap { row -> (UUID, VenueProfileRow)? in
+                        guard let id = row.id else { return nil }
+                        return (id, row)
+                    }
+                }
+            )
+            let claimNameByVenueId = await MainActor.run { hostedVenueClaimNameByVenueIdForDebug() }
+
+            var seen = Set<UUID>()
+            var pendingVenueIds: [UUID] = []
+            var eventMetaByVenueId: [UUID: VenueEventImportHostedVenueRow] = [:]
+            for row in rows {
+                guard let venueId = row.venue_id, seen.insert(venueId).inserted else { continue }
+                eventMetaByVenueId[venueId] = row
+                pendingVenueIds.append(venueId)
+            }
+
+            var venuesTableNameById: [UUID: String] = [:]
+            let missingManagedNameIds = pendingVenueIds.filter { venueId in
+                let managedName = managedById[venueId]?.venue_name?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return managedName.isEmpty
+            }
+            if !missingManagedNameIds.isEmpty {
+                venuesTableNameById = await fetchVenuesTableNames(for: missingManagedNameIds)
+            }
+
+            var summaries: [VenueGameImportHostedVenueSummary] = []
+            for venueId in pendingVenueIds {
+                let managedName = managedById[venueId]?.venue_name?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let venuesTableName = venuesTableNameById[venueId]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let queriedEventName = eventMetaByVenueId[venueId]?.venue_name?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let claimName = claimNameByVenueId[venueId]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                let finalName: String
+                if !managedName.isEmpty {
+                    finalName = managedName
+                } else if !venuesTableName.isEmpty {
+                    finalName = venuesTableName
+                } else {
+                    finalName = "Venue"
+                }
+
+#if DEBUG
+                print(
+                    """
+                    [HostedVenueDebug]
+                    externalGameId=\(trimmedExternalGameID)
+                    venueEventId=\(eventMetaByVenueId[venueId]?.id?.uuidString.lowercased() ?? "nil")
+                    venueId=\(venueId.uuidString.lowercased())
+                    queriedVenueName=\(queriedEventName.isEmpty ? "nil" : queriedEventName)
+                    managedVenueName=\(managedName.isEmpty ? "nil" : managedName)
+                    claimVenueName=\(claimName.isEmpty ? "nil" : claimName)
+                    finalDisplayName=\(finalName)
+                    """
+                )
+#endif
+
+                summaries.append(
+                    VenueGameImportHostedVenueSummary(
+                        venueId: venueId,
+                        venueName: finalName
+                    )
+                )
+            }
+            return summaries
+        } catch {
+#if DEBUG
+            print("[BusinessGameImportDebug] hostedVenuesLookup error=\(error.localizedDescription)")
+#endif
+            return []
+        }
+    }
+
+    private func hostedVenueClaimNameByVenueIdForDebug() -> [UUID: String] {
+        var map: [UUID: String] = [:]
+        for claim in pendingVenueClaimsForSettings {
+            guard let venueId = claim.venue_id else { continue }
+            let name = claim.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !name.isEmpty {
+                map[venueId] = name
+            }
+        }
+        for claim in rejectedVenueClaimsForSettings {
+            guard let venueId = claim.venue_id else { continue }
+            let name = claim.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if map[venueId] == nil, !name.isEmpty {
+                map[venueId] = name
+            }
+        }
+        return map
+    }
+
+    private func fetchVenuesTableNames(for venueIds: [UUID]) async -> [UUID: String] {
+        let uniqueIds = Array(Set(venueIds))
+        guard !uniqueIds.isEmpty else { return [:] }
+
+        struct VenueNameLookupRow: Decodable {
+            let id: UUID?
+            let venue_name: String?
+        }
+
+        do {
+            let rows: [VenueNameLookupRow] = try await supabase
+                .from("venues")
+                .select("id,venue_name")
+                .in("id", values: uniqueIds.map { $0.uuidString.lowercased() })
+                .execute()
+                .value
+
+            var map: [UUID: String] = [:]
+            for row in rows {
+                guard let id = row.id else { continue }
+                let name = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !name.isEmpty {
+                    map[id] = name
+                }
+            }
+            return map
+        } catch {
+#if DEBUG
+            print("[HostedVenueDebug] venuesTableNameLookup error=\(error.localizedDescription)")
+#endif
+            return [:]
+        }
+    }
+
+    private struct VenueEventImportHostedVenueRow: Decodable {
+        let id: UUID?
+        let venue_id: UUID?
+        let venue_name: String?
     }
 
     func venueGameManualDuplicateExists(
@@ -7387,6 +7621,7 @@ extension MapViewModel {
                 )
             }
 #endif
+            await refreshManagedVenueUpcomingGamesSummaries()
 
         } catch {
             print("ERROR UPDATING VENUE GAME:", error)
@@ -7486,21 +7721,166 @@ extension MapViewModel {
                 .execute()
                 .value
 
-            return rows.filter { row in
-                guard let start = VenueGameExpiration.scheduledStartDate(for: row),
-                      let expiration = Calendar.current.date(
-                        byAdding: .hour,
-                        value: VenueOwnerGameDataRetentionHours.fixedHoursAfterStart,
-                        to: start
-                      ) else {
-                    return true
-                }
-                return expiration > now
-            }
+            return Self.filterScheduledGamesWithinRetentionWindow(rows, now: now)
         } catch {
             print("ERROR LOADING SCHEDULED VENUE GAMES:", error)
             return []
         }
+    }
+
+    /// Batched scheduled games for every managed venue (`venue_id IN (...)`), same retention rules as ``loadMyVenueScheduledGames()``.
+    func loadManagedVenuesScheduledGames() async -> [VenueEventRow] {
+        let venueIds = Array(
+            Set(
+                await MainActor.run {
+                    managedVenuesForOwner().compactMap(\.id)
+                }
+            )
+        )
+        guard !venueIds.isEmpty else { return [] }
+
+        do {
+            let iso = ISO8601DateFormatter()
+            iso.timeZone = TimeZone.current
+            iso.formatOptions = [.withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
+            let now = Date()
+            let lowerBound = now.addingTimeInterval(-Double(VenueOwnerGameDataRetentionHours.fixedHoursAfterStart) * 3600)
+            let lowerBoundStr = iso.string(from: lowerBound)
+
+            var byID: [UUID: VenueEventRow] = [:]
+            let chunkSize = 90
+            var index = 0
+            while index < venueIds.count {
+                let end = min(index + chunkSize, venueIds.count)
+                let chunk = Array(venueIds[index..<end])
+                index = end
+
+                let rows: [VenueEventRow] = try await supabase
+                    .from("venue_events")
+                    .select()
+                    .in("venue_id", values: chunk.map { $0.uuidString.lowercased() })
+                    .eq("admin_status", value: "active")
+                    .gte("scheduled_start_at", value: lowerBoundStr)
+                    .order("scheduled_start_at", ascending: true)
+                    .execute()
+                    .value
+
+                for row in rows {
+                    guard let id = row.id else { continue }
+                    byID[id] = row
+                }
+            }
+
+            return Self.filterScheduledGamesWithinRetentionWindow(Array(byID.values), now: now)
+                .sorted { lhs, rhs in
+                    let lhsStart = VenueGameExpiration.scheduledStartDate(for: lhs) ?? .distantFuture
+                    let rhsStart = VenueGameExpiration.scheduledStartDate(for: rhs) ?? .distantFuture
+                    if lhsStart != rhsStart { return lhsStart < rhsStart }
+                    let lhsTitle = lhs.event_title ?? ""
+                    let rhsTitle = rhs.event_title ?? ""
+                    return lhsTitle.localizedCaseInsensitiveCompare(rhsTitle) == .orderedAscending
+                }
+        } catch {
+            print("ERROR LOADING MANAGED VENUES SCHEDULED GAMES:", error)
+            return []
+        }
+    }
+
+    private static func filterScheduledGamesWithinRetentionWindow(
+        _ rows: [VenueEventRow],
+        now: Date
+    ) -> [VenueEventRow] {
+        rows.filter { row in
+            guard let start = VenueGameExpiration.scheduledStartDate(for: row),
+                  let expiration = Calendar.current.date(
+                    byAdding: .hour,
+                    value: VenueOwnerGameDataRetentionHours.fixedHoursAfterStart,
+                    to: start
+                  ) else {
+                return true
+            }
+            return expiration > now
+        }
+    }
+
+    /// Batched upcoming-game counts/next start for all managed venues (one `venue_id IN (...)` query).
+    /// Counts only future, `admin_status == active`, non-cancelled games.
+    func refreshManagedVenueUpcomingGamesSummaries() async {
+        let venueIds = Array(
+            Set(
+                await MainActor.run {
+                    managedVenuesForOwner().compactMap(\.id)
+                }
+            )
+        )
+        guard !venueIds.isEmpty else {
+            await MainActor.run { managedVenueUpcomingGamesByVenueId = [:] }
+            return
+        }
+
+        let now = Date()
+        let iso = ISO8601DateFormatter()
+        iso.timeZone = TimeZone.current
+        iso.formatOptions = [.withInternetDateTime, .withDashSeparatorInDate, .withColonSeparatorInTime]
+        let nowStr = iso.string(from: now)
+
+        do {
+            var counts: [UUID: Int] = [:]
+            var nextStarts: [UUID: Date] = [:]
+            let chunkSize = 90
+            var index = 0
+            while index < venueIds.count {
+                let end = min(index + chunkSize, venueIds.count)
+                let chunk = Array(venueIds[index..<end])
+                index = end
+
+                let rows: [VenueEventRow] = try await supabase
+                    .from("venue_events")
+                    .select("id,venue_id,scheduled_start_at,event_date,event_time,admin_status,cleanup_delay_hours,purge_after_at")
+                    .in("venue_id", values: chunk.map { $0.uuidString.lowercased() })
+                    .eq("admin_status", value: "active")
+                    .gte("scheduled_start_at", value: nowStr)
+                    .order("scheduled_start_at", ascending: true)
+                    .execute()
+                    .value
+
+                for row in rows {
+                    guard let venueId = row.venue_id else { continue }
+                    guard !Self.venueEventIsCancelledForUpcomingSummary(row) else { continue }
+                    guard let start = VenueGameExpiration.scheduledStartDate(for: row), start > now else { continue }
+                    counts[venueId, default: 0] += 1
+                    if let existing = nextStarts[venueId] {
+                        if start < existing { nextStarts[venueId] = start }
+                    } else {
+                        nextStarts[venueId] = start
+                    }
+                }
+            }
+
+            var summaries: [UUID: ManagedVenueUpcomingGamesSummary] = [:]
+            for id in venueIds {
+                let count = counts[id] ?? 0
+                summaries[id] = ManagedVenueUpcomingGamesSummary(
+                    count: count,
+                    nextStartAt: count > 0 ? nextStarts[id] : nil
+                )
+            }
+            await MainActor.run {
+                managedVenueUpcomingGamesByVenueId = summaries
+            }
+        } catch {
+            print("ERROR LOADING MANAGED VENUE UPCOMING SUMMARIES:", error)
+        }
+    }
+
+    private static func venueEventIsCancelledForUpcomingSummary(_ row: VenueEventRow) -> Bool {
+        let status = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        return status == "archived"
+            || status == "cancelled"
+            || status == "canceled"
+            || status == "rejected"
+            || status == "removed"
+            || status == "deleted"
     }
 
     /// Purged-game metadata for the business **History** tab (requires RLS on `business_game_history`).
@@ -7560,6 +7940,7 @@ extension MapViewModel {
                 eventTitle: game.event_title,
                 eventDate: game.event_date
             )
+            await refreshManagedVenueUpcomingGamesSummaries()
 
             return nil
         } catch {

@@ -26,6 +26,7 @@ struct FollowingScreen: View {
     /// Venue events the user marked "Interested" from Following without a Supabase row (table has no status column).
     @AppStorage("gameon.following.interestedOnlyVenueEventIDs") private var interestedOnlyEncoded: String = ""
     @AppStorage(FavoriteTeamsStore.appStorageKey) private var favoriteTeamIDsRaw: String = ""
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(ProGameNotificationPreferenceKeys.favoriteTeamAlerts) private var favoriteTeamProGameAlertsEnabled = false
     @AppStorage(ProGamesFavoriteTeamAutoFollowPreference.windowDaysKey) private var proGamesFavoriteTeamWindowDays = ProGamesFavoriteTeamAutoFollowPreference.Window.next30.rawValue
     @AppStorage("gameon.going.completedFavoriteTeamProGamesCleared.v1") private var clearedCompletedFavoriteTeamProGamesRaw: String = ""
@@ -40,6 +41,11 @@ struct FollowingScreen: View {
     @State private var followingMyPickupDetailGame: PickupGameRow?
     @State private var proGamePredictionSheet: ProGamePredictionSheetContext?
     @State private var proGameMatchDetailSelection: LiveMatch?
+    @State private var goingAddToVenueChooser: CalendarAddToVenueChooserContext?
+    @State private var goingAddToVenueImportPrefill: VenueOwnerScheduleImportPrefill?
+    @State private var showGoingManageGamesFromHostedStatus = false
+    /// Venue IDs already hosting each Going game key (stableKey) — from existing import duplicate source of truth.
+    @State private var goingAddToVenueHostedByGameKey: [String: [VenueGameImportHostedVenueSummary]] = [:]
     @State private var pendingProGameNotificationMatchID: String?
     @State private var followingPickupInviteGame: PickupGameRow?
     @State private var followingPickupInviteDetail: PickupGameInviteDisplay?
@@ -735,6 +741,51 @@ struct FollowingScreen: View {
         }
         .sheet(item: $proGameMatchDetailSelection) { match in
             LiveMatchDetailSheet(match: match)
+        }
+        .sheet(item: $goingAddToVenueChooser) { context in
+            CalendarAddToVenueChooserSheet(
+                viewModel: viewModel,
+                match: context.match,
+                venues: goingAddToVenueChooserVenues(excludingHostedOf: context.match),
+                onSelect: { venueId in
+                    let match = context.match
+                    goingAddToVenueChooser = nil
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 320_000_000)
+                        presentGoingAddToVenueImport(match: match, venueId: venueId)
+                    }
+                },
+                onCancel: {
+                    goingAddToVenueChooser = nil
+                }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
+        }
+        .sheet(item: $goingAddToVenueImportPrefill) { prefill in
+            VenueOwnerDashboardView(
+                viewModel: viewModel,
+                entryPoint: .gamesManager,
+                scheduleImportPrefill: prefill
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
+            .onDisappear {
+                Task {
+                    await refreshGoingAddToVenueHostedStatus(for: prefill.match)
+                }
+            }
+        }
+        .sheet(isPresented: $showGoingManageGamesFromHostedStatus) {
+            VenueOwnerDashboardView(
+                viewModel: viewModel,
+                entryPoint: .gamesManager
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(FGAdaptiveSurface.sheetRoot)
         }
         .sheet(isPresented: $showFavoriteTeamsPicker) {
             FavoriteTeamsPickerSheet(
@@ -2720,6 +2771,10 @@ struct FollowingScreen: View {
                     openProGamePredictionSheet(for: displayGame)
                 }
             }
+
+            if goingCanUseAddToVenueShortcut {
+                goingAddToVenueSection(for: displayGame)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2737,6 +2792,209 @@ struct FollowingScreen: View {
         .onAppear {
             logSavedProGameStatusDebug(displayGame)
             logSavedProGameScoringEventDebug(displayGame)
+        }
+        .task(id: goingAddToVenueHostedTaskId(for: displayGame)) {
+            await refreshGoingAddToVenueHostedStatus(for: displayGame)
+        }
+    }
+
+    private var goingCanUseAddToVenueShortcut: Bool {
+        viewModel.hasAuthenticatedVenueOwnerSession || viewModel.isVenueOwnerLoggedIn
+    }
+
+    private var goingAddToVenueChooserBaseVenues: [VenueProfileRow] {
+        viewModel.managedVenuesForOwner().filter { MapViewModel.venueIsOwnerVisibleManagedStatus($0) }
+    }
+
+    private var goingAddToVenueSelectableVenues: [VenueProfileRow] {
+        viewModel.managedVenuesForOwner().filter { MapViewModel.venueIsActiveForBusinessLimit($0) }
+    }
+
+    private func goingAddToVenueHostedTaskId(for game: SavedProGame) -> String? {
+        guard goingCanUseAddToVenueShortcut else { return nil }
+        guard goingLiveMatchForAddToVenue(game) != nil else { return nil }
+        return game.stableKey
+    }
+
+    private func goingLiveMatchForAddToVenue(_ game: SavedProGame) -> LiveMatch? {
+        viewModel.liveMatchForVenueImport(from: game)
+    }
+
+    private func goingProGameCanImportToVenue(_ match: LiveMatch) -> Bool {
+        let id = match.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let home = match.homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = match.awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !id.isEmpty && !home.isEmpty && !away.isEmpty
+    }
+
+    private func goingHostedVenues(for game: SavedProGame) -> [VenueGameImportHostedVenueSummary] {
+        let cached = goingAddToVenueHostedByGameKey[game.stableKey] ?? []
+        // Always prefer live managed-venue names so renames appear without waiting for a hosted re-fetch.
+        return cached.map { summary in
+            if let managedName = viewModel.managedVenuesForOwner()
+                .first(where: { $0.id == summary.venueId })?
+                .venue_name?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !managedName.isEmpty {
+                return VenueGameImportHostedVenueSummary(venueId: summary.venueId, venueName: managedName)
+            }
+            return summary
+        }
+    }
+
+    private func goingSelectableVenuesExcludingHosted(of match: LiveMatch, gameKey: String) -> [VenueProfileRow] {
+        let hosted = Set((goingAddToVenueHostedByGameKey[gameKey] ?? []).map(\.venueId))
+        return goingAddToVenueSelectableVenues.filter { row in
+            guard let id = row.id else { return false }
+            return !hosted.contains(id)
+        }
+    }
+
+    private func goingAddToVenueChooserVenues(excludingHostedOf match: LiveMatch) -> [VenueProfileRow] {
+        let gameKey = SavedProGame.stableKey(for: match)
+        let hosted = Set((goingAddToVenueHostedByGameKey[gameKey] ?? []).map(\.venueId))
+        return goingAddToVenueChooserBaseVenues.filter { row in
+            guard let id = row.id else { return false }
+            if hosted.contains(id), MapViewModel.venueIsActiveForBusinessLimit(row) {
+                return false
+            }
+            return true
+        }
+    }
+
+    @ViewBuilder
+    private func goingAddToVenueSection(for game: SavedProGame) -> some View {
+        let match = goingLiveMatchForAddToVenue(game)
+        let canImport = match.map(goingProGameCanImportToVenue) ?? false
+        let hosted = goingHostedVenues(for: game)
+        let remaining = match.map { goingSelectableVenuesExcludingHosted(of: $0, gameKey: game.stableKey) } ?? []
+        let showAdd = canImport && !remaining.isEmpty
+        let showHosted = !hosted.isEmpty
+
+        if showHosted || showAdd {
+            VStack(alignment: .leading, spacing: 8) {
+                if showHosted {
+                    goingHostedAtVenueStatusButton(hosted)
+                }
+                if showAdd, let match {
+                    goingAddToVenueButton(match: match, gameKey: game.stableKey)
+                }
+            }
+        }
+    }
+
+    private func goingHostedAtVenueStatusButton(_ hosted: [VenueGameImportHostedVenueSummary]) -> some View {
+        Button {
+            showGoingManageGamesFromHostedStatus = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "building.2.fill")
+                    .font(.caption.weight(.bold))
+                Text(goingHostedAtStatusText(hosted))
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+            .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(FGColor.secondaryText(followingColorScheme).opacity(followingColorScheme == .dark ? 0.14 : 0.08))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(
+                        FGColor.divider(followingColorScheme).opacity(followingColorScheme == .dark ? 0.40 : 0.50),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(goingHostedAtStatusText(hosted))
+    }
+
+    private func goingHostedAtStatusText(_ hosted: [VenueGameImportHostedVenueSummary]) -> String {
+        if hosted.count == 1 {
+            return String(
+                format: L10n.t("Hosted at %@", languageCode: appLanguageRaw),
+                hosted[0].venueName
+            )
+        }
+        return String(
+            format: L10n.t("Hosted at %lld venues", languageCode: appLanguageRaw),
+            Int64(hosted.count)
+        )
+    }
+
+    private func goingAddToVenueButton(match: LiveMatch, gameKey: String) -> some View {
+        Button {
+            handleGoingAddToVenueTapped(match: match, gameKey: gameKey)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "building.2.fill")
+                    .font(.caption.weight(.bold))
+                Text(L10n.t("Add to Venue", languageCode: appLanguageRaw))
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(FGColor.accentBlue)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(FGColor.accentBlue.opacity(followingColorScheme == .dark ? 0.16 : 0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(FGColor.accentBlue.opacity(followingColorScheme == .dark ? 0.32 : 0.18), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.t("Add to Venue", languageCode: appLanguageRaw))
+    }
+
+    private func handleGoingAddToVenueTapped(match: LiveMatch, gameKey: String) {
+        guard goingProGameCanImportToVenue(match) else { return }
+        let remaining = goingSelectableVenuesExcludingHosted(of: match, gameKey: gameKey)
+        guard !remaining.isEmpty else { return }
+
+        if remaining.count == 1, let venueId = remaining.first?.id {
+            presentGoingAddToVenueImport(match: match, venueId: venueId)
+            return
+        }
+
+        goingAddToVenueChooser = CalendarAddToVenueChooserContext(match: match)
+    }
+
+    private func presentGoingAddToVenueImport(match: LiveMatch, venueId: UUID) {
+        goingAddToVenueImportPrefill = VenueOwnerScheduleImportPrefill(match: match, venueId: venueId)
+    }
+
+    private func refreshGoingAddToVenueHostedStatus(for game: SavedProGame) async {
+        guard goingCanUseAddToVenueShortcut else { return }
+        guard let match = goingLiveMatchForAddToVenue(game), goingProGameCanImportToVenue(match) else {
+            await MainActor.run {
+                goingAddToVenueHostedByGameKey[game.stableKey] = []
+            }
+            return
+        }
+
+        let hosted = await viewModel.venueGameImportHostedVenues(
+            externalGameID: match.id,
+            externalSource: LiveSportsService.providerDescription
+        )
+        await MainActor.run {
+            goingAddToVenueHostedByGameKey[game.stableKey] = hosted
+        }
+    }
+
+    private func refreshGoingAddToVenueHostedStatus(for match: LiveMatch) async {
+        let key = SavedProGame.stableKey(for: match)
+        let hosted = await viewModel.venueGameImportHostedVenues(
+            externalGameID: match.id,
+            externalSource: LiveSportsService.providerDescription
+        )
+        await MainActor.run {
+            goingAddToVenueHostedByGameKey[key] = hosted
         }
     }
 

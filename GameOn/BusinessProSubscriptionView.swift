@@ -2,25 +2,30 @@ import SwiftUI
 
 struct BusinessProSubscriptionView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     let businessStatus: BusinessVenueGamePostingStatus?
 
     init(businessStatus: BusinessVenueGamePostingStatus? = nil) {
         self.businessStatus = businessStatus
     }
 
-    private let proFeatureListItems = BusinessPlanLimitPresentation.proPlanFeatureBullets() + [
-        "Analytics access"
-    ]
-
-    private var regularFeatureListItems: [String] {
-        guard let businessStatus else { return BusinessPlanLimitPresentation.regularPlanFeatureBullets() }
-        return [
-            businessStatus.displayActiveVenuesFeatureText,
-            businessStatus.displayHostedGamesFeatureText
+    private var proFeatureListItems: [String] {
+        BusinessPlanLimitPresentation.proPlanFeatureBullets(languageCode: appLanguageRaw) + [
+            L10n.t("analytics_access", languageCode: appLanguageRaw)
         ]
     }
 
-    private let fallbackRegularFeatures = BusinessPlanLimitPresentation.regularPlanFeatureBullets()
+    private var regularFeatureListItems: [String] {
+        guard let businessStatus else { return BusinessPlanLimitPresentation.regularPlanFeatureBullets(languageCode: appLanguageRaw) }
+        return [
+            businessStatus.displayActiveVenuesFeatureText(languageCode: appLanguageRaw),
+            businessStatus.displayHostedGamesFeatureText(languageCode: appLanguageRaw)
+        ]
+    }
+
+    private var fallbackRegularFeatures: [String] {
+        BusinessPlanLimitPresentation.regularPlanFeatureBullets(languageCode: appLanguageRaw)
+    }
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -119,13 +124,13 @@ struct BusinessProSubscriptionView: View {
     private var regularReferenceCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             planHeader(
-                title: "Business Regular",
-                subtitle: "Free business tools for sports venues",
-                badge: "FREE",
+                title: L10n.t("business_regular", languageCode: appLanguageRaw),
+                subtitle: L10n.t("free_business_tools_for_sports_venues", languageCode: appLanguageRaw),
+                badge: L10n.t("free_badge", languageCode: appLanguageRaw),
                 badgeColor: FGColor.accentBlue
             )
 
-            Text("Free plan")
+            Text(L10n.t("free_plan", languageCode: appLanguageRaw))
                 .font(.caption.weight(.heavy))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
 
@@ -212,14 +217,14 @@ struct BusinessProSubscriptionView: View {
     }
 
     private var entitlementTitle: String {
-        guard let businessStatus else { return "Checking plan status" }
-        return businessStatus.businessPlanDisplayTitle
+        guard let businessStatus else { return L10n.t("business_checking_plan_status", languageCode: appLanguageRaw) }
+        return businessStatus.businessPlanDisplayTitle(languageCode: appLanguageRaw)
     }
 
     private var entitlementSubtitle: String {
-        guard let businessStatus else { return "Refreshing entitlement" }
-        guard businessStatus.computedIsPro else { return "Free plan" }
-        return businessStatus.businessPlanDisplaySubtitle
+        guard let businessStatus else { return L10n.t("refreshing_entitlement", languageCode: appLanguageRaw) }
+        guard businessStatus.computedIsPro else { return L10n.t("free_plan", languageCode: appLanguageRaw) }
+        return businessStatus.businessPlanDisplaySubtitle(languageCode: appLanguageRaw)
     }
 
     private var entitlementBadge: String {

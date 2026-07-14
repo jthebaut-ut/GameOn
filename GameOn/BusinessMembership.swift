@@ -16,13 +16,43 @@ enum BusinessMembershipPolicy {
 }
 
 enum BusinessLimitCopy {
-    static let venueLimitReached = "You’ve reached your active venue limit. Upgrade to FanGeo Pro for unlimited locations."
-    static let hostedGameLimitReached = "You’ve reached your hosted game cycle limit. Upgrade to FanGeo Pro for unlimited hosted games, or wait until your next reset."
-    static let planLockedVenueBanner = "Some of your venues are locked because your business exceeds the free plan limit. Upgrade to FanGeo Pro to reactivate all locations."
-    static let planLockedVenueBadge = "Inactive on Regular plan"
-    static let planLockedVenueSubtitle = "Not visible on Discover and cannot host games on the Regular plan."
-    static let planLockedVenueHostedGameBlocked = "This venue is locked under the current business plan. Upgrade to FanGeo Pro to host games here."
-    static let backendCompatibilityRequired = "FanGeo needs a quick update before this business feature can be used. Please update the app and try again."
+    enum Token {
+        static let venueLimitReached = "business_venue_limit_reached"
+        static let hostedGameLimitReached = "business_hosted_game_limit_reached"
+        static let planLockedVenueBanner = "business_plan_locked_venue_banner"
+        static let planLockedVenueBadge = "business_plan_locked_venue_badge"
+        static let planLockedVenueSubtitle = "business_plan_locked_venue_subtitle"
+        static let planLockedVenueHostedGameBlocked = "business_plan_locked_venue_hosted_game_blocked"
+        static let backendCompatibilityRequired = "business_backend_compatibility_required"
+    }
+
+    static func venueLimitReached(languageCode: String? = nil) -> String {
+        L10n.t(Token.venueLimitReached, languageCode: languageCode)
+    }
+
+    static func hostedGameLimitReached(languageCode: String? = nil) -> String {
+        L10n.t(Token.hostedGameLimitReached, languageCode: languageCode)
+    }
+
+    static func planLockedVenueBanner(languageCode: String? = nil) -> String {
+        L10n.t(Token.planLockedVenueBanner, languageCode: languageCode)
+    }
+
+    static func planLockedVenueBadge(languageCode: String? = nil) -> String {
+        L10n.t(Token.planLockedVenueBadge, languageCode: languageCode)
+    }
+
+    static func planLockedVenueSubtitle(languageCode: String? = nil) -> String {
+        L10n.t(Token.planLockedVenueSubtitle, languageCode: languageCode)
+    }
+
+    static func planLockedVenueHostedGameBlocked(languageCode: String? = nil) -> String {
+        L10n.t(Token.planLockedVenueHostedGameBlocked, languageCode: languageCode)
+    }
+
+    static func backendCompatibilityRequired(languageCode: String? = nil) -> String {
+        L10n.t(Token.backendCompatibilityRequired, languageCode: languageCode)
+    }
 }
 
 /// User-facing plan limit copy. Backend may return sentinel values (e.g. 999999) for unlimited capacity;
@@ -57,58 +87,91 @@ enum BusinessPlanLimitPresentation {
         return .regular(limit: max(1, min(raw, BusinessMembershipPolicy.freeMonthlyVenueGameLimit)))
     }
 
-    static func activeVenuesFeatureText(for status: BusinessVenueGamePostingStatus) -> String {
+    static func activeVenuesFeatureText(
+        for status: BusinessVenueGamePostingStatus,
+        languageCode: String? = nil
+    ) -> String {
         switch activeVenueLimit(for: status) {
         case .unlimited:
-            return "Unlimited active venues"
+            return L10n.t("business_unlimited_active_venues", languageCode: languageCode)
         case .regular(let limit):
-            return "Up to \(limit) active venues"
+            return String(
+                format: L10n.t("business_up_to_active_venues_format", languageCode: languageCode),
+                limit
+            )
         }
     }
 
-    static func hostedGamesFeatureText(for status: BusinessVenueGamePostingStatus) -> String {
+    static func hostedGamesFeatureText(
+        for status: BusinessVenueGamePostingStatus,
+        languageCode: String? = nil
+    ) -> String {
         switch hostedGameLimit(for: status) {
         case .unlimited:
-            return "Unlimited hosted games"
+            return L10n.t("business_unlimited_hosted_games", languageCode: languageCode)
         case .regular(let limit):
-            return "Up to \(limit) hosted games/month"
+            return String(
+                format: L10n.t("business_up_to_hosted_games_month_format", languageCode: languageCode),
+                limit
+            )
         }
     }
 
-    static func activeVenuesCountNounText(for status: BusinessVenueGamePostingStatus) -> String {
+    static func activeVenuesCountNounText(
+        for status: BusinessVenueGamePostingStatus,
+        languageCode: String? = nil
+    ) -> String {
         switch activeVenueLimit(for: status) {
         case .unlimited:
-            return "Unlimited active venues"
+            return L10n.t("business_unlimited_active_venues", languageCode: languageCode)
         case .regular(let limit):
-            return "\(limit) active venues"
+            return String(
+                format: L10n.t("business_active_venues_count_format", languageCode: languageCode),
+                limit
+            )
         }
     }
 
-    static func hostedGamesCountNounText(for status: BusinessVenueGamePostingStatus) -> String {
+    static func hostedGamesCountNounText(
+        for status: BusinessVenueGamePostingStatus,
+        languageCode: String? = nil
+    ) -> String {
         switch hostedGameLimit(for: status) {
         case .unlimited:
-            return "Unlimited hosted games"
+            return L10n.t("business_unlimited_hosted_games", languageCode: languageCode)
         case .regular(let limit):
-            return "\(limit) hosted games/month"
+            return String(
+                format: L10n.t("business_hosted_games_count_month_format", languageCode: languageCode),
+                limit
+            )
         }
     }
 
-    static func planLimitsSummarySubtitle(for status: BusinessVenueGamePostingStatus) -> String {
-        guard !status.computedIsPro else { return status.businessPlanDisplaySubtitle }
-        return "\(activeVenuesFeatureText(for: status)) • \(hostedGamesFeatureText(for: status))"
+    static func planLimitsSummarySubtitle(
+        for status: BusinessVenueGamePostingStatus,
+        languageCode: String? = nil
+    ) -> String {
+        guard !status.computedIsPro else { return status.businessPlanDisplaySubtitle(languageCode: languageCode) }
+        return "\(activeVenuesFeatureText(for: status, languageCode: languageCode)) • \(hostedGamesFeatureText(for: status, languageCode: languageCode))"
     }
 
-    static func regularPlanFeatureBullets() -> [String] {
+    static func regularPlanFeatureBullets(languageCode: String? = nil) -> [String] {
         [
-            "Up to \(BusinessMembershipPolicy.freeVenueListingLimit) active venues",
-            "Up to \(BusinessMembershipPolicy.freeMonthlyVenueGameLimit) hosted games/month"
+            String(
+                format: L10n.t("business_up_to_active_venues_format", languageCode: languageCode),
+                BusinessMembershipPolicy.freeVenueListingLimit
+            ),
+            String(
+                format: L10n.t("business_up_to_hosted_games_month_format", languageCode: languageCode),
+                BusinessMembershipPolicy.freeMonthlyVenueGameLimit
+            )
         ]
     }
 
-    static func proPlanFeatureBullets() -> [String] {
+    static func proPlanFeatureBullets(languageCode: String? = nil) -> [String] {
         [
-            "Unlimited active venues",
-            "Unlimited hosted games"
+            L10n.t("business_unlimited_active_venues", languageCode: languageCode),
+            L10n.t("business_unlimited_hosted_games", languageCode: languageCode)
         ]
     }
 
@@ -148,12 +211,16 @@ enum BusinessProPromoDisplay {
         return expiryFormatter.string(from: date)
     }
 
-    static func includedThroughText(from raw: String?) -> String? {
-        formattedExpiry(from: raw).map { "Business Pro included through \($0)." }
+    static func includedThroughText(from raw: String?, languageCode: String? = nil) -> String? {
+        formattedExpiry(from: raw).map {
+            String(format: L10n.t("business_pro_included_through_format", languageCode: languageCode), $0)
+        }
     }
 
-    static func activeUntilText(from raw: String?) -> String? {
-        formattedExpiry(from: raw).map { "Business Pro promo active until \($0)" }
+    static func activeUntilText(from raw: String?, languageCode: String? = nil) -> String? {
+        formattedExpiry(from: raw).map {
+            String(format: L10n.t("business_pro_promo_active_until_format", languageCode: languageCode), $0)
+        }
     }
 }
 
@@ -264,68 +331,90 @@ struct BusinessVenueGamePostingStatus: Equatable {
         let source = status.normalizedEntitlementSource
         return source == "pro_paid" || source == "subscription_pro"
     }
-    static let launchPromoComplimentaryAccessSubtitle = "Launch Promotion (Complimentary Access)"
+    static let launchPromoComplimentaryAccessSubtitleKey = "business_launch_promotion_complimentary_access"
 
     /// Set to `true` only after StoreKit-verified Apple IAP Business Pro subscriptions ship.
     static let useAppleSubscriptionPlanDisplay = false
 
-    var businessPlanDisplayTitle: String {
-        guard computedIsPro else { return "Business Regular" }
+    func businessPlanDisplayTitle(languageCode: String? = nil) -> String {
+        guard computedIsPro else { return L10n.t("business_regular", languageCode: languageCode) }
         if Self.useAppleSubscriptionPlanDisplay, isBusinessSubscriptionPro {
-            return "Business Pro Active"
+            return L10n.t("business_pro_active", languageCode: languageCode)
         }
-        return "Business Pro"
+        return L10n.t("business_pro", languageCode: languageCode)
     }
 
-    var businessPlanDisplaySubtitle: String {
-        guard computedIsPro else { return normalizedPlanStatusForDisplay }
+    var businessPlanDisplayTitle: String { businessPlanDisplayTitle(languageCode: nil) }
+
+    func businessPlanDisplaySubtitle(languageCode: String? = nil) -> String {
+        guard computedIsPro else { return normalizedPlanStatusForDisplay(languageCode: languageCode) }
         if Self.useAppleSubscriptionPlanDisplay, isBusinessSubscriptionPro {
-            var parts = ["Apple Subscription"]
+            var parts = [L10n.t("business_apple_subscription", languageCode: languageCode)]
             if let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) {
-                parts.append("Expires \(formatted)")
+                parts.append(String(format: L10n.t("business_expires_format", languageCode: languageCode), formatted))
             }
             return parts.joined(separator: " • ")
         }
-        var parts = [Self.launchPromoComplimentaryAccessSubtitle]
+        var parts = [L10n.t(Self.launchPromoComplimentaryAccessSubtitleKey, languageCode: languageCode)]
         if let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) {
-            parts.append("Expires \(formatted)")
+            parts.append(String(format: L10n.t("business_expires_format", languageCode: languageCode), formatted))
         }
         return parts.joined(separator: " • ")
     }
-    var businessProPromoIncludedThroughText: String? {
+
+    var businessPlanDisplaySubtitle: String { businessPlanDisplaySubtitle(languageCode: nil) }
+
+    func businessProPromoIncludedThroughText(languageCode: String? = nil) -> String? {
         guard isBusinessProPromo else { return nil }
-        return BusinessProPromoDisplay.includedThroughText(from: proExpiresAt)
+        return BusinessProPromoDisplay.includedThroughText(from: proExpiresAt, languageCode: languageCode)
     }
-    var businessProPromoEndDateText: String? {
+
+    var businessProPromoIncludedThroughText: String? { businessProPromoIncludedThroughText(languageCode: nil) }
+
+    func businessProPromoEndDateText(languageCode: String? = nil) -> String? {
         guard isBusinessProPromo,
               let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) else {
             return nil
         }
-        return "Promotion ends \(formatted)"
+        return String(format: L10n.t("business_promotion_ends_format", languageCode: languageCode), formatted)
     }
-    var businessProPromoActiveUntilText: String? {
+
+    var businessProPromoEndDateText: String? { businessProPromoEndDateText(languageCode: nil) }
+
+    func businessProPromoActiveUntilText(languageCode: String? = nil) -> String? {
         guard isBusinessProPromo else { return nil }
-        return BusinessProPromoDisplay.activeUntilText(from: proExpiresAt)
+        return BusinessProPromoDisplay.activeUntilText(from: proExpiresAt, languageCode: languageCode)
     }
-    var businessProSubscriptionExpiryText: String? {
+
+    var businessProPromoActiveUntilText: String? { businessProPromoActiveUntilText(languageCode: nil) }
+
+    func businessProSubscriptionExpiryText(languageCode: String? = nil) -> String? {
         guard isBusinessSubscriptionPro,
               let formatted = BusinessProPromoDisplay.formattedExpiry(from: proExpiresAt) else {
             return nil
         }
-        return "Expires \(formatted)"
+        return String(format: L10n.t("business_expires_format", languageCode: languageCode), formatted)
     }
 
-    var displayPlanLimitsSummarySubtitle: String {
-        BusinessPlanLimitPresentation.planLimitsSummarySubtitle(for: self)
+    var businessProSubscriptionExpiryText: String? { businessProSubscriptionExpiryText(languageCode: nil) }
+
+    func displayPlanLimitsSummarySubtitle(languageCode: String? = nil) -> String {
+        BusinessPlanLimitPresentation.planLimitsSummarySubtitle(for: self, languageCode: languageCode)
     }
 
-    var displayActiveVenuesFeatureText: String {
-        BusinessPlanLimitPresentation.activeVenuesFeatureText(for: self)
+    var displayPlanLimitsSummarySubtitle: String { displayPlanLimitsSummarySubtitle(languageCode: nil) }
+
+    func displayActiveVenuesFeatureText(languageCode: String? = nil) -> String {
+        BusinessPlanLimitPresentation.activeVenuesFeatureText(for: self, languageCode: languageCode)
     }
 
-    var displayHostedGamesFeatureText: String {
-        BusinessPlanLimitPresentation.hostedGamesFeatureText(for: self)
+    var displayActiveVenuesFeatureText: String { displayActiveVenuesFeatureText(languageCode: nil) }
+
+    func displayHostedGamesFeatureText(languageCode: String? = nil) -> String {
+        BusinessPlanLimitPresentation.hostedGamesFeatureText(for: self, languageCode: languageCode)
     }
+
+    var displayHostedGamesFeatureText: String { displayHostedGamesFeatureText(languageCode: nil) }
 
     /// Effective unlimited venue capacity (Pro, promo Pro, paid Pro, manual Pro, or admin unlimited override).
     var hasUnlimitedVenueCapacity: Bool {
@@ -337,9 +426,12 @@ struct BusinessVenueGamePostingStatus: Equatable {
         !hasUnlimitedVenueCapacity
     }
 
-    private var normalizedPlanStatusForDisplay: String {
+    private func normalizedPlanStatusForDisplay(languageCode: String? = nil) -> String {
         let value = planStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return value.isEmpty ? "active" : value
+        if value.isEmpty || value == "active" {
+            return L10n.t("business_status_active", languageCode: languageCode)
+        }
+        return value
     }
 
     private static let proPlanTypes: Set<String> = ["pro_promo", "pro_paid", "manual_pro", "subscription_pro"]

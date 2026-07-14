@@ -155,7 +155,7 @@ struct AddBusinessLocationRequestSheet: View {
             m.append("Could not resolve business for this request")
         }
         if businessMembershipStatus?.canAddVenue == false {
-            m.append(BusinessLimitCopy.venueLimitReached)
+            m.append(BusinessLimitCopy.venueLimitReached())
         }
         if form.locationName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             m.append("Missing location name")
@@ -526,7 +526,7 @@ struct AddBusinessLocationRequestSheet: View {
         if !membershipStatus.canAddVenue {
             await MainActor.run {
                 form.isSubmitting = false
-                form.errorMessage = BusinessLimitCopy.venueLimitReached
+                form.errorMessage = BusinessLimitCopy.venueLimitReached()
             }
             return
         }

@@ -25,6 +25,8 @@ struct CalendarScreen: View {
     @State private var gameSearchText = ""
     @State private var calendarProGamesSportFilter = "All"
     @State private var calendarProGamePredictionSheet: ProGamePredictionSheetContext?
+    @State private var calendarAddToVenueChooser: CalendarAddToVenueChooserContext?
+    @State private var calendarAddToVenueImportPrefill: VenueOwnerScheduleImportPrefill?
     @State private var calendarFeaturedEventFilterSlug: String?
     @State private var calendarPickupDetailToken: PickupDetailNavigationToken?
     @State private var debouncedGameSearchText = ""
@@ -44,6 +46,12 @@ struct CalendarScreen: View {
     @State private var teamScheduleRecentSearches: [String] = []
     @State private var teamScheduleLookupCache: [String: TeamScheduleCacheEntry] = [:]
     @State private var calendarProGamesPerf = CalendarProGamesPerfState()
+    /// Holds the last stable venue Watch Parties list across day taps to avoid empty-state flicker.
+    @State private var calendarWatchPartiesLastStableEvents: [SportsEvent] = []
+    @State private var calendarWatchPartiesHeldEvents: [SportsEvent] = []
+    @State private var calendarWatchPartiesDayTransitionActive = false
+    @State private var calendarWatchPartiesDayTransitionGeneration: UInt64 = 0
+    @State private var calendarWatchPartiesDayTransitionTask: Task<Void, Never>?
     @FocusState private var isGameSearchFocused: Bool
     @FocusState private var isTeamScheduleSearchFocused: Bool
 
@@ -74,6 +82,8 @@ struct CalendarScreen: View {
         static let statusIndicatorMaxVisibleDuration: TimeInterval = 9
         static let displayCacheByKeyLimit = 21
         static let stripDateCachePrewarmDelayNs: UInt64 = 100_000_000
+        /// Extra settle after deferred day-change work before allowing empty Watch Parties state.
+        static let watchPartiesDayTransitionSettleNs: UInt64 = 180_000_000
     }
 
     private var isBusinessCalendarAccess: Bool {
@@ -936,6 +946,15 @@ struct CalendarScreen: View {
             .onChange(of: viewModel.calendarTabSelectedDate) { _, _ in
                 handleCalendarSelectedDateChange()
             }
+            .onChange(of: displayedEvents.map(\.id)) { _, _ in
+                handleCalendarDisplayedEventsIdentityChanged()
+            }
+            .onChange(of: viewModel.isLoadingEvents) { _, loading in
+                if !loading { completeCalendarWatchPartiesDayTransitionIfReady(reason: "loadingEnded") }
+            }
+            .onChange(of: viewModel.isRefreshingDiscoverEvents) { _, refreshing in
+                if !refreshing { completeCalendarWatchPartiesDayTransitionIfReady(reason: "refreshEnded") }
+            }
             .onChange(of: isBusinessCalendarAccess) { _, _ in
                 sanitizeBusinessCalendarFilterIfNeeded()
             }
@@ -956,6 +975,38 @@ struct CalendarScreen: View {
             }
             .sheet(item: $calendarProGamePredictionSheet) { context in
                 ProGamePredictionSheet(viewModel: viewModel, game: context.game)
+            }
+            .sheet(item: $calendarAddToVenueChooser) { context in
+                CalendarAddToVenueChooserSheet(
+                    viewModel: viewModel,
+                    match: context.match,
+                    venues: calendarAddToVenueChooserVenues,
+                    onSelect: { venueId in
+                        let match = context.match
+                        calendarAddToVenueChooser = nil
+                        // Dismiss chooser before presenting Manage Games (avoids stacked-sheet glitches).
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 320_000_000)
+                            presentAddToVenueImport(match: match, venueId: venueId)
+                        }
+                    },
+                    onCancel: {
+                        calendarAddToVenueChooser = nil
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(FGAdaptiveSurface.sheetRoot)
+            }
+            .sheet(item: $calendarAddToVenueImportPrefill) { prefill in
+                VenueOwnerDashboardView(
+                    viewModel: viewModel,
+                    entryPoint: .gamesManager,
+                    scheduleImportPrefill: prefill
+                )
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(FGAdaptiveSurface.sheetRoot)
             }
     }
 
@@ -1618,6 +1669,7 @@ struct CalendarScreen: View {
     }
 
     private func handleCalendarSelectedDateChange() {
+        beginCalendarWatchPartiesDayTransition(reason: "selectedDateChanged", preserveVisibleCards: true)
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "selectedDateInstant")
         scheduleCalendarInteractionDeferredWork(reason: "calendar_selected_date_change")
     }
@@ -1633,6 +1685,8 @@ struct CalendarScreen: View {
         logScheduleTapProtectedIfNeeded()
         logScheduleTapPerf("[ScheduleTapPerf] tapReceived type=date value=\(dayKey)")
         let started = CFAbsoluteTimeGetCurrent()
+        // Capture the currently visible Watch Parties before the selected day changes.
+        commitCalendarWatchPartiesStableSnapshotIfNeeded()
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -1641,6 +1695,109 @@ struct CalendarScreen: View {
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "dateStripInstant")
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
         logScheduleTapPerf("[ScheduleTapPerf] selectedStateUpdatedMs=\(String(format: "%.2f", ms))")
+    }
+
+    private func beginCalendarWatchPartiesDayTransition(reason: String, preserveVisibleCards: Bool) {
+        guard effectiveCalendarGameFilter == .venueGames else { return }
+        guard !isCalendarSearchModeActive else { return }
+        guard calendarTabSelectedDayIsTodayOrFuture else { return }
+
+        // Hold the previous day's visible cards. Do NOT snapshot calendarBaseDisplayedEvents()
+        // here — the selected date has already changed, so that list is often empty and would
+        // wipe the stable hold we committed on the date strip tap.
+        let holdSnapshot: [SportsEvent]
+        if preserveVisibleCards {
+            if !calendarWatchPartiesLastStableEvents.isEmpty {
+                holdSnapshot = calendarWatchPartiesLastStableEvents
+            } else if !calendarWatchPartiesHeldEvents.isEmpty {
+                holdSnapshot = calendarWatchPartiesHeldEvents
+            } else {
+                holdSnapshot = []
+            }
+        } else {
+            holdSnapshot = []
+        }
+
+        calendarWatchPartiesDayTransitionTask?.cancel()
+        calendarWatchPartiesDayTransitionGeneration &+= 1
+        let generation = calendarWatchPartiesDayTransitionGeneration
+        calendarWatchPartiesDayTransitionActive = true
+        calendarWatchPartiesHeldEvents = holdSnapshot
+#if DEBUG
+        print(
+            "[CalendarWatchPartiesUX] dayTransitionBegan reason=\(reason) held=\(holdSnapshot.count)"
+        )
+#endif
+
+        calendarWatchPartiesDayTransitionTask = Task { @MainActor in
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: CalendarProGamesPerfState.deferredNetworkRefreshDelayNs)
+            while !Task.isCancelled,
+                  (viewModel.isLoadingEvents || viewModel.isRefreshingDiscoverEvents) {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            try? await Task.sleep(nanoseconds: CalendarProGamesPerfState.watchPartiesDayTransitionSettleNs)
+            guard !Task.isCancelled else { return }
+            guard generation == calendarWatchPartiesDayTransitionGeneration else { return }
+            endCalendarWatchPartiesDayTransition(reason: "\(reason):settled")
+        }
+    }
+
+    private func endCalendarWatchPartiesDayTransition(reason: String) {
+        calendarWatchPartiesDayTransitionTask?.cancel()
+        calendarWatchPartiesDayTransitionTask = nil
+        calendarWatchPartiesDayTransitionActive = false
+        calendarWatchPartiesHeldEvents = []
+        commitCalendarWatchPartiesStableSnapshotIfNeeded()
+#if DEBUG
+        print("[CalendarWatchPartiesUX] dayTransitionEnded reason=\(reason)")
+#endif
+    }
+
+    private func completeCalendarWatchPartiesDayTransitionIfReady(reason: String) {
+        guard calendarWatchPartiesDayTransitionActive else { return }
+        guard !viewModel.isLoadingEvents, !viewModel.isRefreshingDiscoverEvents else { return }
+        // Keep holding until the new day has content, or settle completes naturally on empty.
+        if !displayedEvents.isEmpty {
+            endCalendarWatchPartiesDayTransition(reason: reason)
+        }
+    }
+
+    private func handleCalendarDisplayedEventsIdentityChanged() {
+        if calendarWatchPartiesDayTransitionActive, !displayedEvents.isEmpty {
+            endCalendarWatchPartiesDayTransition(reason: "liveEventsReady")
+            return
+        }
+        commitCalendarWatchPartiesStableSnapshotIfNeeded()
+    }
+
+    private func commitCalendarWatchPartiesStableSnapshotIfNeeded() {
+        guard effectiveCalendarGameFilter == .venueGames else { return }
+        guard !isCalendarSearchModeActive else { return }
+        guard !calendarWatchPartiesDayTransitionActive else { return }
+        calendarWatchPartiesLastStableEvents = calendarBaseDisplayedEvents()
+    }
+
+    /// Venue Watch Parties list for rendering: prefer live day results, else held cards during day transition.
+    private var calendarVenueEventsConsideringDayTransition: [SportsEvent] {
+        guard effectiveCalendarGameFilter == .venueGames, !isCalendarSearchModeActive else {
+            return displayedEvents
+        }
+        if !displayedEvents.isEmpty {
+            return displayedEvents
+        }
+        if calendarWatchPartiesDayTransitionActive, !calendarWatchPartiesHeldEvents.isEmpty {
+            return calendarWatchPartiesHeldEvents
+        }
+        return displayedEvents
+    }
+
+    private var calendarVenueEventsAreHeldOverFromPreviousDay: Bool {
+        effectiveCalendarGameFilter == .venueGames
+            && !isCalendarSearchModeActive
+            && calendarWatchPartiesDayTransitionActive
+            && displayedEvents.isEmpty
+            && !calendarWatchPartiesHeldEvents.isEmpty
     }
 
     private func refreshCalendarPickupSourcesIfNeeded(forceRefresh: Bool = false, reason: String) {
@@ -1797,6 +1954,8 @@ struct CalendarScreen: View {
         let calendar = Calendar.current
         let isSelected = calendar.isDate(date, inSameDayAs: viewModel.calendarTabSelectedDate)
         let isToday = calendar.isDateInToday(date)
+        let hasVenueEvents = calendarDateStripHasVenueEvents(on: date)
+        let hasPickupGames = calendarDateStripHasPickupGames(on: date)
         return Button {
             handleCalendarDateStripTap(date)
         } label: {
@@ -1810,6 +1969,13 @@ struct CalendarScreen: View {
             }
             .foregroundStyle(isSelected ? FGColor.accentGreen : FGColor.secondaryText(calendarColorScheme))
             .frame(width: 68, height: 52)
+            .overlay(alignment: .bottom) {
+                calendarDateStripEventIndicators(
+                    hasVenueEvents: hasVenueEvents,
+                    hasPickupGames: hasPickupGames
+                )
+                .padding(.bottom, 5)
+            }
             .background(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(isSelected ? FGColor.accentGreen.opacity(calendarColorScheme == .dark ? 0.20 : 0.12) : Color(.secondarySystemGroupedBackground))
@@ -1826,7 +1992,52 @@ struct CalendarScreen: View {
             .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(calendarDateStripAccessibilityFormatter.string(from: date))
+        .accessibilityLabel(calendarDateStripAccessibilityLabel(
+            date: date,
+            hasVenueEvents: hasVenueEvents,
+            hasPickupGames: hasPickupGames
+        ))
+    }
+
+    /// Reuses Calendar-tab venue/pickup day-dot sets already loaded for the month picker — no new queries.
+    private func calendarDateStripHasVenueEvents(on date: Date) -> Bool {
+        let day = Calendar.current.startOfDay(for: date)
+        return viewModel.venueGameCalendarDotDates.contains(day)
+    }
+
+    private func calendarDateStripHasPickupGames(on date: Date) -> Bool {
+        let day = Calendar.current.startOfDay(for: date)
+        return viewModel.pickupGameCalendarDotDates.contains(day)
+    }
+
+    @ViewBuilder
+    private func calendarDateStripEventIndicators(hasVenueEvents: Bool, hasPickupGames: Bool) -> some View {
+        if hasVenueEvents || hasPickupGames {
+            HStack(spacing: 3.5) {
+                if hasVenueEvents {
+                    Circle()
+                        .fill(FGColor.accentGreen.opacity(calendarColorScheme == .dark ? 0.92 : 0.88))
+                        .frame(width: 4.5, height: 4.5)
+                }
+                if hasPickupGames {
+                    Circle()
+                        .fill(FGColor.accentBlue.opacity(calendarColorScheme == .dark ? 0.92 : 0.88))
+                        .frame(width: 4.5, height: 4.5)
+                }
+            }
+            .accessibilityHidden(true)
+        }
+    }
+
+    private func calendarDateStripAccessibilityLabel(
+        date: Date,
+        hasVenueEvents: Bool,
+        hasPickupGames: Bool
+    ) -> String {
+        var label = calendarDateStripAccessibilityFormatter.string(from: date)
+        if hasVenueEvents { label += ", venue games" }
+        if hasPickupGames { label += ", pickup games" }
+        return label
     }
 
     private var compactCalendarDateTitle: String {
@@ -1854,11 +2065,16 @@ struct CalendarScreen: View {
             Spacer()
 
             if !isProGamesSelected {
-                if viewModel.isLoadingEvents {
+                if viewModel.isLoadingEvents
+                    || viewModel.isRefreshingDiscoverEvents
+                    || calendarWatchPartiesDayTransitionActive {
                     ProgressView()
-                } else if viewModel.isRefreshingDiscoverEvents && !displayedEvents.isEmpty {
-                    ProgressView()
-                        .controlSize(.small)
+                        .controlSize(
+                            (viewModel.isLoadingEvents || calendarWatchPartiesDayTransitionActive)
+                                && calendarVenueEventsConsideringDayTransition.isEmpty
+                                ? .regular
+                                : .small
+                        )
                 }
             }
         }
@@ -2173,7 +2389,7 @@ struct CalendarScreen: View {
                                     calendarEmptyState(calendarProGamesEmptyStateMessage)
                                 }
                             } else {
-                                LazyVStack(spacing: 12) {
+                                LazyVStack(spacing: 18) {
                                     ForEach(proMatches) { match in
                                         CalendarProGameLazyCard { deferExpensiveSections in
                                             calendarProGameCard(match, deferExpensiveSections: deferExpensiveSections)
@@ -2182,15 +2398,25 @@ struct CalendarScreen: View {
                                 }
                                 .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .top)
                             }
-                        } else if viewModel.isLoadingEvents && displayedEvents.isEmpty {
-                            calendarLoadingState("Loading events…")
-                        } else if displayedEvents.isEmpty {
+                        } else if shouldShowCalendarEventsLoadingState {
+                            calendarLoadingState(calendarEventsLoadingCopy)
+                        } else if calendarVenueEventsConsideringDayTransition.isEmpty {
                             calendarEventsEmptyState
                         } else {
-                            VStack(spacing: 12) {
-                                ForEach(displayedEvents) { event in
-                                    calendarEventCard(event)
+                            VStack(alignment: .leading, spacing: 12) {
+                                if calendarVenueEventsAreHeldOverFromPreviousDay
+                                    || ((viewModel.isRefreshingDiscoverEvents || calendarWatchPartiesDayTransitionActive)
+                                        && effectiveCalendarGameFilter == .venueGames) {
+                                    calendarWatchPartiesRefreshingBanner
                                 }
+
+                                VStack(spacing: 18) {
+                                    ForEach(calendarVenueEventsConsideringDayTransition) { event in
+                                        calendarEventCard(event)
+                                    }
+                                }
+                                .opacity(calendarVenueEventsAreHeldOverFromPreviousDay ? 0.58 : 1)
+                                .allowsHitTesting(!calendarVenueEventsAreHeldOverFromPreviousDay)
                             }
                             .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .top)
                         }
@@ -2228,7 +2454,7 @@ struct CalendarScreen: View {
                 .tracking(0.55)
                 .padding(.horizontal, 2)
 
-            LazyVStack(spacing: 12) {
+            LazyVStack(spacing: 18) {
                 ForEach(group.items) { item in
                     calendarSearchResultCard(item)
                 }
@@ -2267,20 +2493,73 @@ struct CalendarScreen: View {
             .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .center)
     }
 
-    private func calendarLoadingState(_ text: String) -> some View {
-        HStack(spacing: 10) {
+    /// Show explicit loading while Watch Parties / pickup lists are empty but still settling or refreshing.
+    private var shouldShowCalendarEventsLoadingState: Bool {
+        guard !isProGamesSelected else { return false }
+        if effectiveCalendarGameFilter == .venueGames, !isCalendarSearchModeActive {
+            if !calendarVenueEventsConsideringDayTransition.isEmpty { return false }
+            if calendarWatchPartiesDayTransitionActive { return true }
+            if viewModel.isLoadingEvents || viewModel.isRefreshingDiscoverEvents { return true }
+            return false
+        }
+        guard displayedEvents.isEmpty else { return false }
+        return viewModel.isLoadingEvents || viewModel.isRefreshingDiscoverEvents
+    }
+
+    private var calendarEventsLoadingCopy: String {
+        switch effectiveCalendarGameFilter {
+        case .venueGames:
+            if viewModel.isLoadingEvents {
+                return "Loading watch parties..."
+            }
+            if calendarDateStripHasVenueEvents(on: viewModel.calendarTabSelectedDate) {
+                return "Finding nearby watch parties..."
+            }
+            return "Refreshing watch parties..."
+        case .pickupGames:
+            return viewModel.isLoadingEvents
+                ? "Loading pickup games…"
+                : "Refreshing pickup games…"
+        case .proGames:
+            return "Loading events…"
+        }
+    }
+
+    private var calendarWatchPartiesRefreshingBanner: some View {
+        HStack(spacing: 8) {
             ProgressView()
                 .controlSize(.small)
+            Text(
+                calendarVenueEventsAreHeldOverFromPreviousDay
+                    ? "Refreshing watch parties..."
+                    : calendarEventsLoadingCopy
+            )
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.tertiarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func calendarLoadingState(_ text: String) -> some View {
+        VStack(spacing: 12) {
+            ProgressView()
             Text(text)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
-            Spacer(minLength: 0)
+                .multilineTextAlignment(.center)
         }
         .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .center)
         .background(Color(.secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 18))
-        .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .center)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
     }
 
     @ViewBuilder
@@ -2580,8 +2859,14 @@ struct CalendarScreen: View {
             if match.supportsProGamePredictions {
                 calendarProGamePredictionFooter(for: match, prefetchEnabled: !deferExpensiveSections)
             }
+
+            if calendarShouldShowAddToVenue(for: match) {
+                calendarProGameAddToVenueButton(match)
+            }
         }
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             isInactiveCompleted
@@ -2590,29 +2875,100 @@ struct CalendarScreen: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {
-            if isInactiveCompleted {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(
-                        FGColor.divider(calendarColorScheme).opacity(calendarColorScheme == .dark ? 0.34 : 0.48),
-                        lineWidth: 1
-                    )
-            }
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(
+                    FGColor.divider(calendarColorScheme).opacity(
+                        isInactiveCompleted
+                            ? (calendarColorScheme == .dark ? 0.42 : 0.56)
+                            : (calendarColorScheme == .dark ? 0.28 : 0.38)
+                    ),
+                    lineWidth: 1
+                )
         }
         .saturation(isInactiveCompleted ? 0.84 : 1)
         .opacity(isInactiveCompleted ? 0.94 : 1)
         .shadow(
             color: Color.black.opacity(
                 isInactiveCompleted
-                    ? (calendarColorScheme == .dark ? 0.06 : 0.02)
-                    : (calendarColorScheme == .dark ? 0.16 : 0.045)
+                    ? (calendarColorScheme == .dark ? 0.09 : 0.035)
+                    : (calendarColorScheme == .dark ? 0.20 : 0.065)
             ),
-            radius: isInactiveCompleted ? 4 : 8,
-            y: isInactiveCompleted ? 1 : 3
+            radius: isInactiveCompleted ? 5 : 10,
+            y: isInactiveCompleted ? 2 : 4
         )
         .onAppear {
             guard !deferExpensiveSections else { return }
             logCalendarScoringEventDebug(match)
         }
+    }
+
+    private var calendarCanUseAddToVenueShortcut: Bool {
+        viewModel.hasAuthenticatedVenueOwnerSession || viewModel.isVenueOwnerLoggedIn
+    }
+
+    /// Owner-visible venues for the chooser (active selectable; plan_locked shown locked).
+    private var calendarAddToVenueChooserVenues: [VenueProfileRow] {
+        viewModel.managedVenuesForOwner().filter { MapViewModel.venueIsOwnerVisibleManagedStatus($0) }
+    }
+
+    private var calendarAddToVenueSelectableVenues: [VenueProfileRow] {
+        viewModel.managedVenuesForOwner().filter { MapViewModel.venueIsActiveForBusinessLimit($0) }
+    }
+
+    private func calendarProGameCanImportToVenue(_ match: LiveMatch) -> Bool {
+        let id = match.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let home = match.homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = match.awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !id.isEmpty && !home.isEmpty && !away.isEmpty
+    }
+
+    private func calendarShouldShowAddToVenue(for match: LiveMatch) -> Bool {
+        calendarCanUseAddToVenueShortcut
+            && !calendarAddToVenueSelectableVenues.isEmpty
+            && calendarProGameCanImportToVenue(match)
+    }
+
+    private func calendarProGameAddToVenueButton(_ match: LiveMatch) -> some View {
+        Button {
+            handleCalendarAddToVenueTapped(match)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "building.2.fill")
+                    .font(.caption.weight(.bold))
+                Text(L10n.t("Add to Venue", languageCode: appLanguageRaw))
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(FGColor.accentBlue)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(FGColor.accentBlue.opacity(calendarColorScheme == .dark ? 0.16 : 0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(FGColor.accentBlue.opacity(calendarColorScheme == .dark ? 0.32 : 0.18), lineWidth: 1)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.t("Add to Venue", languageCode: appLanguageRaw))
+    }
+
+    private func handleCalendarAddToVenueTapped(_ match: LiveMatch) {
+        let selectable = calendarAddToVenueSelectableVenues
+        guard calendarProGameCanImportToVenue(match) else { return }
+        guard !selectable.isEmpty else { return }
+
+        if selectable.count == 1, let venueId = selectable.first?.id {
+            presentAddToVenueImport(match: match, venueId: venueId)
+            return
+        }
+
+        calendarAddToVenueChooser = CalendarAddToVenueChooserContext(match: match)
+    }
+
+    private func presentAddToVenueImport(match: LiveMatch, venueId: UUID) {
+        calendarAddToVenueImportPrefill = VenueOwnerScheduleImportPrefill(match: match, venueId: venueId)
     }
 
     private func calendarProGamePredictionFooter(for match: LiveMatch, prefetchEnabled: Bool) -> some View {

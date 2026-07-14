@@ -13,9 +13,16 @@ enum BusinessProfileLifecycleState: String, Equatable {
 
 extension MapViewModel {
 
-    static let deletedBusinessLoginBlockedTitle = "Business account deleted"
-    static let deletedBusinessLoginBlockedMessage =
-        "This FanGeo business account has been permanently deleted and cannot be used. To request account reactivation, contact FanGeo Support."
+    static let deletedBusinessLoginBlockedTitleKey = "business_account_deleted_title"
+    static let deletedBusinessLoginBlockedMessageKey = "business_account_deleted_message"
+
+    static var deletedBusinessLoginBlockedTitle: String {
+        L10n.t(deletedBusinessLoginBlockedTitleKey)
+    }
+
+    static var deletedBusinessLoginBlockedMessage: String {
+        L10n.t(deletedBusinessLoginBlockedMessageKey)
+    }
 
     static let deletedBusinessSupportRecipient = "support@fangeosports.com"
     static let deletedBusinessSupportSubject = "Deleted business account support request"

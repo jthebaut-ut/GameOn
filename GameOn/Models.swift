@@ -488,6 +488,13 @@ struct BusinessGameHistoryRow: Decodable, Identifiable {
 /// Shared rules for business “Add / update game” scheduling in the device’s local calendar/time zone.
 enum VenueOwnerGameScheduleValidation {
     static let futureDateTimeMessage = "Game time must be in the future."
+    static let endedImportedGameMessage = "This game has already ended."
+
+    /// Imported matches that are actively in progress may keep a kickoff already in the past.
+    /// Uses authoritative ``MatchStatus`` only — never infer liveness from start time alone.
+    static func allowsPastStartForImportedMatchStatus(_ status: MatchStatus?) -> Bool {
+        status?.isHappeningNow == true
+    }
 
     /// Calendar date + clock time from two pickers, interpreted in `calendar`’s local time zone.
     static func combinedLocalStart(gameDate: Date, gameStartTime: Date, calendar: Calendar = .current) -> Date {

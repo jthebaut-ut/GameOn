@@ -556,7 +556,7 @@ private struct AdminBusinessVenueDetailsSheet: View {
                 Text(venueLocation(venue))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(active ? "Active" : BusinessLimitCopy.planLockedVenueBadge)
+                Text(active ? "Active" : BusinessLimitCopy.planLockedVenueBadge())
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(active ? .green : .orange)
             }

@@ -84,6 +84,46 @@ nonisolated struct SavedProGame: Identifiable, Codable, Equatable {
         self.savedAt = savedAt
     }
 
+    /// Reconstructs a `LiveMatch` from saved Pro fields when no live cache row is available (for venue import handoff only).
+    func reconstructedLiveMatchForVenueImport() -> LiveMatch? {
+        let trimmedId = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let home = homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedId.isEmpty, !home.isEmpty, !away.isEmpty else { return nil }
+
+        return LiveMatch(
+            id: trimmedId,
+            source: source,
+            externalId: externalId,
+            sport: sport,
+            homeTeam: home,
+            awayTeam: away,
+            scoreHome: scoreHome,
+            scoreAway: scoreAway,
+            scoresAreAvailable: true,
+            matchStatus: matchStatus,
+            rawMatchStatus: rawMatchStatus,
+            minute: minute,
+            liveClockText: liveClockText,
+            league: league,
+            sourceLeagueName: nil,
+            eventName: nil,
+            leagueAlternate: nil,
+            sourceSportName: nil,
+            startTime: startTime,
+            venueName: nil,
+            venueCity: nil,
+            venueLatitude: nil,
+            venueLongitude: nil,
+            leagueCountry: nil,
+            tvBroadcasts: [],
+            timelineEvents: timelineEvents ?? [],
+            featuredEventSlug: featuredEventSlug,
+            homeTeamBadgeURL: nil,
+            awayTeamBadgeURL: nil
+        )
+    }
+
     var liveSportVisualType: LiveSportVisualType {
         LiveSportVisualType.normalize(sport)
     }
@@ -714,6 +754,15 @@ extension MapViewModel {
         logSavedProGameHydrationDebug(saved: saved, hydration: hydration, merged: merged)
 #endif
         return merged
+    }
+
+    /// Resolves a `LiveMatch` for Manage Games Import From Live Games (prefer live cache; else reconstruct from saved fields).
+    func liveMatchForVenueImport(from saved: SavedProGame) -> LiveMatch? {
+        let snapshot = currentSavedProGameSnapshot(saved)
+        if let match = freshestLiveMatch(for: snapshot)?.match {
+            return match
+        }
+        return snapshot.reconstructedLiveMatchForVenueImport()
     }
 
     func savedProGameDisplayStatusDebugSource(for saved: SavedProGame) -> (game: SavedProGame, source: String) {
