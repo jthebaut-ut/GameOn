@@ -26,6 +26,11 @@ enum EmailVerificationAccountKind: String {
     case business
 }
 
+/// One-time post-signup UI intents that survive email-confirm / root remount transitions.
+enum PostSignupPresentation: String, Equatable {
+    case discoverWelcomeGuide
+}
+
 enum AppleAuthAccountMode: String {
     case fan
     case business
@@ -89,6 +94,17 @@ final class MapViewModel: ObservableObject {
             scheduleDiscoverMapRenderSnapshotRebuild(reason: "debouncedDiscoverSearchText")
         }
     }
+    /// Optional venue-ID allowlist applied after selecting a Discover game/sport/league search result.
+    @Published var discoverSearchVenueIDFilter: Set<UUID>? = nil {
+        didSet {
+            guard oldValue != discoverSearchVenueIDFilter else { return }
+            discoverClusteredBarsCacheKey = nil
+            discoverClusteredBarsCache = nil
+            scheduleDiscoverMapRenderSnapshotRebuild(reason: "discoverSearchVenueIDFilter")
+        }
+    }
+    /// Compact status shown after applying a Discover venue-event search selection.
+    @Published var discoverSearchFilterStatusText: String? = nil
     @Published var favoriteVenueIDs: Set<UUID> = []
     @Published var interestedVenueEventKeys: Set<String> = []
     /// Prevents overlapping save/remove writes for the same venue while keeping the UI on the optimistic state.
@@ -266,6 +282,10 @@ final class MapViewModel: ObservableObject {
     @Published var pendingEmailVerificationKind: EmailVerificationAccountKind?
     @Published var emailVerificationMessage = ""
     @Published var emailVerificationError = ""
+    /// True while an email-confirmation deep link is being exchanged / routed.
+    @Published var resolvingEmailConfirmation = false
+    /// Non-blocking success notice after verification when the user must sign in manually.
+    @Published var emailVerifiedSignInNotice = ""
     var pendingFanEmailSignupDraft: PendingFanEmailSignupDraft?
     @Published var pendingBusinessEmailSignupDraft: PendingBusinessEmailSignupDraft?
     /// User explicitly chose to resume setup for the persisted draft email (Settings → Business auth sheet).
@@ -433,6 +453,11 @@ final class MapViewModel: ObservableObject {
     @Published var pendingClaimPrimarySport: String = ""
     /// Switched to Account tab + venue auth sheet from Discover claim intent (consumed by ``MainTabView`` / ``SettingsScreen``).
     @Published var switchToAccountForVenueClaim: Bool = false
+    /// One-shot post-signup Discover welcome-guide intent (account-scoped; consumed when the existing guide is presented).
+    @Published var postSignupPresentation: PostSignupPresentation?
+    var postSignupPresentationUserId: UUID?
+    /// Bumps when a newly created account should see the language selector (UserDefaults-backed pending id).
+    @Published var postAccountCreationLanguageSelectorRevision: Int = 0
     @Published var openVenueOwnerAuthSheetFromClaimFlow: Bool = false
     @Published var venueCoverPhotoURL = ""
     @Published var venueCoverPhotoThumbnailURL = ""
@@ -699,6 +724,8 @@ final class MapViewModel: ObservableObject {
     @Published var liveMatchesEmptyDebugHint: String?
     @Published var isUpdatingMapGames: Bool = false
     @Published var mapStatusText: String?
+    /// When true, ``mapStatusText`` is a failure/unavailable state (not success).
+    @Published var mapStatusIsError: Bool = false
     @Published var socialActionToastText: String?
     @Published var socialActionToastIsError: Bool = false
     var notificationPermissionMessage: String {
@@ -716,8 +743,11 @@ final class MapViewModel: ObservableObject {
     @Published var currentUserHomeCrowdVenueId: UUID?
     @Published var currentUserHomeCrowdVenue: HomeCrowdVenueSummary?
     @Published var fanXPRewardOverlay = FanXPRewardOverlayManager()
+    @Published var wowMomentOverlay = WowMomentOverlayManager()
     /// When set, ``PublicProfileOverlayWindowPresenter`` shows ``PublicUserProfilePreviewView`` in a top-level UIWindow (not a SwiftUI sheet).
     @Published var publicProfileSheetUserId: UUID?
+    /// True when the open public profile is the signed-in fan previewing their own public surface.
+    @Published var publicProfileIsSelfPreview: Bool = false
     /// Latest avatar-tap context for presentation debug (not shown in UI).
     @Published var publicProfilePresentationContext: String?
     @Published var eventLoadError: String?
@@ -760,6 +790,13 @@ final class MapViewModel: ObservableObject {
     @Published private(set) var discoverMapRenderSnapshot = DiscoverMapRenderSnapshot.empty
     /// Monotonic fence for detached Discover map snapshot builds; only the latest request may publish.
     var discoverMapRenderSnapshotGeneration: UInt64 = 0
+    /// Settled reverse-geocode / pin-derived locality for the current Discover viewport (never profile home).
+    @Published var discoverSettledViewedLocalityLabel: String? = nil
+    /// Coarse center bucket for ``discoverSettledViewedLocalityLabel`` (~0.05°).
+    var discoverViewedLocalityCenterBucket: (lat: Int, lng: Int)?
+    var discoverViewedLocalityResolveTask: Task<Void, Never>?
+    /// Hysteresis latch for Nearby vs Viewing (nil until first distance sample).
+    var discoverActivityPanelNearUserLatched: Bool?
     /// Bottom-tab Calendar selected (updated by ``MainTabView``); gates calendar-only preload/enrichment while tab is preserved off-screen.
     var isCalendarTabSelected = false
     var isLiveTabSelected = false
@@ -790,7 +827,7 @@ final class MapViewModel: ObservableObject {
     @Published var calendarDotDates: Set<Date> = []
     /// Discover calendar overlay: venue ``venue_events`` days from RPC (green dots; Venues map mode only).
     @Published var venueGameCalendarDotDates: Set<Date> = []
-    /// Discover calendar overlay: pickup ``game_start_at`` days in the month window (blue dots; Pickup games map mode only).
+    /// Discover calendar overlay: pickup ``game_start_at`` days with at least one map-eligible game in the current viewport (orange dots; Pickup games map mode).
     @Published var pickupGameCalendarDotDates: Set<Date> = []
     /// Bottom-tab Calendar Pro Games days loaded with a lightweight `live_matches.start_time` query.
     @Published var proGameCalendarDotDates: Set<Date> = []
@@ -927,6 +964,12 @@ final class MapViewModel: ObservableObject {
     /// Pro game reminder notification tap → Going tab / Pro Games / match detail.
     @Published var pendingProGameNotificationDeepLink: ProGameNotificationDeepLinkRequest?
     @Published var pendingSupportReplyNotificationDeepLink: SupportReplyNotificationDeepLinkRequest?
+    /// Discover Activity Panel → Going / Account focus (consumed once by destination screens).
+    @Published var pendingDiscoverTodayDashboardNav: DiscoverTodayDashboardNavIntent?
+    /// Discover match-detail → Schedule Pro Games handoff (consumed once by CalendarScreen).
+    @Published var pendingScheduleProGameNav: ScheduleProGameNavIntent?
+    /// Brief Schedule Pro Games card highlight after Discover handoff.
+    @Published var scheduleProGameHighlightStableKey: String?
     /// Eligible Discover banner announcements for carousel presentation (sorted).
     @Published var discoverBannerAnnouncements: [FanGeoAnnouncement] = []
     /// Resolved promoted venues for sponsored announcement cards (outside current map bounds).
@@ -1043,8 +1086,9 @@ final class MapViewModel: ObservableObject {
     @Published var pickupJoinRequesterAvatarTokenByUserId: [UUID: UUID] = [:]
     /// Discover map segmented control: venue clusters vs pickup pins only.
     @Published var discoverMapContentMode: DiscoverMapContentMode = .venues
-    /// Pickup-only sub-toggle: user-created games vs physical places to play.
-    @Published var discoverPickupSubMode: DiscoverPickupSubMode = .games {
+    /// Pickup-only sub-toggle: physical places to play vs user-created games.
+    /// Defaults to Places (broad browse), matching Watch’s All Spots default.
+    @Published var discoverPickupSubMode: DiscoverPickupSubMode = .places {
         didSet {
             guard oldValue != discoverPickupSubMode else { return }
             selectedBar = nil
@@ -1269,6 +1313,11 @@ final class MapViewModel: ObservableObject {
 
     /// Cancels stale debounced Discover search updates when ``searchText`` changes quickly.
     var discoverSearchDebounceTask: Task<Void, Never>?
+    /// Skips one empty-search filter clear so applying a game result can clear the query without wiping the venue filter.
+    var suppressDiscoverSearchFilterClearOnce = false
+    /// Cached selected-date venue-event search index (invalidated when day/events/venues change).
+    var discoverVenueEventSearchIndexCache: DiscoverVenueEventSearch.Index?
+    var discoverVenueEventSearchIndexCacheKey: String?
 
     /// Discover-only: when set, ``pruneSelectionIfNeededAfterFilterChange()`` keeps ``selectedBar`` even if this id is absent from ``bars`` (remote text search venue with no games — not a default map pin).
     var discoverRemotePreviewHoldVenueId: UUID?

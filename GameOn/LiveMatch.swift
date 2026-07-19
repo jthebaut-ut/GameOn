@@ -2370,6 +2370,8 @@ nonisolated enum LiveLeagueCountryResolver {
 
 nonisolated enum LiveLeagueCountryFilterPreference {
     static let appStorageKey = "liveLeagueCountryFilterSelection.v1"
+    /// Marks that first-use location default (or an explicit user change) has been applied.
+    static let initializedKey = "liveLeagueCountryFilterInitialized.v2"
 
     static func decode(from raw: String) -> Set<String> {
         Set(
@@ -2382,6 +2384,233 @@ nonisolated enum LiveLeagueCountryFilterPreference {
     static func encode(_ countries: Set<String>) -> String {
         countries.sorted().joined(separator: "\n")
     }
+
+    static var isInitialized: Bool {
+        UserDefaults.standard.bool(forKey: initializedKey)
+    }
+
+    static func markInitialized() {
+        UserDefaults.standard.set(true, forKey: initializedKey)
+    }
+
+    /// First-use only: seed from resolved country when the user has never set an explicit choice.
+    /// Returns a new encoded value when the default should be written; otherwise `nil`.
+    static func firstUseDefaultEncodedSelection(
+        currentRaw: String,
+        resolvedCountry: String?
+    ) -> String? {
+        guard !isInitialized else { return nil }
+        markInitialized()
+
+        let existing = decode(from: currentRaw)
+        guard existing.isEmpty else { return nil }
+        guard let country = resolvedCountry else { return nil }
+
+        if LiveLeagueCountryFilterPresentation.northAmericaPreset.contains(country) {
+            return encode(LiveLeagueCountryFilterPresentation.northAmericaPreset)
+        }
+        return encode([country])
+    }
+}
+
+/// Shared Live / Schedule presentation helpers for country filter labels and “Near you” suggestions.
+/// Does not change filter semantics or persistence keys.
+enum LiveLeagueCountryFilterPresentation {
+    nonisolated static let northAmericaPreset: Set<String> = ["United States", "Canada", "Mexico"]
+    nonisolated static let topEuropePreset: Set<String> = ["England", "France", "Spain", "Germany", "Italy"]
+
+    enum PresetSelectionState: Equatable {
+        case none
+        case partial
+        case full
+    }
+
+    /// Live Now header place presentation (Option 3).
+    /// - `inline`: single country or exact named region → embed in title.
+    /// - `summary`: multi-country compact line → secondary filter line.
+    enum LiveHeaderPlaceMode: Equatable {
+        case none
+        case inline(String)
+        case summary(String)
+    }
+
+    /// Localized place label for legacy single-line consumers.
+    /// Multi-country selections resolve to the generic “selected countries” phrase.
+    /// Schedule/Live headers use ``liveHeaderPlaceMode(for:languageCode:)`` instead.
+    static func placeLabel(for selected: Set<String>, languageCode: String) -> String? {
+        guard !selected.isEmpty else { return nil }
+        if selected.count == 1, let only = selected.first {
+            return only
+        }
+        if selected == northAmericaPreset {
+            return L10n.t("live_region_north_america", languageCode: languageCode)
+        }
+        if selected == topEuropePreset {
+            return L10n.t("live_region_europe", languageCode: languageCode)
+        }
+        return L10n.t("live_selected_countries", languageCode: languageCode)
+    }
+
+    /// Live-only Option 3 place mode: keep elegant single-place titles; use a compact summary for multi-select.
+    static func liveHeaderPlaceMode(for selected: Set<String>, languageCode: String) -> LiveHeaderPlaceMode {
+        guard !selected.isEmpty else { return .none }
+        if selected.count == 1, let only = selected.first {
+            return .inline(only)
+        }
+        if selected == northAmericaPreset {
+            return .inline(L10n.t("live_region_north_america", languageCode: languageCode))
+        }
+        if selected == topEuropePreset {
+            return .inline(L10n.t("live_region_europe", languageCode: languageCode))
+        }
+        return .summary(multiCountrySummaryLine(for: selected, languageCode: languageCode))
+    }
+
+    /// Canonical sorted display for multi-country Live filter line.
+    /// 2–3 countries: `A • B • C`. 4+: `First +N more`.
+    static func multiCountrySummaryLine(for selected: Set<String>, languageCode: String) -> String {
+        let ordered = selected.sorted()
+        guard !ordered.isEmpty else { return "" }
+        if ordered.count <= 3 {
+            return ordered.joined(separator: " • ")
+        }
+        return String(
+            format: L10n.t("live_country_summary_plus_more_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            ordered[0],
+            ordered.count - 1
+        )
+    }
+
+    /// Spoken accessibility phrase for multi-country selections (no bullet separators).
+    static func multiCountryAccessibilitySummary(for selected: Set<String>, languageCode: String) -> String {
+        let ordered = selected.sorted()
+        guard !ordered.isEmpty else { return "" }
+        if ordered.count <= 3 {
+            return ListFormatter.localizedString(byJoining: ordered)
+        }
+        return String(
+            format: L10n.t("live_country_a11y_plus_more_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            ordered[0],
+            ordered.count - 1
+        )
+    }
+
+    static func presetSelectionState(_ preset: Set<String>, in selected: Set<String>) -> PresetSelectionState {
+        let overlap = selected.intersection(preset)
+        if overlap.isEmpty { return .none }
+        if overlap == preset { return .full }
+        return .partial
+    }
+
+    /// Toggle a single country in the canonical selected set (additive multi-select).
+    static func toggling(_ country: String, in selected: Set<String>) -> Set<String> {
+        var next = selected
+        if next.contains(country) {
+            next.remove(country)
+        } else {
+            next.insert(country)
+        }
+        return next
+    }
+
+    /// Add or remove an entire regional preset without clearing unrelated countries.
+    static func togglingPreset(_ preset: Set<String>, in selected: Set<String>) -> Set<String> {
+        var next = selected
+        if preset.isSubset(of: next) {
+            next.subtract(preset)
+        } else {
+            next.formUnion(preset)
+        }
+        return next
+    }
+
+    /// Resolve a country suggestion for the picker without prompting for location or reverse-geocoding.
+    /// Prefer in-memory device country when provided; otherwise profile/home country, then locale region.
+    static func suggestedNearYouCountry(
+        deviceCountryInMemory: String? = nil,
+        homeCountry: String?,
+        homeRegion: String? = nil,
+        localeRegionCode: String? = nil
+    ) -> String? {
+        if let fromDevice = canonicalFilterCountry(deviceCountryInMemory) {
+            return fromDevice
+        }
+        if let fromHome = canonicalFilterCountry(homeCountry) {
+            return fromHome
+        }
+        if let fromRegion = unitedStatesIfUSSubdivision(homeRegion) {
+            return fromRegion
+        }
+        if let fromLocale = countryName(forRegionCode: localeRegionCode) {
+            return fromLocale
+        }
+        return nil
+    }
+
+    static func deviceLocaleRegionCode() -> String? {
+        let code = Locale.current.region?.identifier.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return code.isEmpty ? nil : code
+    }
+
+    private static func canonicalFilterCountry(_ raw: String?) -> String? {
+        guard let normalized = LiveLeagueCountryResolver.normalizedCountry(raw) else { return nil }
+        if let us = unitedStatesIfUSSubdivision(normalized) {
+            return us
+        }
+        let lower = normalized.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current).lowercased()
+        if lower == "united kingdom" || lower == "great britain" || lower == "britain" {
+            return "England"
+        }
+        // Prefer catalog / preset names so the suggestion matches the filter list.
+        if LiveLeagueCountryResolver.presetCountries.contains(normalized) {
+            return normalized
+        }
+        if CountryFlagHelper.isCountry(normalized) {
+            return normalized
+        }
+        return nil
+    }
+
+    private static func countryName(forRegionCode code: String?) -> String? {
+        let trimmed = code?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        switch trimmed {
+        case "US", "USA":
+            return "United States"
+        case "GB", "UK":
+            return "England"
+        default:
+            let english = Locale(identifier: "en_US").localizedString(forRegionCode: trimmed)
+            return canonicalFilterCountry(english)
+        }
+    }
+
+    private static func unitedStatesIfUSSubdivision(_ raw: String?) -> String? {
+        let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !value.isEmpty else { return nil }
+        let normalized = value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+        if usStateNamesAndAbbreviations.contains(normalized) {
+            return "United States"
+        }
+        return nil
+    }
+
+    private static let usStateNamesAndAbbreviations: Set<String> = [
+        "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia", "ks", "ky",
+        "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd",
+        "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy", "dc",
+        "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut", "delaware",
+        "florida", "georgia", "hawaii", "idaho", "illinois", "indiana", "iowa", "kansas", "kentucky",
+        "louisiana", "maine", "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+        "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey", "new mexico",
+        "new york", "north carolina", "north dakota", "ohio", "oklahoma", "oregon", "pennsylvania",
+        "rhode island", "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
+        "virginia", "washington", "west virginia", "wisconsin", "wyoming", "district of columbia"
+    ]
 }
 
 nonisolated struct FeaturedEvent: Identifiable, Equatable, Codable, Sendable {

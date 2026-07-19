@@ -458,6 +458,25 @@ extension MapViewModel {
         await refreshVenueGameCardGoingState(venueEventID: wireEventID)
 
         if targetGoing {
+            await MainActor.run {
+                let snapshot = venueGameCardSnapshotStore.snapshot(for: wireEventID)
+                let total: Int
+                let includesSelf: Bool
+                if let snapshot {
+                    // Server row count after refresh includes the current user when going.
+                    total = snapshot.goingCount
+                    includesSelf = snapshot.isCurrentUserGoing
+                } else {
+                    // Optimistic local count already +1'd for the current user.
+                    total = interestCountForVenueEvent(wireEventID)
+                    includesSelf = isInterestedInVenueEvent(wireEventID)
+                }
+                presentGoingWowMoment(
+                    totalGoingCount: total,
+                    includesCurrentUser: includesSelf,
+                    venueEventID: wireEventID
+                )
+            }
             await addGameToCalendar(
                 title: gameTitle,
                 date: eventDate,

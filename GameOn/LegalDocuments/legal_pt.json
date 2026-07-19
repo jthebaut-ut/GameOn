@@ -1,0 +1,145 @@
+{
+  "lastUpdatedLabel": "Última atualização: 18 de junho de 2026",
+  "documents": {
+    "privacyPolicy": [
+      {
+        "heading": "Visão geral",
+        "body": "Esta Política de Privacidade explica como a FanGeo recolhe, utiliza, partilha e conserva informações quando utiliza a aplicação FanGeo."
+      },
+      {
+        "heading": "Dados da conta e do perfil",
+        "body": "Recolhemos as informações que fornece ou cria para a sua conta, tais como endereço de e-mail, nome apresentado, nome de utilizador, biografia, avatar, identificadores de autenticação, equipas favoritas, locais guardados, jogos guardados, sinais de presença ou interesse, preferências de notificações, definições de visibilidade em direto, bloqueios, denúncias e dados de perfil ou preferências semelhantes."
+      },
+      {
+        "heading": "Localização e descoberta",
+        "body": "A FanGeo pode utilizar a localização do seu dispositivo, a região do mapa, a cidade pesquisada ou a localização de um local para lhe mostrar bares desportivos próximos, jogos, atividade de jogos improvisados e atividade local de adeptos. Pode controlar o acesso à localização do dispositivo nas Definições do iOS. As fichas de locais e de negócios podem incluir moradas, coordenadas, fotografias, horários, dados de contacto e informações de reivindicação ou de propriedade submetidas pelos proprietários dos locais."
+      },
+      {
+        "heading": "Mensagens, Fan Chats e conteúdo dos utilizadores",
+        "body": "A FanGeo processa conteúdo gerado pelos utilizadores, como mensagens diretas, conversas privadas, Fan Chats, comentários, publicações sobre locais ou eventos, fotografias, denúncias e metadados relacionados, para que a aplicação possa entregar as conversas, preservar o contexto das discussões, fazer cumprir as regras de segurança, investigar abusos e manter a integridade do serviço."
+      },
+      {
+        "heading": "Denúncias e moderação",
+        "body": "Quando denuncia um utilizador, comentário, mensagem, conversa, local ou outro conteúdo, processamos a sua denúncia, o motivo selecionado, os detalhes opcionais, o conteúdo denunciado, o contexto da mensagem ou da conversa quando suportado, os registos de data e hora, os identificadores de conta e o estado de moderação. Os registos de moderação podem ser conservados para proteger os utilizadores, fazer cumprir as regras e cumprir obrigações legais ou da App Store."
+      },
+      {
+        "heading": "Anúncios, análise e diagnósticos",
+        "body": "A FanGeo utiliza o Google AdMob para apresentar anúncios. O AdMob pode receber informações sobre o dispositivo, a interação com os anúncios, a localização aproximada e o identificador de publicidade, consoante as definições do seu dispositivo e as suas escolhas de consentimento. A FanGeo também pode utilizar diagnósticos da aplicação, registos, dados de desempenho e informações relacionadas com falhas para depurar, prevenir abusos e melhorar a fiabilidade. Os registos de depuração destinam-se a operações e testes, não à venda de informações pessoais."
+      },
+      {
+        "heading": "Serviços de terceiros",
+        "body": "A FanGeo apoia-se em prestadores de serviços como a Supabase para autenticação, base de dados, armazenamento, funcionalidades em tempo real e funções edge; a Google AdMob para anúncios; os serviços da plataforma Apple; e fornecedores de dados desportivos como a TheSportsDB para calendários e dados de jogos em direto. Estes prestadores processam os dados na medida necessária para fornecer os seus serviços."
+      },
+      {
+        "heading": "Eliminação da conta",
+        "body": "Ao eliminar a sua conta, o seu perfil público e as suas preferências pessoais são removidos ou anonimizados. Algumas mensagens, comentários, denúncias e registos de moderação podem ser conservados e apresentados como «Deleted User» para preservar a integridade das conversas, a segurança e os registos legais ou de conformidade. As contas eliminadas não podem voltar a iniciar sessão, a menos que o suporte da FanGeo restaure ou reative a conta."
+      },
+      {
+        "heading": "Conservação de dados",
+        "body": "Conservamos os dados da conta e da aplicação enquanto for necessário para operar a FanGeo, fornecer as funcionalidades solicitadas, prevenir abusos, resolver litígios, cumprir a lei e manter registos de segurança. Os prazos de conservação variam consoante o tipo de dados. O conteúdo público ou partilhado pode permanecer após a eliminação quando for necessário para preservar conversas, denúncias, histórico de moderação, registos de locais, reivindicações de negócios ou registos legais ou de conformidade."
+      },
+      {
+        "heading": "Contacto",
+        "body": "Para questões de privacidade ou eliminação, contacte support@fangeosports.com ou utilize o canal de suporte disponível na aplicação."
+      }
+    ],
+    "termsOfService": [
+      {
+        "heading": "Visão geral",
+        "body": "Estes Termos de Serviço regem a sua utilização da FanGeo. Ao utilizar a aplicação, criar uma conta, publicar conteúdo, enviar mensagens, submeter denúncias, reivindicar um local ou gerir a ficha de um negócio, concorda em cumprir estes termos."
+      },
+      {
+        "heading": "Normas da comunidade e utilização aceitável",
+        "body": "A FanGeo tem tolerância zero para conteúdo censurável ou utilizadores abusivos. Os utilizadores não podem publicar, carregar, enviar ou partilhar conteúdo que inclua assédio, discurso de ódio, ameaças, intimidação, exploração sexual, conteúdo ilegal, spam, personificação, comportamento abusivo ou outro material censurável.\n\nOs utilizadores podem denunciar conteúdo censurável ou utilizadores abusivos na aplicação. A FanGeo pode remover conteúdo, restringir o acesso, suspender contas ou encerrar permanentemente as contas que violem estes Termos ou as Normas da Comunidade."
+      },
+      {
+        "heading": "Utilização aceitável",
+        "body": "Utilize a FanGeo apenas para fins lícitos, pessoais e legítimos relacionados com fichas de negócios. Não faça uso indevido do serviço, não envie spam, não realize scraping, rastreio ou recolha de dados, não manipule a afluência ou as avaliações, não interfira com a segurança da aplicação, não contorne os controlos de acesso, nem tente aceder a contas, mensagens, denúncias, ferramentas de administração, ferramentas de locais ou dados que não está autorizado a utilizar."
+      },
+      {
+        "heading": "Conteúdo do utilizador",
+        "body": "É responsável pelo conteúdo que cria, carrega, envia ou submete, incluindo dados de perfil, avatares, Fan Chats, mensagens diretas, denúncias, atividade de jogos improvisados, fotografias de locais, informações de negócios e calendários de jogos dos locais. Mantém os seus direitos de propriedade, mas concede à FanGeo autorização para alojar, apresentar, armazenar, moderar, reproduzir e distribuir o seu conteúdo na medida necessária para operar, melhorar e proteger o serviço."
+      },
+      {
+        "heading": "Sem assédio nem condutas inseguras",
+        "body": "A rivalidade desportiva e o debate acalorado são bem-vindos. Não são permitidos o assédio, as ameaças, o discurso de ódio, o doxxing, a exploração sexual, o abuso direcionado, a personificação, a perseguição, as fraudes nem o incentivo a comportamentos ilegais ou inseguros. Não utilize a FanGeo para organizar encontros inseguros nem para pressionar os utilizadores a partilharem informações privadas."
+      },
+      {
+        "heading": "Reivindicações de locais e de negócios",
+        "body": "Se reivindicar ou gerir um local, uma conta de negócio ou uma localização, confirma que está autorizado a fazê-lo e que as informações que submete são exatas. A FanGeo pode analisar, recusar, aprovar, arquivar, remover ou limitar reivindicações ou fichas de locais e negócios que sejam inexatas, fraudulentas, duplicadas, inseguras, inativas ou que violem estes termos."
+      },
+      {
+        "heading": "Moderação e aplicação",
+        "body": "A FanGeo pode analisar denúncias, remover ou ocultar conteúdo, restringir funcionalidades, bloquear o acesso, suspender contas, eliminar contas, conservar registos ou tomar outras medidas quando considerar que estes termos, as Normas da Comunidade, as regras de segurança, a lei ou os requisitos da App Store foram violados. Também podemos conservar conteúdo ou registos quando for necessário por motivos de segurança, conformidade, resolução de litígios ou razões legais."
+      },
+      {
+        "heading": "Limitações da aplicação",
+        "body": "A FanGeo é fornecida «tal como está», na medida permitida por lei. Não garantimos um serviço ininterrupto, dados exatos dos locais, calendários desportivos completos, disponibilidade de anúncios, resultados das denúncias, nem que todos os utilizadores ou locais atuem de forma segura. As funcionalidades podem ser alteradas, limitadas ou descontinuadas."
+      }
+    ],
+    "communityGuidelines": [
+      {
+        "heading": "Rivalidade desportiva, sim; abuso, não",
+        "body": "Torça com força, debata sobre as equipas e provoque em relação ao marcador, mas não vise as pessoas com assédio, ameaças, discurso de ódio, insultos, intimidação, perseguição, comentários de teor sexual ou contacto indesejado repetido."
+      },
+      {
+        "heading": "Não permitido",
+        "body": "- Assédio, intimidação, ameaças ou abuso direcionado\n- Discurso de ódio, racismo, insultos ou discriminação\n- Doxxing, partilha de informações privadas ou pressão sobre os utilizadores para revelarem dados pessoais\n- Personificação de utilizadores, locais, equipas, ligas, FanGeo ou figuras públicas\n- Spam, fraudes, phishing, falsas promoções, scraping ou publicações disruptivas repetidas\n- Comportamento inseguro em encontros, coação, perseguição ou incentivo à violência ou a atos ilegais\n- Exploração sexual, conteúdo explícito ou conteúdo que envolva menores"
+      },
+      {
+        "heading": "Fan Chats e comentários",
+        "body": "Mantenha os Fan Chats e os comentários sobre locais ou eventos úteis para o público desportivo local. Não desvie as discussões com spam, ataques pessoais, informações falsas sobre locais ou abuso coordenado. Os comentários podem ser ocultados, removidos ou analisados quando denunciados ou quando parecerem violar estas normas."
+      },
+      {
+        "heading": "DMs e interações entre amigos",
+        "body": "As mensagens diretas destinam-se a conversas respeitosas com pessoas que aceitaram uma ligação de amizade. Não envie mensagens abusivas, ameaçadoras, de teor sexual, fraudulentas, de spam nem mensagens indesejadas de forma repetida. Se alguém lhe pedir para parar, pare."
+      },
+      {
+        "heading": "Denunciar e bloquear",
+        "body": "Denuncie utilizadores, comentários, mensagens ou conversas abusivas utilizando as ferramentas de denúncia da aplicação, quando disponíveis. Bloqueie os utilizadores que não devem contactá-lo. As denúncias ajudam a FanGeo a analisar questões de segurança, mas devem ser verdadeiras e feitas de boa-fé."
+      },
+      {
+        "heading": "Aplicação das normas",
+        "body": "A FanGeo pode avisar os utilizadores, remover conteúdo, ocultar comentários, restringir as mensagens, suspender contas, eliminar contas, conservar denúncias ou tomar outras medidas consoante a gravidade, o contexto e a reincidência."
+      },
+      {
+        "heading": "O seu acordo",
+        "body": "Ao utilizar a FanGeo, concorda em seguir estas normas e em ajudar a manter uma comunidade desportiva respeitosa."
+      }
+    ],
+    "safetyReporting": [
+      {
+        "heading": "Visão geral",
+        "body": "A sua segurança é importante. A FanGeo disponibiliza ferramentas de denúncia e bloqueio para comportamentos abusivos, UGC, DMs, Fan Chats, comentários, conversas e questões relacionadas com locais, quando suportadas na aplicação. As denúncias são analisadas ao abrigo das Normas da Comunidade da FanGeo."
+      },
+      {
+        "heading": "O que pode denunciar",
+        "body": "Utilize as ações de denúncia ou sinalização na aplicação, quando disponíveis, incluindo denúncias de utilizadores, comentários de Fan Chats, mensagens diretas, conversas, fichas de locais e conteúdo de locais ou eventos. Detalhes claros e exatos ajudam os moderadores a compreender o que aconteceu."
+      },
+      {
+        "heading": "Comentários e novidades dos adeptos",
+        "body": "Cada utilizador pode ter uma denúncia ativa por comentário. Pode remover uma denúncia acidental tocando novamente na bandeira vermelha antes de os limiares se aplicarem. Várias denúncias ativas distintas podem acionar a ocultação automática da visualização pública enquanto o conteúdo é analisado. Se um comentário já tiver sido ocultado automaticamente, remover uma denúncia não o restaura automaticamente."
+      },
+      {
+        "heading": "Denúncia de conversas privadas",
+        "body": "A partir de um chat direto, pode denunciar a conversa ou o conteúdo de mensagem suportado para análise por um moderador. As denúncias de DMs podem incluir apenas a janela de análise selecionada, juntamente com os metadados relacionados necessários para avaliar a denúncia. A submissão de uma denúncia não bane automaticamente um utilizador, não elimina mensagens, não oculta o chat nem notifica a pessoa que denunciou. A FanGeo pode aplicar períodos de espera, limites a denúncias duplicadas e verificações de prevenção de abusos."
+      },
+      {
+        "heading": "Bloqueio",
+        "body": "Os utilizadores podem bloquear outros utilizadores para impedir que interajam consigo onde o bloqueio for suportado, incluindo as superfícies de chat direto. O bloqueio limita o contacto indesejado na FanGeo; não impede que alguém o contacte fora da FanGeo."
+      },
+      {
+        "heading": "Análise de moderação",
+        "body": "A análise de moderação pode incluir os detalhes da denúncia, os identificadores de conta do denunciante e do denunciado, os registos de data e hora, os motivos selecionados, os comentários ou mensagens denunciados, um contexto envolvente limitado, as decisões de moderação e os registos necessários para a segurança ou a conformidade. Os registos de moderação podem ser conservados por motivos de segurança. Os moderadores podem avisar os utilizadores, ocultar ou eliminar conteúdo, restringir funcionalidades, restringir utilizadores abusivos, suspender contas, eliminar contas ou conservar registos consoante a gravidade e a reincidência."
+      },
+      {
+        "heading": "Conformidade com a App Store",
+        "body": "A FanGeo inclui mecanismos de denúncia na aplicação e de escalonamento de moderação para UGC e mensagens privadas. Os utilizadores podem bloquear outros utilizadores para impedir que interajam consigo onde o bloqueio for suportado na aplicação."
+      },
+      {
+        "heading": "Emergências",
+        "body": "Se você ou outra pessoa estiver em perigo imediato, contacte imediatamente os serviços de emergência locais. A FanGeo não é um serviço de crise e não pode substituir a polícia, os serviços médicos ou outros socorristas de emergência."
+      }
+    ]
+  }
+}

@@ -1841,10 +1841,7 @@ private final class DirectChatPresenter: ObservableObject {
 }
 
 private enum DirectChatQuickReactions {
-    static let emojis: [String] = [
-        "👍", "❤️", "😂", "🔥", "⚽", "🏀", "🏈", "🏆", "🎉", "👀", "🙌", "😮", "🍻",
-        "⚾", "🎾", "🏒", "🥊"
-    ]
+    static let emojis: [String] = ChatQuickReactions.emojis
 }
 
 struct DirectChatView: View {
@@ -1959,98 +1956,18 @@ struct DirectChatView: View {
     }
 
     var body: some View {
-        ZStack {
-            FGColor.screenGradient(colorScheme)
-                .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                chatPrimaryContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                if hasVisibleThreadBanner {
-                    chatThreadStatusStack
+        directChatInteractiveRoot
+            // Composer must attach to the topmost interactive chat container so SwiftUI's
+            // keyboard safe area can lift it. Do not ignore keyboard anywhere above this.
+            .safeAreaInset(edge: .bottom, spacing: 8) {
+                composer
+            }
+            .onChange(of: composerFocused) { _, focused in
+                if focused {
+                    dismissChatOverflow()
                 }
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 8) {
-            composer
-        }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarBackground(.thinMaterial, for: .navigationBar)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                HStack(spacing: FGSpacing.sm) {
-                    ProfileAvatarView(preview: resolvedFriendPreview, size: 34)
-
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(resolvedFriendPreview.displayName)
-                            .font(FGTypography.cardTitle)
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
-                            .lineLimit(1)
-
-                        Text(chatHeaderSubtitle)
-                            .font(FGTypography.metadata)
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .lineLimit(1)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    resignComposerFirstResponder()
-                    composerFocused = false
-                    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                        if chatOverflowPhase == .hidden {
-                            chatOverflowPhase = .actions
-                        } else {
-                            chatOverflowPhase = .hidden
-                        }
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle.fill")
-                        .font(.system(size: 20, weight: .semibold))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .frame(width: 34, height: 34)
-                        .background(FGColor.cardBackground(colorScheme))
-                        .clipShape(Circle())
-                        .overlay {
-                            Circle()
-                                .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-                        }
-                        .accessibilityLabel("Chat options")
-                }
-                .buttonStyle(.plain)
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: ChatOverflowAnchorKey.self,
-                            value: geo.frame(in: .global)
-                        )
-                    }
-                )
-            }
-        }
-        .onPreferenceChange(ChatOverflowAnchorKey.self) { rect in
-            overflowAnchorGlobal = rect
-        }
-        .overlay(alignment: .topTrailing) {
-            if chatOverflowPhase != .hidden {
-                chatOverflowChromeOverlay
-                    .transition(.scale(scale: 0.96, anchor: .topTrailing).combined(with: .opacity))
-                    .zIndex(10)
-            }
-        }
-        .zIndex(chatOverflowPhase != .hidden ? 50 : 0)
-        .animation(.spring(response: 0.42, dampingFraction: 0.88), value: chatOverflowPhase)
-        .onChange(of: composerFocused) { _, focused in
-            if focused {
-                dismissChatOverflow()
-            }
-        }
-        .task(id: directChatThreadTaskIdentity) {
+            .task(id: directChatThreadTaskIdentity) {
             presenter.bindChatViewModel(chatViewModel)
             await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
             resolvedFriendOverride = await chatViewModel.resolveDmParticipantPreview(
@@ -2083,6 +2000,12 @@ struct DirectChatView: View {
             }
         }
         .onAppear {
+#if DEBUG
+            print("[DirectChatNav] directChatAppear")
+            print(
+                "[DirectChatNav] setActive peerPresent=true conversationPresent=\(presenter.conversationId != nil || presenter.friend.dmConversationId != nil)"
+            )
+#endif
             chatViewModel.hidesFloatingTabBarForDirectChat = true
             DMRealtimeDiagnostics.debug("scenePhase=directChatAppear")
             DMRealtimeDiagnostics.debug("activeConversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") scenePhase=directChatAppear")
@@ -2123,6 +2046,9 @@ struct DirectChatView: View {
             }
         }
         .onDisappear {
+#if DEBUG
+            print("[DirectChatNav] directChatDisappear reason=viewOnDisappear")
+#endif
             chatViewModel.hidesFloatingTabBarForDirectChat = false
             chatOverflowPhase = .hidden
             DMRealtimeDiagnostics.debug("scenePhase=directChatDisappear")
@@ -2216,6 +2142,96 @@ struct DirectChatView: View {
             print("[PrivateReportConsent] consent_checked=\(checked)")
             #endif
         }
+    }
+
+    /// Interactive Direct Chat chrome (messages + nav). Decorative background may ignore all
+    /// safe areas as a leaf; keyboard region stays active on this interactive container for
+    /// the outer ``safeAreaInset`` composer lift.
+    private var directChatInteractiveRoot: some View {
+        VStack(spacing: 0) {
+            chatPrimaryContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if hasVisibleThreadBanner {
+                chatThreadStatusStack
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background {
+            // Decorative leaf only — full edge-to-edge. Interactive content above keeps keyboard safe area.
+            FGColor.screenGradient(colorScheme)
+                .ignoresSafeArea()
+        }
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarBackground(.thinMaterial, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: FGSpacing.sm) {
+                    ProfileAvatarView(preview: resolvedFriendPreview, size: 34)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(resolvedFriendPreview.displayName)
+                            .font(FGTypography.cardTitle)
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(1)
+
+                        Text(chatHeaderSubtitle)
+                            .font(FGTypography.metadata)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    resignComposerFirstResponder()
+                    composerFocused = false
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                        if chatOverflowPhase == .hidden {
+                            chatOverflowPhase = .actions
+                        } else {
+                            chatOverflowPhase = .hidden
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .frame(width: 34, height: 34)
+                        .background(FGColor.cardBackground(colorScheme))
+                        .clipShape(Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+                        }
+                        .accessibilityLabel("Chat options")
+                }
+                .buttonStyle(.plain)
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(
+                            key: ChatOverflowAnchorKey.self,
+                            value: geo.frame(in: .global)
+                        )
+                    }
+                )
+            }
+        }
+        .onPreferenceChange(ChatOverflowAnchorKey.self) { rect in
+            overflowAnchorGlobal = rect
+        }
+        .overlay(alignment: .topTrailing) {
+            if chatOverflowPhase != .hidden {
+                chatOverflowChromeOverlay
+                    .transition(.scale(scale: 0.96, anchor: .topTrailing).combined(with: .opacity))
+                    .zIndex(10)
+            }
+        }
+        .zIndex(chatOverflowPhase != .hidden ? 50 : 0)
+        .animation(.spring(response: 0.42, dampingFraction: 0.88), value: chatOverflowPhase)
     }
 
     @ViewBuilder
@@ -3225,10 +3241,6 @@ struct DirectChatView: View {
                     tint: FGColor.secondaryText(colorScheme)
                 )
             }
-            if showEmojiQuickTray {
-                quickReactionTray
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
 #if DEBUG
             if presenter.loadError == nil, presenter.conversationId != nil {
                 RealtimeConnectionStatusView(status: presenter.realtimeConnectionStatus)
@@ -3237,168 +3249,38 @@ struct DirectChatView: View {
                     .transition(.opacity)
             }
 #endif
-            composerInputRow
+            ChatMessageComposer(
+                draft: $presenter.draft,
+                showEmojiQuickTray: $showEmojiQuickTray,
+                composerFocused: $composerFocused,
+                canSend: presenter.canSend,
+                sendingDisabled: sendingDisabled,
+                isRefreshing: presenter.isManuallyRefreshingMessages,
+                showsRefreshButton: true,
+                refreshEnabled: presenter.conversationId != nil,
+                placeholder: "Message",
+                maxBodyLength: 1000,
+                colorScheme: colorScheme,
+                emojis: DirectChatQuickReactions.emojis,
+                refreshAccessibilityLabel: "Refresh private chat",
+                emojiToggleAccessibilityLabel: "Toggle emoji reactions",
+                sendAccessibilityLabel: "Send",
+                emojiReactionAccessibilityFormat: "Send %@ reaction",
+                onSend: { sendDraftIfBusinessAllowed() },
+                onQuickEmoji: { sendQuickReactionIfBusinessAllowed($0) },
+                onRefresh: {
+                    Task { await presenter.manualRefreshCurrentThread() }
+                },
+                onTrimDraft: { presenter.trimDraftIfNeeded() }
+            )
         }
         .padding(.horizontal, FGSpacing.lg)
         .padding(.top, FGSpacing.sm)
-        .padding(.bottom, 10)
+        .padding(.bottom, 0)
         .animation(.spring(response: 0.34, dampingFraction: 0.92), value: showEmojiQuickTray)
 #if DEBUG
         .animation(.easeInOut(duration: 0.18), value: presenter.realtimeConnectionStatus)
 #endif
-    }
-
-    private var composerInputRow: some View {
-        HStack(alignment: .bottom, spacing: FGSpacing.sm) {
-            Button {
-                FGInteractionHaptics.selection()
-                showEmojiQuickTray.toggle()
-            } label: {
-                Image(systemName: "face.smiling")
-                    .font(.system(size: 18, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(showEmojiQuickTray ? FGColor.accentBlue : FGColor.secondaryText(colorScheme))
-                    .frame(width: 38, height: 38)
-                    .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.58 : 0.94))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
-            .accessibilityLabel("Toggle emoji reactions")
-            .disabled(sendingDisabled)
-
-            TextField("Message", text: $presenter.draft)
-                .textFieldStyle(.plain)
-                .font(FGTypography.body)
-                .lineLimit(1)
-                .submitLabel(.send)
-                .onSubmit {
-                    guard presenter.canSend, !sendingDisabled else { return }
-                    FGInteractionHaptics.softImpact()
-                    sendDraftIfBusinessAllowed()
-                }
-                .padding(.horizontal, FGSpacing.md)
-                .padding(.vertical, FGSpacing.sm + 1)
-                .background(
-                    RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
-                        .fill(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.64 : 0.98))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
-                        .strokeBorder(
-                            composerFocused
-                                ? FGColor.accentBlue.opacity(0.42)
-                                : FGColor.divider(colorScheme),
-                            lineWidth: composerFocused ? 1.5 : 1
-                        )
-                        .animation(.easeInOut(duration: 0.2), value: composerFocused)
-                )
-                .focused($composerFocused)
-                .onChange(of: presenter.draft) { _, _ in
-                    presenter.trimDraftIfNeeded()
-                }
-                .frame(minHeight: 38, alignment: .center)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .disabled(sendingDisabled)
-
-            manualRefreshMessagesButton
-
-            Button {
-                FGInteractionHaptics.softImpact()
-                sendDraftIfBusinessAllowed()
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 38, height: 38)
-                    .background(
-                        Circle()
-                            .fill(
-                                presenter.canSend && !sendingDisabled
-                                    ? AnyShapeStyle(FGColor.brandGradient)
-                                    : AnyShapeStyle(Color.gray.opacity(0.35))
-                            )
-                    )
-            }
-            .disabled(!presenter.canSend || sendingDisabled)
-            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.94, hapticOnPress: false))
-            .contentShape(Rectangle())
-            .accessibilityLabel("Send")
-        }
-        .padding(.horizontal, FGSpacing.sm)
-        .padding(.vertical, FGSpacing.sm)
-        .background(.thinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.sheet, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: FGRadius.sheet, style: .continuous)
-                .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-        }
-        .floatingShadow()
-    }
-
-    private var manualRefreshMessagesButton: some View {
-        Button {
-            Task { await presenter.manualRefreshCurrentThread() }
-        } label: {
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .frame(width: 38, height: 38)
-                .background {
-                    Circle()
-                        .fill(.ultraThinMaterial)
-                }
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.18 : 0.38), lineWidth: 0.75)
-                }
-                .rotationEffect(.degrees(presenter.isManuallyRefreshingMessages ? 360 : 0))
-                .animation(
-                    presenter.isManuallyRefreshingMessages
-                        ? .linear(duration: 0.75).repeatForever(autoreverses: false)
-                        : .easeOut(duration: 0.16),
-                    value: presenter.isManuallyRefreshingMessages
-                )
-                .contentShape(Circle())
-        }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.94, hapticOnPress: false))
-        .disabled(presenter.isManuallyRefreshingMessages || presenter.conversationId == nil)
-        .opacity(presenter.isManuallyRefreshingMessages ? 0.62 : 1.0)
-        .accessibilityLabel("Refresh private chat")
-    }
-
-    /// Slim horizontally scrollable strip; tray hidden unless `showEmojiQuickTray`.
-    private var quickReactionTray: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: FGSpacing.sm) {
-                ForEach(DirectChatQuickReactions.emojis, id: \.self) { emoji in
-                    Button {
-                        sendQuickReactionIfBusinessAllowed(emoji)
-                    } label: {
-                        Text(emoji)
-                            .font(.system(size: 23))
-                            .frame(width: 40, height: 40)
-                            .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.56 : 0.94))
-                            .clipShape(Circle())
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(sendingDisabled)
-                    .accessibilityLabel("Send \(emoji) reaction")
-                }
-            }
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, FGSpacing.sm)
-            .padding(.vertical, FGSpacing.sm)
-        }
-        .frame(height: 58)
-        .scrollBounceBehavior(.basedOnSize)
-        .background(.thinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous)
-                .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-        }
-        .floatingShadow()
     }
 }
 

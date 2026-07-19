@@ -59,8 +59,9 @@ struct ModerationService {
         let raw = error.localizedDescription
         let s = raw.lowercased()
         if s.contains("could not find the table")
+            || s.contains("could not find the function")
             || (s.contains("relation") && s.contains("does not exist"))
-            || s.contains("schema cache") || s.contains("pgrst205")
+            || s.contains("schema cache") || s.contains("pgrst205") || s.contains("pgrst202")
             || s.contains("42p01") {
             return "Reporting isn’t available on the server yet. Please try again after an update, or contact support if this continues."
         }
@@ -68,7 +69,10 @@ struct ModerationService {
             return "The reporting database isn’t fully updated yet. Please try again later or contact support."
         }
         if s.contains("user_reports") || s.contains("conversation_reports") || s.contains("message_reports")
-            || s.contains("venue_reports") {
+            || s.contains("venue_reports")
+            || s.contains("group_conversation_reports")
+            || s.contains("group_message_reports")
+            || s.contains("report_group_conversation") {
             return "We couldn’t save your report. This feature may still be rolling out—please try again later."
         }
         if s.contains("permission denied") || s.contains("new row violates row-level security") || s.contains("rls") {

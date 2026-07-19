@@ -1,7 +1,7 @@
 import Foundation
 import Supabase
 
-struct FanSignupProfileInput: Sendable {
+struct FanSignupProfileInput: Codable, Sendable {
     let displayName: String
     let handle: String
     let bio: String
@@ -27,6 +27,79 @@ struct FanSignupSubmitOutcome: Sendable {
 
 extension MapViewModel {
     static let defaultFanSignupBio = "I am a FanGeo Fan."
+
+    /// Marks a newly completed fan signup so Discover can select itself and present the existing Welcome guide once.
+    func requestPostSignupDiscoverWelcomeGuide(userId: UUID, source: String) {
+        FanGeoStartupGuidePreferences.ensureNewAccountDefaultUnchecked(for: userId)
+        requestPostAccountCreationLanguageSelector(userId: userId, source: source)
+        postSignupPresentationUserId = userId
+        postSignupPresentation = .discoverWelcomeGuide
+#if DEBUG
+        print("[PostSignupRoute] requested discoverWelcomeGuide userId=\(userId.uuidString) source=\(source)")
+#endif
+    }
+
+    /// One-time language selector after a confirmed brand-new account (fan or business).
+    /// Existing accounts are never enrolled — only explicit new-account creation paths call this.
+    func requestPostAccountCreationLanguageSelector(userId: UUID, source: String) {
+        guard !FanGeoFirstLaunchLanguagePreferences.hasCompletedPostAccountCreation(for: userId) else {
+#if DEBUG
+            print("[FirstLaunchLanguage] postAccountSkipAlreadyCompleted userId=\(userId.uuidString.lowercased()) source=\(source)")
+#endif
+            return
+        }
+        FanGeoFirstLaunchLanguagePreferences.setPendingPostAccountCreation(userId: userId)
+        postAccountCreationLanguageSelectorRevision &+= 1
+#if DEBUG
+        print("[FirstLaunchLanguage] requestedPostAccountCreation userId=\(userId.uuidString.lowercased()) source=\(source)")
+#endif
+    }
+
+    var hasPendingPostAccountCreationLanguageSelector: Bool {
+        FanGeoFirstLaunchLanguagePreferences.shouldPresentPostAccountCreation(
+            currentUserId: currentUserAuthId
+        )
+    }
+
+    var hasPostSignupDiscoverWelcomeGuide: Bool {
+        postSignupPresentation == .discoverWelcomeGuide
+    }
+
+    /// Returns `true` and clears the intent only when the guide is about to be shown for the matching account.
+    @discardableResult
+    func consumePostSignupDiscoverWelcomeGuide(currentUserId: UUID?) -> Bool {
+        guard postSignupPresentation == .discoverWelcomeGuide else { return false }
+        guard let expected = postSignupPresentationUserId else {
+            postSignupPresentation = nil
+            return false
+        }
+        guard let currentUserId, currentUserId == expected else {
+#if DEBUG
+            print("[PostSignupRoute] consumeSkipped userMismatch expected=\(expected.uuidString) current=\(currentUserId?.uuidString ?? "nil")")
+#endif
+            return false
+        }
+        postSignupPresentation = nil
+        postSignupPresentationUserId = nil
+#if DEBUG
+        print("[PostSignupRoute] consumed discoverWelcomeGuide userId=\(expected.uuidString)")
+#endif
+        return true
+    }
+
+    func clearPostSignupPresentation(reason: String) {
+        guard postSignupPresentation != nil || postSignupPresentationUserId != nil else { return }
+        postSignupPresentation = nil
+        postSignupPresentationUserId = nil
+#if DEBUG
+        print("[PostSignupRoute] cleared reason=\(reason)")
+#endif
+    }
+
+    func markPostSignupDiscoverWelcomeGuideIfPossible(source: String) {
+        guard let userId = currentUserAuthId else { return }
+        requestPostSignupDiscoverWelcomeGuide(userId: userId, source: source)
+    }
 
     /// Pre-auth business @handle availability (business signup). Uses `check_business_handle_available_for_registration`.
     func checkBusinessHandleAvailableForSignup(_ rawHandle: String) async -> Bool? {
@@ -213,11 +286,13 @@ extension MapViewModel {
               Self.userEmailConfirmed(session.user) else {
             await forceLogout(reason: "fanSignupNeedsEmailConfirmation", source: "MapViewModel.registerFanAccountWithProfile")
             await MainActor.run {
-                pendingFanEmailSignupDraft = PendingFanEmailSignupDraft(
+                let draft = PendingFanEmailSignupDraft(
                     email: fanEmail,
                     profile: profile,
                     recordFanGuidelinesAcceptance: recordFanGuidelinesAcceptance
                 )
+                pendingFanEmailSignupDraft = draft
+                persistPendingFanEmailSignupDraft(draft)
                 markEmailVerificationPending(
                     email: fanEmail,
                     kind: .fan,
@@ -318,6 +393,10 @@ extension MapViewModel {
 
         Task { await refreshUserPersonalizationInBackground() }
 
+        await MainActor.run {
+            markPostSignupDiscoverWelcomeGuideIfPossible(source: "registerFanAccountWithProfile")
+        }
+
         return FanSignupSubmitOutcome(
             succeeded: true,
             failureStep: nil,
@@ -339,6 +418,9 @@ extension MapViewModel {
         }
         print("[SignupUX] profileCreated")
         Task { await refreshUserPersonalizationInBackground() }
+        await MainActor.run {
+            markPostSignupDiscoverWelcomeGuideIfPossible(source: "retryFanSignupProfileSave")
+        }
         return FanSignupSubmitOutcome(
             succeeded: true,
             failureStep: nil,
@@ -465,6 +547,10 @@ extension MapViewModel {
         print("[AppleAuthDebug] profileCreationSucceeded=true")
         Task { await refreshUserPersonalizationInBackground() }
 
+        await MainActor.run {
+            markPostSignupDiscoverWelcomeGuideIfPossible(source: "completeAppleFanSignupProfile")
+        }
+
         return FanSignupSubmitOutcome(
             succeeded: true,
             failureStep: nil,
@@ -487,6 +573,39 @@ extension MapViewModel {
             await undoPartialSupabaseSessionAfterAccountTypeMismatch()
             let message = Self.fanLoginBlockedBecauseBusinessMessage
             await MainActor.run { authErrorMessage = message }
+            return true
+        }
+
+        // Idempotent: profile already completed for this confirmed user.
+        if let existingProfile = await existingFanProfileRow(for: session.user.id),
+           !(existingProfile.username ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await MainActor.run {
+                clearPendingFanEmailSignupDraft()
+                pendingEmailVerificationEmail = ""
+                pendingEmailVerificationKind = nil
+                emailVerificationError = ""
+                emailVerifiedSignInNotice = ""
+                beginFanLoginSession(
+                    userId: session.user.id,
+                    reason: "emailConfirmedFanProfileAlreadyComplete",
+                    email: fanEmail
+                ) {
+                    isLoggedIn = true
+                    isVenueOwnerLoggedIn = false
+                    venueOwnerMode = false
+                    authSessionState = .signedIn
+                    authErrorMessage = ""
+                    bumpCurrentUserAvatarDisplayRefresh()
+                }
+                // Do not re-request Welcome Guide for an already completed profile.
+            }
+            await persistAccountModeForActiveAuthSession(.fanUser)
+            clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+            await registerFanActiveSessionOnLogin()
+            Task { await refreshUserPersonalizationInBackground() }
+#if DEBUG
+            print("[EmailConfirmationRoute] profileState=alreadyCompleteIdempotent")
+#endif
             return true
         }
 
@@ -536,10 +655,13 @@ extension MapViewModel {
             venueOwnerMode = false
             authSessionState = .signedIn
             pendingFanEmailSignupDraft = nil
+            clearPersistedPendingFanEmailSignupDraft()
             pendingEmailVerificationEmail = ""
             pendingEmailVerificationKind = nil
             emailVerificationError = ""
             emailVerificationMessage = "Email verified. Your FanGeo profile is ready."
+            emailVerifiedSignInNotice = ""
+            markPostSignupDiscoverWelcomeGuideIfPossible(source: "completePendingEmailFanSignupAfterConfirmation")
         }
         await persistAccountModeForActiveAuthSession(.fanUser)
         clearExplicitLogoutMarkerAfterManualAuthSucceeded()
@@ -552,6 +674,24 @@ extension MapViewModel {
         print("[SignupUX] profileCreated")
         Task { await refreshUserPersonalizationInBackground() }
         return true
+    }
+
+    private func existingFanProfileRow(for userId: UUID) async -> UserProfileRow? {
+        do {
+            let rows: [UserProfileRow] = try await supabase
+                .from("user_profiles")
+                .select("id,username")
+                .eq("id", value: userId.uuidString.lowercased())
+                .limit(1)
+                .execute()
+                .value
+            return rows.first
+        } catch {
+#if DEBUG
+            print("[EmailConfirmationRoute] existingProfileLookupFailed error=\(error.localizedDescription)")
+#endif
+            return nil
+        }
     }
 
     private func finishFanSignupProfile(profile: FanSignupProfileInput) async -> String? {

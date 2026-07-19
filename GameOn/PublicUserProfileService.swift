@@ -28,8 +28,11 @@ struct PublicUserProfileData {
     let isBusinessAccount: Bool
     /// True when `user_profiles` row was loaded from network or cache (not purely synthetic).
     let hasResolvedIdentity: Bool
-    /// False when target is undiscoverable, blocked, or missing.
+    /// False when the viewer cannot open this profile (blocked, missing, or not discoverable/friend).
     let isPubliclyVisible: Bool
+    /// Global Discover My Profile flag. Independent of viewer access: accepted friends may
+    /// see `isPubliclyVisible == true` while this remains `false`.
+    let isDiscoverableByFans: Bool
     let memberSinceLabel: String?
     let openToItems: [PublicProfileOpenToItem]
     let mutualFansCount: Int
@@ -51,6 +54,57 @@ struct PublicUserProfileData {
             base: publicHandleLine,
             profileCreatedAt: profileCreatedAt,
             showFanSince: !isBusinessAccount
+        )
+    }
+
+    /// Self-preview only: fill gaps from already-loaded owner state without changing public visibility rules.
+    func seededForSelfPreview(
+        homeCrowd ownerHomeCrowd: HomeCrowdVenueSummary?,
+        openToPreferences ownerPreferences: FanIdentityPreferences
+    ) -> PublicUserProfileData {
+        let seededHome = homeCrowd ?? ownerHomeCrowd
+        let ownerOpenTo = PublicProfileOpenToBuilder.items(
+            preferences: ownerPreferences,
+            favoriteTeams: favoriteTeams,
+            venueCount: venueCount,
+            pickupHostedCount: pickupHostedCount,
+            pickupJoinedCount: pickupJoinedCount
+        )
+        let seededOpenTo = openToItems.count >= ownerOpenTo.count ? openToItems : ownerOpenTo
+        guard seededHome?.venueId != homeCrowd?.venueId || seededOpenTo.count != openToItems.count else {
+            return self
+        }
+        return PublicUserProfileData(
+            userId: userId,
+            displayName: displayName,
+            publicHandleLine: publicHandleLine,
+            profileCreatedAt: profileCreatedAt,
+            bio: bio,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            reputation: reputation,
+            organizerStats: organizerStats,
+            favoriteTeams: favoriteTeams,
+            primaryFavoriteTeamID: primaryFavoriteTeamID,
+            nationalTeam: nationalTeam,
+            isBusinessAccount: isBusinessAccount,
+            hasResolvedIdentity: hasResolvedIdentity,
+            isPubliclyVisible: isPubliclyVisible,
+            isDiscoverableByFans: isDiscoverableByFans,
+            memberSinceLabel: memberSinceLabel,
+            openToItems: seededOpenTo,
+            mutualFansCount: mutualFansCount,
+            mutualFanAvatars: mutualFanAvatars,
+            sharedTeamsCount: sharedTeamsCount,
+            venueCount: venueCount,
+            venueCards: venueCards,
+            homeCrowd: seededHome,
+            homeCityDisplayLine: homeCityDisplayLine,
+            pickupHostedCount: pickupHostedCount,
+            pickupJoinedCount: pickupJoinedCount,
+            socialHighlightLabels: socialHighlightLabels,
+            personalityTags: personalityTags,
+            sharedTeamNames: sharedTeamNames
         )
     }
 }
@@ -81,30 +135,188 @@ enum PublicUserProfileService {
         "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,created_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,home_city,home_region,home_country,show_home_city"
 
     /// Always returns a displayable profile; optional sections use safe fallbacks.
-    static func load(userId: UUID, cachedProfile: UserProfileRow? = nil) async -> PublicUserProfileData {
+    /// - Parameter isSelfPreview: When `true` and `userId` matches the authenticated session user,
+    ///   loads the signed-in fan’s public projection even if discoverability is off.
+    ///   Does not weaken visibility for other viewers.
+    static func load(
+        userId: UUID,
+        cachedProfile: UserProfileRow? = nil,
+        isSelfPreview: Bool = false
+    ) async -> PublicUserProfileData {
+#if DEBUG
+        print("[PublicProfilePreview] requested selfPreview=\(isSelfPreview)")
+#endif
+        if isSelfPreview {
+            let authId = await authenticatedSessionUserId()
+            let ownershipMatch = authId == userId
+#if DEBUG
+            print("[PublicProfilePreview] ownershipMatch=\(ownershipMatch)")
+#endif
+            if ownershipMatch {
+#if DEBUG
+                print("[PublicProfilePreview] loaderPath=self")
+#endif
+                return await loadSelfPublicProjection(userId: userId, cachedProfile: cachedProfile)
+            }
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=idMismatch")
+            print("[PublicProfilePreview] loaderPath=public")
+#endif
+        } else {
+#if DEBUG
+            print("[PublicProfilePreview] ownershipMatch=false")
+            print("[PublicProfilePreview] loaderPath=public")
+#endif
+        }
+
 #if DEBUG
         print("[PublicProfileLoadDebug] requestedUserId=\(userId.uuidString.lowercased())")
 #endif
         if cachedProfile?.isDeletedAccount == true {
             logPublicProfileBlocked(userId: userId, reason: "deleted_cached")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=missingProfile")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
             return hiddenProfile(userId: userId)
         }
 
         if let identity = await fetchPublicIdentityRPC(targetUserId: userId) {
+            SuggestedFanProfileOpenDebug.rpcReceived(visible: identity.visible)
             if identity.visible {
-                return await assembleFromIdentityRPC(identity, userId: userId, cachedProfile: cachedProfile)
+                let assembled = await assembleFromIdentityRPC(identity, userId: userId, cachedProfile: cachedProfile)
+#if DEBUG
+                print("[PublicProfilePreview] loaded success=true")
+#endif
+                return assembled
             }
             logPublicProfileBlocked(userId: userId, reason: "identity_not_visible")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=discoverability")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
+            SuggestedFanProfileOpenDebug.failure("identity_not_visible")
             return hiddenProfile(userId: userId)
         }
 
         return await loadLegacy(userId: userId, cachedProfile: cachedProfile)
     }
 
-    /// Matches ``get_public_fan_identity_profile`` visibility for suggestion filtering.
+    /// Authenticated own-profile public projection for WYSIWYG self-preview.
+    /// Bypasses discoverability / “viewer ≠ target” RPC gates only for `auth.uid() == userId`.
+    private static func loadSelfPublicProjection(
+        userId: UUID,
+        cachedProfile: UserProfileRow?
+    ) async -> PublicUserProfileData {
+        let fetched = await fetchProfileRow(userId: userId)
+        let row: UserProfileRow?
+        if let fetchedRow = fetched.row {
+            row = fetchedRow
+        } else if let cached = cachedProfile, cached.id == userId {
+            row = cached
+        } else {
+            row = nil
+        }
+        let profileQuerySuccess = fetched.success || row != nil
+
+        if row == nil && !profileQuerySuccess {
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=queryFailure")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
+            return hiddenProfile(userId: userId)
+        }
+
+        if row?.isDeletedAccount == true {
+            logPublicProfileBlocked(userId: userId, reason: "deleted_self_preview")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=missingProfile")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
+            return hiddenProfile(userId: userId)
+        }
+
+        let isBusiness = await resolveIsBusinessAccount(userId: userId, profileRow: row)
+        if isBusiness {
+            logPublicProfileBlocked(userId: userId, reason: "business_self_preview")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=missingProfile")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
+            return hiddenProfile(userId: userId)
+        }
+
+        if let adminStatus = row?.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !adminStatus.isEmpty,
+           adminStatus != "active" {
+            logPublicProfileBlocked(userId: userId, reason: "inactive_self_preview")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=missingProfile")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
+            return hiddenProfile(userId: userId)
+        }
+
+        let (fanXP, _) = await loadPublicXP(userId: userId)
+        let organizerStats = await fetchOrganizerStats(userId: userId)
+        let favoriteSelection = await fetchPublicFavoriteTeamSelection(userId: userId)
+        let favoriteTeams = FavoriteTeamsStore.resolvedTeams(fromIDs: favoriteSelection.teamIDs)
+        let preferences = await fetchFanIdentityPreferences(userId: userId) ?? .empty
+        // Public home-crowd RPCs intentionally return nil when viewer == target.
+        // Self-preview must use the owner-safe profile pointer path so WYSIWYG
+        // matches what other fans see via those RPCs.
+        let homeCrowd = await fetchSelfHomeCrowdForPublicProjection(userId: userId)
+
+        let built = buildProfileData(
+            userId: userId,
+            row: row,
+            fanXP: fanXP,
+            organizerStats: organizerStats,
+            favoriteTeams: favoriteTeams,
+            primaryFavoriteTeamID: favoriteSelection.primaryTeamID,
+            isBusinessAccount: false,
+            hasResolvedIdentity: profileQuerySuccess,
+            isPubliclyVisible: true,
+            isDiscoverableByFans: row?.discoverableByFans ?? true,
+            memberSinceLabel: resolveMemberSinceLabel(
+                rpcMemberSince: nil,
+                profileCreatedAt: row?.created_at
+            ),
+            openToItems: resolvePublicOpenToItems(
+                preferences: preferences,
+                favoriteTeams: favoriteTeams,
+                venueCount: 0,
+                pickupHostedCount: 0,
+                pickupJoinedCount: 0
+            ),
+            mutualFansCount: 0,
+            mutualFanAvatars: [],
+            sharedTeamsCount: 0,
+            venueCount: 0,
+            venueCards: [],
+            homeCrowd: homeCrowd,
+            pickupHostedCount: 0,
+            pickupJoinedCount: 0,
+            sharedTeamNames: []
+        )
+
+#if DEBUG
+        print("[PublicProfilePreview] loaded success=true")
+#endif
+        logRenderedHomeCrowd(built.homeCrowd?.venueId)
+        return built
+    }
+
+    private static func authenticatedSessionUserId() async -> UUID? {
+        (try? await supabase.auth.session)?.user.id
+    }
+
+    /// Discovery eligibility for Suggested Fans / Nearby-style filters.
+    /// Uses global discoverability — not mere friend-visible profile access.
     static func isPublicIdentityVisible(userId: UUID) async -> Bool {
         if let identity = await fetchPublicIdentityRPC(targetUserId: userId) {
-            return identity.visible
+            // Friend exception can yield visible=true while discoverable_by_fans=false.
+            return identity.visible && (identity.discoverable_by_fans ?? true)
         }
 
         let fetched = await fetchProfileRow(userId: userId)
@@ -168,6 +380,8 @@ enum PublicUserProfileService {
 
     private struct PublicIdentityRPCResponse: Decodable {
         let visible: Bool
+        /// Present after friend-exception migration; nil on older backends defaults to discoverable.
+        let discoverable_by_fans: Bool?
         let user_id: UUID?
         let display_name: String?
         let username: String?
@@ -212,6 +426,7 @@ enum PublicUserProfileService {
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             visible = try c.decode(Bool.self, forKey: .visible)
+            discoverable_by_fans = try? c.decode(Bool.self, forKey: .discoverable_by_fans)
             user_id = try? c.decode(UUID.self, forKey: .user_id)
             display_name = try? c.decode(String.self, forKey: .display_name)
             username = try? c.decode(String.self, forKey: .username)
@@ -271,6 +486,7 @@ enum PublicUserProfileService {
 
         private enum CodingKeys: String, CodingKey {
             case visible
+            case discoverable_by_fans
             case user_id
             case display_name
             case username
@@ -417,6 +633,31 @@ enum PublicUserProfileService {
         return nil
     }
 
+    /// Owner-safe Home Crowd load for self public-profile preview.
+    /// Does not use public RPCs that reject `viewer == target`.
+    private static func fetchSelfHomeCrowdForPublicProjection(userId: UUID) async -> HomeCrowdVenueSummary? {
+        let loaded = await HomeCrowdService.loadSelfHomeCrowd(userId: userId)
+        if let summary = resolvePublicHomeCrowd(loaded.summary) {
+            print("[HomeCrowdDebug] selfPreviewHomeCrowd= source=owner_profile_pointer")
+            return summary
+        }
+
+        // Venue id present but summary RPC failed — fall back to venues table identity.
+        if let venueId = loaded.venueId,
+           let tableSummary = await HomeCrowdService.fetchVenueSummaryFromTable(
+                venueId: venueId,
+                setAt: nil
+           ),
+           let crowd = resolvePublicHomeCrowd(tableSummary) {
+            print("[HomeCrowdDebug] selfPreviewHomeCrowd= source=venues_table")
+            return crowd
+        }
+
+        print("[HomeCrowdDebug] selfPreviewHomeCrowd= nil")
+        logRenderedHomeCrowd(nil)
+        return nil
+    }
+
     private static func resolvePublicOpenToItems(
         preferences: FanIdentityPreferences,
         favoriteTeams: [FavoriteTeam],
@@ -460,6 +701,8 @@ enum PublicUserProfileService {
         print("[ProfileBioDebug] publicProfileLoadedBio=\(resolvedBio ?? "")")
 #endif
 
+        let isDiscoverableByFans = rpc.discoverable_by_fans ?? true
+
         let row = UserProfileRow(
             id: userId,
             email: cachedProfile?.email,
@@ -473,7 +716,7 @@ enum PublicUserProfileService {
             live_visibility_enabled: true,
             live_visibility_mode: LiveVisibilityMode.allFriends.rawValue,
             selected_live_visibility_friend_ids: [],
-            discoverable_by_fans: true,
+            discoverable_by_fans: isDiscoverableByFans,
             created_at: {
                 let rpcSince = rpc.member_since?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if !rpcSince.isEmpty { return rpcSince }
@@ -511,6 +754,7 @@ enum PublicUserProfileService {
             isBusinessAccount: false,
             hasResolvedIdentity: true,
             isPubliclyVisible: true,
+            isDiscoverableByFans: isDiscoverableByFans,
             memberSinceLabel: resolveMemberSinceLabel(
                 rpcMemberSince: rpc.member_since,
                 profileCreatedAt: cachedProfile?.created_at
@@ -523,15 +767,30 @@ enum PublicUserProfileService {
                 pickupJoinedCount: pickupJoined
             ),
             mutualFansCount: max(0, rpc.mutual_fans_count ?? 0),
-            mutualFanAvatars: (rpc.mutual_fan_avatars ?? []).compactMap { avatarRow in
-                guard let id = avatarRow.user_id else { return nil }
-                let name = (avatarRow.display_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                return PublicProfileMutualFanAvatar(
-                    userId: id,
-                    displayName: name.isEmpty ? "Fan" : name,
-                    avatarURL: ImageDisplayURL.canonicalStorageURLString(avatarRow.avatar_url)
+            mutualFanAvatars: {
+                let rawRows = rpc.mutual_fan_avatars ?? []
+                let decoded = rawRows.compactMap { avatarRow -> PublicProfileMutualFanAvatar? in
+                    guard let id = avatarRow.user_id else { return nil }
+                    let name = (avatarRow.display_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    return PublicProfileMutualFanAvatar(
+                        userId: id,
+                        displayName: name.isEmpty ? "Fan" : name,
+                        avatarURL: ImageDisplayURL.canonicalStorageURLString(avatarRow.avatar_url)
+                    )
+                }
+#if DEBUG
+                let count = max(0, rpc.mutual_fans_count ?? 0)
+                print(
+                    "[PublicProfileMutualFriends] rpcDecode targetUserId=\(userId.uuidString.lowercased()) totalCount=\(count) payloadIdentityCount=\(rawRows.count) decodedCount=\(decoded.count)"
                 )
-            },
+                if count > 0, decoded.isEmpty {
+                    print(
+                        "[PublicProfileMutualFriends] identityOmitted reason=rpc_returned_count_without_identities totalCount=\(count) payloadIdentityCount=\(rawRows.count)"
+                    )
+                }
+#endif
+                return decoded
+            }(),
             sharedTeamsCount: max(0, rpc.shared_teams_count ?? 0),
             venueCount: venueCount,
             venueCards: (rpc.venue_cards ?? []).compactMap { card in
@@ -588,6 +847,7 @@ enum PublicUserProfileService {
             isBusinessAccount: false,
             hasResolvedIdentity: false,
             isPubliclyVisible: false,
+            isDiscoverableByFans: false,
             memberSinceLabel: nil,
             openToItems: [],
             mutualFansCount: 0,
@@ -650,9 +910,27 @@ enum PublicUserProfileService {
         let isBusiness = await resolveIsBusinessAccount(userId: userId, profileRow: row)
         let discoverable = row?.discoverableByFans ?? true
 
-        if isBusiness || discoverable == false {
-            logPublicProfileBlocked(userId: userId, reason: isBusiness ? "business_legacy" : "not_discoverable_legacy")
+        if isBusiness {
+            logPublicProfileBlocked(userId: userId, reason: "business_legacy")
+#if DEBUG
+            print("[PublicProfilePreview] rejected reason=missingProfile")
+            print("[PublicProfilePreview] loaded success=false")
+#endif
             return hiddenProfile(userId: userId)
+        }
+
+        // Fail closed: without the friend-aware identity RPC, only allow undiscoverable
+        // targets when an accepted user↔user friendship can be proven.
+        if discoverable == false {
+            let isAcceptedFriend = await viewerHasAcceptedFriendship(with: userId)
+            guard isAcceptedFriend else {
+                logPublicProfileBlocked(userId: userId, reason: "not_discoverable_legacy")
+#if DEBUG
+                print("[PublicProfilePreview] rejected reason=discoverability")
+                print("[PublicProfilePreview] loaded success=false")
+#endif
+                return hiddenProfile(userId: userId)
+            }
         }
 
         let venueCount = 0
@@ -677,6 +955,7 @@ enum PublicUserProfileService {
             isBusinessAccount: isBusiness,
             hasResolvedIdentity: profileQuerySuccess,
             isPubliclyVisible: true,
+            isDiscoverableByFans: discoverable,
             memberSinceLabel: resolveMemberSinceLabel(
                 rpcMemberSince: nil,
                 profileCreatedAt: row?.created_at
@@ -700,6 +979,9 @@ enum PublicUserProfileService {
         )
 
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
+#if DEBUG
+        print("[PublicProfilePreview] loaded success=true")
+#endif
         return built
     }
 
@@ -855,6 +1137,7 @@ enum PublicUserProfileService {
         isBusinessAccount: Bool,
         hasResolvedIdentity: Bool,
         isPubliclyVisible: Bool,
+        isDiscoverableByFans: Bool,
         memberSinceLabel: String?,
         openToItems: [PublicProfileOpenToItem],
         mutualFansCount: Int,
@@ -895,10 +1178,21 @@ enum PublicUserProfileService {
         let avatarThumb = ImageDisplayURL.canonicalStorageURLString(row?.avatar_thumbnail_url)
         let trimmedBio = row?.bio?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
+        let uniquedTeams = Self.uniquedFavoriteTeams(favoriteTeams)
+        let uniquedMutualAvatars = Self.uniquedMutualFanAvatars(mutualFanAvatars)
+        let uniquedVenueCards = Self.uniquedVenueCards(venueCards)
+        SuggestedFanProfileOpenDebug.decodingCompleted(
+            mutualAvatarCount: mutualFanAvatars.count,
+            uniqueMutualAvatarCount: uniquedMutualAvatars.count,
+            teamCount: favoriteTeams.count,
+            uniqueTeamCount: uniquedTeams.count,
+            openToCount: openToItems.count
+        )
+
         let reputation = FanReputationEngine.evaluate(
             FanReputationSignals(
                 fanXP: fanXP,
-                favoriteTeams: favoriteTeams,
+                favoriteTeams: uniquedTeams,
                 savedVenueCount: venueCount,
                 pickupHostedCount: pickupHostedCount,
                 pickupJoinedCount: pickupJoinedCount,
@@ -917,23 +1211,24 @@ enum PublicUserProfileService {
             avatarThumbnailURL: avatarThumb.isEmpty ? nil : avatarThumb,
             reputation: reputation,
             organizerStats: organizerStats,
-            favoriteTeams: favoriteTeams,
+            favoriteTeams: uniquedTeams,
             primaryFavoriteTeamID: {
                 let raw = primaryFavoriteTeamID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                guard !raw.isEmpty, favoriteTeams.contains(where: { $0.id == raw }) else { return nil }
+                guard !raw.isEmpty, uniquedTeams.contains(where: { $0.id == raw }) else { return nil }
                 return raw
             }(),
             nationalTeam: row?.nationalTeamIdentity,
             isBusinessAccount: isBusinessAccount,
             hasResolvedIdentity: hasResolvedIdentity,
             isPubliclyVisible: isPubliclyVisible,
+            isDiscoverableByFans: isDiscoverableByFans,
             memberSinceLabel: memberSinceLabel,
             openToItems: openToItems,
             mutualFansCount: mutualFansCount,
-            mutualFanAvatars: mutualFanAvatars,
+            mutualFanAvatars: uniquedMutualAvatars,
             sharedTeamsCount: sharedTeamsCount,
             venueCount: venueCount,
-            venueCards: venueCards,
+            venueCards: uniquedVenueCards,
             homeCrowd: homeCrowd,
             homeCityDisplayLine: homeCityDisplayLine ?? resolvePublicHomeCityDisplay(from: row),
             pickupHostedCount: pickupHostedCount,
@@ -947,6 +1242,67 @@ enum PublicUserProfileService {
             personalityTags: [],
             sharedTeamNames: sharedTeamNames
         )
+    }
+
+    /// SwiftUI `ForEach` fatals on duplicate `Identifiable.id` values — mutual avatar RPC can
+    /// emit the same friend more than once when friendship edges are duplicated.
+    private static func uniquedMutualFanAvatars(
+        _ avatars: [PublicProfileMutualFanAvatar]
+    ) -> [PublicProfileMutualFanAvatar] {
+        var seen = Set<UUID>()
+        var out: [PublicProfileMutualFanAvatar] = []
+        out.reserveCapacity(avatars.count)
+        for avatar in avatars {
+            guard seen.insert(avatar.userId).inserted else { continue }
+            out.append(avatar)
+        }
+        return out
+    }
+
+    private static func uniquedFavoriteTeams(_ teams: [FavoriteTeam]) -> [FavoriteTeam] {
+        var seen = Set<String>()
+        var out: [FavoriteTeam] = []
+        out.reserveCapacity(teams.count)
+        for team in teams {
+            guard seen.insert(team.id).inserted else { continue }
+            out.append(team)
+        }
+        return out
+    }
+
+    private static func uniquedVenueCards(_ cards: [PublicProfileVenueCard]) -> [PublicProfileVenueCard] {
+        var seen = Set<String>()
+        var out: [PublicProfileVenueCard] = []
+        out.reserveCapacity(cards.count)
+        for card in cards {
+            guard seen.insert(card.id).inserted else { continue }
+            out.append(card)
+        }
+        return out
+    }
+
+    /// Accepted user↔user friendship check for legacy fallback (fail closed on error).
+    private static func viewerHasAcceptedFriendship(with targetUserId: UUID) async -> Bool {
+        struct Params: Encodable {
+            let p_user_a: UUID
+            let p_user_b: UUID
+        }
+        guard let viewerId = await authenticatedSessionUserId() else { return false }
+        do {
+            let areFriends: Bool = try await supabase
+                .rpc(
+                    "pickup_invite_users_are_friends",
+                    params: Params(p_user_a: viewerId, p_user_b: targetUserId)
+                )
+                .execute()
+                .value
+            return areFriends
+        } catch {
+#if DEBUG
+            print("[PublicProfileLoadDebug] friendshipCheckFailed error=\(error.localizedDescription)")
+#endif
+            return false
+        }
     }
 
     private static func resolveIsBusinessAccount(userId: UUID, profileRow: UserProfileRow?) async -> Bool {

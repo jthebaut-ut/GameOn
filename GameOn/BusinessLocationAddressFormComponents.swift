@@ -13,6 +13,12 @@ struct BusinessVenueLocationDraft: Equatable, Sendable {
     var latitude: Double?
     var longitude: Double?
     var formattedAddress: String?
+    /// Latest explicit location action that produced this draft.
+    var updateSource: BusinessVenueLocationUpdateSource = .manualAddress
+    /// Monotonic revision for discarding stale geocode responses.
+    var locationRevision: UInt64 = 0
+    /// True when the pin moved but reverse geocode did not supply a usable street line.
+    var addressNeedsConfirmation: Bool = false
 
     var coordinate: CLLocationCoordinate2D? {
         guard let latitude, let longitude else { return nil }
@@ -31,6 +37,74 @@ struct BusinessVenueLocationDraft: Equatable, Sendable {
             postalCode: postalCode,
             countryCode: countryCode
         )
+    }
+}
+
+enum BusinessVenueLocationUpdateSource: String, Equatable, Sendable {
+    case manualAddress
+    case forwardGeocode
+    case adjustedPin
+    case currentLocation
+    case search
+}
+
+extension BusinessVenueLocationDraft {
+    /// Applies a reverse-geocode result for an adjusted / current-location pin without keeping a stale street.
+    mutating func applyPinReverseGeocode(
+        _ result: BusinessVenueReverseGeocodeResult,
+        coordinate: CLLocationCoordinate2D,
+        source: BusinessVenueLocationUpdateSource,
+        revision: UInt64
+    ) {
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+        updateSource = source
+        locationRevision = revision
+
+        let line1 = result.addressLine1?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let line2 = result.addressLine2?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let localityValue = result.locality?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let regionValue = result.region?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let postal = result.postalCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let country = result.countryCode.map(BusinessLocationCountryPolicy.normalizedStoredCountryCode) ?? ""
+
+        // Pin selection is authoritative: never keep a previous street that no longer matches the pin.
+        if !line1.isEmpty {
+            addressLine1 = line1
+            addressNeedsConfirmation = false
+        } else {
+            addressLine1 = ""
+            addressNeedsConfirmation = true
+        }
+
+        if !line2.isEmpty {
+            addressLine2 = line2
+        } else if source == .adjustedPin || source == .currentLocation {
+            addressLine2 = ""
+        }
+
+        if !localityValue.isEmpty { locality = localityValue }
+        if !regionValue.isEmpty { region = regionValue }
+        if !postal.isEmpty {
+            postalCode = postal
+        } else if source == .adjustedPin || source == .currentLocation, !localityValue.isEmpty {
+            // Locality changed from reverse geocode without a postal — drop the old ZIP.
+            postalCode = ""
+        }
+        if !country.isEmpty { countryCode = country }
+
+        if let formatted = result.formattedAddress?.trimmingCharacters(in: .whitespacesAndNewlines), !formatted.isEmpty {
+            formattedAddress = formatted
+        } else {
+            formattedAddress = BusinessVenueAddressFormatter.formattedAddress(
+                line1: addressLine1,
+                line2: addressLine2,
+                locality: locality,
+                region: region,
+                postalCode: postalCode,
+                countryCode: countryCode
+            )
+        }
     }
 }
 
@@ -111,6 +185,7 @@ struct BusinessVenueLocationPinPickerView: View {
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var draft: BusinessVenueLocationDraft
     @State private var pinCoordinate: CLLocationCoordinate2D
@@ -119,6 +194,8 @@ struct BusinessVenueLocationPinPickerView: View {
     @State private var statusText = "Tap the map, search an address, or use current location."
     @State private var isResolving = false
     @State private var resolveTask: Task<Void, Never>?
+    @State private var reverseGeocodeGeneration: UInt64 = 0
+    @State private var isConfirming = false
 
     init(
         viewModel: MapViewModel,
@@ -176,12 +253,14 @@ struct BusinessVenueLocationPinPickerView: View {
         }
         .task {
 #if DEBUG
-            print("[InternationalAddressDebug] pinPlacementStarted=true")
+            print(
+                "[BusinessVenuePinSync] pinAdjustOpened original=\((initialDraft.latitude.map { String($0) } ?? "nil")),\((initialDraft.longitude.map { String($0) } ?? "nil")) street=\(initialDraft.addressLine1)"
+            )
 #endif
             if initialDraft.coordinate == nil {
                 await geocodeSearchTextIfPossible()
             }
-            await reverseGeocodePin()
+            await reverseGeocodePin(source: .adjustedPin)
         }
     }
 
@@ -260,11 +339,7 @@ struct BusinessVenueLocationPinPickerView: View {
 
     private var confirmButton: some View {
         Button {
-            resolveTask?.cancel()
-            draft.latitude = pinCoordinate.latitude
-            draft.longitude = pinCoordinate.longitude
-            onConfirm(draft)
-            dismiss()
+            Task { await confirmPinSelection() }
         } label: {
             Text("Confirm Venue Location")
                 .font(FGTypography.cardTitle.weight(.semibold))
@@ -278,12 +353,19 @@ struct BusinessVenueLocationPinPickerView: View {
                 .shadow(color: .black.opacity(colorScheme == .dark ? 0.55 : 0.22), radius: 18, y: 10)
         }
         .buttonStyle(.plain)
+        .disabled(isResolving || isConfirming)
     }
 
-    private func movePin(to coordinate: CLLocationCoordinate2D, shouldCenter: Bool) {
+    private func movePin(
+        to coordinate: CLLocationCoordinate2D,
+        shouldCenter: Bool,
+        source: BusinessVenueLocationUpdateSource = .adjustedPin
+    ) {
         guard CLLocationCoordinate2DIsValid(coordinate) else { return }
 #if DEBUG
-        print("[InternationalAddressDebug] mapPinMoved=true")
+        print(
+            "[BusinessVenuePinSync] pinMoved confirmedCoordinate=\(coordinate.latitude),\(coordinate.longitude) source=\(source.rawValue)"
+        )
 #endif
         withAnimation(.spring(response: 0.42, dampingFraction: 0.84)) {
             pinCoordinate = coordinate
@@ -296,15 +378,17 @@ struct BusinessVenueLocationPinPickerView: View {
                 )
             }
         }
-        scheduleReverseGeocode()
+        scheduleReverseGeocode(source: source)
     }
 
-    private func scheduleReverseGeocode() {
+    private func scheduleReverseGeocode(source: BusinessVenueLocationUpdateSource) {
         resolveTask?.cancel()
+        reverseGeocodeGeneration &+= 1
+        let generation = reverseGeocodeGeneration
         resolveTask = Task {
             try? await Task.sleep(for: .milliseconds(320))
             guard !Task.isCancelled else { return }
-            await reverseGeocodePin()
+            await reverseGeocodePin(source: source, generation: generation)
         }
     }
 
@@ -323,7 +407,8 @@ struct BusinessVenueLocationPinPickerView: View {
             isResolving = false
             if let result {
                 draft.formattedAddress = result.formattedAddress
-                movePin(to: result.coordinate, shouldCenter: true)
+                draft.updateSource = .search
+                movePin(to: result.coordinate, shouldCenter: true, source: .search)
             } else {
                 statusText = "No exact match found. You can still place the pin manually."
             }
@@ -339,35 +424,108 @@ struct BusinessVenueLocationPinPickerView: View {
         await MainActor.run {
             isResolving = false
             if let coordinate {
-                movePin(to: coordinate, shouldCenter: true)
+                movePin(to: coordinate, shouldCenter: true, source: .currentLocation)
             } else {
                 statusText = "Current location is unavailable. Search or tap the map to place the pin."
             }
         }
     }
 
-    private func reverseGeocodePin() async {
-        await MainActor.run {
+    private func confirmPinSelection() async {
+        guard !isConfirming else { return }
+        isConfirming = true
+        defer { isConfirming = false }
+
+        resolveTask?.cancel()
+        reverseGeocodeGeneration &+= 1
+        let generation = reverseGeocodeGeneration
+#if DEBUG
+        print(
+            "[BusinessVenuePinSync] confirmStarted coordinate=\(pinCoordinate.latitude),\(pinCoordinate.longitude) generation=\(generation)"
+        )
+#endif
+        await reverseGeocodePin(source: .adjustedPin, generation: generation)
+        guard generation == reverseGeocodeGeneration else {
+#if DEBUG
+            print("[BusinessVenuePinSync] confirmSkippedStale generation=\(generation) current=\(reverseGeocodeGeneration)")
+#endif
+            return
+        }
+        draft.latitude = pinCoordinate.latitude
+        draft.longitude = pinCoordinate.longitude
+        draft.updateSource = .adjustedPin
+        draft.locationRevision = generation
+#if DEBUG
+        print(
+            "[BusinessVenuePinSync] confirmApplied street=\(draft.addressLine1) city=\(draft.locality) region=\(draft.region) postal=\(draft.postalCode) country=\(draft.countryCode) needsConfirmation=\(draft.addressNeedsConfirmation) formatted=\(draft.formattedAddress ?? "")"
+        )
+#endif
+        onConfirm(draft)
+        dismiss()
+    }
+
+    private func reverseGeocodePin(
+        source: BusinessVenueLocationUpdateSource,
+        generation: UInt64? = nil
+    ) async {
+        let coordinate = await MainActor.run { () -> CLLocationCoordinate2D in
             isResolving = true
             statusText = "Resolving selected location..."
+            return pinCoordinate
         }
-        let result = await viewModel.reverseGeocodeBusinessVenueLocation(for: pinCoordinate)
+        let activeGeneration: UInt64
+        if let generation {
+            activeGeneration = generation
+        } else {
+            activeGeneration = await MainActor.run { () -> UInt64 in
+                reverseGeocodeGeneration &+= 1
+                return reverseGeocodeGeneration
+            }
+        }
+#if DEBUG
+        print(
+            "[BusinessVenuePinSync] reverseGeocodeStarted coordinate=\(coordinate.latitude),\(coordinate.longitude) source=\(source.rawValue) generation=\(activeGeneration)"
+        )
         await MainActor.run {
+            print(
+                "[BusinessVenuePinSync] draftBefore street=\(draft.addressLine1) city=\(draft.locality) lat=\((draft.latitude.map { String($0) } ?? "nil")) lon=\((draft.longitude.map { String($0) } ?? "nil"))"
+            )
+        }
+#endif
+        let result = await viewModel.reverseGeocodeBusinessVenueLocation(for: coordinate)
+        await MainActor.run {
+            guard activeGeneration == reverseGeocodeGeneration else {
+#if DEBUG
+                print(
+                    "[BusinessVenuePinSync] staleResultRejected generation=\(activeGeneration) current=\(reverseGeocodeGeneration)"
+                )
+#endif
+                isResolving = false
+                return
+            }
             isResolving = false
-            draft.latitude = pinCoordinate.latitude
-            draft.longitude = pinCoordinate.longitude
-            if let line1 = result.addressLine1, !line1.isEmpty { draft.addressLine1 = line1 }
-            if let line2 = result.addressLine2, !line2.isEmpty { draft.addressLine2 = line2 }
-            if let locality = result.locality, !locality.isEmpty { draft.locality = locality }
-            if let region = result.region, !region.isEmpty { draft.region = region }
-            if let postal = result.postalCode, !postal.isEmpty { draft.postalCode = postal }
-            if let country = result.countryCode, !country.isEmpty { draft.countryCode = country }
-            if let formatted = result.formattedAddress, !formatted.isEmpty {
-                draft.formattedAddress = formatted
+            draft.applyPinReverseGeocode(
+                result,
+                coordinate: coordinate,
+                source: source,
+                revision: activeGeneration
+            )
+            if draft.addressNeedsConfirmation {
+                statusText = L10n.t("Confirm the address for this pin", languageCode: appLanguageRaw)
+            } else if let formatted = draft.formattedAddress, !formatted.isEmpty {
                 statusText = formatted
             } else {
                 statusText = "Pin selected. You can confirm and edit address text manually."
             }
+#if DEBUG
+            print(
+                "[BusinessVenuePinSync] reverseGeocodeCompleted line1=\(result.addressLine1 ?? "") locality=\(result.locality ?? "") region=\(result.region ?? "") postal=\(result.postalCode ?? "") country=\(result.countryCode ?? "") formatted=\(result.formattedAddress ?? "")"
+            )
+            print(
+                "[BusinessVenuePinSync] draftAfter street=\(draft.addressLine1) city=\(draft.locality) region=\(draft.region) postal=\(draft.postalCode) lat=\((draft.latitude.map { String($0) } ?? "nil")) lon=\((draft.longitude.map { String($0) } ?? "nil")) needsConfirmation=\(draft.addressNeedsConfirmation) source=\(draft.updateSource.rawValue)"
+            )
+            print("[BusinessVenuePinSync] updateApplied=true generation=\(activeGeneration)")
+#endif
         }
     }
 }

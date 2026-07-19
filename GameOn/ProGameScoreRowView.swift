@@ -16,18 +16,22 @@ nonisolated struct ProGameTeamScoreIdentity: Equatable {
             return ProGameTeamScoreIdentity(leading: .none, displayName: cleanedName)
         }
 
-        if let flag = CountryFlagHelper.flag(for: cleanedName, source: source)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !flag.isEmpty {
+        // Shared sports-identity policy: flags OK; remote official crests only when verified licensed.
+        let artwork = SportsIdentityArtworkResolver.resolveProGameTeam(
+            teamName: cleanedName,
+            badgeURL: badgeURL,
+            source: source
+        )
+        switch artwork.kind {
+        case .countryFlag(let flag):
             return ProGameTeamScoreIdentity(leading: .flag(flag), displayName: cleanedName)
-        }
-
-        let cleanedBadge = badgeURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !cleanedBadge.isEmpty, let url = URL(string: cleanedBadge) {
+        case .verifiedRemote(let url):
             return ProGameTeamScoreIdentity(leading: .logoURL(url), displayName: cleanedName)
+        case .fanGeoMonogram, .genericSymbol:
+            // Consumers that only support flag/URL/none keep `.none` and show name text;
+            // rich cards can adopt ``SportsIdentityArtworkView`` in a later migration phase.
+            return ProGameTeamScoreIdentity(leading: .none, displayName: cleanedName)
         }
-
-        return ProGameTeamScoreIdentity(leading: .none, displayName: cleanedName)
     }
 
     static func cleanTeamName(_ raw: String) -> String {

@@ -3,15 +3,42 @@ import Foundation
 import MapKit
 import SwiftUI
 
-// MARK: - Following → Discover (saved venue on map)
+// MARK: - Following → Discover (favorite venue on map)
 
 @MainActor
 extension MapViewModel {
 
-    /// Saved venue row in Following: switch to Discover and focus this venue when consumed.
+    /// Watch + All Spots + All Sports so a favorite venue is never hidden by Play / Hosting Games / sport filters.
+    /// Idempotent: skips mutations that are already in the required state.
+    func prepareDiscoverFavoriteSpotBrowsingContext() {
+        if discoverMapContentMode != .venues {
+            clearDiscoverMapContentSelectionsWhenSwitching(to: .venues)
+            discoverMapContentMode = .venues
+        }
+        if mapDisplayMode != .allSpots {
+            mapDisplayMode = .allSpots
+        }
+        if selectedSport != "All" {
+            selectedSport = "All"
+        }
+    }
+
+    /// Favorite Spots row in Going: switch to Discover and focus this venue when consumed.
     func requestDiscoverFocusForSavedVenue(_ bar: BarVenue) {
+        // Establish browsing context before the tab switch so Discover never flashes Play / Games dock.
+        prepareDiscoverFavoriteSpotBrowsingContext()
         pendingFollowingMapVenueID = bar.id
         pendingFollowingMapVenueSnapshot = bar
+    }
+
+    /// Chat Watch Spot (and other callers with an authoritative venue id): same Discover path as Favorite Spots.
+    /// Uses in-memory venue snapshots when available; ``consumeFollowingVenueNavigationIfPending`` fetches by id if needed.
+    func requestDiscoverFocusForVenueId(_ venueId: UUID) {
+        prepareDiscoverFavoriteSpotBrowsingContext()
+        let snapshot = bars.first(where: { $0.id == venueId })
+            ?? followingTabSavedVenues.first(where: { $0.id == venueId })
+        pendingFollowingMapVenueID = venueId
+        pendingFollowingMapVenueSnapshot = snapshot
     }
 
     /// Pickup row in Following: switch to Discover and focus this pickup game when consumed.
@@ -34,6 +61,9 @@ extension MapViewModel {
         }
 
         followingMapNavigationMessage = nil
+
+        // Re-assert safe venue-viewing context in case state drifted before consume.
+        prepareDiscoverFavoriteSpotBrowsingContext()
 
         var resolved: BarVenue?
         if let match = bars.first(where: { $0.id == id }) {

@@ -1,5 +1,6 @@
 import Foundation
 import CoreLocation
+import SwiftUI
 
 enum CompactGameTimeFormatter {
     static func timeWithZone(for date: Date, timeZoneOption: FanGeoTimeZonePreference) -> String {
@@ -89,8 +90,10 @@ enum DiscoverMapContentMode: String, CaseIterable, Identifiable, Equatable {
 
 /// Pickup-only map layer: user-created games vs physical places to play.
 enum DiscoverPickupSubMode: String, CaseIterable, Identifiable, Equatable {
-    case games
+    /// Broad browsing (places to play). Listed first for UI / VoiceOver order.
     case places
+    /// Narrower activity (active pickup games).
+    case games
 
     var id: String { rawValue }
 
@@ -119,9 +122,18 @@ enum CalendarTabGameFilter: String, CaseIterable, Identifiable, Equatable {
 
     var segmentTitle: String {
         switch self {
-        case .venueGames: return "Venues"
-        case .pickupGames: return "Pickup"
-        case .proGames: return "Pro"
+        case .venueGames: return L10n.t("intent_watch")
+        case .pickupGames: return L10n.t("intent_play")
+        case .proGames: return L10n.t("pro_games")
+        }
+    }
+
+    /// Shared consumer intent tint: Watch green / Play orange / Pro Games blue.
+    var intentTint: Color {
+        switch self {
+        case .venueGames: return FGColor.intentWatch
+        case .pickupGames: return FGColor.intentPlay
+        case .proGames: return FGColor.intentProGames
         }
     }
 }
@@ -762,7 +774,8 @@ enum DiscoverMapDisplayMode: String, CaseIterable, Equatable {
         case .allSpots:
             return "All Spots"
         case .gamesOnly:
-            return "Games Only"
+            // Consumer-facing Discover label (Watch → Hosting Games). Internal rawValue stays `gamesOnly`.
+            return "Hosting Games"
         }
     }
 
@@ -925,7 +938,7 @@ struct BusinessOwnerSignupPayload: Codable, Sendable {
     }
 }
 
-struct PendingFanEmailSignupDraft: Sendable {
+struct PendingFanEmailSignupDraft: Codable, Sendable {
     let email: String
     let profile: FanSignupProfileInput
     let recordFanGuidelinesAcceptance: Bool

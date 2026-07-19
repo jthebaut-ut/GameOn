@@ -15,8 +15,11 @@ struct WatchZoneApp: App {
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     init() {
+        // Must run before ad-consent acknowledgment so upgrade migration is not polluted.
+        FanGeoFirstLaunchLanguagePreferences.prepareAtProcessStart()
         GoogleMobileAdsBootstrap.startIfNeeded()
         #if DEBUG
+        DebugLogGate.applyLaunchArgumentOverridesIfNeeded()
         let b = Bundle.main
         print("GAMEON_DEBUG bundlePath=\(b.bundlePath)")
         print("GAMEON_DEBUG executablePath=\(b.executablePath ?? "(nil)")")

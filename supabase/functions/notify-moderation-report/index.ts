@@ -2,27 +2,35 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "npm:@supabase/supabase-js@2"
 
 /**
- * Admin email for DM moderation reports (user / conversation / message).
+ * Admin email for moderation reports (user / conversation / message / group_conversation / group_message).
  *
  * Secrets (set via `supabase secrets set`):
  *   ADMIN_EMAIL_TO, RESEND_API_KEY, RESEND_FROM
+ * Optional:
+ *   ADMIN_REPORT_REVIEW_BASE_URL
  * Auto-provided on hosted projects:
  *   SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
  *
  * Deploy: `supabase functions deploy notify-moderation-report`
  *
- * Caller JWT validates the reporter. Conversation-report emails read the bounded
- * `conversation_reports.message_snapshot` from the database (never full DM history).
+ * Auth:
+ * - User JWT (iOS best-effort invoke for user/conversation/message/group types)
+ * - Service-role bearer (preferred async pg_net queue for group_conversation / group_message)
+ *
+ * Conversation-report emails read the bounded `conversation_reports.message_snapshot`
+ * from the database (never full DM history). Group conversation emails load title/member
+ * snapshots only. Group message emails include the stored message_text_snapshot only.
  */
 
-type ReportType = "user" | "conversation" | "message"
+type ReportType = "user" | "conversation" | "message" | "group_conversation" | "group_message"
 
-/** Client may send `reporter_user_id`; it is ignored — reporter is always `auth.getUser()` from the JWT. */
+/** Client may send `reporter_user_id`; it is ignored for JWT callers — reporter is JWT subject. */
 interface Payload {
   report_id?: string | null
   report_type: ReportType
-  reported_user_id: string
-  category: string
+  /** Required for user / conversation / message JWT path. Optional when DB row is loaded. */
+  reported_user_id?: string | null
+  category?: string | null
   details?: string | null
   created_at?: string | null
   conversation_id?: string | null
@@ -31,6 +39,9 @@ interface Payload {
   review_window_start?: string | null
   review_window_end?: string | null
   conversation_message_snapshot?: ConversationMessageSnapshot[] | null
+  group_title?: string | null
+  member_count?: number | null
+  source?: string | null
   /** @deprecated Ignored; use JWT subject only. */
   reporter_user_id?: string | null
 }
@@ -70,6 +81,33 @@ interface ConversationReportRow {
   created_at: string | null
 }
 
+interface GroupConversationReportRow {
+  id: string
+  reporter_user_id: string
+  group_conversation_id: string
+  category: string
+  details: string | null
+  group_title_snapshot: string | null
+  member_count_snapshot: number | null
+  moderation_notified_at: string | null
+  created_at: string | null
+  status: string | null
+}
+
+interface GroupMessageReportRow {
+  id: string
+  reporter_user_id: string
+  reported_user_id: string
+  message_id: string
+  conversation_id: string
+  message_text_snapshot: string | null
+  category: string | null
+  details: string | null
+  moderation_notified_at: string | null
+  created_at: string | null
+  status: string | null
+}
+
 interface ProfileNameRow {
   id: string
   display_name: string | null
@@ -92,7 +130,15 @@ function normalizeReportId(raw: string | null | undefined): string {
 
 function normalizeReportType(raw: string | null | undefined): ReportType | null {
   const t = (raw ?? "").trim().toLowerCase()
-  if (t === "user" || t === "conversation" || t === "message") return t
+  if (
+    t === "user"
+    || t === "conversation"
+    || t === "message"
+    || t === "group_conversation"
+    || t === "group_message"
+  ) {
+    return t
+  }
   return null
 }
 
@@ -250,6 +296,101 @@ async function loadConversationReportSnapshotWithRetry(
   return null
 }
 
+async function loadGroupConversationReport(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+  reporterUserId?: string | null,
+): Promise<GroupConversationReportRow | null> {
+  let query = admin
+    .from("group_conversation_reports")
+    .select(
+      "id,reporter_user_id,group_conversation_id,category,details,group_title_snapshot,member_count_snapshot,moderation_notified_at,created_at,status",
+    )
+    .eq("id", reportId)
+
+  if (reporterUserId) {
+    query = query.eq("reporter_user_id", reporterUserId)
+  }
+
+  const { data, error } = await query.maybeSingle()
+
+  if (error) {
+    console.error("notify-moderation-report: group_conversation_reports load failed", error.message)
+    return null
+  }
+  return data as GroupConversationReportRow | null
+}
+
+async function loadGroupMessageReport(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+  reporterUserId?: string | null,
+): Promise<GroupMessageReportRow | null> {
+  let query = admin
+    .from("group_message_reports")
+    .select(
+      "id,reporter_user_id,reported_user_id,message_id,conversation_id,message_text_snapshot,category,details,moderation_notified_at,created_at,status",
+    )
+    .eq("id", reportId)
+
+  if (reporterUserId) {
+    query = query.eq("reporter_user_id", reporterUserId)
+  }
+
+  const { data, error } = await query.maybeSingle()
+
+  if (error) {
+    console.error("notify-moderation-report: group_message_reports load failed", error.message)
+    return null
+  }
+  return data as GroupMessageReportRow | null
+}
+
+async function markGroupConversationReportNotified(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+): Promise<void> {
+  const { error } = await admin
+    .from("group_conversation_reports")
+    .update({ moderation_notified_at: new Date().toISOString() })
+    .eq("id", reportId)
+    .is("moderation_notified_at", null)
+
+  if (error) {
+    console.error("notify-moderation-report: failed to stamp group_conversation moderation_notified_at", error.message)
+  }
+}
+
+async function markGroupMessageReportNotified(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+): Promise<void> {
+  const { error } = await admin
+    .from("group_message_reports")
+    .update({ moderation_notified_at: new Date().toISOString() })
+    .eq("id", reportId)
+    .is("moderation_notified_at", null)
+
+  if (error) {
+    console.error("notify-moderation-report: failed to stamp group_message moderation_notified_at", error.message)
+  }
+}
+
+async function fetchReporterEmail(
+  admin: ReturnType<typeof createClient>,
+  reporterUserId: string,
+): Promise<string> {
+  try {
+    const { data, error } = await admin.auth.admin.getUserById(reporterUserId)
+    if (error || !data.user?.email) {
+      return ""
+    }
+    return data.user.email.trim()
+  } catch {
+    return ""
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "method_not_allowed" }), {
@@ -277,17 +418,8 @@ Deno.serve(async (req) => {
     })
   }
 
-  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-    global: { headers: { Authorization: authHeader } },
-  })
-
-  const { data: { user }, error: authErr } = await supabase.auth.getUser()
-  if (authErr || !user) {
-    return new Response(JSON.stringify({ error: "unauthorized" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    })
-  }
+  const bearerToken = authHeader.replace(/^Bearer\s+/i, "").trim()
+  const isServiceRole = Boolean(serviceRoleKey && bearerToken === serviceRoleKey)
 
   let payload: Payload
   try {
@@ -307,36 +439,88 @@ Deno.serve(async (req) => {
     })
   }
 
-  if (!payload.reported_user_id?.trim() || !payload.category?.trim()) {
-    return new Response(JSON.stringify({ error: "missing_fields" }), {
-      status: 400,
+  if (isServiceRole && reportType !== "group_conversation" && reportType !== "group_message") {
+    return new Response(JSON.stringify({ error: "service_role_type_not_allowed" }), {
+      status: 403,
       headers: { "Content-Type": "application/json" },
     })
   }
 
-  if (reportType === "conversation") {
-    const cid = payload.conversation_id?.trim()
-    if (!cid) {
-      return new Response(JSON.stringify({ error: "conversation_id_required" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      })
-    }
+  let userId = ""
+  let reporterEmail = ""
+
+  if (isServiceRole) {
     if (!normalizeReportId(payload.report_id)) {
       return new Response(JSON.stringify({ error: "report_id_required" }), {
         status: 400,
         headers: { "Content-Type": "application/json" },
       })
     }
-  }
+  } else {
+    const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+      global: { headers: { Authorization: authHeader } },
+    })
+    const { data: { user }, error: authErr } = await supabase.auth.getUser()
+    if (authErr || !user) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    userId = user.id
+    reporterEmail = user.email?.trim() || ""
 
-  if (reportType === "message") {
-    const mid = payload.message_id?.trim()
-    if (!mid) {
-      return new Response(JSON.stringify({ error: "message_id_required" }), {
+    if (!payload.category?.trim() && reportType !== "group_conversation" && reportType !== "group_message") {
+      return new Response(JSON.stringify({ error: "missing_fields" }), {
         status: 400,
         headers: { "Content-Type": "application/json" },
       })
+    }
+
+    if (
+      reportType !== "group_conversation"
+      && reportType !== "group_message"
+      && !payload.reported_user_id?.trim()
+    ) {
+      return new Response(JSON.stringify({ error: "missing_fields" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    if (reportType === "conversation") {
+      const cid = payload.conversation_id?.trim()
+      if (!cid) {
+        return new Response(JSON.stringify({ error: "conversation_id_required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      if (!normalizeReportId(payload.report_id)) {
+        return new Response(JSON.stringify({ error: "report_id_required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+    }
+
+    if (reportType === "group_conversation" || reportType === "group_message") {
+      if (!normalizeReportId(payload.report_id)) {
+        return new Response(JSON.stringify({ error: "report_id_required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+    }
+
+    if (reportType === "message") {
+      const mid = payload.message_id?.trim()
+      if (!mid) {
+        return new Response(JSON.stringify({ error: "message_id_required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
     }
   }
 
@@ -352,30 +536,144 @@ Deno.serve(async (req) => {
   }
 
   const createdAt = (payload.created_at?.trim() || new Date().toISOString())
-  const reporterEmail = user.email?.trim() || ""
   const reporterEmailLine = reporterEmail.length > 0 ? reporterEmail : "(not on file)"
 
   const detailsRaw = (payload.details ?? "").trim()
   const detailsLine = detailsRaw.length > 0 ? detailsRaw : "—"
 
+  const reportIdNormalized = normalizeReportId(payload.report_id)
+  const admin = serviceRoleKey ? createClient(supabaseUrl, serviceRoleKey) : null
+
+  let groupTitle = (payload.group_title ?? "").trim()
+  let memberCountDisplay = payload.member_count == null ? "" : String(payload.member_count)
+  let groupConversationId = (payload.conversation_id ?? "").trim()
+  let categoryForEmail = (payload.category ?? "").trim()
+  let createdAtForEmail = createdAt
+  let detailsForEmail = detailsLine
+  let reportedUserIdForEmail = (payload.reported_user_id ?? "").trim()
+  let messageIdForEmail = (payload.message_id ?? "").trim()
+  let messageSnapshotForEmail = (payload.message_text_snapshot ?? "").trim()
+  let reporterUserIdForEmail = userId
+
+  if (reportType === "group_conversation") {
+    if (!admin || !reportIdNormalized) {
+      return new Response(JSON.stringify({ error: "server_misconfigured" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    const groupReport = await loadGroupConversationReport(
+      admin,
+      reportIdNormalized,
+      isServiceRole ? null : userId,
+    )
+    if (!groupReport) {
+      return new Response(JSON.stringify({ error: "report_not_found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    if (groupReport.moderation_notified_at) {
+      return new Response(JSON.stringify({ ok: true, skipped: true, reason: "already_notified" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    reporterUserIdForEmail = groupReport.reporter_user_id
+    if (isServiceRole || !reporterEmail) {
+      reporterEmail = await fetchReporterEmail(admin, groupReport.reporter_user_id)
+    }
+    groupTitle = (groupReport.group_title_snapshot ?? groupTitle).trim() || "(untitled group)"
+    memberCountDisplay =
+      groupReport.member_count_snapshot == null ? memberCountDisplay || "—" : String(groupReport.member_count_snapshot)
+    groupConversationId = groupReport.group_conversation_id || groupConversationId
+    categoryForEmail = (groupReport.category || categoryForEmail).trim() || "other"
+    createdAtForEmail = (groupReport.created_at || createdAtForEmail).trim()
+    const dbDetails = (groupReport.details ?? "").trim()
+    detailsForEmail = dbDetails.length > 0 ? dbDetails : detailsForEmail
+  }
+
+  if (reportType === "group_message") {
+    if (!admin || !reportIdNormalized) {
+      return new Response(JSON.stringify({ error: "server_misconfigured" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    const groupMessageReport = await loadGroupMessageReport(
+      admin,
+      reportIdNormalized,
+      isServiceRole ? null : userId,
+    )
+    if (!groupMessageReport) {
+      return new Response(JSON.stringify({ error: "report_not_found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    if (groupMessageReport.moderation_notified_at) {
+      return new Response(JSON.stringify({ ok: true, skipped: true, reason: "already_notified" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    reporterUserIdForEmail = groupMessageReport.reporter_user_id
+    if (isServiceRole || !reporterEmail) {
+      reporterEmail = await fetchReporterEmail(admin, groupMessageReport.reporter_user_id)
+    }
+    reportedUserIdForEmail = groupMessageReport.reported_user_id
+    messageIdForEmail = groupMessageReport.message_id
+    groupConversationId = groupMessageReport.conversation_id || groupConversationId
+    messageSnapshotForEmail = (groupMessageReport.message_text_snapshot ?? messageSnapshotForEmail).trim()
+    categoryForEmail = (groupMessageReport.category || categoryForEmail).trim() || "other"
+    createdAtForEmail = (groupMessageReport.created_at || createdAtForEmail).trim()
+    const dbDetails = (groupMessageReport.details ?? "").trim()
+    detailsForEmail = dbDetails.length > 0 ? dbDetails : detailsForEmail
+
+    const { data: conversation } = await admin
+      .from("group_conversations")
+      .select("title")
+      .eq("id", groupMessageReport.conversation_id)
+      .maybeSingle()
+    groupTitle = ((conversation as { title?: string } | null)?.title ?? groupTitle).trim() || "Group"
+  }
+
+  if (!categoryForEmail && reportType !== "group_conversation" && reportType !== "group_message") {
+    return new Response(JSON.stringify({ error: "missing_fields" }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
+
+  const reporterEmailDisplay = reporterEmail.length > 0 ? reporterEmail : reporterEmailLine
+
   let snapshotSection = ""
-  if (reportType === "message") {
-    const snap = truncateSnapshot((payload.message_text_snapshot ?? "").trim())
+  if (reportType === "message" || reportType === "group_message") {
+    const snap = truncateSnapshot(messageSnapshotForEmail || (payload.message_text_snapshot ?? "").trim())
     const snapDisplay = snap.length > 0 ? snap : "(empty message)"
     snapshotSection = `<p style="margin:8px 0"><strong>Message text (snapshot):</strong><br/><span style="white-space:pre-wrap">${escapeHtml(snapDisplay)}</span></p>`
   }
 
-  const convLine = payload.conversation_id?.trim()
-    ? `<p style="margin:8px 0"><strong>Conversation ID:</strong> ${escapeHtml(payload.conversation_id!.trim())}</p>`
+  const convLine = groupConversationId || payload.conversation_id?.trim()
+    ? `<p style="margin:8px 0"><strong>${
+      reportType === "group_conversation" || reportType === "group_message"
+        ? "Group conversation ID"
+        : "Conversation ID"
+    }:</strong> ${escapeHtml((groupConversationId || payload.conversation_id || "").trim())}</p>`
     : ""
 
-  const reportIdNormalized = normalizeReportId(payload.report_id)
   const reportIdLine = reportIdNormalized
     ? `<p style="margin:8px 0"><strong>Report ID:</strong> ${escapeHtml(reportIdNormalized)}</p>`
     : ""
 
-  const msgLine = payload.message_id?.trim()
-    ? `<p style="margin:8px 0"><strong>Message ID:</strong> ${escapeHtml(payload.message_id!.trim())}</p>`
+  const msgLine = messageIdForEmail || payload.message_id?.trim()
+    ? `<p style="margin:8px 0"><strong>Message ID:</strong> ${escapeHtml((messageIdForEmail || payload.message_id || "").trim())}</p>`
     : ""
 
   let windowStart = (payload.review_window_start ?? "").trim()
@@ -385,8 +683,8 @@ Deno.serve(async (req) => {
   if (reportType === "conversation") {
     const reportId = reportIdNormalized
     let snapshotMessages: ConversationMessageSnapshot[] = []
-    let reporterUserId = user.id
-    let reportedUserId = payload.reported_user_id.trim()
+    let reporterUserId = userId
+    let reportedUserId = reportedUserIdForEmail
     const payloadSnapshot = filterSnapshotToReviewWindow(
       normalizeSnapshotMessages(payload.conversation_message_snapshot),
       windowStart,
@@ -397,10 +695,8 @@ Deno.serve(async (req) => {
     console.log(`[PrivateReportEmail] report_type=${reportType}`)
     console.log(`[PrivateReportEmail] payload_snapshot_count=${payloadSnapshot.length}`)
 
-    const admin = serviceRoleKey ? createClient(supabaseUrl, serviceRoleKey) : null
-
     if (admin && reportId) {
-      const reportRow = await loadConversationReportSnapshotWithRetry(admin, reportId, user.id)
+      const reportRow = await loadConversationReportSnapshotWithRetry(admin, reportId, userId)
       if (reportRow) {
         windowStart = (reportRow.review_window_start ?? windowStart).trim()
         windowEnd = (reportRow.review_window_end ?? windowEnd).trim()
@@ -423,7 +719,7 @@ Deno.serve(async (req) => {
         }
       } else {
         console.error(
-          `notify-moderation-report: missing conversation_reports row report_id=${reportId} reporter=${user.id} — using payload snapshot`,
+          `notify-moderation-report: missing conversation_reports row report_id=${reportId} reporter=${userId} — using payload snapshot`,
         )
         snapshotMessages = payloadSnapshot
       }
@@ -477,15 +773,38 @@ Deno.serve(async (req) => {
     )
   }
 
+  const groupSection = reportType === "group_conversation" || reportType === "group_message"
+    ? `<tr><td style="padding:6px 0;vertical-align:top"><strong>Group title</strong></td><td style="padding:6px 0">${escapeHtml(groupTitle || "—")}</td></tr>${
+      reportType === "group_conversation"
+        ? `<tr><td style="padding:6px 0;vertical-align:top"><strong>Member count</strong></td><td style="padding:6px 0">${escapeHtml(memberCountDisplay || "—")}</td></tr>`
+        : ""
+    }`
+    : ""
+
+  const reportedUserRow = reportType === "group_conversation"
+    ? ""
+    : `<tr><td style="padding:6px 0;vertical-align:top"><strong>Reported user ID</strong></td><td style="padding:6px 0">${escapeHtml(reportedUserIdForEmail || "—")}</td></tr>`
+
   const reviewWindowSection = ""
 
   const adminReviewBaseUrl = Deno.env.get("ADMIN_REPORT_REVIEW_BASE_URL")?.trim() ?? ""
   const reportReviewLink = adminReviewBaseUrl && reportIdNormalized
-    ? `${adminReviewBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(reportIdNormalized)}`
+    ? reportType === "group_conversation"
+      ? `${adminReviewBaseUrl.replace(/\/+$/, "")}?reportId=${encodeURIComponent(reportIdNormalized)}#group-conversation-reports`
+      : reportType === "group_message"
+        ? `${adminReviewBaseUrl.replace(/\/+$/, "")}?reportId=${encodeURIComponent(reportIdNormalized)}#group-message-reports`
+        : `${adminReviewBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(reportIdNormalized)}`
     : ""
   const reportReviewLinkLine = reportReviewLink
     ? `<p style="margin:8px 0"><strong>Admin review:</strong> <a href="${escapeHtml(reportReviewLink)}">${escapeHtml(reportReviewLink)}</a></p>`
     : ""
+
+  const reportTypeLabel =
+    reportType === "group_conversation"
+      ? "group conversation"
+      : reportType === "group_message"
+        ? "group message"
+        : reportType
 
   const html = `<!DOCTYPE html>
 <html>
@@ -494,23 +813,30 @@ Deno.serve(async (req) => {
   <p style="margin:10px 0;font-size:15px">A user submitted a report that needs manual review.</p>
   <hr style="border:none;border-top:1px solid #e2e8f0;margin:18px 0"/>
   <table style="font-size:14px;border-collapse:collapse;width:100%">
-    <tr><td style="padding:6px 0;vertical-align:top;width:160px"><strong>Report type</strong></td><td style="padding:6px 0">${escapeHtml(reportType)}</td></tr>
-    <tr><td style="padding:6px 0;vertical-align:top"><strong>Category</strong></td><td style="padding:6px 0">${escapeHtml(payload.category.trim())}</td></tr>
-    <tr><td style="padding:6px 0;vertical-align:top"><strong>Created at</strong></td><td style="padding:6px 0">${escapeHtml(createdAt)}</td></tr>
-    <tr><td style="padding:6px 0;vertical-align:top"><strong>Reporter user ID</strong></td><td style="padding:6px 0">${escapeHtml(user.id)}</td></tr>
-    <tr><td style="padding:6px 0;vertical-align:top"><strong>Reporter email</strong></td><td style="padding:6px 0">${escapeHtml(reporterEmailLine)}</td></tr>
-    <tr><td style="padding:6px 0;vertical-align:top"><strong>Reported user ID</strong></td><td style="padding:6px 0">${escapeHtml(payload.reported_user_id.trim())}</td></tr>
+    <tr><td style="padding:6px 0;vertical-align:top;width:160px"><strong>Report type</strong></td><td style="padding:6px 0">${escapeHtml(reportTypeLabel)}</td></tr>
+    <tr><td style="padding:6px 0;vertical-align:top"><strong>Category</strong></td><td style="padding:6px 0">${escapeHtml(categoryForEmail || "—")}</td></tr>
+    <tr><td style="padding:6px 0;vertical-align:top"><strong>Created at</strong></td><td style="padding:6px 0">${escapeHtml(createdAtForEmail)}</td></tr>
+    <tr><td style="padding:6px 0;vertical-align:top"><strong>Reporter user ID</strong></td><td style="padding:6px 0">${escapeHtml(reporterUserIdForEmail || userId || "—")}</td></tr>
+    <tr><td style="padding:6px 0;vertical-align:top"><strong>Reporter email</strong></td><td style="padding:6px 0">${escapeHtml(reporterEmailDisplay)}</td></tr>
+    ${reportedUserRow}
+    ${groupSection}
   </table>
   ${reportIdLine}
   ${convLine}
   ${msgLine}
   ${conversationContextSection}
   <p style="margin:14px 0 8px;font-size:14px"><strong>Details</strong></p>
-  <p style="margin:0;font-size:14px;white-space:pre-wrap;background:#f8fafc;padding:12px 14px;border-radius:10px;border:1px solid #e2e8f0">${escapeHtml(detailsLine)}</p>
+  <p style="margin:0;font-size:14px;white-space:pre-wrap;background:#f8fafc;padding:12px 14px;border-radius:10px;border:1px solid #e2e8f0">${escapeHtml(detailsForEmail)}</p>
   ${reviewWindowSection}
   ${reportReviewLinkLine}
   ${snapshotSection}
-  <p style="margin-top:22px;font-size:12px;color:#64748b">This message was generated by the FanGeo moderation notification service.</p>
+  <p style="margin-top:22px;font-size:12px;color:#64748b">This message was generated by the FanGeo moderation notification service.${
+    reportType === "group_conversation"
+      ? " Group message history is not included."
+      : reportType === "group_message"
+        ? " Only the stored message snapshot is included."
+        : ""
+  }</p>
 </body>
 </html>`
 
@@ -523,7 +849,7 @@ Deno.serve(async (req) => {
     body: JSON.stringify({
       from: resendFrom,
       to: [adminTo],
-      subject: `FanGeo moderation report — ${reportType}`,
+      subject: `FanGeo moderation report — ${reportTypeLabel}`,
       html,
     }),
   })
@@ -535,6 +861,13 @@ Deno.serve(async (req) => {
       JSON.stringify({ ok: false, error: "email_send_failed" }),
       { status: 502, headers: { "Content-Type": "application/json" } },
     )
+  }
+
+  if (reportType === "group_conversation" && admin && reportIdNormalized) {
+    await markGroupConversationReportNotified(admin, reportIdNormalized)
+  }
+  if (reportType === "group_message" && admin && reportIdNormalized) {
+    await markGroupMessageReportNotified(admin, reportIdNormalized)
   }
 
   return new Response(JSON.stringify({ ok: true }), {

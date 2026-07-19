@@ -183,9 +183,13 @@ struct TeamTheme {
             }
         }
         if missing.isEmpty {
-            print("[TeamThemeDebug] ukSubdivisionDisplayFlagsValidation=passed count=3 source=\(source)")
+            DebugLogGate.calendarFlagVerbose(
+                "[CalendarFlagDebug] ukSubdivisionDisplayFlagsValidation=passed count=3 source=\(source)"
+            )
         } else {
-            print("[TeamThemeDebug] ukSubdivisionDisplayFlagsValidation=failed missingCount=\(missing.count) missing=\(missing.joined(separator: ", ")) source=\(source)")
+            DebugLogGate.notificationWarning(
+                "[CalendarFlagDebug] validationFailed missing=\(missing.joined(separator: ",")) count=\(missing.count)"
+            )
         }
         return missing
     }

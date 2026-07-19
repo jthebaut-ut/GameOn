@@ -166,9 +166,17 @@ enum NationalTeamCountryCatalog {
 }
 
 struct NationalTeamIdentityCard: View {
+    enum PresentationStyle: Equatable {
+        /// Profile / picker title: "[Country] Fan" + World Cup line.
+        case standard
+        /// Onboarding selected-country identity messaging.
+        case joiningTeam
+    }
+
     let identity: NationalTeamIdentity
     var showsEditAffordance = false
     var compact = false
+    var presentationStyle: PresentationStyle = .standard
     var onTap: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -180,7 +188,7 @@ struct NationalTeamIdentityCard: View {
         let cardCorner: CGFloat = compact ? 22 : 20
         let horizontalPadding: CGFloat = compact ? 16 : 13
         let verticalPadding: CGFloat = compact ? 15 : 13
-        let minCardHeight: CGFloat? = compact ? 92 : nil
+        let minCardHeight: CGFloat? = compact ? (presentationStyle == .joiningTeam ? 104 : 92) : nil
         Button {
             onTap?()
         } label: {
@@ -208,19 +216,34 @@ struct NationalTeamIdentityCard: View {
                     )
 
                 VStack(alignment: .leading, spacing: compact ? 5 : 4) {
-                    Text(identity.resolvedSupporterLabel(languageCode: appLanguageRaw))
+                    Text(primaryTitle)
                         .font(.system(size: compact ? 18 : 17, weight: .heavy, design: .rounded))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(1)
+                        .lineLimit(presentationStyle == .joiningTeam ? 2 : 1)
                         .minimumScaleFactor(0.72)
-                    HStack(spacing: 6) {
-                        Image(systemName: "soccerball")
-                            .font(.system(size: compact ? 11 : 10, weight: .bold))
-                        Text(NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw))
-                            .font(.system(size: compact ? 12 : 11, weight: .bold, design: .rounded))
-                            .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if presentationStyle == .joiningTeam {
+                        Text(CountryDemonymCopy.connectionMessage(
+                            countryCode: identity.countryCode,
+                            countryName: identity.countryName,
+                            languageCode: appLanguageRaw
+                        ))
+                        .font(.system(size: compact ? 12 : 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(3)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        HStack(spacing: 6) {
+                            Image(systemName: "soccerball")
+                                .font(.system(size: compact ? 11 : 10, weight: .bold))
+                            Text(NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw))
+                                .font(.system(size: compact ? 12 : 11, weight: .bold, design: .rounded))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(FGColor.accentGreen)
                     }
-                    .foregroundStyle(FGColor.accentGreen)
                 }
 
                 Spacer(minLength: 0)
@@ -281,6 +304,180 @@ struct NationalTeamIdentityCard: View {
         .buttonStyle(.plain)
         .disabled(onTap == nil)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var primaryTitle: String {
+        switch presentationStyle {
+        case .standard:
+            return identity.resolvedSupporterLabel(languageCode: appLanguageRaw)
+        case .joiningTeam:
+            return String(
+                format: L10n.t("onboarding_joining_team_format", languageCode: appLanguageRaw),
+                locale: Locale(identifier: appLanguageRaw),
+                identity.countryName
+            )
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch presentationStyle {
+        case .standard:
+            return identity.displayTitle(languageCode: appLanguageRaw)
+        case .joiningTeam:
+            let supporting = CountryDemonymCopy.connectionMessage(
+                countryCode: identity.countryCode,
+                countryName: identity.countryName,
+                languageCode: appLanguageRaw
+            )
+            return "\(primaryTitle). \(supporting)"
+        }
+    }
+}
+
+/// Small curated demonym table for country identity copy — never invents demonyms from names.
+enum CountryDemonymCopy {
+    /// ISO region code → localization key. Keep this list curated; omit uncertain demonyms.
+    private static let demonymKeysByCountryCode: [String: String] = [
+        "US": "country_demonym_US",
+        "MX": "country_demonym_MX",
+        "CA": "country_demonym_CA",
+        "BR": "country_demonym_BR",
+        "AR": "country_demonym_AR",
+        "FR": "country_demonym_FR",
+        "ES": "country_demonym_ES",
+        "DE": "country_demonym_DE",
+        "IT": "country_demonym_IT",
+        "PT": "country_demonym_PT",
+        "NL": "country_demonym_NL",
+        "BE": "country_demonym_BE",
+        "GB": "country_demonym_GB",
+        "IE": "country_demonym_IE",
+        "JP": "country_demonym_JP",
+        "KR": "country_demonym_KR",
+        "AU": "country_demonym_AU",
+        "NZ": "country_demonym_NZ",
+        "MA": "country_demonym_MA",
+        "SN": "country_demonym_SN",
+        "NG": "country_demonym_NG",
+        "GH": "country_demonym_GH",
+        "EG": "country_demonym_EG",
+        "SA": "country_demonym_SA",
+        "AE": "country_demonym_AE",
+        "QA": "country_demonym_QA",
+        "TR": "country_demonym_TR",
+        "PL": "country_demonym_PL",
+        "SE": "country_demonym_SE",
+        "NO": "country_demonym_NO",
+        "DK": "country_demonym_DK",
+        "CH": "country_demonym_CH",
+        "AT": "country_demonym_AT",
+        "CL": "country_demonym_CL",
+        "CO": "country_demonym_CO",
+        "UY": "country_demonym_UY",
+        "PE": "country_demonym_PE",
+        "EC": "country_demonym_EC",
+        "CR": "country_demonym_CR",
+        "JM": "country_demonym_JM"
+    ]
+
+    private static let englishDemonymFallbacks: [String: String] = [
+        "US": "U.S.",
+        "MX": "Mexican",
+        "CA": "Canadian",
+        "BR": "Brazilian",
+        "AR": "Argentine",
+        "FR": "French",
+        "ES": "Spanish",
+        "DE": "German",
+        "IT": "Italian",
+        "PT": "Portuguese",
+        "NL": "Dutch",
+        "BE": "Belgian",
+        "GB": "British",
+        "IE": "Irish",
+        "JP": "Japanese",
+        "KR": "South Korean",
+        "AU": "Australian",
+        "NZ": "New Zealand",
+        "MA": "Moroccan",
+        "SN": "Senegalese",
+        "NG": "Nigerian",
+        "GH": "Ghanaian",
+        "EG": "Egyptian",
+        "SA": "Saudi",
+        "AE": "Emirati",
+        "QA": "Qatari",
+        "TR": "Turkish",
+        "PL": "Polish",
+        "SE": "Swedish",
+        "NO": "Norwegian",
+        "DK": "Danish",
+        "CH": "Swiss",
+        "AT": "Austrian",
+        "CL": "Chilean",
+        "CO": "Colombian",
+        "UY": "Uruguayan",
+        "PE": "Peruvian",
+        "EC": "Ecuadorian",
+        "CR": "Costa Rican",
+        "JM": "Jamaican"
+    ]
+
+    static func demonym(countryCode: String, languageCode: String) -> String? {
+        demonym(countryCode: countryCode, countryName: nil, languageCode: languageCode)
+    }
+
+    static func demonym(countryCode: String, countryName: String?, languageCode: String) -> String? {
+        let normalizedName = (countryName ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        // Prefer nation-specific adjectives over a generic GB demonym for UK home nations.
+        let homeNationKeys: [String: String] = [
+            "england": "country_demonym_ENGLAND",
+            "scotland": "country_demonym_SCOTLAND",
+            "wales": "country_demonym_WALES",
+            "northern ireland": "country_demonym_NORTHERN_IRELAND"
+        ]
+        if let nationKey = homeNationKeys[normalizedName] {
+            let localized = L10n.t(nationKey, languageCode: languageCode)
+            if localized != nationKey { return localized }
+            let english: [String: String] = [
+                "england": "English",
+                "scotland": "Scottish",
+                "wales": "Welsh",
+                "northern ireland": "Northern Irish"
+            ]
+            return english[normalizedName]
+        }
+
+        let code = countryCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        // Avoid mapping UK home-nation selections (often stored as GB) to "British".
+        if code == "GB", !normalizedName.isEmpty, normalizedName != "united kingdom", normalizedName != "great britain" {
+            return nil
+        }
+        guard let key = demonymKeysByCountryCode[code] else { return nil }
+        let localized = L10n.t(key, languageCode: languageCode)
+        if localized != key {
+            return localized
+        }
+        return englishDemonymFallbacks[code]
+    }
+
+    static func connectionMessage(countryCode: String, countryName: String, languageCode: String) -> String {
+        let locale = Locale(identifier: languageCode)
+        if let demonym = demonym(countryCode: countryCode, countryName: countryName, languageCode: languageCode) {
+            return String(
+                format: L10n.t("onboarding_country_connect_demonym_format", languageCode: languageCode),
+                locale: locale,
+                demonym
+            )
+        }
+        return String(
+            format: L10n.t("onboarding_country_connect_fallback_format", languageCode: languageCode),
+            locale: locale,
+            countryName
+        )
     }
 }
 

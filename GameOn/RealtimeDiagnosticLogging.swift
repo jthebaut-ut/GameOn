@@ -18,11 +18,73 @@ nonisolated enum DebugLogGate {
     /// Discover tab-visible consistency / annotation tracing.
     static var verboseDiscoverTabPerfLogging = false
 
+    /// Calendar / national-team flag alias audits and per-team dumps (DEBUG, off by default).
+    static var calendarFlagDiagnosticsEnabled = false
+    /// Push notification team/flag dumps (DEBUG, off by default).
+    static var pushFlagDiagnosticsEnabled = false
+    /// Per-game reminder cancel / skip / reminderDate dumps (DEBUG, off by default).
+    static var proGameReminderDiagnosticsEnabled = false
+
     static var hotPathPerfLoggingEnabled: Bool {
 #if DEBUG
         return true
 #else
         return releaseHotPathPerfLogging
+#endif
+    }
+
+#if DEBUG
+    /// Enables opt-in diagnostic gates from Xcode scheme launch arguments.
+    /// `-CalendarFlagDiagnostics`, `-PushFlagDiagnostics`, `-ProGameReminderDiagnostics`
+    /// `-TabSwitchPerfDiagnostics`, `-UIPerfDiagnostics`
+    static func applyLaunchArgumentOverridesIfNeeded() {
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("-CalendarFlagDiagnostics") {
+            calendarFlagDiagnosticsEnabled = true
+        }
+        if args.contains("-PushFlagDiagnostics") {
+            pushFlagDiagnosticsEnabled = true
+        }
+        if args.contains("-ProGameReminderDiagnostics") {
+            proGameReminderDiagnosticsEnabled = true
+        }
+        if args.contains("-TabSwitchPerfDiagnostics") {
+            verboseTabSwitchPerfLogging = true
+            verboseGoingTabPerfLogging = true
+        }
+        if args.contains("-UIPerfDiagnostics") {
+            DispatchQueue.main.async {
+                UIPerformanceDiagnostics.uiPerformanceDiagnosticsEnabled = true
+            }
+        }
+    }
+#endif
+
+    static func calendarFlagVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard calendarFlagDiagnosticsEnabled else { return }
+        print(log())
+#endif
+    }
+
+    static func pushFlagVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard pushFlagDiagnosticsEnabled else { return }
+        print(log())
+#endif
+    }
+
+    static func proGameReminderVerbose(_ log: @autoclosure () -> String) {
+#if DEBUG
+        guard proGameReminderDiagnosticsEnabled else { return }
+        print(log())
+#endif
+    }
+
+    /// Always-visible DEBUG warning/error for notification & flag correctness.
+    static func notificationWarning(_ log: @autoclosure () -> String) {
+#if DEBUG
+        print(log())
 #endif
     }
 
@@ -363,6 +425,38 @@ enum SuggestedFansDebug {
 #endif
     }
 
+    static func requestStarted(currentUserId: UUID?) {
+#if DEBUG
+        let user = currentUserId?.uuidString.lowercased() ?? "nil"
+        print("[SuggestedFansDebug] currentUser=\(user) requestStarted=true")
+#endif
+    }
+
+    static func profileReady(
+        favoritesCount: Int,
+        countryCode: String?,
+        coordinatesAvailable: Bool
+    ) {
+#if DEBUG
+        let country = countryCode?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? "nil"
+        print(
+            "[SuggestedFansDebug] profileReady=true favorites=\(favoritesCount) country=\(country) coordinatesAvailable=\(coordinatesAvailable)"
+        )
+#endif
+    }
+
+    static func filterSummary(_ summary: SuggestedFansEligibility.FilterSummary) {
+#if DEBUG
+        print(
+            "[SuggestedFansDebug] backendRows=\(summary.backendRows) decodedRows=\(summary.decodedRows) clientVisibleRows=\(summary.clientVisibleRows)"
+        )
+        print(
+            "[SuggestedFansDebug] excluded blocked=\(summary.blocked) alreadyFriends=\(summary.alreadyFriends) undiscoverable=\(summary.notDiscoverable) deleted=\(summary.deleted) banned=\(summary.banned + summary.inactiveAdmin) missingLocation=\(summary.missingLocation) outsideRadius=\(summary.outsideRadius) belowScore=\(summary.belowScore) identityHidden=\(summary.publicIdentityHidden) profileRowUnavailable=\(summary.profileRowUnavailable) self=\(summary.selfExcluded) business=\(summary.businessAccount)"
+        )
+        print("[SuggestedFansDebug] finalSuggestions=\(summary.clientVisibleRows)")
+#endif
+    }
+
     static func firstContentVisibleMs(_ milliseconds: Int) {
 #if DEBUG
         print("[SuggestedFansDebug] firstContentVisibleMs=\(milliseconds)")
@@ -372,6 +466,140 @@ enum SuggestedFansDebug {
     static func loadingFinished(count: Int) {
 #if DEBUG
         print("[SuggestedFansDebug] loadingFinished count=\(count)")
+#endif
+    }
+}
+
+/// DEBUG-only tap → public-profile open tracing for Suggested Fans (and related profile opens).
+enum SuggestedFanProfileOpenDebug {
+    private static let signpostLog = OSLog(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.jt.fangio",
+        category: "SuggestedFanProfileOpen"
+    )
+    private static var activeSignpostID: OSSignpostID?
+    private static var activeGeneration: UInt64 = 0
+
+    static var currentGeneration: UInt64 { activeGeneration }
+
+    static func cardTapReceived(
+        recommendationStableId: UUID,
+        targetUserIdPresent: Bool,
+        displayModelIdType: String,
+        authenticatedUserPresent: Bool,
+        context: String
+    ) {
+#if DEBUG
+        activeGeneration &+= 1
+        let generation = activeGeneration
+        if let prior = activeSignpostID {
+            os_signpost(.end, log: signpostLog, name: "SuggestedFanProfileOpen", signpostID: prior)
+        }
+        let signpostID = OSSignpostID(log: signpostLog)
+        activeSignpostID = signpostID
+        os_signpost(.begin, log: signpostLog, name: "SuggestedFanProfileOpen", signpostID: signpostID)
+        print(
+            "[SuggestedFanProfileOpen] cardTapReceived generation=\(generation) recommendationStableIdPresent=true targetUserIdPresent=\(targetUserIdPresent) displayModelIdType=\(displayModelIdType) authenticatedUserPresent=\(authenticatedUserPresent) context=\(context)"
+        )
+        // Keep exact UUIDs out of user-facing surfaces; DEBUG console only, hashed prefix.
+        print(
+            "[SuggestedFanProfileOpen] recommendationStableIdPrefix=\(recommendationStableId.uuidString.lowercased().prefix(8)) generation=\(generation)"
+        )
+#endif
+    }
+
+    static func eligibility(
+        isSelf: Bool,
+        isBlocked: Bool,
+        generation: UInt64? = nil
+    ) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print(
+            "[SuggestedFanProfileOpen] eligibilityResult generation=\(gen) self=\(isSelf) blocked=\(isBlocked) deleted=unchecked_until_rpc"
+        )
+#endif
+    }
+
+    static func presentationStarted(
+        alreadyPresented: Bool,
+        generation: UInt64? = nil
+    ) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print(
+            "[SuggestedFanProfileOpen] presentationRequestStarted generation=\(gen) existingProfileSheetAlreadyPresented=\(alreadyPresented)"
+        )
+#endif
+    }
+
+    static func serviceRequestStarted(generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] publicProfileServiceRequestStarted generation=\(gen)")
+#endif
+    }
+
+    static func rpcReceived(visible: Bool, generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] rpcResponseReceived visible=\(visible) generation=\(gen)")
+#endif
+    }
+
+    static func decodingCompleted(
+        mutualAvatarCount: Int,
+        uniqueMutualAvatarCount: Int,
+        teamCount: Int,
+        uniqueTeamCount: Int,
+        openToCount: Int,
+        generation: UInt64? = nil
+    ) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print(
+            "[SuggestedFanProfileOpen] profileDecodingCompleted generation=\(gen) mutualAvatars=\(mutualAvatarCount) uniqueMutualAvatars=\(uniqueMutualAvatarCount) teams=\(teamCount) uniqueTeams=\(uniqueTeamCount) openTo=\(openToCount)"
+        )
+        if mutualAvatarCount != uniqueMutualAvatarCount || teamCount != uniqueTeamCount {
+            print(
+                "[SuggestedFanProfileOpen] duplicateIdentityKeysDetected mutualDelta=\(mutualAvatarCount - uniqueMutualAvatarCount) teamDelta=\(teamCount - uniqueTeamCount) generation=\(gen)"
+            )
+        }
+#endif
+    }
+
+    static func rendererConstructionStarted(generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] rendererConstructionStarted generation=\(gen)")
+#endif
+    }
+
+    static func sheetPresented(generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] sheetPresented generation=\(gen)")
+        if let signpostID = activeSignpostID {
+            os_signpost(.end, log: signpostLog, name: "SuggestedFanProfileOpen", signpostID: signpostID)
+            activeSignpostID = nil
+        }
+#endif
+    }
+
+    static func sheetDismissed(generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] sheetDismissed generation=\(gen)")
+#endif
+    }
+
+    static func failure(_ reason: String, generation: UInt64? = nil) {
+#if DEBUG
+        let gen = generation ?? activeGeneration
+        print("[SuggestedFanProfileOpen] failureOrCancellation reason=\(reason) generation=\(gen)")
+        if let signpostID = activeSignpostID {
+            os_signpost(.end, log: signpostLog, name: "SuggestedFanProfileOpen", signpostID: signpostID)
+            activeSignpostID = nil
+        }
 #endif
     }
 }

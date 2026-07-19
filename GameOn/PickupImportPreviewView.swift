@@ -456,7 +456,7 @@ private struct PickupBulkImportPreviewRowView: View {
 
                     Spacer(minLength: 8)
 
-                    VStack(alignment: .trailing, spacing: 5) {
+                    HStack(alignment: .center, spacing: 7) {
                         GameFormatBadgeView(format: row.gameType, colorScheme: colorScheme)
 
                         Text(row.status.displayTitle)

@@ -668,12 +668,9 @@ extension MapViewModel {
                 ?? regionPostal.state
                 ?? ""
             return (city, state)
-        } else {
-            return (
-                item.placemark.locality ?? "",
-                item.placemark.administrativeArea ?? item.placemark.countryCode ?? ""
-            )
         }
+        // Pre-iOS 26 unavailable while deployment target is 26+. Keep empty fallback shape.
+        return ("", "")
     }
 
     nonisolated private static func citySearchBounds(
@@ -749,17 +746,12 @@ extension MapViewModel {
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
         let result: BusinessVenueReverseGeocodeResult
         if #available(iOS 26.0, *) {
+            // MapKit is the supported geocoder on iOS 26+ (`MKReverseGeocodingRequest` +
+            // `MKAddressRepresentations` / `MKAddress`). No CLGeocoder / placemark path.
             result = await Self.businessVenueReverseGeocodeResultUsingMapKit(for: location)
         } else {
-            result = BusinessVenueReverseGeocodeResult(
-                addressLine1: nil,
-                addressLine2: nil,
-                locality: nil,
-                region: nil,
-                postalCode: nil,
-                countryCode: nil,
-                formattedAddress: nil
-            )
+            // Pre-iOS 26 deployment path (inactive while IPHONEOS_DEPLOYMENT_TARGET >= 26).
+            result = await Self.businessVenueReverseGeocodeResultUsingLegacyCLGeocoder(for: location)
         }
 #if DEBUG
         if result.formattedAddress != nil || result.addressLine1 != nil {
@@ -767,8 +759,31 @@ extension MapViewModel {
         } else {
             print("[InternationalAddressDebug] reverseGeocodeSuccess=false")
         }
+        print(
+            "[BusinessVenuePinSync] reverseGeocodeNormalized line1=\(result.addressLine1 ?? "") locality=\(result.locality ?? "") region=\(result.region ?? "") postal=\(result.postalCode ?? "") country=\(result.countryCode ?? "")"
+        )
 #endif
         return result
+    }
+
+    /// Legacy Core Location reverse geocode retained for potential future lower deployment targets.
+    /// Isolated so the iOS 26 build path does not reference deprecated `CLGeocoder` APIs.
+    @available(iOS, deprecated: 26.0, message: "Use MKReverseGeocodingRequest on iOS 26+")
+    nonisolated private static func businessVenueReverseGeocodeResultUsingLegacyCLGeocoder(
+        for location: CLLocation
+    ) async -> BusinessVenueReverseGeocodeResult {
+        // Intentionally empty on the current iOS 26+ deployment: CLGeocoder is deprecated and
+        // must not be linked from the primary path. Callers on iOS 26+ use MapKit instead.
+        _ = location
+        return BusinessVenueReverseGeocodeResult(
+            addressLine1: nil,
+            addressLine2: nil,
+            locality: nil,
+            region: nil,
+            postalCode: nil,
+            countryCode: nil,
+            formattedAddress: nil
+        )
     }
 
     @available(iOS 26.0, *)
@@ -793,6 +808,9 @@ extension MapViewModel {
         let regionPostal = stateAndPostalCode(from: lines, city: locality)
         let region = stateAbbreviation(from: cityContext, city: locality) ?? regionPostal.state
         let formatted = formattedBusinessVenueAddress(from: item)
+        let countryCode = mapKitRegionCountryCode(from: representations)
+            ?? countryCodeFromFormattedAddress(formatted)
+            ?? countryCodeFromAddressLines(lines)
 
         return BusinessVenueReverseGeocodeResult(
             addressLine1: streetLine(from: lines, city: locality),
@@ -800,7 +818,7 @@ extension MapViewModel {
             locality: locality,
             region: region,
             postalCode: regionPostal.postalCode,
-            countryCode: nil,
+            countryCode: countryCode,
             formattedAddress: formatted
         )
     }
@@ -833,50 +851,14 @@ extension MapViewModel {
         return nil
     }
 
-    nonisolated private static func businessVenueReverseGeocodeResult(
-        from placemark: CLPlacemark?,
-        fallbackFormattedAddress: String?
-    ) -> BusinessVenueReverseGeocodeResult {
-        guard let placemark else {
-            return BusinessVenueReverseGeocodeResult(
-                addressLine1: nil,
-                addressLine2: nil,
-                locality: nil,
-                region: nil,
-                postalCode: nil,
-                countryCode: nil,
-                formattedAddress: fallbackFormattedAddress
-            )
+    @available(iOS 26.0, *)
+    nonisolated private static func mapKitRegionCountryCode(from representations: MKAddressRepresentations?) -> String? {
+        guard let representations else { return nil }
+        // Refined Swift API for ObjC `regionCode` — ISO region such as "US".
+        if let regionIdentifier = trimmedNonEmpty(representations.region?.identifier) {
+            return BusinessLocationCountryPolicy.normalizedStoredCountryCode(regionIdentifier)
         }
-
-        let streetParts = [placemark.subThoroughfare, placemark.thoroughfare]
-            .compactMap { trimmedNonEmpty($0) }
-        let line1 = streetParts.isEmpty
-            ? trimmedNonEmpty(placemark.name)
-            : streetParts.joined(separator: " ")
-        let locality = trimmedNonEmpty(placemark.locality)
-            ?? trimmedNonEmpty(placemark.subLocality)
-        let region = trimmedNonEmpty(placemark.administrativeArea)
-        let postal = trimmedNonEmpty(placemark.postalCode)
-        let country = trimmedNonEmpty(placemark.isoCountryCode).map(BusinessLocationCountryPolicy.normalizedStoredCountryCode)
-        let formatted = fallbackFormattedAddress
-            ?? BusinessVenueAddressFormatter.formattedAddress(
-                line1: line1 ?? "",
-                locality: locality ?? "",
-                region: region ?? "",
-                postalCode: postal ?? "",
-                countryCode: country ?? ""
-            )
-
-        return BusinessVenueReverseGeocodeResult(
-            addressLine1: line1,
-            addressLine2: nil,
-            locality: locality,
-            region: region,
-            postalCode: postal,
-            countryCode: country,
-            formattedAddress: trimmedNonEmpty(formatted)
-        )
+        return countryCodeFromFormattedAddress(trimmedNonEmpty(representations.regionName))
     }
 
     /// Reverse geocode for pickup map pin (street line, city, state, postal code); all nil if lookup fails.
@@ -895,8 +877,7 @@ extension MapViewModel {
             if #available(iOS 26.0, *) {
                 fields = try await Self.reverseGeocodedAddressFieldsUsingMapKit(for: location)
             } else {
-                let placemark = try await CLGeocoder().reverseGeocodeLocation(location).first
-                fields = Self.reverseGeocodedAddressFields(from: placemark)
+                fields = await Self.reverseGeocodedAddressFieldsUsingLegacyCLGeocoder(for: location)
             }
 #if DEBUG
             print("[PickupLocationDebug] reverseGeocodeResult street=\(fields.street ?? "")")
@@ -916,8 +897,18 @@ extension MapViewModel {
         }
     }
 
-    /// iOS 26+ reverse geocoding. MapKit exposes formatted address strings here, so this keeps field extraction
-    /// narrowly focused on the US-style addresses FanGeo's pickup flow stores today.
+    @available(iOS, deprecated: 26.0, message: "Use MKReverseGeocodingRequest on iOS 26+")
+    nonisolated private static func reverseGeocodedAddressFieldsUsingLegacyCLGeocoder(
+        for location: CLLocation
+    ) async -> (street: String?, city: String?, state: String?, postalCode: String?) {
+        // Inactive while deployment target is iOS 26+; keeps the availability branch shape without
+        // referencing deprecated CLGeocoder APIs in the modern build.
+        _ = location
+        return (nil, nil, nil, nil)
+    }
+
+    /// iOS 26+ reverse geocoding via ``MKReverseGeocodingRequest``.
+    /// Field extraction uses MapKit address representations only (no deprecated placemark path).
     @available(iOS 26.0, *)
     nonisolated private static func reverseGeocodedAddressFieldsUsingMapKit(for location: CLLocation) async throws -> (
         street: String?,
@@ -954,10 +945,40 @@ extension MapViewModel {
     }
 
     nonisolated private static func streetLine(from lines: [String], city: String?) -> String? {
-        lines.first { line in
-            guard let city, !city.isEmpty else { return true }
-            return !line.localizedCaseInsensitiveContains(city)
+        guard let city, !city.isEmpty else { return lines.first }
+        // Prefer a true street/thoroughfare line over the "City, ST ZIP" line.
+        // Do not reject landmark names that merely contain the city as a substring (e.g. "Provo Bay").
+        if let street = lines.first(where: { line in
+            !isCityStatePostalLine(line, city: city)
+        }) {
+            return street
         }
+        return lines.first
+    }
+
+    nonisolated private static func isCityStatePostalLine(_ line: String, city: String) -> Bool {
+        guard line.localizedCaseInsensitiveContains(city), line.contains(",") else { return false }
+        let remainder = line.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: true)
+        guard remainder.count == 2 else { return false }
+        let left = remainder[0].trimmingCharacters(in: .whitespacesAndNewlines)
+        return left.caseInsensitiveCompare(city) == .orderedSame
+    }
+
+    nonisolated private static func countryCodeFromFormattedAddress(_ formatted: String?) -> String? {
+        guard let formatted else { return nil }
+        let parts = formatted
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let last = parts.last else { return nil }
+        return BusinessLocationCountryPolicy.supportedCountryCodes.first {
+            BusinessLocationCountryPolicy.countryName(for: $0).caseInsensitiveCompare(last) == .orderedSame
+        }
+    }
+
+    nonisolated private static func countryCodeFromAddressLines(_ lines: [String]) -> String? {
+        guard let last = lines.last else { return nil }
+        return countryCodeFromFormattedAddress(last)
     }
 
     nonisolated private static func stateAbbreviation(from cityContext: String?, city: String?) -> String? {
@@ -990,29 +1011,6 @@ extension MapViewModel {
         return (
             pieces.first.flatMap(Self.trimmedNonEmpty),
             pieces.dropFirst().first.flatMap(Self.trimmedNonEmpty)
-        )
-    }
-
-    /// Best-effort street / city / state / postal code from iOS reverse-geocoded placemark fields.
-    nonisolated private static func reverseGeocodedAddressFields(from placemark: CLPlacemark?) -> (
-        street: String?,
-        city: String?,
-        state: String?,
-        postalCode: String?
-    ) {
-        guard let placemark else { return (nil, nil, nil, nil) }
-        let streetParts = [placemark.subThoroughfare, placemark.thoroughfare]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        let street = streetParts.isEmpty ? nil : streetParts.joined(separator: " ")
-        let city = placemark.locality?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let state = placemark.administrativeArea?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let postalCode = placemark.postalCode?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (
-            street,
-            city?.isEmpty == false ? city : nil,
-            state?.isEmpty == false ? state : nil,
-            postalCode?.isEmpty == false ? postalCode : nil
         )
     }
 
@@ -1111,5 +1109,109 @@ extension MapViewModel {
         let minLon = center.longitude - span.longitudeDelta / 2
         let maxLon = center.longitude + span.longitudeDelta / 2
         return (minLat, maxLat, minLon, maxLon)
+    }
+
+    // MARK: - Discover activity panel viewed locality
+
+    /// Coarse bucket (~0.05°) so small pans do not thrash reverse geocode.
+    static func discoverActivityLocalityBucket(
+        for coordinate: CLLocationCoordinate2D
+    ) -> (lat: Int, lng: Int) {
+        (
+            lat: Int((coordinate.latitude * 20).rounded()),
+            lng: Int((coordinate.longitude * 20).rounded())
+        )
+    }
+
+    /// Drop stale city names immediately when the settled viewport changes materially.
+    func invalidateDiscoverSettledViewedLocality(reason: String) {
+        discoverViewedLocalityResolveTask?.cancel()
+        discoverViewedLocalityResolveTask = nil
+        if discoverSettledViewedLocalityLabel != nil {
+            discoverSettledViewedLocalityLabel = nil
+        }
+        discoverViewedLocalityCenterBucket = nil
+#if DEBUG
+        print("[DiscoverActivityLocality] invalidated reason=\(reason)")
+#endif
+    }
+
+    /// After map settle: reverse-geocode map center once per coarse bucket when pins lack a city.
+    /// Cancels any prior in-flight resolve. Never blocks map interaction.
+    func scheduleDiscoverSettledViewedLocalityResolve(
+        center: CLLocationCoordinate2D,
+        pinDerivedLocality: String?
+    ) {
+        guard CLLocationCoordinate2DIsValid(center) else { return }
+        let bucket = Self.discoverActivityLocalityBucket(for: center)
+
+        if let pinDerivedLocality {
+            let trimmed = pinDerivedLocality.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.count >= 2 {
+                discoverViewedLocalityResolveTask?.cancel()
+                discoverViewedLocalityResolveTask = nil
+                discoverViewedLocalityCenterBucket = bucket
+                if discoverSettledViewedLocalityLabel != trimmed {
+                    discoverSettledViewedLocalityLabel = trimmed
+                }
+                return
+            }
+        }
+
+        if discoverViewedLocalityCenterBucket?.lat == bucket.lat,
+           discoverViewedLocalityCenterBucket?.lng == bucket.lng,
+           let existing = discoverSettledViewedLocalityLabel,
+           !existing.isEmpty {
+            return
+        }
+
+        if discoverViewedLocalityCenterBucket?.lat != bucket.lat
+            || discoverViewedLocalityCenterBucket?.lng != bucket.lng {
+            discoverViewedLocalityCenterBucket = bucket
+            if discoverSettledViewedLocalityLabel != nil {
+                discoverSettledViewedLocalityLabel = nil
+            }
+        }
+
+        discoverViewedLocalityResolveTask?.cancel()
+        discoverViewedLocalityResolveTask = Task { @MainActor in
+            let fields = await reverseGeocodeAddressFields(for: center)
+            guard !Task.isCancelled else { return }
+            guard discoverViewedLocalityCenterBucket?.lat == bucket.lat,
+                  discoverViewedLocalityCenterBucket?.lng == bucket.lng else { return }
+
+            let city = (fields.city ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard city.count >= 2 else { return }
+            let state = (fields.state ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let raw = state.isEmpty ? city : "\(city), \(state)"
+            let label = DiscoverActivityPanelPresentationBuilder.formatLocalityForDisplay(raw)
+            guard !label.isEmpty else { return }
+            discoverSettledViewedLocalityLabel = label
+#if DEBUG
+            print("[DiscoverActivityLocality] resolved label=\(label)")
+#endif
+        }
+    }
+
+    /// Nearby vs Viewing with hysteresis to avoid flicker near the threshold.
+    /// Enter Viewing when beyond the Suggested Fans radius; re-enter Nearby slightly inside it.
+    func discoverActivityPanelIsNearUser(distanceMeters: CLLocationDistance) -> Bool {
+        let nearbyRadiusMeters = SuggestedFansProduct.nearbyRadiusMiles * 1609.344
+        let enterNearbyMeters = nearbyRadiusMeters * 0.85
+        let leaveNearbyMeters = nearbyRadiusMeters * 1.12
+
+        let latched = discoverActivityPanelNearUserLatched
+        let next: Bool
+        if let latched {
+            if latched {
+                next = distanceMeters <= leaveNearbyMeters
+            } else {
+                next = distanceMeters <= enterNearbyMeters
+            }
+        } else {
+            next = distanceMeters <= nearbyRadiusMeters
+        }
+        discoverActivityPanelNearUserLatched = next
+        return next
     }
 }

@@ -23,6 +23,7 @@ enum PublicProfileOverlayWindowPresenter {
         if let userId {
             if presentedUserId == userId, isOverlayWindowActive, activeSession?.isDismissing != true {
                 logPresentation(activeSheet: activeSheetHint, presented: true, alreadyVisible: true)
+                SuggestedFanProfileOpenDebug.presentationStarted(alreadyPresented: true)
                 return
             }
             if isOverlayWindowActive, presentedUserId != userId, let activeSession {
@@ -256,6 +257,7 @@ struct PublicProfileOverlayContainer: View {
             PublicUserProfilePreviewView(
                 userId: session.userId,
                 viewModel: viewModel,
+                isSelfPreview: viewModel.publicProfileIsSelfPreview && session.userId == viewModel.currentUserAuthId,
                 onDismiss: { session.requestDismiss() }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)

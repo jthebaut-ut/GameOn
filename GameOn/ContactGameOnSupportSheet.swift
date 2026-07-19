@@ -5,6 +5,7 @@ struct ContactGameOnSupportSheet: View {
     @ObservedObject var viewModel: MapViewModel
     @EnvironmentObject private var chatViewModel: ChatViewModel
     var onRequestSignIn: () -> Void
+    /// `true` for standalone sheets; `false` when already inside a parent `NavigationStack` (Settings).
     var embedsInNavigationStack = true
     var showsCloseButton = true
     var screenTitle: String = "Support Center"

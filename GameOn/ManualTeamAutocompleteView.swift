@@ -42,6 +42,39 @@ enum ManualVenueTeamResolver {
         return ManualVenueTeamSelection(name: name, type: .custom, countryCode: nil)
     }
 
+    /// Exact catalog resolution for Discover personalization: name / shortCode / alias normalized equality only.
+    /// Returns a team only when exactly one distinct `FavoriteTeam.id` matches; unresolved or ambiguous → nil.
+    static func exactFavoriteTeam(for raw: String) -> FavoriteTeam? {
+        exactFavoriteTeam(for: raw, index: exactNormalizedTeamIDIndex())
+    }
+
+    /// Precomputed normalized-name → unique catalog team ID map (ambiguous names omitted).
+    static func exactNormalizedTeamIDIndex() -> [String: String] {
+        var buckets: [String: Set<String>] = [:]
+        for team in FavoriteTeamCatalog.all where team.kind == .team {
+            let names = [team.name, team.shortCode ?? ""] + team.searchAliases
+            for name in names {
+                let normalized = normalize(name)
+                guard !normalized.isEmpty else { continue }
+                buckets[normalized, default: []].insert(team.id)
+            }
+        }
+        var unique: [String: String] = [:]
+        unique.reserveCapacity(buckets.count)
+        for (normalized, ids) in buckets where ids.count == 1 {
+            unique[normalized] = ids.first!
+        }
+        return unique
+    }
+
+    static func exactFavoriteTeam(for raw: String, index: [String: String]) -> FavoriteTeam? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalizedQuery = normalize(trimmed)
+        guard !normalizedQuery.isEmpty, let teamID = index[normalizedQuery] else { return nil }
+        return FavoriteTeamCatalog.team(id: teamID)
+    }
+
     private static func matches(_ team: FavoriteTeam, query: String) -> Bool {
         let normalizedQuery = normalize(query)
         guard !normalizedQuery.isEmpty else { return false }
@@ -94,9 +127,22 @@ struct ManualTeamAutocompleteView: View {
         let query = trimmedPickerSearchText
         guard !query.isEmpty else { return nil }
         let merged = regionGroups.flatMap { $0.groups }.flatMap(\.options)
-        if merged.contains(where: { $0.displayName.caseInsensitiveCompare(query) == .orderedSame }) {
+        // Suppress custom when an exact real catalog match already exists (any sport/mode).
+        if SportsTeamPickerData.exactOption(named: query) != nil {
+#if DEBUG
+            print("[ManualTeamPicker] fallbackCustom=false")
+#endif
             return nil
         }
+        if merged.contains(where: { $0.displayName.caseInsensitiveCompare(query) == .orderedSame }) {
+#if DEBUG
+            print("[ManualTeamPicker] fallbackCustom=false")
+#endif
+            return nil
+        }
+#if DEBUG
+        print("[ManualTeamPicker] fallbackCustom=true")
+#endif
         return TeamPickerOption(
             id: "custom-\(query.lowercased())",
             displayName: query,

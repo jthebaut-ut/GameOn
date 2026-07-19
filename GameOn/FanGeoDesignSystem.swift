@@ -72,9 +72,18 @@ enum FGColor {
 
     static let accentYellow = Color(red: 0.98, green: 0.80, blue: 0.20)
     static let accentBlue = Color(red: 0.33, green: 0.63, blue: 0.94)
+    /// Darker FanGeo blue for selected fills on light materials (Discover Watch dock, etc.).
+    /// Between `accentBlue` and `gradientEnd` for stronger contrast without leaving the brand family.
+    static let accentBlueStrong = Color(red: 0.20, green: 0.46, blue: 0.82)
     static let accentGreen = Color(red: 0.22, green: 0.76, blue: 0.45)
     static let dangerRed = Color(red: 0.91, green: 0.25, blue: 0.28)
     static let businessGreen = Color(red: 0.18, green: 0.66, blue: 0.37)
+
+    /// Consumer Watch / Play / Pro Games intent accents (Discover, Schedule, Going).
+    /// Play uses system orange to match existing FanGeo pickup chrome.
+    static let intentWatch = accentGreen
+    static let intentPlay = Color.orange
+    static let intentProGames = accentBlue
 
     static let gradientStart = Color(red: 0.78, green: 0.90, blue: 0.99)
     static let gradientMiddle = Color(red: 0.43, green: 0.68, blue: 0.93)
@@ -120,6 +129,10 @@ struct FanGeoPagePurposeHeader: View {
     let title: String
     let subtitle: String
 
+    private var trimmedSubtitle: String {
+        subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
@@ -127,11 +140,13 @@ struct FanGeoPagePurposeHeader: View {
                 .foregroundStyle(FGColor.primaryText(colorScheme))
                 .lineLimit(1)
 
-            Text(subtitle)
-                .font(FGTypography.caption)
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
+            if !trimmedSubtitle.isEmpty {
+                Text(trimmedSubtitle)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

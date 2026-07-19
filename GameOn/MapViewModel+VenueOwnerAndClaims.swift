@@ -284,6 +284,7 @@ extension MapViewModel {
         let restoredSession = try? await supabase.auth.session
         guard let session = signUpSession ?? restoredSession,
               Self.userEmailConfirmed(session.user) else {
+            let pendingUserId = signUpResponse.user.id
             await forceLogout(reason: "businessSignupNeedsEmailConfirmation", source: "MapViewModel.registerBusinessAccountOnly")
             await MainActor.run {
                 let draft = PendingBusinessEmailSignupDraft(
@@ -300,6 +301,11 @@ extension MapViewModel {
                     kind: .business,
                     verificationEmailConfirmedAsSent: Self.userConfirmationEmailConfirmedAsSent(signUpResponse.user),
                     includeEmailDeliveryGuidance: true
+                )
+                // Persist post-account language intent across confirm + re-sign-in.
+                requestPostAccountCreationLanguageSelector(
+                    userId: pendingUserId,
+                    source: "registerBusinessAccountOnly.pendingEmailConfirmation"
                 )
             }
             return
@@ -319,6 +325,10 @@ extension MapViewModel {
             markBusinessEmailVerifiedAwaitingVenueSetup(email: ownerEmail)
             currentUserAuthId = session.user.id
             venueOwnerEmail = ownerEmail
+            requestPostAccountCreationLanguageSelector(
+                userId: session.user.id,
+                source: "registerBusinessAccountOnly"
+            )
         }
 
         let lifecycle = await resolveBusinessProfileLifecycleState()
@@ -912,6 +922,11 @@ extension MapViewModel {
                 UserDefaults.standard.set(true, forKey: "venueGuidelinesAccepted")
             }
 
+            requestPostAccountCreationLanguageSelector(
+                userId: ownerUserId,
+                source: "registerVenueOwnerAfterEstablishedSession"
+            )
+
             await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
             await refreshPendingVenueClaimsForSettings()
 
@@ -1235,6 +1250,10 @@ extension MapViewModel {
             if draft.recordVenueGuidelinesAcceptance {
                 UserDefaults.standard.set(true, forKey: "venueGuidelinesAccepted")
             }
+            requestPostAccountCreationLanguageSelector(
+                userId: ownerUserId,
+                source: "completePendingBusinessSignupAfterConfirmation"
+            )
             await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
             await refreshPendingVenueClaimsForSettings()
         } catch {
@@ -6455,15 +6474,15 @@ extension MapViewModel {
 
         do {
             let session = try? await supabase.auth.session
-            print("CURRENT SUPABASE USER:", session?.user.email ?? "NO USER")
-            print("VENUE OWNER EMAIL:", venueOwnerEmail)
+            DebugLogGate.debug("CURRENT SUPABASE USER: \(session?.user.email ?? "NO USER")")
+            DebugLogGate.debug("VENUE OWNER EMAIL: \(venueOwnerEmail)")
 
             let safeEmail = OwnerBusinessEmail.normalized(venueOwnerEmail)
                 .replacingOccurrences(of: "@", with: "_")
                 .replacingOccurrences(of: ".", with: "_")
 
             let fieldName = fileName.lowercased().contains("menu") ? "menu_photo_url" : "cover_photo_url"
-            print("[VenuePhotoSaveDebug] uploadStarted field=\(fieldName)")
+            DebugLogGate.debug("[VenuePhotoSaveDebug] uploadStarted field=\(fieldName)")
 
             let storedFileName = Self.versionedVenuePhotoFileName(for: fileName)
             let pathFull = "\(safeEmail)/\(storedFileName)"
@@ -6546,13 +6565,14 @@ extension MapViewModel {
             let pendingLogURL = assignToCurrentVenueProfile
                 ? (fieldName == "cover_photo_url" ? pendingVenueCoverPhotoURL ?? "" : pendingVenueMenuPhotoURL ?? "")
                 : fullStr
-            print("[VenuePhotoSaveDebug] uploadCompleted url=\(fullStr)")
-            print("[VenuePhotoSaveDebug] pendingPhotoURL=\(pendingLogURL)")
+            DebugLogGate.debug("[VenuePhotoSaveDebug] uploadCompleted url=\(fullStr)")
+            DebugLogGate.debug("[VenuePhotoSaveDebug] pendingPhotoURL=\(pendingLogURL)")
 
             return fullStr
 
         } catch {
-            print("ERROR UPLOADING PHOTO:", error)
+            // Storage paths are email-keyed; keep failure details out of Release logs.
+            DebugLogGate.debug("ERROR UPLOADING PHOTO: \(error)")
             return nil
         }
     }

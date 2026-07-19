@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 
 // MARK: - Join request withdraw (Calendar / Following / detail)
@@ -91,12 +92,19 @@ struct DiscoverPickupGameDetailSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var showJoinComposer = false
     @State private var showInviteComposer = false
     @State private var joinError: String?
     @State private var isCancellingRequest = false
     @State private var withdrawConfirm: PickupJoinWithdrawConfirmState?
+    @State private var isRequestingDiscoverMapFocus = false
+    @State private var mapFocusUnavailableMessage: String?
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var game: PickupGameRow? {
         viewModel.resolvedPickupGameRow(for: gameId)
@@ -191,6 +199,17 @@ struct DiscoverPickupGameDetailSheet: View {
                     },
                     secondaryButton: .cancel()
                 )
+            }
+            .alert(
+                "Map location unavailable",
+                isPresented: Binding(
+                    get: { mapFocusUnavailableMessage != nil },
+                    set: { if !$0 { mapFocusUnavailableMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { mapFocusUnavailableMessage = nil }
+            } message: {
+                Text(mapFocusUnavailableMessage ?? "This game does not have a map location yet.")
             }
         }
     }
@@ -573,57 +592,84 @@ struct DiscoverPickupGameDetailSheet: View {
     }
 
     private func pickupHeroCard(g: PickupGameRow, locationLine: String, subtitleLine: String, showStarted: Bool) -> some View {
-        HStack(alignment: .top, spacing: FGSpacing.md) {
-            PickupGameStartedSportGlyphFrame(showStarted: showStarted) {
-                SportArtworkIconView(sport: g.sport, diameter: 48)
-            }
+        let hasUsableMapCoordinate = Self.pickupHasUsableMapCoordinate(g)
 
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                GameFormatBadgeView(format: g.gameFormat, colorScheme: colorScheme)
-
-                Text(g.title)
-                    .font(FGTypography.sectionTitle)
-                    .foregroundStyle(pickupDetailMainInk)
-
-                Text(subtitleLine)
-                    .font(FGTypography.metadata.weight(.medium))
-                    .foregroundStyle(pickupDetailSubInk)
-
-                if showStarted {
-                    PickupGameStartedLineCaption()
-                }
-
-                if let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at) {
-                    Text(g.pickupDateWithCompactTimeRange ?? start.formatted(date: .abbreviated, time: .shortened))
-                        .font(FGTypography.cardTitle.weight(.semibold))
-                        .foregroundStyle(pickupDetailMainInk)
-                }
-
+        return VStack(alignment: .leading, spacing: FGSpacing.sm) {
+            Button {
+                showPickupOnDiscoverMap(g)
+            } label: {
                 HStack(alignment: .top, spacing: FGSpacing.md) {
-                    VStack(alignment: .leading, spacing: 4) {
+                    PickupGameStartedSportGlyphFrame(showStarted: showStarted) {
+                        SportArtworkIconView(sport: g.sport, diameter: 48)
+                    }
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                        GameFormatBadgeView(format: g.gameFormat, colorScheme: colorScheme)
+                            .accessibilityHidden(true)
+
+                        Text(g.title)
+                            .font(FGTypography.sectionTitle)
+                            .foregroundStyle(pickupDetailMainInk)
+                            .multilineTextAlignment(.leading)
+
+                        Text(subtitleLine)
+                            .font(FGTypography.metadata.weight(.medium))
+                            .foregroundStyle(pickupDetailSubInk)
+                            .multilineTextAlignment(.leading)
+
+                        if showStarted {
+                            PickupGameStartedLineCaption()
+                        }
+
+                        if let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at) {
+                            Text(g.pickupDateWithCompactTimeRange ?? start.formatted(date: .abbreviated, time: .shortened))
+                                .font(FGTypography.cardTitle.weight(.semibold))
+                                .foregroundStyle(pickupDetailMainInk)
+                                .multilineTextAlignment(.leading)
+                        }
+
                         if !locationLine.isEmpty {
                             Text(locationLine)
                                 .font(FGTypography.caption)
                                 .foregroundStyle(pickupDetailSubInk)
                                 .lineLimit(3)
+                                .multilineTextAlignment(.leading)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isRequestingDiscoverMapFocus)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                String(
+                    format: L10n.t("discover_pickup_show_on_map_a11y_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    g.title
+                )
+            )
+            .accessibilityHint(L10n.t("discover_pickup_show_on_map_a11y_hint", languageCode: languageCode))
+            .accessibilityAddTraits(.isButton)
 
-                    if let lat = g.latitude, let lon = g.longitude {
-                        Button {
-                            if let url = URL(string: "http://maps.apple.com/?ll=\(lat),\(lon)&q=Pickup%20game") {
-                                openURL(url)
-                            }
-                        } label: {
-                            Label("Directions", systemImage: "map")
-                                .font(FGTypography.caption.weight(.semibold))
-                                .labelStyle(.titleAndIcon)
+            if hasUsableMapCoordinate, let lat = g.latitude, let lon = g.longitude {
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        if let url = URL(string: "http://maps.apple.com/?ll=\(lat),\(lon)&q=Pickup%20game") {
+                            openURL(url)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .tint(FGColor.accentBlue)
-                        .fixedSize()
+                    } label: {
+                        Label("Directions", systemImage: "map")
+                            .font(FGTypography.caption.weight(.semibold))
+                            .labelStyle(.titleAndIcon)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(FGColor.accentBlue)
+                    .fixedSize()
                 }
             }
         }
@@ -631,6 +677,52 @@ struct DiscoverPickupGameDetailSheet: View {
         .background { pickupGlassBackground(cornerRadius: FGRadius.large) }
         .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
         .overlay { pickupGlassStroke(cornerRadius: FGRadius.large) }
+    }
+
+    private static func pickupHasUsableMapCoordinate(_ g: PickupGameRow) -> Bool {
+        guard let lat = g.latitude, let lon = g.longitude else { return false }
+        guard CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon)) else {
+            return false
+        }
+        if abs(lat) < 1e-5 && abs(lon) < 1e-5 { return false }
+        return abs(lat) <= 90 && abs(lon) <= 180
+    }
+
+    /// Dismiss detail → Discover tab → focus existing pickup annotation (no nested map, no sheet reopen loop).
+    private func showPickupOnDiscoverMap(_ g: PickupGameRow) {
+        guard !isRequestingDiscoverMapFocus else { return }
+        guard Self.pickupHasUsableMapCoordinate(g) else {
+            mapFocusUnavailableMessage = "This game does not have a map location yet."
+            viewModel.followingMapNavigationMessage = mapFocusUnavailableMessage
+            return
+        }
+
+        isRequestingDiscoverMapFocus = true
+        dismiss()
+
+        Task { @MainActor in
+            // Let the detail sheet finish dismissing before focusing Discover (avoids reopen loops).
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+
+            if viewModel.discoverMapContentMode != .pickupGames {
+                viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: .pickupGames)
+                viewModel.discoverMapContentMode = .pickupGames
+            }
+            if viewModel.discoverPickupSubMode != .games {
+                viewModel.discoverPickupSubMode = .games
+            }
+
+            // Clear any prior pending id so onChange always fires for this explicit user action.
+            if viewModel.pendingFollowingMapPickupGameID != nil {
+                viewModel.pendingFollowingMapPickupGameID = nil
+                viewModel.pendingFollowingMapPickupGameSnapshot = nil
+                await Task.yield()
+            }
+
+            viewModel.requestDiscoverFocusForPickupGame(id: g.id, snapshot: g)
+            isRequestingDiscoverMapFocus = false
+        }
     }
 
     private func pickupInviteActionRow(for g: PickupGameRow) -> some View {
@@ -822,7 +914,8 @@ struct PickupGameInviteFriendsSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
 
-    @State private var selectedFriendIds: Set<UUID> = []
+    /// Selected invitee profile/auth user IDs only (`UserPreview.id` / search `user_id`). Never conversation IDs.
+    @State private var selectedInviteeUserIds: Set<UUID> = []
     @State private var searchText = ""
     @State private var searchResults: [PickupInvitableFanSearchResult] = []
     @State private var inviteStatusByUserId: [UUID: String] = [:]
@@ -832,18 +925,24 @@ struct PickupGameInviteFriendsSheet: View {
     @State private var errorText: String?
 
     private var eligibleFriends: [ChatViewModel.FriendDisplay] {
-        chatViewModel.friends
-            .filter { friend in
-                friend.id != viewModel.currentUserAuthId
-                    && !chatViewModel.isEitherDirectionBlocked(with: friend.id)
-            }
-            .sorted {
-                $0.preview.displayName.localizedCaseInsensitiveCompare($1.preview.displayName) == .orderedAscending
-            }
+        var seenProfileIds = Set<UUID>()
+        let sorted = chatViewModel.friends.sorted {
+            $0.preview.displayName.localizedCaseInsensitiveCompare($1.preview.displayName) == .orderedAscending
+        }
+        var result: [ChatViewModel.FriendDisplay] = []
+        result.reserveCapacity(sorted.count)
+        for friend in sorted {
+            let profileId = friend.preview.id
+            guard profileId != viewModel.currentUserAuthId else { continue }
+            guard !chatViewModel.isEitherDirectionBlocked(with: profileId) else { continue }
+            guard seenProfileIds.insert(profileId).inserted else { continue }
+            result.append(friend)
+        }
+        return result
     }
 
     private var canSend: Bool {
-        !selectedFriendIds.isEmpty && !isSending && game.isPickupGameInvitable()
+        !selectedInviteeUserIds.isEmpty && !isSending && game.isPickupGameInvitable()
     }
 
     var body: some View {
@@ -864,7 +963,7 @@ struct PickupGameInviteFriendsSheet: View {
                     } header: {
                         Text("Friends")
                     } footer: {
-                        Text("\(selectedFriendIds.count)/20 selected")
+                        Text("\(selectedInviteeUserIds.count)/20 selected")
                     }
 
                     Section {
@@ -976,10 +1075,12 @@ struct PickupGameInviteFriendsSheet: View {
     }
 
     private func pickupInviteFriendRow(_ friend: ChatViewModel.FriendDisplay) -> some View {
-        let inviteStatus = inviteStatusByUserId[friend.id]
+        let profileId = friend.preview.id
+        let inviteStatus = inviteStatusByUserId[profileId]
         let disabled = inviteStatus != nil
+        let isSelected = selectedInviteeUserIds.contains(profileId)
         return Button {
-            toggleFriend(friend.id)
+            toggleInviteeUserId(profileId)
         } label: {
             HStack(spacing: 12) {
                 ProfileAvatarView(preview: friend.preview, size: 38)
@@ -997,9 +1098,9 @@ struct PickupGameInviteFriendsSheet: View {
                     }
                 }
                 Spacer(minLength: 0)
-                Image(systemName: disabled ? "checkmark.seal.fill" : (selectedFriendIds.contains(friend.id) ? "checkmark.circle.fill" : "circle"))
+                Image(systemName: disabled ? "checkmark.seal.fill" : (isSelected ? "checkmark.circle.fill" : "circle"))
                     .font(.title3)
-                    .foregroundStyle(disabled ? Color.orange : (selectedFriendIds.contains(friend.id) ? FGColor.accentGreen : FGColor.mutedText(colorScheme)))
+                    .foregroundStyle(disabled ? Color.orange : (isSelected ? FGColor.accentGreen : FGColor.mutedText(colorScheme)))
             }
             .contentShape(Rectangle())
         }
@@ -1009,8 +1110,10 @@ struct PickupGameInviteFriendsSheet: View {
     }
 
     private func pickupInviteSearchResultRow(_ result: PickupInvitableFanSearchResult) -> some View {
-        let inviteStatus = inviteStatusByUserId[result.user_id]
+        let profileId = result.user_id
+        let inviteStatus = inviteStatusByUserId[profileId]
         let disabled = inviteStatus != nil
+        let isSelected = selectedInviteeUserIds.contains(profileId)
         return Button {
             toggleSearchResult(result)
         } label: {
@@ -1040,9 +1143,9 @@ struct PickupGameInviteFriendsSheet: View {
                     }
                 }
                 Spacer(minLength: 0)
-                Image(systemName: disabled ? "checkmark.seal.fill" : (selectedFriendIds.contains(result.user_id) ? "checkmark.circle.fill" : "circle"))
+                Image(systemName: disabled ? "checkmark.seal.fill" : (isSelected ? "checkmark.circle.fill" : "circle"))
                     .font(.title3)
-                    .foregroundStyle(disabled ? Color.orange : (selectedFriendIds.contains(result.user_id) ? FGColor.accentGreen : FGColor.mutedText(colorScheme)))
+                    .foregroundStyle(disabled ? Color.orange : (isSelected ? FGColor.accentGreen : FGColor.mutedText(colorScheme)))
             }
             .contentShape(Rectangle())
         }
@@ -1051,24 +1154,25 @@ struct PickupGameInviteFriendsSheet: View {
         .opacity(disabled ? 0.62 : 1)
     }
 
-    private func toggleFriend(_ id: UUID) {
-        guard inviteStatusByUserId[id] == nil else { return }
-        if selectedFriendIds.contains(id) {
-            selectedFriendIds.remove(id)
-        } else if selectedFriendIds.count < 20 {
-            selectedFriendIds.insert(id)
+    private func toggleInviteeUserId(_ profileUserId: UUID) {
+        guard inviteStatusByUserId[profileUserId] == nil else { return }
+        if selectedInviteeUserIds.contains(profileUserId) {
+            selectedInviteeUserIds.remove(profileUserId)
+        } else if selectedInviteeUserIds.count < 20 {
+            selectedInviteeUserIds.insert(profileUserId)
         } else {
             errorText = "You can invite up to 20 people per game."
         }
     }
 
     private func toggleSearchResult(_ result: PickupInvitableFanSearchResult) {
-        guard inviteStatusByUserId[result.user_id] == nil else { return }
-        let wasSelected = selectedFriendIds.contains(result.user_id)
-        toggleFriend(result.user_id)
+        let profileId = result.user_id
+        guard inviteStatusByUserId[profileId] == nil else { return }
+        let wasSelected = selectedInviteeUserIds.contains(profileId)
+        toggleInviteeUserId(profileId)
 #if DEBUG
-        if !result.is_friend, !wasSelected, selectedFriendIds.contains(result.user_id) {
-            print("[PickupInviteDebug] nonFriendInviteSelected=\(result.user_id.uuidString.lowercased())")
+        if !result.is_friend, !wasSelected, selectedInviteeUserIds.contains(profileId) {
+            print("[PickupInviteDebug] nonFriendInviteSelected=\(profileId.uuidString.lowercased()) idSource=preview")
         }
 #endif
     }
@@ -1129,20 +1233,46 @@ struct PickupGameInviteFriendsSheet: View {
         errorText = nil
         defer { isSending = false }
 
+        // Profile/auth user IDs only — never FriendDisplay.id / conversation IDs.
+        let recipientIds = Array(selectedInviteeUserIds)
+#if DEBUG
+        print("[PickupInviteDebug] sendTapped gameId=\(game.id.uuidString.lowercased())")
+        print("[PickupInviteDebug] senderId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil")")
+        print("[PickupInviteDebug] recipientCount=\(recipientIds.count)")
+        print("[PickupInviteDebug] recipientIds=\(recipientIds.map { $0.uuidString.lowercased() }.joined(separator: ","))")
+        print("[PickupInviteDebug] idSource=preview")
+        for friend in eligibleFriends where selectedInviteeUserIds.contains(friend.preview.id) {
+            print(
+                "[PickupInviteDebug] selectedFriendRow previewId=\(friend.preview.id.uuidString.lowercased()) friendDisplayId=\(friend.id.uuidString.lowercased()) idSource=preview"
+            )
+        }
+        for result in searchResults where selectedInviteeUserIds.contains(result.user_id) {
+            print(
+                "[PickupInviteDebug] selectedSearchRow userId=\(result.user_id.uuidString.lowercased()) isFriend=\(result.is_friend) idSource=preview"
+            )
+        }
+#endif
+
         let results = await viewModel.createPickupGameInvites(
             game: game,
-            inviteeUserIds: Array(selectedFriendIds),
+            inviteeUserIds: recipientIds,
             message: nil
         )
         let created = results.filter { $0.outcome == "created" }.count
         let duplicates = results.filter { $0.outcome == "duplicate" }.count
+        let skipped = results.filter { $0.outcome == "skipped" }.count
+        let maxReached = results.filter { $0.outcome == "max_reached" }.count
 #if DEBUG
-        print("[PickupInviteDebug] duplicateSkipped=\(duplicates)")
+        print("[PickupInviteDebug] sendUI created=\(created) duplicates=\(duplicates) skipped=\(skipped) maxReached=\(maxReached)")
 #endif
         if created > 0 || duplicates > 0 {
             dismiss()
         } else {
+            // Soft outcomes (skipped/max_reached/empty) keep the existing generic failure copy.
             errorText = "No invites were sent. Try again."
+#if DEBUG
+            print("[PickupInviteDebug] uiSwallowedDetail showingGenericNoInvites=true")
+#endif
         }
     }
 }
@@ -1155,6 +1285,8 @@ struct PickupGameJoinRequestComposerSheet: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @AppStorage("pickup_chat_privacy_tip_dismissed.v1") private var privacyTipDismissed = false
 
     @State private var skill: PickupGameSkillLevel = .casual
     @State private var message: String = ""
@@ -1178,6 +1310,7 @@ struct PickupGameJoinRequestComposerSheet: View {
                             .font(.system(size: 18, weight: .semibold))
                             .foregroundStyle(FGColor.accentYellow)
                             .padding(.top, 1)
+                            .accessibilityHidden(true)
                         Text("Pickup games and meetups involve physical activity and real-world interaction. Participate at your own risk and use good judgment.")
                             .font(FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
@@ -1187,6 +1320,10 @@ struct PickupGameJoinRequestComposerSheet: View {
                 Section("Optional message") {
                     TextField("Short intro (optional)", text: $message, axis: .vertical)
                         .lineLimit(3...6)
+
+                    if !privacyTipDismissed {
+                        pickupChatPrivacyTip
+                    }
                 }
                 if let errorText, !errorText.isEmpty {
                     Section {
@@ -1213,6 +1350,36 @@ struct PickupGameJoinRequestComposerSheet: View {
                 }
             }
         }
+    }
+
+    private var pickupChatPrivacyTip: some View {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(FGColor.accentBlue)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+
+            Text(L10n.t("pickup_chat_privacy_note", languageCode: languageCode))
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button {
+                privacyTipDismissed = true
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t("pickup_chat_privacy_tip_dismiss_a11y", languageCode: languageCode))
+        }
+        .padding(.top, 6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(L10n.t("pickup_chat_privacy_note", languageCode: languageCode))
     }
 
     private func submit() async {

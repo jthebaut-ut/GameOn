@@ -549,6 +549,10 @@ extension MapViewModel {
         guard venueIsActiveForMap(venue) else { return false }
         guard !venue.isPickupPlayPlace else { return false }
 
+        if let venueFilter = discoverSearchVenueIDFilter {
+            return venueFilter.contains(venue.id)
+        }
+
         let sportScopedEvents = selectedDayEventsForMap(venue)
         let allSportEvents = selectedDayEventsForMap(venue, sportFilter: "All")
         let searchScopedEvents = selectedSport == "All"
@@ -707,17 +711,20 @@ extension MapViewModel {
         selectedEvent = nil
         selectedBar = nil
         discoverRemotePreviewHoldVenueId = nil
+        clearDiscoverVenueEventSearchFilter()
         loadGamesFromSupabase()
     }
 
     func setDiscoverMapStatus(
         _ text: String?,
         isLoading: Bool,
+        isError: Bool = false,
         autoClearAfter delay: TimeInterval? = nil
     ) {
         mapStatusDismissTask?.cancel()
         mapStatusDismissTask = nil
         isUpdatingMapGames = isLoading
+        mapStatusIsError = isError && !(text?.isEmpty ?? true)
         mapStatusText = text
 
         guard let delay, delay > 0, let text, !text.isEmpty else { return }
@@ -726,8 +733,104 @@ extension MapViewModel {
             guard let self, !Task.isCancelled else { return }
             guard self.mapStatusText == text, !self.isUpdatingMapGames else { return }
             self.mapStatusText = nil
+            self.mapStatusIsError = false
             self.mapStatusDismissTask = nil
         }
+    }
+
+    /// User-facing Discover toast language for background refresh (no cache/stale jargon).
+    func discoverMapRefreshStatusLanguageCode() -> String {
+        L10n.normalizedLanguageCode(UserDefaults.standard.string(forKey: L10n.appLanguageKey))
+    }
+
+    func discoverMapRefreshSportDisplayName() -> String? {
+        let trimmed = selectedSport.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "All" else { return nil }
+        switch trimmed {
+        case "NBA": return "Basketball"
+        case "NFL": return "Football"
+        case "NHL": return "Hockey"
+        case "MLB": return "Baseball"
+        default:
+            if let pair = AppSportCatalog.discoverMapDefaultPopularPairs.first(where: { $0.0 == trimmed }) {
+                return pair.1
+            }
+            return AppSportCatalog.displayLabel(forSportToken: trimmed)
+        }
+    }
+
+    /// Transient toast while results are already on screen and a refresh is running.
+    func discoverMapRefreshUpdatingToastText() -> String {
+        let languageCode = discoverMapRefreshStatusLanguageCode()
+        switch discoverMapContentMode {
+        case .pickupGames:
+            if discoverPickupSubMode == .places {
+                return L10n.t("discover_refresh_updating_places", languageCode: languageCode)
+            }
+            return L10n.t("discover_refresh_updating_pickup", languageCode: languageCode)
+        case .venues:
+            if mapDisplayMode == .gamesOnly {
+                if let sport = discoverMapRefreshSportDisplayName() {
+                    return String(
+                        format: L10n.t("discover_refresh_updating_hosting_sport_format", languageCode: languageCode),
+                        locale: Locale(identifier: languageCode),
+                        sport
+                    )
+                }
+                return L10n.t("discover_refresh_updating_hosting", languageCode: languageCode)
+            }
+            if let sport = discoverMapRefreshSportDisplayName() {
+                return String(
+                    format: L10n.t("discover_refresh_updating_watch_sport_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    sport
+                )
+            }
+            return L10n.t("discover_refresh_updating_watch", languageCode: languageCode)
+        }
+    }
+
+    /// Transient toast / dock copy when no pins are visible yet and a refresh is running.
+    func discoverMapRefreshLookingToastText() -> String {
+        let languageCode = discoverMapRefreshStatusLanguageCode()
+        switch discoverMapContentMode {
+        case .pickupGames:
+            if discoverPickupSubMode == .places {
+                return L10n.t("discover_refresh_looking_places", languageCode: languageCode)
+            }
+            return L10n.t("discover_refresh_looking_pickup", languageCode: languageCode)
+        case .venues:
+            if mapDisplayMode == .gamesOnly {
+                if let sport = discoverMapRefreshSportDisplayName() {
+                    return String(
+                        format: L10n.t("discover_refresh_looking_hosting_sport_format", languageCode: languageCode),
+                        locale: Locale(identifier: languageCode),
+                        sport
+                    )
+                }
+                return L10n.t("discover_refresh_looking_hosting", languageCode: languageCode)
+            }
+            if let sport = discoverMapRefreshSportDisplayName() {
+                return String(
+                    format: L10n.t("discover_refresh_looking_watch_sport_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    sport
+                )
+            }
+            return L10n.t("discover_refresh_looking_watch", languageCode: languageCode)
+        }
+    }
+
+    func discoverMapRefreshUpdatedJustNowText() -> String {
+        L10n.t("discover_refresh_updated_just_now", languageCode: discoverMapRefreshStatusLanguageCode())
+    }
+
+    func discoverMapRefreshShowingAvailableText() -> String {
+        L10n.t("discover_refresh_showing_available", languageCode: discoverMapRefreshStatusLanguageCode())
+    }
+
+    func discoverMapRefreshCouldNotUpdateText() -> String {
+        L10n.t("discover_refresh_couldnt_update", languageCode: discoverMapRefreshStatusLanguageCode())
     }
 
     /// Local start-of-day floor for Discover map date selection (Calendar tab uses its own picker without this floor).
@@ -768,11 +871,15 @@ extension MapViewModel {
         discoverSelectedDayRefreshRequestID = requestID
         markPickupDiscoverMapDataDirtyForNextRefresh()
         if discoverMapContentMode == .pickupGames, discoverPickupSubMode == .games {
-            setDiscoverMapStatus("Updating map…", isLoading: true)
+            let hasExisting = !pickupGamesForDiscoverMap.isEmpty
+            setDiscoverMapStatus(
+                hasExisting ? discoverMapRefreshUpdatingToastText() : discoverMapRefreshLookingToastText(),
+                isLoading: true
+            )
         } else if discoverCurrentVisibleVenueRows.isEmpty {
-            setDiscoverMapStatus("Refreshing nearby venues...", isLoading: true)
+            setDiscoverMapStatus(discoverMapRefreshLookingToastText(), isLoading: true)
         } else {
-            setDiscoverMapStatus("Updating games...", isLoading: true)
+            setDiscoverMapStatus(discoverMapRefreshUpdatingToastText(), isLoading: true)
         }
         return requestID
     }
@@ -840,6 +947,7 @@ extension MapViewModel {
         selectedPickupGameForMap = nil
         selectedPickupPlaceForMap = nil
         discoverRemotePreviewHoldVenueId = nil
+        clearDiscoverVenueEventSearchFilter()
 
         markPickupDiscoverMapDataDirtyForNextRefresh()
         if discoverMapContentMode == .venues {

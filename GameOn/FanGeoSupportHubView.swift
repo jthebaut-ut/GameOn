@@ -13,8 +13,10 @@ struct FanGeoSupportHubView: View {
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var chatViewModel: ChatViewModel
     var onRequestSignIn: (() -> Void)?
-    /// Kept for call-site compatibility. Ticket presentation always uses a single `NavigationPath`
-    /// so Settings / notification sheets never stack competing `navigationDestination` modifiers.
+    /// When `true`, this view owns a `NavigationStack` (standalone sheet presentation).
+    /// When `false`, it must reuse the parent stack (e.g. Settings) — nesting a second
+    /// `NavigationStack` desynchronizes the parent path (destination disappears, path stays nonzero).
+    /// Embedded ticket/create navigation uses in-view state — never mutates the Settings route path.
     var embedsInNavigationStack = true
     var showsCloseButton = true
     var screenTitle: String = "Support Center"
@@ -23,6 +25,8 @@ struct FanGeoSupportHubView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var presenter = FanGeoSupportCenterPresenter()
     @State private var navigationPath = NavigationPath()
+    /// Embedded (Settings) sub-navigation — does not touch the outer Settings typed path.
+    @State private var embeddedRoute: SupportCenterRoute?
     @State private var presentedTicketDetailID: UUID?
     @State private var pendingDeepLinkTicketID: UUID?
     @State private var didConsumeInitialTicketDeepLink = false
@@ -32,14 +36,23 @@ struct FanGeoSupportHubView: View {
         mapViewModel.isLoggedIn || mapViewModel.isVenueOwnerLoggedIn
     }
 
+    private var activeNavigationPathCount: Int {
+        if embedsInNavigationStack {
+            return navigationPath.count
+        }
+        return embeddedRoute == nil ? 0 : 1
+    }
+
     var body: some View {
-        // Always own a single NavigationStack for ticket/report/create destinations.
-        // Avoids competing item/isPresented destinations and keeps Settings + push sheets consistent.
-        NavigationStack(path: $navigationPath) {
-            centerListContent
-                .navigationDestination(for: SupportCenterRoute.self) { route in
-                    destinationView(for: route)
+        Group {
+            if embedsInNavigationStack {
+                NavigationStack(path: $navigationPath) {
+                    supportRootWithDestinations
                 }
+            } else {
+                // Reuse parent NavigationStack — never nest another stack inside Settings.
+                embeddedSupportContainer
+            }
         }
         .alert(
             "Ticket unavailable",
@@ -54,7 +67,7 @@ struct FanGeoSupportHubView: View {
         }
         .task(id: initialTicketID?.uuidString ?? "none") {
 #if DEBUG
-            print("[SupportNotificationRoute] support center opened initialTicketID=\(initialTicketID?.uuidString.lowercased() ?? "nil")")
+            print("[SupportNotificationRoute] support center opened initialTicketID=\(initialTicketID?.uuidString.lowercased() ?? "nil") embedsInNavigationStack=\(embedsInNavigationStack)")
 #endif
             await presenter.loadRequests()
 #if DEBUG
@@ -64,13 +77,44 @@ struct FanGeoSupportHubView: View {
             await openInitialTicketIfNeeded()
             await consumePendingDeepLinkTicketIfNeeded()
         }
-        .onChange(of: navigationPath.count) { _, count in
+        .onChange(of: activeNavigationPathCount) { _, count in
             if count == 0 {
                 presentedTicketDetailID = nil
             }
 #if DEBUG
-            print("[SupportNotificationRoute] current route state pathCount=\(count) presentedTicket=\(presentedTicketDetailID?.uuidString.lowercased() ?? "nil")")
+            print("[SupportNotificationRoute] current route state pathCount=\(count) presentedTicket=\(presentedTicketDetailID?.uuidString.lowercased() ?? "nil") embedsOwnStack=\(embedsInNavigationStack)")
 #endif
+        }
+    }
+
+    private var supportRootWithDestinations: some View {
+        centerListContent
+            .navigationDestination(for: SupportCenterRoute.self) { route in
+                destinationView(for: route)
+            }
+    }
+
+    @ViewBuilder
+    private var embeddedSupportContainer: some View {
+        if let embeddedRoute {
+            destinationView(for: embeddedRoute)
+                .navigationBarBackButtonHidden(true)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            popToSupportRoot()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.left")
+                                    .font(.body.weight(.semibold))
+                                Text(screenTitle)
+                            }
+                        }
+                        .accessibilityLabel("Back to \(screenTitle)")
+                    }
+                }
+        } else {
+            centerListContent
         }
     }
 
@@ -157,7 +201,8 @@ struct FanGeoSupportHubView: View {
             presenter: presenter,
             mapViewModel: mapViewModel,
             chatViewModel: chatViewModel,
-            onCreateFollowUp: openCreateRequest
+            onCreateFollowUp: openCreateRequest,
+            onClose: embedsInNavigationStack ? nil : { popToSupportRoot() }
         )
         .onAppear {
 #if DEBUG
@@ -232,7 +277,8 @@ struct FanGeoSupportHubView: View {
     private func reportDetailDestination(_ reportKey: SupportReportItemKey) -> some View {
         FanGeoSupportReportDetailView(
             reportKey: reportKey,
-            presenter: presenter
+            presenter: presenter,
+            onClose: embedsInNavigationStack ? nil : { popToSupportRoot() }
         )
     }
 
@@ -247,7 +293,7 @@ struct FanGeoSupportHubView: View {
 #if DEBUG
         print("[SupportCenter] submit completed emailOnly=true")
 #endif
-        navigationPath = NavigationPath()
+        popToSupportRoot()
         presentedTicketDetailID = nil
     }
 
@@ -258,13 +304,33 @@ struct FanGeoSupportHubView: View {
         case .createRequest, .reportDetail:
             presentedTicketDetailID = nil
         }
-        var next = NavigationPath()
-        next.append(route)
-        navigationPath = next
+        if embedsInNavigationStack {
+            var next = NavigationPath()
+            next.append(route)
+            navigationPath = next
+            return
+        }
+        // Embedded in Settings: keep outer typed Settings path untouched.
+        embeddedRoute = route
+#if DEBUG
+        print("[SupportNotificationRoute] embeddedPresent route=\(String(describing: route))")
+#endif
+    }
+
+    private func popToSupportRoot() {
+        if embedsInNavigationStack {
+            navigationPath = NavigationPath()
+            return
+        }
+        embeddedRoute = nil
+        presentedTicketDetailID = nil
+#if DEBUG
+        print("[SupportNotificationRoute] embeddedPopToSupportRoot")
+#endif
     }
 
     private func resetNavigationState() {
-        navigationPath = NavigationPath()
+        popToSupportRoot()
         presentedTicketDetailID = nil
         pendingDeepLinkTicketID = nil
         didConsumeInitialTicketDeepLink = false
@@ -338,17 +404,45 @@ final class FanGeoSupportCenterPresenter: ObservableObject {
             requests = try await ticketsTask
             do {
                 reportItems = try await reportsTask
-            } catch {
-                reportItems = []
-                reportLoadError = error.localizedDescription
+            } catch is CancellationError {
 #if DEBUG
-                print("[SupportCenter] load report items failed error=\(error.localizedDescription)")
+                print("[SupportCenter] load report items cancelled (ignored)")
 #endif
+            } catch let urlError as URLError where urlError.code == .cancelled {
+#if DEBUG
+                print("[SupportCenter] load report items URL cancelled (ignored)")
+#endif
+            } catch {
+                if Task.isCancelled {
+#if DEBUG
+                    print("[SupportCenter] load report items task cancelled (ignored)")
+#endif
+                } else {
+                    reportItems = []
+                    reportLoadError = error.localizedDescription
+#if DEBUG
+                    print("[SupportCenter] load report items failed error=\(error.localizedDescription)")
+#endif
+                }
             }
 #if DEBUG
             print("[SupportCenter] loaded tickets count=\(requests.count) reports count=\(reportItems.count)")
 #endif
+        } catch is CancellationError {
+#if DEBUG
+            print("[SupportCenter] load requests cancelled (ignored — not an error, no dismiss)")
+#endif
+        } catch let urlError as URLError where urlError.code == .cancelled {
+#if DEBUG
+            print("[SupportCenter] load requests URL cancelled (ignored — not an error, no dismiss)")
+#endif
         } catch {
+            if Task.isCancelled {
+#if DEBUG
+                print("[SupportCenter] load requests task cancelled (ignored — not an error, no dismiss)")
+#endif
+                return
+            }
             loadError = error.localizedDescription
 #if DEBUG
             print("[SupportCenter] load requests failed error=\(error.localizedDescription)")
@@ -875,9 +969,19 @@ private struct FanGeoSupportReportItemRowView: View {
 private struct FanGeoSupportReportDetailView: View {
     let reportKey: SupportReportItemKey
     @ObservedObject var presenter: FanGeoSupportCenterPresenter
+    /// When set (Settings embedded), prefer this over `dismiss()` so the outer Settings sheet is not dismissed.
+    var onClose: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var showWithdrawConfirmation = false
+
+    private func closeDetail() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
+        }
+    }
 
     var body: some View {
         Group {
@@ -900,7 +1004,7 @@ private struct FanGeoSupportReportDetailView: View {
                 Task {
                     if let report = presenter.reportItem(for: reportKey),
                        await presenter.withdrawReport(report) {
-                        dismiss()
+                        closeDetail()
                     }
                 }
             }
@@ -1079,9 +1183,19 @@ private struct FanGeoSupportTicketDetailView: View {
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var chatViewModel: ChatViewModel
     var onCreateFollowUp: () -> Void
+    /// When set (Settings embedded), prefer this over `dismiss()` so the outer Settings sheet is not dismissed.
+    var onClose: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @State private var showCancelConfirmation = false
+
+    private func closeDetail() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
+        }
+    }
 
     var body: some View {
         Group {
@@ -1103,7 +1217,7 @@ private struct FanGeoSupportTicketDetailView: View {
             Button("Cancel Request", role: .destructive) {
                 Task {
                     if await presenter.cancelTicket(conversationId: conversationId) {
-                        dismiss()
+                        closeDetail()
                     }
                 }
             }

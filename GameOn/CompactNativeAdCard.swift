@@ -114,9 +114,10 @@ struct CompactNativeAdCard: View {
                 .frame(height: adLoaded ? CompactNativeAdLayout.preferredHeight : 0)
                 .background(Color.clear)
                 .opacity(adLoaded ? 1 : 0)
-                .allowsHitTesting(allowsAdHitTesting)
-                .clipped()
+                .compositingGroup()
+                .clipShape(Rectangle())
                 .contentShape(Rectangle())
+                .allowsHitTesting(allowsAdHitTesting)
                 .onAppear {
                     logNativeAdDebug("mounted=true collapsed=\(!adLoaded) unitID=\(adUnitID) layoutWidth=\(String(format: "%.1f", Double(layoutWidth)))")
                     AdDebugDiagnostics.logEvent(
@@ -535,6 +536,7 @@ private final class CompactNativeAdHostView: NativeAdView {
         layer.masksToBounds = true
 
         chromeBackgroundView.backgroundColor = .clear
+        chromeBackgroundView.isUserInteractionEnabled = false
         chromeBackgroundView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(chromeBackgroundView)
 
@@ -642,6 +644,25 @@ private final class CompactNativeAdHostView: NativeAdView {
 
             heightAnchor.constraint(equalToConstant: Self.preferredHeight)
         ])
+    }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.contains(point)
+    }
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        // Constrain AdMob native click-through to the visible host bounds only.
+        // SwiftUI `.clipped()` does not reliably clip UIKit hit testing for UIViewRepresentable.
+        guard isUserInteractionEnabled, !isHidden, alpha > 0.01, bounds.contains(point) else {
+            return nil
+        }
+        return super.hitTest(point, with: event)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        clipsToBounds = true
+        layer.masksToBounds = true
     }
 
     private func applyChromeColors() {

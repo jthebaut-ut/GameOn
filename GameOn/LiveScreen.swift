@@ -119,14 +119,24 @@ struct LiveScreen: View {
         let tvDisplayText: String?
         let scorerSummaryText: String?
         let statusText: String
+        let canonicalStatus: LiveCanonicalMatchStatus
         let isLiveNow: Bool
         let startsSoon: Bool
+        let isRecentFinalFallback: Bool
         let nearbyFanCount: Int
         let nearbyVenueCount: Int
         let friendGoingCount: Int
         let activityCount: Int
         let score: Int
         let startDate: Date?
+        let primaryMatch: LiveMatch?
+        let awayTeam: String?
+        let homeTeam: String?
+        let awayScore: Int?
+        let homeScore: Int?
+        let scoresAvailable: Bool
+        let awayBadgeURL: String?
+        let homeBadgeURL: String?
 
         var socialTokens: [String] {
             var tokens: [String] = []
@@ -409,6 +419,122 @@ struct LiveScreen: View {
         liveLeagueCountryFilterCount == 0 ? "Countries" : "Countries \(liveLeagueCountryFilterCount)"
     }
 
+    private var liveNowLanguageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    private var liveHeaderPlaceMode: LiveLeagueCountryFilterPresentation.LiveHeaderPlaceMode {
+        LiveLeagueCountryFilterPresentation.liveHeaderPlaceMode(
+            for: selectedLiveLeagueCountries,
+            languageCode: liveNowLanguageCode
+        )
+    }
+
+    private var liveNearYouSuggestedCountry: String? {
+        LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
+            homeCountry: viewModel.currentUserHomeCountry,
+            homeRegion: viewModel.currentUserHomeRegion,
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+    }
+
+    private var liveNowSectionTitle: String {
+        let languageCode = liveNowLanguageCode
+        let locale = Locale(identifier: languageCode)
+        let sportLabel: String? = {
+            guard selectedLiveFeaturedEvent == nil else { return nil }
+            return liveGamesSportFilter?.filterChipLabel
+        }()
+
+        switch liveHeaderPlaceMode {
+        case .none, .summary:
+            if let sportLabel {
+                return String(
+                    format: L10n.t("live_now_title_sport_format", languageCode: languageCode),
+                    locale: locale,
+                    sportLabel
+                )
+            }
+            return L10n.t("live_now_title", languageCode: languageCode)
+        case .inline(let place):
+            if let sportLabel {
+                return String(
+                    format: L10n.t("live_now_title_sport_in_place_format", languageCode: languageCode),
+                    locale: locale,
+                    sportLabel,
+                    place
+                )
+            }
+            return String(
+                format: L10n.t("live_now_title_in_place_format", languageCode: languageCode),
+                locale: locale,
+                place
+            )
+        }
+    }
+
+    private var liveNowSectionSubtitle: String {
+        let languageCode = liveNowLanguageCode
+        let locale = Locale(identifier: languageCode)
+        let sportLabel: String? = {
+            guard selectedLiveFeaturedEvent == nil else { return nil }
+            return liveGamesSportFilter?.filterChipLabel
+        }()
+
+        switch liveHeaderPlaceMode {
+        case .none:
+            return L10n.t("live_now_subtitle_default", languageCode: languageCode)
+        case .summary(let summary):
+            return summary
+        case .inline(let place):
+            if let sportLabel {
+                return String(
+                    format: L10n.t("live_now_subtitle_sport_in_place_format", languageCode: languageCode),
+                    locale: locale,
+                    sportLabel,
+                    place
+                )
+            }
+            return String(
+                format: L10n.t("live_now_subtitle_in_place_format", languageCode: languageCode),
+                locale: locale,
+                place
+            )
+        }
+    }
+
+    private var liveNowSectionUsesCountrySummarySubtitle: Bool {
+        if case .summary = liveHeaderPlaceMode { return true }
+        return false
+    }
+
+    private func liveNowSectionAccessibilityLabel(count: Int) -> String {
+        let languageCode = liveNowLanguageCode
+        let locale = Locale(identifier: languageCode)
+        let title = liveNowSectionTitle
+        switch liveHeaderPlaceMode {
+        case .none, .inline:
+            return String(
+                format: L10n.t("live_now_a11y_with_count_format", languageCode: languageCode),
+                locale: locale,
+                title,
+                count
+            )
+        case .summary:
+            let spokenPlaces = LiveLeagueCountryFilterPresentation.multiCountryAccessibilitySummary(
+                for: selectedLiveLeagueCountries,
+                languageCode: languageCode
+            )
+            return String(
+                format: L10n.t("live_now_a11y_with_count_and_selection_format", languageCode: languageCode),
+                locale: locale,
+                title,
+                count,
+                spokenPlaces
+            )
+        }
+    }
+
     private var liveLeagueCountryOptions: [String] {
         let allMatches = viewModel.liveTabTodayMatchesDisplayed(searchQuery: "", sportFilter: nil, calendarDay: liveCalendarToday)
         let detected = allMatches.compactMap(\.leagueCountry)
@@ -436,6 +562,20 @@ struct LiveScreen: View {
 
     private func updateSelectedLiveLeagueCountries(_ countries: Set<String>) {
         liveLeagueCountryFilterRaw = LiveLeagueCountryFilterPreference.encode(countries)
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
+    private func applyLiveLeagueCountryFilterFirstUseDefaultIfNeeded() {
+        let resolved = LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
+            homeCountry: viewModel.currentUserHomeCountry,
+            homeRegion: viewModel.currentUserHomeRegion,
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+        guard let encoded = LiveLeagueCountryFilterPreference.firstUseDefaultEncodedSelection(
+            currentRaw: liveLeagueCountryFilterRaw,
+            resolvedCountry: resolved
+        ) else { return }
+        liveLeagueCountryFilterRaw = encoded
     }
 
     private func liveMatchesFilteredBySelectedCountries(_ matches: [LiveMatch]) -> [LiveMatch] {
@@ -500,6 +640,7 @@ struct LiveScreen: View {
                 Text(fanFeatureGateAlertMessage ?? "")
             }
             .onAppear {
+                applyLiveLeagueCountryFilterFirstUseDefaultIfNeeded()
                 logLiveFeedRefresh(reason: "appear")
                 logLiveAudienceDebug()
                 updateLiveAutoRefreshForCurrentState(scheduleActivationRefresh: isLiveTabSelected)
@@ -710,8 +851,11 @@ struct LiveScreen: View {
                                 items: favoriteTeamItems,
                                 favoriteTeams: favoriteTeams,
                                 hasFavoriteTeams: !favoriteTeams.isEmpty,
-                                onWatchNearby: { _ in
-                                    selectedTab = .discover
+                                onWatchNearby: { item in
+                                    watchNearbyFavoriteTeam(
+                                        item,
+                                        matchRelatedItemsByMatchID: feedComputed.matchRelatedItemsByMatchID
+                                    )
                                 }
                             )
                         }
@@ -724,21 +868,25 @@ struct LiveScreen: View {
                             sportFilterOptions: sportFilterChipOptions
                         )
                             .id(LiveScrollSection.liveGames.rawValue)
-                        if showVenuesAndPickupToday {
-                            liveVenuesAndPickupTodaySection(rows: venuesAndPickupToday)
-                                .id(LiveScrollSection.today.rawValue)
+                        VStack(alignment: .leading, spacing: 0) {
+                            if showVenuesAndPickupToday {
+                                liveVenuesAndPickupTodaySection(rows: venuesAndPickupToday)
+                                    .id(LiveScrollSection.today.rawValue)
+                            }
+                            if showPersonalLiveSections {
+                                liveFriendsSection(items: friendsGoing)
+                                    .id(LiveScrollSection.friends.rawValue)
+                            }
+                            liveCrowdBuildingSection(items: crowdBuilding)
+                                .id(LiveScrollSection.crowdBuilding.rawValue)
                         }
-                        if showPersonalLiveSections {
-                            liveFriendsSection(items: friendsGoing)
-                                .id(LiveScrollSection.friends.rawValue)
-                        }
-                        liveCrowdBuildingSection(items: crowdBuilding)
-                            .id(LiveScrollSection.crowdBuilding.rawValue)
+                        .zIndex(2)
                     }
                     .padding(.horizontal, 20)
                     .background {
                         GeometryReader { geometry in
                             Color.clear
+                                .allowsHitTesting(false)
                                 .onAppear {
                                     updateLiveFeedNativeAdLayoutWidth(geometry.size.width)
                                 }
@@ -746,6 +894,7 @@ struct LiveScreen: View {
                                     updateLiveFeedNativeAdLayoutWidth(width)
                                 }
                         }
+                        .allowsHitTesting(false)
                     }
                     .padding(.top, 76)
                     .padding(.bottom, 112)
@@ -785,6 +934,7 @@ struct LiveScreen: View {
                 .frame(width: 260, height: 260)
                 .blur(radius: 58)
                 .offset(x: 110, y: 80)
+                .allowsHitTesting(false)
         }
         .overlay(alignment: .bottomLeading) {
             Circle()
@@ -792,14 +942,16 @@ struct LiveScreen: View {
                 .frame(width: 240, height: 240)
                 .blur(radius: 62)
                 .offset(x: -120, y: -80)
+                .allowsHitTesting(false)
         }
+        .allowsHitTesting(false)
     }
 
     private var liveHeroHeader: some View {
         HStack(alignment: .top, spacing: 12) {
             FanGeoPagePurposeHeader(
-                title: "Live",
-                subtitle: "Find live games and watch parties happening now."
+                title: L10n.t("Live", languageCode: appLanguageRaw),
+                subtitle: L10n.t("live_tab_subtitle", languageCode: appLanguageRaw)
             )
 
             Spacer(minLength: 0)
@@ -845,7 +997,7 @@ struct LiveScreen: View {
         matches: [LiveMatch],
         venuesAndPickup: [LiveVenuesPickupRow]
     ) -> Int {
-        matches.count + venuesAndPickup.filter(\.isLiveNow).count
+        matches.count + venuesAndPickup.filter(liveVenuesPickupRowIsInProgress).count
     }
 
     private var liveCrowdSummaryAccent: Color {
@@ -1130,9 +1282,11 @@ struct LiveScreen: View {
 
         return liveCollapsiblePanelSection(
             kind: .liveGames,
-            title: "Live Now",
+            title: liveNowSectionTitle,
             count: liveNowMatches.count,
-            subtitle: "Pro scores on TV right now",
+            subtitle: liveNowSectionSubtitle,
+            subtitleUsesSubheadline: liveNowSectionUsesCountrySummarySubtitle,
+            accessibilityLabelText: liveNowSectionAccessibilityLabel(count: liveNowMatches.count),
             isExpanded: liveNowExpanded,
             toggle: toggleLiveNowExpanded
         ) {
@@ -1275,7 +1429,7 @@ struct LiveScreen: View {
         if let liveGamesSportFilter {
             return "No live \(liveGamesSportFilter.filterChipLabel) games right now"
         }
-        return "No live pro games right now"
+        return L10n.t("no_live_pro_sports_games")
     }
 
     private func liveGamesSportFilterBar(sportFilterOptions: [LiveSportVisualType]) -> some View {
@@ -1291,6 +1445,7 @@ struct LiveScreen: View {
                         liveGamesSportFilter = nil
                     }
                 }
+                liveCountryFilterChip
                 ForEach(liveFeaturedEvents) { featuredEvent in
                     liveFeaturedEventChip(featuredEvent)
                 }
@@ -1307,7 +1462,6 @@ struct LiveScreen: View {
                         }
                     }
                 }
-                liveCountryFilterChip
             }
             .padding(.horizontal, 1)
             .padding(.vertical, 2)
@@ -1430,7 +1584,7 @@ struct LiveScreen: View {
     }
 
     private func favoriteTeamLiveItem(for team: FavoriteTeam, rankedItems: [LiveFeedItem]) -> FavoriteTeamLiveItem? {
-        let matchingMatches = viewModel.liveMatches
+        let matchingLiveOrSoonMatches = viewModel.liveMatches
             .filter { liveMatchIsLiveOrStartingSoon($0) }
             .filter(liveMatchMatchesSelectedCountries)
             .filter { favoriteTeamMatches(team, in: $0) }
@@ -1438,29 +1592,67 @@ struct LiveScreen: View {
         let matchingVenueItems = rankedItems
             .filter { favoriteTeamMatches(team, in: $0.event) }
             .filter { item in
-                item.energy.isLiveNow
-                    || item.energy.startsSoon
+                item.energy.startsSoon
                     || item.energy.goingCount > 0
                     || item.energy.friendGoingCount > 0
                     || item.energy.commentCount > 0
                     || item.vibeCount > 0
+                    || linkedLiveMatch(for: item)?.matchStatus.isHappeningNow == true
+                    || linkedLiveMatch(for: item)?.matchStatus == .fullTime
             }
 
-        guard !matchingMatches.isEmpty || !matchingVenueItems.isEmpty else {
+        let primaryMatch: LiveMatch?
+        let isRecentFinalFallback: Bool
+        if let liveOrSoon = matchingLiveOrSoonMatches.first {
+            primaryMatch = liveOrSoon
+            isRecentFinalFallback = false
+        } else if matchingLiveOrSoonMatches.isEmpty {
+            primaryMatch = recentFullTimeFavoriteMatch(for: team)
+            isRecentFinalFallback = primaryMatch != nil
+        } else {
+            primaryMatch = nil
+            isRecentFinalFallback = false
+        }
+
+        guard primaryMatch != nil || !matchingVenueItems.isEmpty else {
             return nil
         }
 
-        let primaryMatch = matchingMatches.first
         let primaryVenueItem = matchingVenueItems.first
-        let title = primaryMatch.map { "\($0.awayTeam) at \($0.homeTeam)" } ?? primaryVenueItem?.event.title ?? team.name
+        let title: String = {
+            if let match = primaryMatch {
+                if match.scoresAreAvailable, match.matchStatus.isHappeningNow || match.matchStatus == .fullTime {
+                    return "\(match.awayTeam) \(match.scoreAway)–\(match.scoreHome) \(match.homeTeam)"
+                }
+                return "\(match.awayTeam) vs \(match.homeTeam)"
+            }
+            return primaryVenueItem?.event.title ?? team.name
+        }()
         let scoreRows = primaryMatch.flatMap(favoriteTeamScoreRows)
         let leagueSportText = favoriteTeamLeagueSportText(team: team, match: primaryMatch, item: primaryVenueItem)
         let tvDisplayText = primaryMatch?.tvDisplayText
-        let scorerSummaryText = primaryMatch?.latestScoringEvent?.displayText
-        let liveNow = matchingMatches.contains { $0.matchStatus.isHappeningNow } || matchingVenueItems.contains { $0.energy.isLiveNow }
-        let soonMinutes = favoriteTeamSoonMinutes(matches: matchingMatches, items: matchingVenueItems)
-        let startsSoon = soonMinutes != nil || matchingVenueItems.contains { $0.energy.startsSoon }
-        let statusText = favoriteTeamStatusText(isLiveNow: liveNow, soonMinutes: soonMinutes, match: primaryMatch)
+        let scorerSummaryText = isRecentFinalFallback ? nil : primaryMatch?.latestScoringEvent?.displayText
+
+        let canonicalStatus: LiveCanonicalMatchStatus = {
+            if let primaryMatch {
+                return LiveCanonicalMatchStatus.from(match: primaryMatch)
+            }
+            if let venueItem = primaryVenueItem {
+                return resolveVenueEventMatchStatus(for: venueItem)
+            }
+            return .unknown
+        }()
+
+        let liveNow = canonicalStatus.isLive
+        let soonMinutes: Int? = {
+            if case .startingSoon(let minutes) = canonicalStatus { return minutes }
+            return favoriteTeamSoonMinutes(matches: matchingLiveOrSoonMatches, items: matchingVenueItems)
+        }()
+        let startsSoon = {
+            if case .startingSoon = canonicalStatus { return true }
+            return soonMinutes != nil || matchingVenueItems.contains { $0.energy.startsSoon }
+        }()
+        let statusText = favoriteTeamStatusText(canonicalStatus: canonicalStatus, soonMinutes: soonMinutes, match: primaryMatch)
         let nearbyVenueIDs = Set(matchingVenueItems.map(\.bar.id))
         let nearbyFanCount = matchingVenueItems.reduce(0) { $0 + $1.energy.goingCount }
         let friendCount = matchingVenueItems.reduce(0) { $0 + $1.energy.friendGoingCount }
@@ -1475,6 +1667,9 @@ struct LiveScreen: View {
             activityCount: activityCount
         )
 
+        let scoresAvailable = primaryMatch?.scoresAreAvailable == true
+            && (primaryMatch?.matchStatus.isHappeningNow == true || primaryMatch?.matchStatus == .fullTime)
+
         return FavoriteTeamLiveItem(
             id: team.id,
             team: team,
@@ -1484,22 +1679,91 @@ struct LiveScreen: View {
             tvDisplayText: tvDisplayText,
             scorerSummaryText: scorerSummaryText,
             statusText: statusText,
+            canonicalStatus: canonicalStatus,
             isLiveNow: liveNow,
             startsSoon: startsSoon,
+            isRecentFinalFallback: isRecentFinalFallback,
             nearbyFanCount: nearbyFanCount,
             nearbyVenueCount: nearbyVenueIDs.count,
             friendGoingCount: friendCount,
             activityCount: activityCount,
             score: score,
-            startDate: startDate
+            startDate: startDate,
+            primaryMatch: primaryMatch,
+            awayTeam: primaryMatch?.awayTeam,
+            homeTeam: primaryMatch?.homeTeam,
+            awayScore: scoresAvailable ? primaryMatch?.scoreAway : nil,
+            homeScore: scoresAvailable ? primaryMatch?.scoreHome : nil,
+            scoresAvailable: scoresAvailable,
+            awayBadgeURL: primaryMatch?.awayTeamBadgeURL,
+            homeBadgeURL: primaryMatch?.homeTeamBadgeURL
         )
+    }
+
+    private func recentFullTimeFavoriteMatch(for team: FavoriteTeam) -> LiveMatch? {
+        let cal = Calendar.current
+        let now = Date()
+        let candidates = viewModel.liveMatches
+            .filter { $0.matchStatus == .fullTime }
+            .filter(liveMatchMatchesSelectedCountries)
+            .filter { favoriteTeamMatches(team, in: $0) }
+
+        let todayCandidates = candidates.filter { cal.isDate($0.startTime, inSameDayAs: liveCalendarToday) }
+        let pool: [LiveMatch]
+        if !todayCandidates.isEmpty {
+            pool = todayCandidates
+        } else {
+            // Short recent window only: completion known and still within post-game activity window,
+            // or otherwise omit stale finals without inventing Discover's 4h live-energy window.
+            pool = candidates.filter { match in
+                guard let completion = FanGeoLivePostGameTiming.completionTime(from: match) else {
+                    return false
+                }
+                return FanGeoLivePostGameTiming.isWithinPostGameActivityWindow(
+                    completionTime: completion,
+                    now: now
+                )
+            }
+        }
+        return pool.sorted { $0.startTime > $1.startTime }.first
+    }
+
+    private func linkedLiveMatch(for item: LiveFeedItem) -> LiveMatch? {
+        liveMatchRelatedItems(forVenueEvent: item)
+    }
+
+    private func liveMatchRelatedItems(forVenueEvent item: LiveFeedItem) -> LiveMatch? {
+        let eventText = normalizedLiveAudienceText([
+            item.event.title,
+            item.event.league,
+            item.event.sport
+        ].joined(separator: " "))
+        return viewModel.liveMatches
+            .filter(liveMatchMatchesSelectedCountries)
+            .first { match in
+                let home = normalizedLiveAudienceText(match.homeTeam)
+                let away = normalizedLiveAudienceText(match.awayTeam)
+                return (!home.isEmpty && eventText.contains(home))
+                    || (!away.isEmpty && eventText.contains(away))
+            }
+    }
+
+    private func resolveVenueEventMatchStatus(for item: LiveFeedItem) -> LiveCanonicalMatchStatus {
+        if let match = linkedLiveMatch(for: item) {
+            return LiveCanonicalMatchStatus.from(match: match)
+        }
+        let row = viewModel.cachedVenueEventRow(for: item.bar, gameTitle: item.event.title)
+        let start = row.flatMap { FanGeoLiveEnergyTiming.parseScheduledStart($0.scheduled_start_at, eventId: $0.id) }
+            ?? item.event.date
+        return LiveCanonicalMatchStatus.from(adminStatus: row?.admin_status, eventStart: start)
     }
 
     private func liveMatchIsLiveOrStartingSoon(_ match: LiveMatch) -> Bool {
         if match.matchStatus.isHappeningNow { return true }
         guard match.matchStatus == .scheduled else { return false }
-        let secondsUntil = match.startTime.timeIntervalSince(Date())
-        return secondsUntil > 0 && secondsUntil <= TimeInterval(FanGeoLiveEnergyTiming.startsSoonWindowMinutes * 60)
+        if LiveCanonicalMatchStatus.from(match: match).isLive { return true }
+        if case .startingSoon = LiveCanonicalMatchStatus.from(match: match) { return true }
+        return false
     }
 
     private func favoriteTeamLiveMatchSort(_ lhs: LiveMatch, _ rhs: LiveMatch) -> Bool {
@@ -1522,7 +1786,8 @@ struct LiveScreen: View {
     }
 
     private func favoriteTeamScoreRows(_ match: LiveMatch) -> [LiveMatchTeamScoreRow]? {
-        guard match.matchStatus.isHappeningNow, match.scoresAreAvailable else { return nil }
+        let mayShowScores = match.matchStatus.isHappeningNow || match.matchStatus == .fullTime
+        guard mayShowScores, match.scoresAreAvailable else { return nil }
         return [
             LiveMatchTeamScoreRow(
                 id: "away-\(match.id)",
@@ -1551,20 +1816,38 @@ struct LiveScreen: View {
         return (matchMinutes + itemMinutes).min()
     }
 
-    private func favoriteTeamStatusText(isLiveNow: Bool, soonMinutes: Int?, match: LiveMatch?) -> String {
-        if isLiveNow {
-            if let minute = match?.minute {
+    private func favoriteTeamStatusText(
+        canonicalStatus: LiveCanonicalMatchStatus,
+        soonMinutes: Int?,
+        match: LiveMatch?
+    ) -> String {
+        switch canonicalStatus {
+        case .live(let minute):
+            if let minute {
                 return "LIVE \(minute)'"
             }
             return "LIVE NOW"
+        case .halfTime:
+            return "HT"
+        case .startingSoon(let minutes):
+            return "Starts in \(minutes) min"
+        case .upcoming(let start):
+            return "Starts \(formattedLocalGameStartTime(start))"
+        case .final:
+            return "FINAL"
+        case .postponed:
+            return "Postponed"
+        case .canceled:
+            return "Canceled"
+        case .unknown:
+            if let soonMinutes {
+                return "Starts in \(soonMinutes) min"
+            }
+            if let match {
+                return "Starts \(formattedLocalGameStartTime(match.startTime))"
+            }
+            return "Starting soon"
         }
-        if let soonMinutes {
-            return "Starts in \(soonMinutes) min"
-        }
-        if let match {
-            return "Starts \(formattedLocalGameStartTime(match.startTime))"
-        }
-        return "Starting soon"
     }
 
     private func favoriteTeamLiveScore(
@@ -1814,6 +2097,22 @@ struct LiveScreen: View {
         } else {
             activeSheet = .watchSpots(LiveWatchSpotsPresentation(id: match.id, items: sorted.items))
         }
+    }
+
+    private func watchNearbyFavoriteTeam(
+        _ item: FavoriteTeamLiveItem,
+        matchRelatedItemsByMatchID: [String: [LiveFeedItem]]
+    ) {
+        if let match = item.primaryMatch {
+            let relatedItems = matchRelatedItemsByMatchID[match.id] ?? []
+            liveFindVenuesTapped(match: match, relatedItems: relatedItems)
+            return
+        }
+        if viewModel.discoverMapContentMode != .venues {
+            viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: .venues)
+            viewModel.discoverMapContentMode = .venues
+        }
+        selectedTab = .discover
     }
 
     private func liveFindVenuesOpenDiscoverFallback(sportType: LiveSportVisualType) {
@@ -2084,7 +2383,7 @@ struct LiveScreen: View {
                 }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(isSaved ? "Unsave pro game" : "Save pro game")
+        .accessibilityLabel(isSaved ? L10n.t("unsave_pro_sports_game_a11y") : L10n.t("save_pro_sports_game_a11y"))
     }
 
     private func liveFeedNativeAdCard(slotIndex: Int) -> some View {
@@ -2098,8 +2397,9 @@ struct LiveScreen: View {
         )
         .frame(maxWidth: .infinity)
         .frame(height: CompactNativeAdLayout.preferredHeight)
-        .clipped()
-        .contentShape(Rectangle())
+        .compositingGroup()
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
     private func updateLiveFeedNativeAdLayoutWidth(_ width: CGFloat) {
@@ -2322,6 +2622,7 @@ struct LiveScreen: View {
         var isLiveNow: Bool {
             switch self {
             case .venue(let item):
+                // Deprecated for sports LIVE — use sports-canonical status at call site.
                 return item.energy.isLiveNow
             case .pickup(let row):
                 return row.hasPickupGameStarted()
@@ -2330,40 +2631,58 @@ struct LiveScreen: View {
 
     }
 
+    private func liveVenuesPickupRowIsInProgress(_ row: LiveVenuesPickupRow) -> Bool {
+        switch row {
+        case .venue(let item):
+            return resolveVenueEventMatchStatus(for: item).isLive
+        case .pickup(let pickup):
+            return LivePickupCardModelBuilder.build(row: pickup).isInProgress
+        }
+    }
+
     private func liveVenuesAndPickupTodaySection(rows: [LiveVenuesPickupRow]) -> some View {
-        livePanelSection(
+        let languageCode = liveNowLanguageCode
+        let title = L10n.t("live_supporting_venues_title", languageCode: languageCode)
+        let subtitle = L10n.t("live_supporting_venues_subtitle", languageCode: languageCode)
+        let statusText = liveSupportingTodayCountText(rows.count, languageCode: languageCode)
+        return liveSupportingCompactSection(
             kind: .venuesPickup,
-            title: "Venues & Pickup Games Today",
-            subtitle: "Watch parties, pickup runs, and plans near you"
+            title: title,
+            subtitle: subtitle,
+            statusText: statusText,
+            isEmpty: rows.isEmpty,
+            showsBottomDivider: true,
+            accessibilityLabel: liveSupportingRowAccessibilityLabel(
+                title: title,
+                statusText: statusText,
+                subtitle: subtitle,
+                languageCode: languageCode
+            )
         ) {
-            if rows.isEmpty {
-                liveSectionEmptyState("No venues or pickup games today")
-            } else {
-                let liveRows = rows.filter(\.isLiveNow)
-                let otherRows = rows.filter { !$0.isLiveNow }
-                VStack(alignment: .leading, spacing: 12) {
-                    if !liveRows.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(alignment: .top, spacing: 12) {
-                                ForEach(liveRows) { row in
-                                    liveVenuesPickupCompactCard(row)
-                                        .frame(width: 272)
-                                }
+            let liveRows = rows.filter(liveVenuesPickupRowIsInProgress)
+            let otherRows = rows.filter { !liveVenuesPickupRowIsInProgress($0) }
+            VStack(alignment: .leading, spacing: 12) {
+                if !liveRows.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(alignment: .top, spacing: 12) {
+                            ForEach(liveRows) { row in
+                                liveVenuesPickupCompactCard(row)
+                                    .frame(width: 288)
                             }
-                            .padding(.horizontal, 1)
-                            .padding(.vertical, 2)
                         }
-                        .scrollClipDisabled()
+                        .padding(.horizontal, 1)
+                        .padding(.vertical, 2)
                     }
-                    if !otherRows.isEmpty {
-                        VStack(spacing: 10) {
-                            ForEach(otherRows) { row in
-                                switch row {
-                                case .venue(let item):
-                                    liveVenuesPickupVenueRow(item)
-                                case .pickup(let pickup):
-                                    liveVenuesPickupPickupRow(pickup)
-                                }
+                    .scrollClipDisabled()
+                }
+                if !otherRows.isEmpty {
+                    VStack(spacing: 10) {
+                        ForEach(otherRows) { row in
+                            switch row {
+                            case .venue(let item):
+                                liveVenuesPickupVenueRow(item)
+                            case .pickup(let pickup):
+                                liveVenuesPickupPickupRow(pickup)
                             }
                         }
                     }
@@ -2376,56 +2695,80 @@ struct LiveScreen: View {
     private func liveVenuesPickupCompactCard(_ row: LiveVenuesPickupRow) -> some View {
         switch row {
         case .venue(let item):
-            Button {
-                openLiveItem(item)
-            } label: {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        SportArtworkIconView(sport: item.event.sport, diameter: 36)
-                        Spacer(minLength: 0)
-                        livePillBadge
-                    }
-                    Text(item.event.title)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(2)
-                    Text(item.bar.name)
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(liveCardSurface(cornerRadius: 18, highlighted: true))
-            }
-            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+            liveVenuesPickupVenueRow(item, compact: true)
         case .pickup(let pickup):
-            Button {
-                viewModel.discoverMapContentMode = .pickupGames
-                viewModel.calendarTabGameFilter = .pickupGames
-                selectedTab = .discover
-            } label: {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        SportArtworkIconView(sport: pickup.sport, diameter: 36)
-                        Spacer(minLength: 0)
-                        livePillBadge
-                    }
-                    Text(pickup.title)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(2)
-                    Text("\(AppSportCatalog.displayLabel(forSportToken: pickup.sport)) pickup · \(pickupStartDisplay(for: pickup))")
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                }
-                .padding(14)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(liveCardSurface(cornerRadius: 18, highlighted: true))
-            }
-            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+            liveVenuesPickupPickupRow(pickup, compact: true)
         }
+    }
+
+    private func liveVenueEventCardModel(for item: LiveFeedItem) -> LiveVenueEventCardModel {
+        let linked = linkedLiveMatch(for: item)
+        let row = viewModel.cachedVenueEventRow(for: item.bar, gameTitle: item.event.title)
+        let thumbnail = ImageDisplayURL.forList(
+            thumbnail: item.bar.coverPhotoThumbnailURL,
+            full: item.bar.coverPhotoURL
+        )
+        let bridge = LiveScreenLiveFeedItemBridge(
+            id: item.id,
+            eventTitle: item.event.title,
+            eventDate: linked?.startTime ?? item.event.date,
+            sport: item.event.sport,
+            venueName: item.bar.name,
+            homeTeam: row?.home_team,
+            awayTeam: row?.away_team,
+            goingCount: item.energy.goingCount,
+            commentCount: canShowPersonalLiveSections ? item.energy.commentCount : 0,
+            friendGoingCount: canShowPersonalLiveSections ? item.energy.friendGoingCount : 0,
+            vibeCount: item.vibeCount,
+            energyStartsSoon: item.energy.startsSoon,
+            thumbnailURLString: thumbnail
+        )
+        return LiveVenueEventCardModelBuilder.build(
+            item: bridge,
+            linkedMatch: linked,
+            venueRowAdminStatus: row?.admin_status,
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+            formattedStartTime: { formattedLocalGameStartTime($0) }
+        )
+    }
+
+    private func liveVenuesPickupVenueRow(_ item: LiveFeedItem, compact: Bool = false) -> some View {
+        let model = liveVenueEventCardModel(for: item)
+        return Button {
+            openLiveItem(item)
+        } label: {
+            LiveVenueEventRichCard(model: model, compact: compact)
+        }
+        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+        .accessibilityHint(L10n.t("live_open_venue_hint", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
+    }
+
+    private func liveVenuesPickupPickupRow(_ row: PickupGameRow, compact: Bool = false) -> some View {
+        let model = LivePickupCardModelBuilder.build(row: row)
+        return Button {
+            openPickupGameFromLive(row)
+        } label: {
+            LivePickupRichCard(
+                model: model,
+                compact: compact,
+                relevanceLabel: isPickupUserRelevant(row) ? userPickupRelevanceLabel(row) : nil
+            )
+        }
+        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+        .accessibilityHint(L10n.t("live_open_pickup_hint", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
+    }
+
+    private func openPickupGameFromLive(_ row: PickupGameRow) {
+        if viewModel.discoverMapContentMode != .pickupGames {
+            viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: .pickupGames)
+            viewModel.discoverMapContentMode = .pickupGames
+        }
+        if viewModel.discoverPickupSubMode != .games {
+            viewModel.discoverPickupSubMode = .games
+        }
+        viewModel.calendarTabGameFilter = .pickupGames
+        viewModel.requestDiscoverFocusForPickupGame(id: row.id, snapshot: row)
+        selectedTab = .discover
     }
 
     private func venuesAndPickupTodayRows(from rankedItems: [LiveFeedItem]) -> [LiveVenuesPickupRow] {
@@ -2457,22 +2800,26 @@ struct LiveScreen: View {
     private func venuesAndPickupSortScore(_ row: LiveVenuesPickupRow) -> Int {
         switch row {
         case .venue(let item):
+            let sportsLiveBoost = resolveVenueEventMatchStatus(for: item).isLive ? 20_000 : 0
             return item.score
-                + (item.energy.isLiveNow ? 20_000 : 0)
+                + sportsLiveBoost
                 + (item.energy.startsSoon ? 5_000 : 0)
         case .pickup(let pickup):
             let userBoost = isPickupUserRelevant(pickup) ? 8_000 : 0
-            let liveBoost = pickup.hasPickupGameStarted() ? 20_000 : 0
+            let liveBoost = LivePickupCardModelBuilder.build(row: pickup).isInProgress ? 20_000 : 0
             return userBoost + liveBoost + pickup.approvedJoinCount * 140
         }
     }
 
     private func venuesAndPickupVenueQualifies(_ item: LiveFeedItem) -> Bool {
-        if item.energy.isLiveNow || item.energy.startsSoon { return true }
+        let status = resolveVenueEventMatchStatus(for: item)
+        if status.isLive || item.energy.startsSoon { return true }
+        if case .startingSoon = status { return true }
         if item.energy.goingCount > 0 { return true }
         if canShowPersonalLiveSections && item.energy.friendGoingCount > 0 { return true }
         if canShowPersonalLiveSections && item.energy.commentCount > 0 { return true }
         if item.vibeCount > 0 { return true }
+        if status.isFinal { return true }
         return false
     }
 
@@ -2492,82 +2839,6 @@ struct LiveScreen: View {
         return false
     }
 
-    private func liveVenuesPickupVenueRow(_ item: LiveFeedItem) -> some View {
-        Button {
-            openLiveItem(item)
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                SportArtworkIconView(sport: item.event.sport, diameter: 42)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        if item.energy.isLiveNow {
-                            livePillBadge
-                        } else if item.energy.startsSoon, let minutes = item.energy.minutesUntilStart {
-                            Text("Starts in \(minutes) min")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(FGColor.accentGreen)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    Text(item.event.title)
-                        .font(FGTypography.cardTitle)
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(2)
-                    Text(item.bar.name)
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                    liveInlineTokens(item)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(14)
-            .background(liveCardSurface(cornerRadius: 20, highlighted: item.energy.isLiveNow))
-        }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
-    }
-
-    private func liveVenuesPickupPickupRow(_ row: PickupGameRow) -> some View {
-        let isLive = row.hasPickupGameStarted()
-        return Button {
-            viewModel.discoverMapContentMode = .pickupGames
-            viewModel.calendarTabGameFilter = .pickupGames
-            selectedTab = .discover
-        } label: {
-            HStack(alignment: .top, spacing: 12) {
-                SportArtworkIconView(sport: row.sport, diameter: 42)
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        if isLive {
-                            livePillBadge
-                        }
-                        if isPickupUserRelevant(row) {
-                            Text(userPickupRelevanceLabel(row))
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(FGColor.accentBlue)
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    Text(row.title)
-                        .font(FGTypography.cardTitle)
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(2)
-                    Text("\(AppSportCatalog.displayLabel(forSportToken: row.sport)) pickup · \(pickupStartDisplay(for: row))")
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                    Text(row.lookingForPlayersLine)
-                        .font(FGTypography.metadata.weight(.semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(14)
-            .background(liveCardSurface(cornerRadius: 20, highlighted: isLive))
-        }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
-    }
-
     private func userPickupRelevanceLabel(_ row: PickupGameRow) -> String {
         guard let me = viewModel.currentUserAuthId else { return "Your game" }
         if row.creator_user_id == me { return "You host" }
@@ -2582,44 +2853,64 @@ struct LiveScreen: View {
     }
 
     private func liveFriendsSection(items: [LiveFeedItem]) -> some View {
-        livePanelSection(
+        let languageCode = liveNowLanguageCode
+        let title = L10n.t("live_supporting_friends_title", languageCode: languageCode)
+        let subtitle = L10n.t("live_supporting_friends_subtitle", languageCode: languageCode)
+        let statusText = liveSupportingPlansCountText(items.count, languageCode: languageCode)
+        return liveSupportingCompactSection(
             kind: .friendsGoing,
-            title: "Friends Going",
-            subtitle: "Where people you know are headed"
+            title: title,
+            subtitle: subtitle,
+            statusText: statusText,
+            isEmpty: items.isEmpty,
+            showsBottomDivider: true,
+            accessibilityLabel: liveSupportingRowAccessibilityLabel(
+                title: title,
+                statusText: statusText,
+                subtitle: subtitle,
+                languageCode: languageCode
+            )
         ) {
-            if items.isEmpty {
-                liveSectionEmptyState("Friends' plans will appear here")
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 12) {
-                        ForEach(items) { item in
-                            liveFriendCompactCard(item)
-                                .frame(width: 260)
-                        }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    ForEach(items) { item in
+                        liveFriendCompactCard(item)
+                            .frame(width: 260)
                     }
-                    .padding(.horizontal, 1)
-                    .padding(.vertical, 2)
                 }
-                .scrollClipDisabled()
+                .padding(.horizontal, 1)
+                .padding(.vertical, 2)
             }
+            .scrollClipDisabled()
         }
     }
 
     private func liveCrowdBuildingSection(items: [LiveCrowdMomentum]) -> some View {
-        livePanelSection(
+        let languageCode = liveNowLanguageCode
+        let title = isBusinessLiveAudienceUser
+            ? L10n.t("live_supporting_crowd_momentum_title", languageCode: languageCode)
+            : L10n.t("live_supporting_crowd_title", languageCode: languageCode)
+        let subtitle = isBusinessLiveAudienceUser
+            ? L10n.t("live_supporting_crowd_momentum_subtitle", languageCode: languageCode)
+            : L10n.t("live_supporting_crowd_subtitle", languageCode: languageCode)
+        let statusText = liveSupportingActiveCountText(items.count, languageCode: languageCode)
+        return liveSupportingCompactSection(
             kind: .crowdBuilding,
-            title: isBusinessLiveAudienceUser ? "Crowd Momentum" : "Crowd Building",
-            subtitle: isBusinessLiveAudienceUser
-                ? "Venues where fan activity is building today"
-                : "Games and watch spots gaining momentum today"
+            title: title,
+            subtitle: subtitle,
+            statusText: statusText,
+            isEmpty: items.isEmpty,
+            showsBottomDivider: false,
+            accessibilityLabel: liveSupportingRowAccessibilityLabel(
+                title: title,
+                statusText: statusText,
+                subtitle: subtitle,
+                languageCode: languageCode
+            )
         ) {
-            if items.isEmpty {
-                liveSectionEmptyState("Crowd momentum shows up here.")
-            } else {
-                VStack(spacing: 10) {
-                    ForEach(items) { momentum in
-                        liveCrowdBuildingCard(momentum)
-                    }
+            VStack(spacing: 10) {
+                ForEach(items) { momentum in
+                    liveCrowdBuildingCard(momentum)
                 }
             }
         }
@@ -2705,51 +2996,117 @@ struct LiveScreen: View {
         .background(Capsule(style: .continuous).fill(accent.opacity(colorScheme == .dark ? 0.16 : 0.10)))
     }
 
-    private func livePanelSection<Content: View>(
+    private func liveSupportingTodayCountText(_ count: Int, languageCode: String) -> String {
+        String(format: L10n.t("live_supporting_today_count_format", languageCode: languageCode), Int64(count))
+    }
+
+    private func liveSupportingPlansCountText(_ count: Int, languageCode: String) -> String {
+        String(format: L10n.t("live_supporting_plans_count_format", languageCode: languageCode), Int64(count))
+    }
+
+    private func liveSupportingActiveCountText(_ count: Int, languageCode: String) -> String {
+        String(format: L10n.t("live_supporting_active_count_format", languageCode: languageCode), Int64(count))
+    }
+
+    private func liveSupportingRowAccessibilityLabel(
+        title: String,
+        statusText: String,
+        subtitle: String,
+        languageCode: String
+    ) -> String {
+        String(
+            format: L10n.t("live_supporting_row_a11y_format", languageCode: languageCode),
+            title,
+            statusText,
+            subtitle
+        )
+    }
+
+    /// Compact Apple-style summary row for Live supporting sections (Venues, Friends, Crowd).
+    private func liveSupportingCompactSection<Content: View>(
         kind: LivePanelKind,
         title: String,
         subtitle: String,
+        statusText: String,
+        isEmpty: Bool,
+        showsBottomDivider: Bool,
+        accessibilityLabel: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
         let accent = kind.accentColor(colorScheme: colorScheme)
-        return VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(accent.opacity(colorScheme == .dark ? 0.22 : 0.14))
-                        .frame(width: 40, height: 40)
-                    Image(systemName: kind.icon)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(accent)
-                }
+        return VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: isEmpty ? 0 : 10) {
+                // Full-row hit target absorbs taps so they cannot fall through to UIKit ad hosts.
+                Button(action: {}) {
+                    HStack(alignment: .center, spacing: 12) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(accent.opacity(colorScheme == .dark ? 0.22 : 0.14))
+                                .frame(width: 36, height: 36)
+                            Image(systemName: kind.icon)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(accent)
+                        }
+                        .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title)
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                    Text(subtitle)
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-            }
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(title)
+                                .font(.headline.weight(.semibold))
+                                .foregroundStyle(FGColor.primaryText(colorScheme))
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.85)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(subtitle)
+                                .font(.subheadline)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
 
-            VStack(alignment: .leading, spacing: 12) {
-                content()
+                        Spacer(minLength: 8)
+
+                        Text(statusText)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(accent)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(accent.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                            )
+                            .fixedSize(horizontal: true, vertical: false)
+                            .accessibilityHidden(true)
+
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.mutedText(colorScheme))
+                            .opacity(isEmpty ? 0.45 : 1)
+                            .accessibilityHidden(true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibilityLabel)
+                .accessibilityAddTraits(.isHeader)
+
+                if !isEmpty {
+                    content()
+                }
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(kind.panelFill(colorScheme: colorScheme))
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(kind.panelStroke(colorScheme: colorScheme), lineWidth: 1)
+            .padding(.vertical, 6)
+
+            if showsBottomDivider {
+                Divider()
+                    .overlay(FGColor.mutedText(colorScheme).opacity(colorScheme == .dark ? 0.35 : 0.22))
+                    .padding(.top, 2)
+                    .allowsHitTesting(false)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .zIndex(2)
     }
 
     private func liveCollapsiblePanelSection<Content: View>(
@@ -2757,6 +3114,8 @@ struct LiveScreen: View {
         title: String,
         count: Int,
         subtitle: String,
+        subtitleUsesSubheadline: Bool = false,
+        accessibilityLabelText: String? = nil,
         isExpanded: Bool,
         toggle: @escaping () -> Void,
         @ViewBuilder content: () -> Content
@@ -2774,11 +3133,14 @@ struct LiveScreen: View {
                             .foregroundStyle(accent)
                     }
 
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 7) {
                             Text("\(title) (\(count))")
                                 .font(.system(size: 20, weight: .bold, design: .rounded))
                                 .foregroundStyle(FGColor.primaryText(colorScheme))
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.82)
+                                .fixedSize(horizontal: false, vertical: true)
                             if count > 0 {
                                 Circle()
                                     .fill(FGColor.dangerRed)
@@ -2787,8 +3149,10 @@ struct LiveScreen: View {
                             }
                         }
                         Text(subtitle)
-                            .font(FGTypography.caption)
+                            .font(subtitleUsesSubheadline ? .subheadline.weight(.medium) : FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(subtitleUsesSubheadline ? 1 : 3)
+                            .minimumScaleFactor(0.78)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 0)
@@ -2801,7 +3165,7 @@ struct LiveScreen: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(title), \(count) games")
+            .accessibilityLabel(accessibilityLabelText ?? "\(title), \(count) games")
             .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
             .accessibilityHint("Toggles the live games section")
 
@@ -2819,6 +3183,8 @@ struct LiveScreen: View {
                     RoundedRectangle(cornerRadius: 22, style: .continuous)
                         .strokeBorder(kind.panelStroke(colorScheme: colorScheme), lineWidth: 1)
                 }
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
@@ -3105,12 +3471,15 @@ struct LiveScreen: View {
 
     private func liveEnergyTokens(for item: LiveFeedItem) -> [String] {
         var tokens: [String] = []
-        if item.energy.isLiveNow {
+        let status = resolveVenueEventMatchStatus(for: item)
+        if status.isLive {
             tokens.append("LIVE NOW")
+        } else if case .startingSoon = status {
+            tokens.append("Starts Soon")
         } else if item.energy.startsSoon {
             tokens.append("Starts Soon")
         }
-        if item.energy.goingCount > 0 && !item.energy.isLiveNow {
+        if item.energy.goingCount > 0 && !status.isLive {
             tokens.append("Momentum")
         }
         if canShowPersonalLiveSections && item.energy.friendGoingCount > 0 {
@@ -3142,7 +3511,8 @@ struct LiveScreen: View {
     }
 
     private func crowdMomentumCandidate(for item: LiveFeedItem) -> LiveCrowdMomentum? {
-        guard !item.energy.isLiveNow else { return nil }
+        // Crowd Building is venue activity, not sports LIVE.
+        if resolveVenueEventMatchStatus(for: item).isLive { return nil }
 
         let packedCount = packedVibeCount(for: item.venueEventID)
         let homeCrowdFanCount = homeCrowdActivityCount(for: item.bar)
@@ -3343,6 +3713,7 @@ struct LiveScreen: View {
         case .countryFilter:
             LiveLeagueCountryFilterSheet(
                 countries: liveLeagueCountryOptions,
+                suggestedNearYouCountry: liveNearYouSuggestedCountry,
                 selectedCountries: Binding(
                     get: { selectedLiveLeagueCountries },
                     set: { updateSelectedLiveLeagueCountries($0) }
@@ -3376,6 +3747,7 @@ struct LiveScreen: View {
             )
             let displayedLiveEnergy = liveEnergy.map(liveEnergyForCurrentAudience)
             let effectiveBusinessId = viewModel.effectiveBusinessIdForVenueChat(for: selectedBar)
+            let isBusinessConfirmed = venueIsBusinessConfirmed(bar: selectedBar, claimStatus: claimStatus)
             let openVenueChatAction: (() async -> Void)? = {
                 guard effectiveBusinessId != nil else { return nil }
                 return { await openVenueChatFromDetail(for: selectedBar) }
@@ -3397,7 +3769,7 @@ struct LiveScreen: View {
                 hasGamesScheduledToday: !selectedDayGames.isEmpty,
                 venueEventRows: viewModel.venueEventRows,
                 venuePredictionSummaries: viewModel.venueEventPredictionSummaries,
-                isBusinessConfirmed: venueIsBusinessConfirmed(bar: selectedBar, claimStatus: claimStatus),
+                isBusinessConfirmed: isBusinessConfirmed,
                 onDirections: { viewModel.openDirections(to: selectedBar) },
                 onCall: { viewModel.callVenue(selectedBar) },
                 onFavorite: {
@@ -3487,7 +3859,15 @@ struct LiveScreen: View {
                     await viewModel.toggleHomeCrowd(for: selectedBar)
                 },
                 onOpenVenueChat: openVenueChatAction,
-                effectiveBusinessId: effectiveBusinessId
+                effectiveBusinessId: effectiveBusinessId,
+                showsUnclaimedBusinessCallout: selectedBar.isUnclaimedCommunityVenue && !isBusinessConfirmed,
+                onBeginUnclaimedVenueClaim: {
+                    viewModel.beginVenueClaimFromDiscover(bar: selectedBar)
+                    activeSheet = nil
+                },
+                unclaimedSocialProofMetrics: (selectedBar.isUnclaimedCommunityVenue && !isBusinessConfirmed)
+                    ? unclaimedVenueSocialProofMetrics(for: selectedBar, gamesToday: selectedDayGames)
+                    : nil
             )
             .task {
                 await viewModel.refreshApprovedVenueOwnershipState(for: selectedBar)
@@ -3497,6 +3877,32 @@ struct LiveScreen: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+    }
+
+    private func unclaimedVenueSocialProofMetrics(
+        for bar: BarVenue,
+        gamesToday: [SportsEvent]
+    ) -> UnclaimedVenueSocialProofMetrics {
+        var extraEventIDs = Set<UUID>()
+        for game in gamesToday {
+            if let id = viewModel.peekVenueEventIDForRender(for: bar, gameTitle: game.title) {
+                extraEventIDs.insert(id)
+            }
+        }
+        let favoritedByFans: Int = {
+            guard viewModel.currentUserHomeCrowdVenueId == bar.id else { return 0 }
+            return max(0, viewModel.currentUserHomeCrowdVenue?.fanCount ?? 0)
+        }()
+        return UnclaimedVenueSocialProofBuilder.metrics(
+            bar: bar,
+            favoritedByFans: favoritedByFans,
+            venueEventRows: viewModel.venueEventRows,
+            extraEventIDs: Array(extraEventIDs),
+            gamesTodayCount: gamesToday.count,
+            interestCount: { viewModel.interestCountForVenueEvent($0) },
+            commentCount: { viewModel.fanUpdatesDisplayCommentCount(for: $0) },
+            vibeCounts: { fanUpdatesStore.venueEventVibeCounts[$0] ?? [:] }
+        )
     }
 
     private func selectedEventForVenue(gamesToday: [SportsEvent]) -> SportsEvent? {
@@ -3743,7 +4149,7 @@ private struct FavoriteTeamsLiveSection: View {
         let orbDiameter: CGFloat = 22
         return HStack(spacing: -(orbDiameter * 0.34)) {
             ForEach(teams) { team in
-                FavoriteTeamLogoBadge(team: team, diameter: orbDiameter)
+                SportsIdentityArtworkView(favoriteTeam: team, diameter: orbDiameter)
                     .overlay {
                         Circle()
                             .strokeBorder(
@@ -3774,8 +4180,21 @@ private struct FavoriteTeamsLiveSection: View {
 
 struct LiveMatchDetailSheet: View {
     let match: LiveMatch
+    /// When set (Discover), enables Watch Spots + Open in Schedule.
+    var viewModel: MapViewModel? = nil
+    var mapBounds: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)? = nil
+    var showsDiscoverProGameActions: Bool = false
+    var onSelectWatchSpot: ((BarVenue) -> Void)? = nil
+    var onOpenInSchedule: (() -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    @State private var watchSpotsState: MapViewModel.DiscoverProGameWatchSpotsLoadState = .idle
+    @State private var watchSpotsTask: Task<Void, Never>?
+
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     var body: some View {
         NavigationStack {
@@ -3790,6 +4209,11 @@ struct LiveMatchDetailSheet: View {
                     eventSection(title: "Goals", systemImage: "soccerball", events: match.goalTimelineEvents)
                     eventSection(title: "Cards", systemImage: "rectangle.fill", events: match.cardTimelineEvents)
                     eventSection(title: "Substitutions", systemImage: "arrow.left.arrow.right", events: match.substitutionTimelineEvents)
+
+                    if showsDiscoverProGameActions {
+                        discoverWatchSpotsSection
+                        discoverOpenInScheduleButton
+                    }
                 }
                 .padding(20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -3798,6 +4222,243 @@ struct LiveMatchDetailSheet: View {
             .navigationTitle("Match Details")
             .navigationBarTitleDisplayMode(.inline)
         }
+        .task(id: discoverWatchSpotsTaskID) {
+            await loadDiscoverWatchSpotsIfNeeded()
+        }
+        .onDisappear {
+            watchSpotsTask?.cancel()
+            watchSpotsTask = nil
+        }
+    }
+
+    private var discoverWatchSpotsTaskID: String {
+        guard showsDiscoverProGameActions else { return "off" }
+        let boundsKey: String = {
+            guard let mapBounds else { return "nobounds" }
+            return String(
+                format: "%.4f:%.4f:%.4f:%.4f",
+                mapBounds.minLat,
+                mapBounds.maxLat,
+                mapBounds.minLon,
+                mapBounds.maxLon
+            )
+        }()
+        return "\(SavedProGame.stableKey(for: match))|\(boundsKey)"
+    }
+
+    @ViewBuilder
+    private var discoverWatchSpotsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(L10n.t("discover_pro_game_watch_spots_title", languageCode: languageCode))
+                .font(FGTypography.cardTitle)
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .accessibilityAddTraits(.isHeader)
+
+            switch watchSpotsState {
+            case .idle, .loading:
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text(L10n.t("discover_pro_game_watch_spots_loading", languageCode: languageCode))
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+                .padding(.vertical, 8)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(L10n.t("discover_pro_game_watch_spots_loading", languageCode: languageCode))
+
+            case .unavailable:
+                discoverWatchSpotsMessageCard(
+                    title: L10n.t("discover_pro_game_watch_spots_unavailable_title", languageCode: languageCode),
+                    supporting: L10n.t("discover_pro_game_watch_spots_unavailable_supporting", languageCode: languageCode)
+                )
+
+            case .loaded(let spots) where spots.isEmpty:
+                discoverWatchSpotsMessageCard(
+                    title: L10n.t("discover_pro_game_watch_spots_empty_title", languageCode: languageCode),
+                    supporting: L10n.t("discover_pro_game_watch_spots_empty_supporting", languageCode: languageCode)
+                )
+
+            case .loaded(let spots):
+                VStack(spacing: 10) {
+                    ForEach(spots) { spot in
+                        Button {
+                            onSelectWatchSpot?(spot.bar)
+                        } label: {
+                            discoverWatchSpotRow(spot)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+
+    private func discoverWatchSpotsMessageCard(title: String, supporting: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(FGTypography.body.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+            Text(supporting)
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(colorScheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.72))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title). \(supporting)")
+    }
+
+    private func discoverWatchSpotRow(_ spot: MapViewModel.DiscoverProGameWatchSpot) -> some View {
+        let bar = spot.bar
+        let location = discoverWatchSpotLocationText(for: bar)
+        let distanceText = spot.distanceFromRegionCenterMiles.map { miles -> String in
+            if miles < 10 {
+                return String(format: "%.1f mi", miles)
+            }
+            return String(format: "%.0f mi", miles)
+        }
+
+        return HStack(alignment: .center, spacing: 12) {
+            discoverWatchSpotThumbnail(bar)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(bar.name)
+                    .font(FGTypography.cardTitle)
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !location.isEmpty {
+                    Text(location)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 8) {
+                    Text(L10n.t("discover_pro_game_watch_spot_showing_status", languageCode: languageCode))
+                        .font(FGTypography.metadata.weight(.bold))
+                        .foregroundStyle(FGColor.intentWatch)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(FGColor.intentWatch.opacity(colorScheme == .dark ? 0.18 : 0.12))
+                        )
+
+                    if let distanceText {
+                        Text(distanceText)
+                            .font(FGTypography.metadata.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                }
+            }
+
+            Spacer(minLength: 4)
+
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .accessibilityHidden(true)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(colorScheme == .dark ? Color.white.opacity(0.06) : Color.white.opacity(0.72))
+        )
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            [
+                bar.name,
+                location,
+                L10n.t("discover_pro_game_watch_spot_showing_status", languageCode: languageCode),
+                distanceText
+            ]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
+        )
+        .accessibilityHint(L10n.t("discover_pro_game_watch_spot_a11y_hint", languageCode: languageCode))
+    }
+
+    @ViewBuilder
+    private func discoverWatchSpotThumbnail(_ bar: BarVenue) -> some View {
+        let urlString = ImageDisplayURL.forList(
+            thumbnail: bar.coverPhotoThumbnailURL,
+            full: bar.coverPhotoURL
+        )
+        ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(FGColor.intentWatch.opacity(colorScheme == .dark ? 0.18 : 0.10))
+            if let urlString, let url = URL(string: urlString) {
+                DiscoverCachedRemoteImage(url: url, contentMode: .fill) {
+                    Image(systemName: "building.2.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(FGColor.intentWatch)
+                }
+                .frame(width: 48, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                Image(systemName: "building.2.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(FGColor.intentWatch)
+            }
+        }
+        .frame(width: 48, height: 48)
+        .accessibilityHidden(true)
+    }
+
+    private func discoverWatchSpotLocationText(for bar: BarVenue) -> String {
+        let address = bar.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else { return "" }
+        let parts = address.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        if parts.count >= 2 {
+            return parts.suffix(2).joined(separator: ", ")
+        }
+        return parts.first.map { String($0) } ?? address
+    }
+
+    private var discoverOpenInScheduleButton: some View {
+        FGPrimaryButton(
+            title: L10n.t("discover_pro_game_open_in_schedule", languageCode: languageCode),
+            systemImage: "calendar"
+        ) {
+            onOpenInSchedule?()
+            dismiss()
+        }
+        .padding(.top, 4)
+        .accessibilityHint(L10n.t("discover_pro_game_open_in_schedule_a11y_hint", languageCode: languageCode))
+    }
+
+    private func loadDiscoverWatchSpotsIfNeeded() async {
+        guard showsDiscoverProGameActions, let viewModel else {
+            watchSpotsState = .idle
+            return
+        }
+        watchSpotsTask?.cancel()
+        watchSpotsState = .loading
+        let task = Task { @MainActor in
+            let result = await viewModel.loadDiscoverWatchSpots(
+                for: match,
+                mapBounds: mapBounds,
+                limit: 5
+            )
+            guard !Task.isCancelled else { return }
+            watchSpotsState = result
+        }
+        watchSpotsTask = task
+        await task.value
     }
 
     private var header: some View {
@@ -3924,13 +4585,14 @@ struct LiveMatchDetailSheet: View {
 
 private struct LiveLeagueCountryFilterSheet: View {
     let countries: [String]
+    let suggestedNearYouCountry: String?
     @Binding var selectedCountries: Set<String>
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
-    private let northAmericaPreset = ["United States", "Canada", "Mexico"]
-    private let topEuropePreset = ["England", "France", "Spain", "Germany", "Italy"]
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     var body: some View {
         NavigationStack {
@@ -3947,38 +4609,63 @@ private struct LiveLeagueCountryFilterSheet: View {
                     .padding(.vertical, 4)
                 }
 
+                if let nearYou = suggestedNearYouCountry {
+                    Section {
+                        countryRow(
+                            title: nearYou,
+                            subtitle: L10n.t("near_you", languageCode: languageCode),
+                            flag: CountryFlagHelper.flag(for: nearYou),
+                            isSelected: selectedCountries.contains(nearYou),
+                            accessibilityLabel: String(
+                                format: L10n.t("near_you_country_a11y_format", languageCode: languageCode),
+                                locale: Locale(identifier: languageCode),
+                                nearYou
+                            ),
+                            accessibilityHint: countryToggleHint(isSelected: selectedCountries.contains(nearYou))
+                        ) {
+                            applySelection(LiveLeagueCountryFilterPresentation.toggling(nearYou, in: selectedCountries))
+                        }
+                    }
+                }
+
                 Section("Quick Actions") {
-                    quickAction("Select All") {
-                        selectedCountries = Set(countries)
+                    quickAction(
+                        title: L10n.t("country_filter_select_all", languageCode: languageCode),
+                        accessibilityHint: L10n.t("country_filter_select_all_a11y_hint", languageCode: languageCode)
+                    ) {
+                        applySelection(Set(countries))
                     }
-                    quickAction("Clear") {
-                        selectedCountries = []
+                    quickAction(
+                        title: L10n.t("country_filter_clear", languageCode: languageCode),
+                        accessibilityHint: L10n.t("country_filter_clear_a11y_hint", languageCode: languageCode)
+                    ) {
+                        applySelection([])
                     }
-                    quickAction("North America") {
-                        selectedCountries = Set(northAmericaPreset)
-                    }
-                    quickAction("Top European") {
-                        selectedCountries = Set(topEuropePreset)
-                    }
+                    presetRow(
+                        title: L10n.t("live_region_north_america", languageCode: languageCode),
+                        preset: LiveLeagueCountryFilterPresentation.northAmericaPreset,
+                        accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
+                    )
+                    presetRow(
+                        title: L10n.t("country_filter_top_european", languageCode: languageCode),
+                        preset: LiveLeagueCountryFilterPresentation.topEuropePreset,
+                        accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
+                    )
                 }
 
                 Section("Countries") {
                     ForEach(countries, id: \.self) { country in
-                        Button {
-                            toggle(country)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Text(country)
-                                    .font(FGTypography.body)
-                                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                                Spacer()
-                                if selectedCountries.contains(country) {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(FGColor.accentGreen)
-                                }
-                            }
+                        let isSelected = selectedCountries.contains(country)
+                        countryRow(
+                            title: country,
+                            subtitle: nil,
+                            flag: nil,
+                            isSelected: isSelected,
+                            accessibilityLabel: country,
+                            accessibilityHint: countryToggleHint(isSelected: isSelected)
+                        ) {
+                            applySelection(LiveLeagueCountryFilterPresentation.toggling(country, in: selectedCountries))
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -3995,18 +4682,123 @@ private struct LiveLeagueCountryFilterSheet: View {
         }
     }
 
-    private func quickAction(_ title: String, action: @escaping () -> Void) -> some View {
+    private func applySelection(_ next: Set<String>) {
+        selectedCountries = next
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
+    private func countryToggleHint(isSelected: Bool) -> String {
+        isSelected
+            ? L10n.t("country_filter_deselect_a11y_hint", languageCode: languageCode)
+            : L10n.t("country_filter_select_a11y_hint", languageCode: languageCode)
+    }
+
+    private func quickAction(title: String, accessibilityHint: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(FGTypography.body.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityHint(accessibilityHint)
+    }
+
+    private func presetRow(title: String, preset: Set<String>, accessibilityHint: String) -> some View {
+        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(preset, in: selectedCountries)
+        return Button {
+            applySelection(LiveLeagueCountryFilterPresentation.togglingPreset(preset, in: selectedCountries))
+        } label: {
+            HStack(spacing: 12) {
+                Text(title)
+                    .font(FGTypography.body.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                Spacer(minLength: 8)
+                presetTrailingIcon(state)
+            }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(title)
+        .accessibilityValue(presetAccessibilityValue(state))
+        .accessibilityHint(accessibilityHint)
+    }
+
+    private func countryRow(
+        title: String,
+        subtitle: String?,
+        flag: String?,
+        isSelected: Bool,
+        accessibilityLabel: String,
+        accessibilityHint: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    HStack(spacing: 8) {
+                        if let flag, !flag.isEmpty {
+                            Text(flag)
+                                .font(.system(size: 22))
+                                .accessibilityHidden(true)
+                        }
+                        Text(title)
+                            .font(FGTypography.body.weight(subtitle == nil ? .regular : .semibold))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+                Spacer(minLength: 8)
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(FGColor.accentGreen)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(
+            isSelected
+                ? L10n.t("country_filter_selected_a11y", languageCode: languageCode)
+                : L10n.t("country_filter_not_selected_a11y", languageCode: languageCode)
+        )
+        .accessibilityHint(accessibilityHint)
+    }
+
+    @ViewBuilder
+    private func presetTrailingIcon(_ state: LiveLeagueCountryFilterPresentation.PresetSelectionState) -> some View {
+        switch state {
+        case .full:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(FGColor.accentGreen)
+        case .partial:
+            Image(systemName: "minus.circle.fill")
+                .foregroundStyle(FGColor.accentGreen.opacity(0.85))
+        case .none:
+            EmptyView()
         }
     }
 
-    private func toggle(_ country: String) {
-        if selectedCountries.contains(country) {
-            selectedCountries.remove(country)
-        } else {
-            selectedCountries.insert(country)
+    private func presetAccessibilityValue(_ state: LiveLeagueCountryFilterPresentation.PresetSelectionState) -> String {
+        switch state {
+        case .full:
+            return L10n.t("country_filter_selected_a11y", languageCode: languageCode)
+        case .partial:
+            return L10n.t("country_filter_partially_selected_a11y", languageCode: languageCode)
+        case .none:
+            return L10n.t("country_filter_not_selected_a11y", languageCode: languageCode)
         }
     }
 }
@@ -4016,73 +4808,74 @@ private struct FavoriteTeamLiveCard: View {
     let onWatchNearby: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     var body: some View {
-        Button(action: onWatchNearby) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .top, spacing: 12) {
-                    teamBadge
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .center, spacing: 8) {
+                LiveCanonicalStatusPill(status: item.canonicalStatus, languageCode: languageCode)
+                Text(item.team.name)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(item.team.badgeColor)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                SportsIdentityArtworkView(favoriteTeam: item.team, diameter: 28)
+                    .accessibilityHidden(true)
+            }
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 7) {
-                            statusPill
+            if let away = item.awayTeam, let home = item.homeTeam {
+                LiveCompactMatchupRow(
+                    awayTeam: away,
+                    homeTeam: home,
+                    awayScore: item.awayScore,
+                    homeScore: item.homeScore,
+                    scoresAvailable: item.scoresAvailable,
+                    awayBadgeURL: item.awayBadgeURL,
+                    homeBadgeURL: item.homeBadgeURL
+                )
+            } else {
+                Text(item.title)
+                    .font(FGTypography.cardTitle)
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+            }
 
-                            Text(item.team.name)
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(item.team.badgeColor)
-                                .lineLimit(1)
-                        }
+            Text(item.leagueSportText)
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .lineLimit(1)
 
-                        if let scoreRows = item.scoreRows {
-                            teamScoreboard(scoreRows)
-                        } else {
-                            Text(item.title)
-                                .font(FGTypography.cardTitle)
-                                .foregroundStyle(FGColor.primaryText(colorScheme))
-                                .lineLimit(2)
-                        }
+            if item.isRecentFinalFallback {
+                Text(L10n.t("Recent final", languageCode: languageCode))
+                    .font(FGTypography.metadata.weight(.semibold))
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+            }
 
-                        Text(item.leagueSportText)
-                            .font(FGTypography.caption)
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .lineLimit(1)
+            if item.nearbyVenueCount > 0 {
+                Text(
+                    item.nearbyVenueCount == 1
+                        ? L10n.t("1 venue showing", languageCode: languageCode)
+                        : String(format: L10n.t("%lld venues showing", languageCode: languageCode), item.nearbyVenueCount)
+                )
+                .font(FGTypography.metadata.weight(.semibold))
+                .foregroundStyle(item.team.badgeColor)
+            }
 
-                        if let tvDisplayText = item.tvDisplayText {
-                            HStack(spacing: 5) {
-                                Image(systemName: "tv.fill")
-                                    .font(.caption2.weight(.bold))
-                                Text(tvDisplayText)
-                                    .font(FGTypography.metadata.weight(.semibold))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                            }
-                            .foregroundStyle(item.team.badgeColor)
-                        }
-
-                        if let scorerSummaryText = item.scorerSummaryText {
-                            Text(scorerSummaryText)
-                                .font(FGTypography.metadata.weight(.semibold))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            .foregroundStyle(item.team.badgeColor)
-                        }
+            if !item.socialTokens.isEmpty {
+                FGWrappingLayout(horizontalSpacing: 6, verticalSpacing: 6) {
+                    ForEach(item.socialTokens.filter { !$0.contains("venue showing") }, id: \.self) { token in
+                        socialToken(token)
                     }
-
-                    Spacer(minLength: 0)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
-                if !item.socialTokens.isEmpty {
-                    FGWrappingLayout(horizontalSpacing: 6, verticalSpacing: 6) {
-                        ForEach(item.socialTokens, id: \.self) { token in
-                            socialToken(token)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
+            Button(action: onWatchNearby) {
                 HStack {
                     Spacer(minLength: 0)
-                    Text("Watch Nearby")
+                    Text(L10n.t("Watch Nearby", languageCode: languageCode))
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Color.white)
                         .padding(.horizontal, 12)
@@ -4090,75 +4883,21 @@ private struct FavoriteTeamLiveCard: View {
                         .background(Capsule(style: .continuous).fill(FGColor.accentGreen))
                 }
             }
-            .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(cardSurface)
-            .overlay(alignment: .topTrailing) {
-                Circle()
-                    .fill(item.team.badgeColor.opacity(colorScheme == .dark ? 0.18 : 0.11))
-                    .frame(width: 86, height: 86)
-                    .blur(radius: 28)
-                    .offset(x: 24, y: -34)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t("Watch Nearby", languageCode: languageCode))
         }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
-    }
-
-    private func teamScoreboard(_ rows: [LiveScreen.LiveMatchTeamScoreRow]) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(rows) { row in
-                ProGameScoreRowView(
-                    identity: ProGameTeamScoreIdentity.resolve(
-                        teamName: row.teamName,
-                        badgeURL: row.badgeURL,
-                        source: "Live"
-                    ),
-                    score: row.score,
-                    scoreFont: .system(size: 16, weight: .black, design: .rounded).monospacedDigit(),
-                    nameFont: .system(size: 14.5, weight: .heavy, design: .rounded),
-                    leadingSpacing: 7,
-                    scoreMinWidth: 18
-                )
-            }
-        }
-        .padding(.vertical, 1)
-    }
-
-    private var teamBadge: some View {
-        ZStack {
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(cardSurface)
+        .overlay(alignment: .topTrailing) {
             Circle()
-                .fill(item.team.badgeColor.opacity(colorScheme == .dark ? 0.28 : 0.16))
-            Text(item.team.initials)
-                .font(.system(size: 15, weight: .bold, design: .rounded))
-                .foregroundStyle(item.team.badgeColor)
-                .minimumScaleFactor(0.72)
-                .lineLimit(1)
+                .fill(item.team.badgeColor.opacity(colorScheme == .dark ? 0.18 : 0.11))
+                .frame(width: 86, height: 86)
+                .blur(radius: 28)
+                .offset(x: 24, y: -34)
         }
-        .frame(width: 48, height: 48)
-        .overlay {
-            Circle()
-                .strokeBorder(item.team.badgeColor.opacity(colorScheme == .dark ? 0.42 : 0.28), lineWidth: 1)
-        }
-    }
-
-    private var statusPill: some View {
-        let tint = item.isLiveNow ? FGColor.dangerRed : item.team.badgeColor
-        return HStack(spacing: 5) {
-            Circle()
-                .fill(item.isLiveNow ? FGColor.dangerRed : Color.white)
-                .frame(width: 5, height: 5)
-            Text(item.statusText)
-                .font(.caption2.weight(.bold))
-        }
-        .foregroundStyle(item.isLiveNow ? tint : Color.white)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Capsule(style: .continuous).fill(item.isLiveNow ? tint.opacity(colorScheme == .dark ? 0.18 : 0.11) : tint))
-        .overlay {
-            Capsule(style: .continuous)
-                .strokeBorder(item.isLiveNow ? tint.opacity(0.26) : Color.clear, lineWidth: 1)
-        }
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 
     private func socialToken(_ token: String) -> some View {
@@ -4201,6 +4940,7 @@ private struct FavoriteTeamLiveCard: View {
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.07), radius: 16, y: 8)
     }
 }
+
 
 private struct LiveSummaryChipButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {

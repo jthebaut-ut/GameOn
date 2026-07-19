@@ -82,8 +82,26 @@ enum ReservedNameValidation {
     }
 
     nonisolated static func containsReservedTerm(_ raw: String) -> Bool {
+        !matchedReservedTerms(in: raw).isEmpty
+    }
+
+    /// Reserved/protected tokens present in `raw` after normalization (substring match).
+    nonisolated static func matchedReservedTerms(in raw: String) -> Set<String> {
         let normalized = reservedNameNormalizeForComparison(raw)
-        guard !normalized.isEmpty else { return false }
-        return normalizedReservedTerms.contains { normalized.contains($0) }
+        guard !normalized.isEmpty else { return [] }
+        return Set(normalizedReservedTerms.filter { normalized.contains($0) })
+    }
+
+    /// True when `edited` introduces reserved tokens that were not already present in `original`.
+    /// Used for edit flows so approved baselines that already contain tokens like "FanGeo" can evolve.
+    nonisolated static func introducesNewReservedTerms(edited: String, original: String) -> Bool {
+        let newlyIntroduced = matchedReservedTerms(in: edited)
+            .subtracting(matchedReservedTerms(in: original))
+        return !newlyIntroduced.isEmpty
+    }
+
+    /// Edit-flow reserved rejection, or `nil` when only baseline tokens (or none) remain.
+    nonisolated static func editReservedRejectionMessage(edited: String, original: String) -> String? {
+        introducesNewReservedTerms(edited: edited, original: original) ? rejectionMessage : nil
     }
 }

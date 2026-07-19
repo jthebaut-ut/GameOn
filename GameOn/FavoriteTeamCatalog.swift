@@ -2,7 +2,7 @@ import SwiftUI
 
 // MARK: - Models
 
-enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
+nonisolated enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable, Sendable {
     case soccer = "Soccer"
     case basketball = "Basketball"
     case football = "Football"
@@ -15,6 +15,9 @@ enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
     case racing = "Racing"
     case dance = "Dance"
     case ncaa = "NCAA"
+    case cricket = "Cricket"
+    case rugby = "Rugby"
+    case olympics = "Olympics"
 
     var id: String { rawValue }
 
@@ -23,6 +26,7 @@ enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
         case .racing: return "Racing"
         case .combat: return "Combat"
         case .ncaa: return "NCAA"
+        case .olympics: return "Olympics"
         default: return rawValue
         }
     }
@@ -41,6 +45,9 @@ enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
         case .racing: return "flag.checkered.2.crossed.fill"
         case .dance: return "figure.dance"
         case .ncaa: return "building.columns.fill"
+        case .cricket: return "sportscourt.fill"
+        case .rugby: return "sportscourt.fill"
+        case .olympics: return "medal.fill"
         }
     }
 
@@ -58,6 +65,9 @@ enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
         case .racing: return Color(red: 0.88, green: 0.12, blue: 0.16)
         case .dance: return Color(red: 0.72, green: 0.28, blue: 0.78)
         case .ncaa: return Color(red: 0.52, green: 0.14, blue: 0.22)
+        case .cricket: return Color(red: 0.10, green: 0.68, blue: 0.54)
+        case .rugby: return Color(red: 0.48, green: 0.18, blue: 0.13)
+        case .olympics: return Color(red: 0.12, green: 0.42, blue: 0.72)
         }
     }
 
@@ -70,6 +80,9 @@ enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable, Hashable {
         case .racing: return "Formula 1"
         case .badminton: return "badminton"
         case .dance: return "Break Dance"
+        case .cricket: return "Cricket"
+        case .rugby: return "Rugby"
+        case .olympics: return "Olympics"
         default: return chipTitle
         }
     }
@@ -194,11 +207,13 @@ func sportAccentColor(for sportName: String) -> Color {
     return Color(red: 0.12, green: 0.64, blue: 0.72)
 }
 
-enum FavoriteTeamKind: String, CaseIterable, Identifiable, Codable, Hashable {
+nonisolated enum FavoriteTeamKind: String, CaseIterable, Identifiable, Codable, Hashable, Sendable {
     case team = "team"
     case nationalTeam = "national_team"
     case player = "player"
     case tournament = "tournament"
+    case league = "league"
+    case competition = "competition"
     case driver = "driver"
     case fighter = "fighter"
     case interest = "interest"
@@ -209,11 +224,20 @@ enum FavoriteTeamKind: String, CaseIterable, Identifiable, Codable, Hashable {
         switch self {
         case .team: return "Team"
         case .nationalTeam: return "National Team"
-        case .player: return "Player"
-        case .tournament: return "League/Tournament"
+        case .player: return "Featured Athlete"
+        case .tournament: return "Tournament"
+        case .league: return "League"
+        case .competition: return "Competition"
         case .driver: return "Driver"
         case .fighter: return "Fighter"
         case .interest: return "Interest"
+        }
+    }
+
+    var isCompetitionLike: Bool {
+        switch self {
+        case .tournament, .league, .competition: return true
+        default: return false
         }
     }
 }
@@ -224,7 +248,7 @@ struct FavoriteTeamCategory: Identifiable, Hashable {
 }
 
 /// Local catalog entry (text names only; logos are generated initials / SF Symbols — no third-party marks).
-struct FavoriteTeam: Identifiable, Hashable, Codable {
+nonisolated struct FavoriteTeam: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let name: String
     let sport: FavoriteTeamSport
@@ -262,30 +286,32 @@ struct FavoriteTeam: Identifiable, Hashable, Codable {
 // MARK: - Catalog
 
 enum FavoriteTeamCatalog {
+    /// Canonical merged catalog: curated local + global expansion + business picker entities.
+    /// Dedupes by sport|kind|normalized name while preserving every unique persisted ID.
     private static let localCatalog: [FavoriteTeam] =
-        soccer + basketball + football + baseball + hockey + golf + racing + tennis + badminton + combat + dance + ncaa + favoritePlayers + favoriteTournaments
+        soccer + basketball + football + baseball + hockey + golf + racing + tennis + badminton
+        + combat + dance + ncaa + favoritePlayers + favoriteTournaments + expandedGlobalEntities
     private static let businessGameManagementCatalog = businessGameManagementFavorites(excluding: localCatalog)
 
-    /// Favorite Teams uses the same country/team source as business game management, then layers in
-    /// player/tournament favorites that only exist in the fan-facing picker.
+    /// Single access layer for Following / favorites. Screens must not merge picker arrays independently.
+    /// Includes curated locals + ``expandedGlobalEntities`` (worldwide coverage) + business picker extras.
     static let all: [FavoriteTeam] = localCatalog + businessGameManagementCatalog
 
-    static let selectorSports: [FavoriteTeamSport] = [
-        .soccer,
-        .basketball,
-        .football,
-        .tennis,
-        .badminton,
-        .baseball,
-        .hockey,
-        .golf,
-        .combat,
-        .racing,
-        .dance
-    ]
+    /// Canonical expanded Following catalog alias — same collection as ``all``.
+    /// Prefer this name in new call sites to make the worldwide source explicit.
+    static var allEntities: [FavoriteTeam] { all }
+
+    /// Sports that currently have at least one followable entity (empty sports are hidden).
+    static var selectorSports: [FavoriteTeamSport] {
+        let preferredOrder: [FavoriteTeamSport] = [
+            .soccer, .basketball, .football, .baseball, .hockey, .tennis, .golf, .cricket, .rugby,
+            .racing, .combat, .badminton, .olympics, .dance
+        ]
+        return preferredOrder.filter { !categories(for: $0).isEmpty }
+    }
 
     static var defaultSport: FavoriteTeamSport {
-        selectorSports.first { !categories(for: $0).isEmpty } ?? .soccer
+        selectorSports.first ?? .soccer
     }
 
     static func defaultCategoryID(for sport: FavoriteTeamSport) -> String? {
@@ -293,7 +319,7 @@ enum FavoriteTeamCatalog {
     }
 
     static func team(id: String) -> FavoriteTeam? {
-        all.first { $0.id == id }
+        FavoriteFollowingSearch.team(id: id) ?? all.first { $0.id == id }
     }
 
     static func teams(
@@ -328,10 +354,8 @@ enum FavoriteTeamCatalog {
         }
     }
 
-    static func searchTeams(_ search: String) -> [FavoriteTeam] {
-        let q = normalizeSearch(search)
-        guard !q.isEmpty else { return all }
-        return all.filter { matchesSearch($0, query: q) }
+    static func searchTeams(_ search: String, prioritizingSelectedIDs selectedIDs: Set<String> = []) -> [FavoriteTeam] {
+        FavoriteFollowingSearch.rankedResults(query: search, prioritizingSelectedIDs: selectedIDs)
     }
 
     static func regions(for sport: FavoriteTeamSport?) -> [String] {
@@ -414,61 +438,62 @@ enum FavoriteTeamCatalog {
         switch sport {
         case .soccer:
             return [
-                FavoriteTeamCategory(id: "soccer-clubs", title: "Clubs"),
+                FavoriteTeamCategory(id: "soccer-clubs", title: "Teams"),
                 FavoriteTeamCategory(id: "soccer-national-teams", title: "National Teams"),
-                FavoriteTeamCategory(id: "soccer-players", title: "Players"),
-                FavoriteTeamCategory(id: "soccer-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "soccer-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "soccer-tournaments", title: "Competitions & Tournaments")
             ]
         case .basketball:
             return [
-                FavoriteTeamCategory(id: "basketball-clubs", title: "Clubs"),
+                FavoriteTeamCategory(id: "basketball-clubs", title: "Teams"),
                 FavoriteTeamCategory(id: "basketball-national-teams", title: "National Teams"),
-                FavoriteTeamCategory(id: "basketball-players", title: "Players"),
-                FavoriteTeamCategory(id: "basketball-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "basketball-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "basketball-tournaments", title: "Competitions & Tournaments")
             ]
         case .football:
             return [
-                FavoriteTeamCategory(id: "football-clubs", title: "Clubs"),
-                FavoriteTeamCategory(id: "football-players", title: "Players"),
-                FavoriteTeamCategory(id: "football-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "football-clubs", title: "Teams"),
+                FavoriteTeamCategory(id: "football-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "football-tournaments", title: "Competitions & Tournaments")
             ]
         case .tennis:
             return [
-                FavoriteTeamCategory(id: "tennis-players", title: "Players"),
-                FavoriteTeamCategory(id: "tennis-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "tennis-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "tennis-tournaments", title: "Competitions & Tournaments")
             ]
         case .badminton:
             return [
-                FavoriteTeamCategory(id: "badminton-players", title: "Players"),
-                FavoriteTeamCategory(id: "badminton-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "badminton-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "badminton-tournaments", title: "Competitions & Tournaments")
             ]
         case .baseball:
             return [
-                FavoriteTeamCategory(id: "baseball-clubs", title: "Clubs"),
+                FavoriteTeamCategory(id: "baseball-clubs", title: "Teams"),
                 FavoriteTeamCategory(id: "baseball-national-teams", title: "National Teams"),
-                FavoriteTeamCategory(id: "baseball-players", title: "Players"),
-                FavoriteTeamCategory(id: "baseball-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "baseball-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "baseball-tournaments", title: "Competitions & Tournaments")
             ]
         case .hockey:
             return [
-                FavoriteTeamCategory(id: "hockey-clubs", title: "Clubs"),
-                FavoriteTeamCategory(id: "hockey-national-teams", title: "National Teams")
+                FavoriteTeamCategory(id: "hockey-clubs", title: "Teams"),
+                FavoriteTeamCategory(id: "hockey-national-teams", title: "National Teams"),
+                FavoriteTeamCategory(id: "hockey-tournaments", title: "Competitions & Tournaments")
             ]
         case .golf:
             return [
-                FavoriteTeamCategory(id: "golf-players", title: "Players"),
-                FavoriteTeamCategory(id: "golf-tournaments", title: "Tournaments")
+                FavoriteTeamCategory(id: "golf-players", title: "Featured Athletes"),
+                FavoriteTeamCategory(id: "golf-tournaments", title: "Competitions & Tournaments")
             ]
         case .combat:
             return [
                 FavoriteTeamCategory(id: "combat-fighters", title: "Fighters"),
-                FavoriteTeamCategory(id: "combat-promotions", title: "Promotions")
+                FavoriteTeamCategory(id: "combat-promotions", title: "Competitions & Tournaments")
             ]
         case .racing:
             return [
                 FavoriteTeamCategory(id: "racing-teams", title: "Teams"),
                 FavoriteTeamCategory(id: "racing-drivers", title: "Drivers"),
-                FavoriteTeamCategory(id: "racing-series", title: "Series")
+                FavoriteTeamCategory(id: "racing-series", title: "Competitions & Tournaments")
             ]
         case .dance:
             return [
@@ -478,6 +503,18 @@ enum FavoriteTeamCatalog {
         case .ncaa:
             return [
                 FavoriteTeamCategory(id: "basketball-ncaa", title: "NCAA")
+            ]
+        case .cricket:
+            return [
+                FavoriteTeamCategory(id: "cricket-tournaments", title: "Competitions & Tournaments")
+            ]
+        case .rugby:
+            return [
+                FavoriteTeamCategory(id: "rugby-tournaments", title: "Competitions & Tournaments")
+            ]
+        case .olympics:
+            return [
+                FavoriteTeamCategory(id: "olympics-tournaments", title: "Competitions & Tournaments")
             ]
         }
     }
@@ -491,7 +528,7 @@ enum FavoriteTeamCatalog {
         case "soccer-players":
             return team.sport == .soccer && team.kind == .player
         case "soccer-tournaments":
-            return team.sport == .soccer && team.kind == .tournament
+            return team.sport == .soccer && team.kind.isCompetitionLike
         case "basketball-nba":
             return team.sport == .basketball && (team.league == "NBA" || team.id == "league-nba")
         case "basketball-ncaa":
@@ -507,7 +544,7 @@ enum FavoriteTeamCatalog {
         case "basketball-players":
             return team.sport == .basketball && team.kind == .player
         case "basketball-tournaments":
-            return team.sport == .basketball && team.kind == .tournament
+            return (team.sport == .basketball || team.sport == .ncaa) && team.kind.isCompetitionLike
         case "football-nfl":
             return team.sport == .football && team.kind == .team
         case "football-clubs":
@@ -515,15 +552,16 @@ enum FavoriteTeamCatalog {
         case "football-players":
             return team.sport == .football && team.kind == .player
         case "football-tournaments":
-            return team.sport == .football && team.kind == .tournament
+            return (team.sport == .football || (team.sport == .ncaa && team.league.localizedCaseInsensitiveContains("Football")))
+                && team.kind.isCompetitionLike
         case "tennis-players":
             return team.sport == .tennis && team.kind == .player
         case "tennis-tournaments":
-            return team.sport == .tennis && team.kind == .tournament
+            return team.sport == .tennis && team.kind.isCompetitionLike
         case "badminton-players":
             return team.sport == .badminton && team.kind == .player
         case "badminton-tournaments":
-            return team.sport == .badminton && team.kind == .tournament
+            return team.sport == .badminton && team.kind.isCompetitionLike
         case "baseball-mlb":
             return team.sport == .baseball && team.kind == .team
         case "baseball-clubs":
@@ -533,27 +571,35 @@ enum FavoriteTeamCatalog {
         case "baseball-players":
             return team.sport == .baseball && team.kind == .player
         case "baseball-tournaments":
-            return team.sport == .baseball && team.kind == .tournament
+            return team.sport == .baseball && team.kind.isCompetitionLike
         case "hockey-teams":
             return team.sport == .hockey
         case "hockey-clubs":
             return team.sport == .hockey && team.kind == .team
         case "hockey-national-teams":
             return team.sport == .hockey && team.kind == .nationalTeam
+        case "hockey-tournaments":
+            return team.sport == .hockey && team.kind.isCompetitionLike
         case "golf-players":
             return team.sport == .golf && team.kind == .player
         case "golf-tournaments":
-            return team.sport == .golf && team.kind == .tournament
+            return team.sport == .golf && team.kind.isCompetitionLike
         case "combat-fighters":
             return team.sport == .combat && team.kind == .fighter
         case "combat-promotions":
-            return team.sport == .combat && team.kind == .tournament
+            return team.sport == .combat && team.kind.isCompetitionLike
         case "racing-teams":
             return team.sport == .racing && team.kind == .team
         case "racing-drivers":
             return team.sport == .racing && team.kind == .driver
         case "racing-series":
-            return team.sport == .racing && team.kind == .tournament
+            return team.sport == .racing && team.kind.isCompetitionLike
+        case "cricket-tournaments":
+            return team.sport == .cricket && team.kind.isCompetitionLike
+        case "rugby-tournaments":
+            return team.sport == .rugby && team.kind.isCompetitionLike
+        case "olympics-tournaments":
+            return team.sport == .olympics && team.kind.isCompetitionLike
         case "dance-urban":
             return team.sport == .dance && team.region == "Dance / Urban Sports"
         case "dance-performing":
@@ -596,8 +642,8 @@ enum FavoriteTeamCatalog {
         switch team.kind {
         case .team, .nationalTeam:
             return team.league
-        case .tournament:
-            return team.region == "Leagues & Tournaments" ? "Tournaments" : team.region
+        case .tournament, .league, .competition:
+            return team.region == "Leagues & Tournaments" ? "Competitions & Tournaments" : team.region
         case .player, .driver, .fighter, .interest:
             return team.region
         }
@@ -636,8 +682,11 @@ enum FavoriteTeamCatalog {
         "Dance / Urban Sports",
         "Dance / Performing Arts",
         "Favorite Players",
+        "Featured Athletes",
+        "Women's National Teams",
         "Drivers",
         "Fighters",
+        "Competitions & Tournaments",
         "Tournaments"
     ]
 
@@ -713,6 +762,9 @@ enum FavoriteTeamCatalog {
         case .racing: return (0.84, 0.12, 0.16)
         case .dance: return (0.72, 0.28, 0.78)
         case .ncaa: return (0.48, 0.16, 0.52)
+        case .cricket: return (0.10, 0.68, 0.54)
+        case .rugby: return (0.48, 0.18, 0.13)
+        case .olympics: return (0.12, 0.42, 0.72)
         }
     }
 
@@ -725,9 +777,9 @@ enum FavoriteTeamCatalog {
         team("soccer-napoli", "Napoli", .soccer, "Serie A", "soccerball", 0.12, 0.42, 0.82, region: "Europe", kind: .team, shortCode: "NAP"),
         team("soccer-roma", "Roma", .soccer, "Serie A", "soccerball", 0.72, 0.18, 0.18, region: "Europe", kind: .team, shortCode: "ROM"),
         team("soccer-real-madrid", "Real Madrid", .soccer, "La Liga", "soccerball", 0.95, 0.82, 0.22, region: "Europe", kind: .team, shortCode: "RMA", aliases: ["Real Madrid CF"]),
-        team("soccer-barcelona", "Barcelona", .soccer, "La Liga", "soccerball", 0.72, 0.12, 0.28, region: "Europe", kind: .team, shortCode: "BAR", aliases: ["FC Barcelona", "Barça"]),
+        team("soccer-barcelona", "Barcelona", .soccer, "La Liga", "soccerball", 0.72, 0.12, 0.28, region: "Europe", kind: .team, shortCode: "BAR", aliases: ["FC Barcelona", "Barça", "Barca"]),
         team("soccer-atletico-madrid", "Atlético Madrid", .soccer, "La Liga", "soccerball", 0.78, 0.12, 0.18, region: "Europe", kind: .team, shortCode: "ATM", aliases: ["Atletico Madrid"]),
-        team("soccer-man-utd", "Manchester United", .soccer, "Premier League", "soccerball", 0.78, 0.12, 0.16, region: "Europe", kind: .team, shortCode: "MUN", aliases: ["Man United", "Man Utd"]),
+        team("soccer-man-utd", "Manchester United", .soccer, "Premier League", "soccerball", 0.78, 0.12, 0.16, region: "Europe", kind: .team, shortCode: "MUN", aliases: ["Man United", "Man Utd", "Man U"]),
         team("soccer-man-city", "Manchester City", .soccer, "Premier League", "soccerball", 0.32, 0.66, 0.88, region: "Europe", kind: .team, shortCode: "MCI", aliases: ["Man City"]),
         team("soccer-liverpool", "Liverpool", .soccer, "Premier League", "soccerball", 0.78, 0.14, 0.18, region: "Europe", kind: .team, shortCode: "LIV"),
         team("soccer-chelsea", "Chelsea", .soccer, "Premier League", "soccerball", 0.12, 0.35, 0.72, region: "Europe", kind: .team, shortCode: "CHE"),
@@ -754,7 +806,7 @@ enum FavoriteTeamCatalog {
         team("soccer-monterrey", "Monterrey", .soccer, "Liga MX", "soccerball", 0.12, 0.32, 0.62, region: "North America", kind: .team, shortCode: "MTY"),
         team("soccer-pumas", "Pumas", .soccer, "Liga MX", "soccerball", 0.12, 0.22, 0.52, region: "North America", kind: .team, shortCode: "PUM"),
         team("soccer-france", "France", .soccer, "National Team", "soccerball", 0.12, 0.28, 0.68, region: "National Teams", kind: .nationalTeam, shortCode: "FRA", aliases: ["France National Team", "French National Team", "Les Bleus", "French"]),
-        team("soccer-usa", "United States", .soccer, "National Team", "soccerball", 0.12, 0.32, 0.72, region: "National Teams", kind: .nationalTeam, shortCode: "USA", aliases: ["USA", "USMNT", "USWNT", "United States of America", "United States National Team"]),
+        team("soccer-usa", "United States", .soccer, "National Team", "soccerball", 0.12, 0.32, 0.72, region: "National Teams", kind: .nationalTeam, shortCode: "USA", aliases: ["USA", "USMNT", "United States of America", "United States National Team", "US Men's National Team"]),
         team("soccer-mexico", "Mexico", .soccer, "National Team", "soccerball", 0.12, 0.52, 0.28, region: "National Teams", kind: .nationalTeam, shortCode: "MEX", aliases: ["Mexico National Team", "Mexican National Team", "El Tri"]),
         team("soccer-canada", "Canada", .soccer, "National Team", "soccerball", 0.78, 0.12, 0.16, region: "National Teams", kind: .nationalTeam, shortCode: "CAN"),
         team("soccer-argentina", "Argentina", .soccer, "National Team", "soccerball", 0.32, 0.64, 0.88, region: "National Teams", kind: .nationalTeam, shortCode: "ARG", aliases: ["Argentina National Team", "Albiceleste", "La Albiceleste"]),
@@ -774,69 +826,69 @@ enum FavoriteTeamCatalog {
     // MARK: Basketball (12)
 
     private static let basketball: [FavoriteTeam] = [
-        team("nba-lakers", "Los Angeles Lakers", .basketball, "NBA", "basketball.fill", 0.42, 0.18, 0.62),
-        team("nba-celtics", "Boston Celtics", .basketball, "NBA", "basketball.fill", 0.12, 0.48, 0.28),
-        team("nba-warriors", "Golden State Warriors", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72),
-        team("nba-bulls", "Chicago Bulls", .basketball, "NBA", "basketball.fill", 0.78, 0.12, 0.18),
-        team("nba-heat", "Miami Heat", .basketball, "NBA", "basketball.fill", 0.78, 0.32, 0.18),
-        team("nba-knicks", "New York Knicks", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72),
-        team("nba-mavericks", "Dallas Mavericks", .basketball, "NBA", "basketball.fill", 0.12, 0.42, 0.62),
-        team("nba-nuggets", "Denver Nuggets", .basketball, "NBA", "basketball.fill", 0.22, 0.32, 0.52),
-        team("nba-suns", "Phoenix Suns", .basketball, "NBA", "basketball.fill", 0.92, 0.42, 0.12),
-        team("nba-bucks", "Milwaukee Bucks", .basketball, "NBA", "basketball.fill", 0.12, 0.48, 0.32),
-        team("nba-nets", "Brooklyn Nets", .basketball, "NBA", "basketball.fill", 0.12, 0.12, 0.12),
-        team("nba-spurs", "San Antonio Spurs", .basketball, "NBA", "basketball.fill", 0.32, 0.32, 0.38)
+        team("nba-lakers", "Los Angeles Lakers", .basketball, "NBA", "basketball.fill", 0.42, 0.18, 0.62, region: "North America"),
+        team("nba-celtics", "Boston Celtics", .basketball, "NBA", "basketball.fill", 0.12, 0.48, 0.28, region: "North America"),
+        team("nba-warriors", "Golden State Warriors", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72, region: "North America"),
+        team("nba-bulls", "Chicago Bulls", .basketball, "NBA", "basketball.fill", 0.78, 0.12, 0.18, region: "North America"),
+        team("nba-heat", "Miami Heat", .basketball, "NBA", "basketball.fill", 0.78, 0.32, 0.18, region: "North America"),
+        team("nba-knicks", "New York Knicks", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72, region: "North America"),
+        team("nba-mavericks", "Dallas Mavericks", .basketball, "NBA", "basketball.fill", 0.12, 0.42, 0.62, region: "North America"),
+        team("nba-nuggets", "Denver Nuggets", .basketball, "NBA", "basketball.fill", 0.22, 0.32, 0.52, region: "North America"),
+        team("nba-suns", "Phoenix Suns", .basketball, "NBA", "basketball.fill", 0.92, 0.42, 0.12, region: "North America"),
+        team("nba-bucks", "Milwaukee Bucks", .basketball, "NBA", "basketball.fill", 0.12, 0.48, 0.32, region: "North America"),
+        team("nba-nets", "Brooklyn Nets", .basketball, "NBA", "basketball.fill", 0.12, 0.12, 0.12, region: "North America"),
+        team("nba-spurs", "San Antonio Spurs", .basketball, "NBA", "basketball.fill", 0.32, 0.32, 0.38, region: "North America")
     ]
 
     // MARK: Football (12)
 
     private static let football: [FavoriteTeam] = [
-        team("nfl-chiefs", "Kansas City Chiefs", .football, "NFL", "football.fill", 0.78, 0.18, 0.22),
-        team("nfl-eagles", "Philadelphia Eagles", .football, "NFL", "football.fill", 0.12, 0.42, 0.32),
-        team("nfl-cowboys", "Dallas Cowboys", .football, "NFL", "football.fill", 0.12, 0.22, 0.48),
-        team("nfl-49ers", "San Francisco 49ers", .football, "NFL", "football.fill", 0.78, 0.22, 0.18),
-        team("nfl-bills", "Buffalo Bills", .football, "NFL", "football.fill", 0.12, 0.32, 0.62),
-        team("nfl-ravens", "Baltimore Ravens", .football, "NFL", "football.fill", 0.18, 0.12, 0.42),
-        team("nfl-dolphins", "Miami Dolphins", .football, "NFL", "football.fill", 0.12, 0.52, 0.62),
-        team("nfl-packers", "Green Bay Packers", .football, "NFL", "football.fill", 0.12, 0.42, 0.22),
-        team("nfl-steelers", "Pittsburgh Steelers", .football, "NFL", "football.fill", 0.22, 0.22, 0.22),
-        team("nfl-bengals", "Cincinnati Bengals", .football, "NFL", "football.fill", 0.78, 0.22, 0.12),
-        team("nfl-lions", "Detroit Lions", .football, "NFL", "football.fill", 0.12, 0.42, 0.62),
-        team("nfl-jets", "New York Jets", .football, "NFL", "football.fill", 0.12, 0.32, 0.22)
+        team("nfl-chiefs", "Kansas City Chiefs", .football, "NFL", "football.fill", 0.78, 0.18, 0.22, region: "North America"),
+        team("nfl-eagles", "Philadelphia Eagles", .football, "NFL", "football.fill", 0.12, 0.42, 0.32, region: "North America"),
+        team("nfl-cowboys", "Dallas Cowboys", .football, "NFL", "football.fill", 0.12, 0.22, 0.48, region: "North America"),
+        team("nfl-49ers", "San Francisco 49ers", .football, "NFL", "football.fill", 0.78, 0.22, 0.18, region: "North America"),
+        team("nfl-bills", "Buffalo Bills", .football, "NFL", "football.fill", 0.12, 0.32, 0.62, region: "North America"),
+        team("nfl-ravens", "Baltimore Ravens", .football, "NFL", "football.fill", 0.18, 0.12, 0.42, region: "North America"),
+        team("nfl-dolphins", "Miami Dolphins", .football, "NFL", "football.fill", 0.12, 0.52, 0.62, region: "North America"),
+        team("nfl-packers", "Green Bay Packers", .football, "NFL", "football.fill", 0.12, 0.42, 0.22, region: "North America"),
+        team("nfl-steelers", "Pittsburgh Steelers", .football, "NFL", "football.fill", 0.22, 0.22, 0.22, region: "North America"),
+        team("nfl-bengals", "Cincinnati Bengals", .football, "NFL", "football.fill", 0.78, 0.22, 0.12, region: "North America"),
+        team("nfl-lions", "Detroit Lions", .football, "NFL", "football.fill", 0.12, 0.42, 0.62, region: "North America"),
+        team("nfl-jets", "New York Jets", .football, "NFL", "football.fill", 0.12, 0.32, 0.22, region: "North America")
     ]
 
     // MARK: Baseball (12)
 
     private static let baseball: [FavoriteTeam] = [
-        team("mlb-yankees", "New York Yankees", .baseball, "MLB", "baseball.fill", 0.12, 0.22, 0.42),
-        team("mlb-red-sox", "Boston Red Sox", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.18),
-        team("mlb-dodgers", "Los Angeles Dodgers", .baseball, "MLB", "baseball.fill", 0.12, 0.32, 0.62),
-        team("mlb-cubs", "Chicago Cubs", .baseball, "MLB", "baseball.fill", 0.12, 0.38, 0.72),
-        team("mlb-braves", "Atlanta Braves", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.22),
-        team("mlb-astros", "Houston Astros", .baseball, "MLB", "baseball.fill", 0.78, 0.42, 0.18),
-        team("mlb-phillies", "Philadelphia Phillies", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.28),
-        team("mlb-mets", "New York Mets", .baseball, "MLB", "baseball.fill", 0.18, 0.42, 0.72),
-        team("mlb-cardinals", "St. Louis Cardinals", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.16),
-        team("mlb-giants", "San Francisco Giants", .baseball, "MLB", "baseball.fill", 0.78, 0.32, 0.18),
-        team("mlb-padres", "San Diego Padres", .baseball, "MLB", "baseball.fill", 0.78, 0.52, 0.22),
-        team("mlb-mariners", "Seattle Mariners", .baseball, "MLB", "baseball.fill", 0.12, 0.42, 0.58)
+        team("mlb-yankees", "New York Yankees", .baseball, "MLB", "baseball.fill", 0.12, 0.22, 0.42, region: "North America"),
+        team("mlb-red-sox", "Boston Red Sox", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.18, region: "North America"),
+        team("mlb-dodgers", "Los Angeles Dodgers", .baseball, "MLB", "baseball.fill", 0.12, 0.32, 0.62, region: "North America"),
+        team("mlb-cubs", "Chicago Cubs", .baseball, "MLB", "baseball.fill", 0.12, 0.38, 0.72, region: "North America"),
+        team("mlb-braves", "Atlanta Braves", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.22, region: "North America"),
+        team("mlb-astros", "Houston Astros", .baseball, "MLB", "baseball.fill", 0.78, 0.42, 0.18, region: "North America"),
+        team("mlb-phillies", "Philadelphia Phillies", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.28, region: "North America"),
+        team("mlb-mets", "New York Mets", .baseball, "MLB", "baseball.fill", 0.18, 0.42, 0.72, region: "North America"),
+        team("mlb-cardinals", "St. Louis Cardinals", .baseball, "MLB", "baseball.fill", 0.78, 0.12, 0.16, region: "North America"),
+        team("mlb-giants", "San Francisco Giants", .baseball, "MLB", "baseball.fill", 0.78, 0.32, 0.18, region: "North America"),
+        team("mlb-padres", "San Diego Padres", .baseball, "MLB", "baseball.fill", 0.78, 0.52, 0.22, region: "North America"),
+        team("mlb-mariners", "Seattle Mariners", .baseball, "MLB", "baseball.fill", 0.12, 0.42, 0.58, region: "North America")
     ]
 
     // MARK: Hockey (12) — generic city + sport names, color-inspired only
 
     private static let hockey: [FavoriteTeam] = [
-        team("nhl-vegas-hockey", "Vegas Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.62, 0.18),
-        team("nhl-dallas-hockey", "Dallas Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.42, 0.62),
-        team("nhl-boston-hockey", "Boston Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.18, 0.22),
-        team("nhl-detroit-hockey", "Detroit Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.12, 0.18),
-        team("nhl-tampa-hockey", "Tampa Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.38, 0.72),
-        team("nhl-colorado-hockey", "Colorado Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.52, 0.22, 0.62),
-        team("nhl-chicago-hockey", "Chicago Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.18, 0.22),
-        team("nhl-toronto-hockey", "Toronto Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.12, 0.12),
-        team("nhl-edmonton-hockey", "Edmonton Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.22, 0.42, 0.72),
-        team("nhl-montreal-hockey", "Montreal Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.12, 0.22),
-        team("nhl-pittsburgh-hockey", "Pittsburgh Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.52, 0.12),
-        team("nhl-seattle-hockey", "Seattle Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.18, 0.52, 0.58)
+        team("nhl-vegas-hockey", "Vegas Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.62, 0.18, region: "North America"),
+        team("nhl-dallas-hockey", "Dallas Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.42, 0.62, region: "North America"),
+        team("nhl-boston-hockey", "Boston Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.18, 0.22, region: "North America"),
+        team("nhl-detroit-hockey", "Detroit Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.12, 0.18, region: "North America"),
+        team("nhl-tampa-hockey", "Tampa Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.38, 0.72, region: "North America"),
+        team("nhl-colorado-hockey", "Colorado Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.52, 0.22, 0.62, region: "North America"),
+        team("nhl-chicago-hockey", "Chicago Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.18, 0.22, region: "North America"),
+        team("nhl-toronto-hockey", "Toronto Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.12, 0.12, 0.12, region: "North America"),
+        team("nhl-edmonton-hockey", "Edmonton Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.22, 0.42, 0.72, region: "North America"),
+        team("nhl-montreal-hockey", "Montreal Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.12, 0.22, region: "North America"),
+        team("nhl-pittsburgh-hockey", "Pittsburgh Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.78, 0.52, 0.12, region: "North America"),
+        team("nhl-seattle-hockey", "Seattle Hockey", .hockey, "Pro Hockey", "hockey.puck.fill", 0.18, 0.52, 0.58, region: "North America")
     ]
 
     // MARK: Golf (players and tournaments; text-only identities)
@@ -847,9 +899,9 @@ enum FavoriteTeamCatalog {
         team("golf-tiger-woods", "Tiger Woods", .golf, "Golf", "figure.golf", 0.18, 0.18, 0.18, region: "Favorite Players", kind: .player, shortCode: "TW", aliases: ["Tiger"]),
         team("golf-nelly-korda", "Nelly Korda", .golf, "Golf", "figure.golf", 0.78, 0.32, 0.52, region: "Favorite Players", kind: .player, shortCode: "NK", aliases: ["Korda"]),
         team("golf-lydia-ko", "Lydia Ko", .golf, "Golf", "figure.golf", 0.42, 0.18, 0.62, region: "Favorite Players", kind: .player, shortCode: "LK", aliases: ["Ko"]),
-        team("golf-masters", "The Masters", .golf, "Golf Major", "figure.golf", 0.12, 0.48, 0.28, region: "Tournaments", kind: .tournament, shortCode: "MAS", aliases: ["Masters"]),
-        team("golf-us-open", "U.S. Open Golf", .golf, "Golf Major", "figure.golf", 0.12, 0.32, 0.72, region: "Tournaments", kind: .tournament, shortCode: "USO", aliases: ["US Open Golf"]),
-        team("golf-the-open", "The Open", .golf, "Golf Major", "figure.golf", 0.22, 0.42, 0.32, region: "Tournaments", kind: .tournament, shortCode: "OPEN", aliases: ["British Open", "Open Championship"]),
+        team("golf-masters", "The Masters", .golf, "Golf Major", "figure.golf", 0.12, 0.48, 0.28, region: "Tournaments", kind: .tournament, shortCode: "MAS", aliases: ["Masters", "Masters Tournament"]),
+        team("golf-us-open", "U.S. Open Golf", .golf, "Golf Major", "figure.golf", 0.12, 0.32, 0.72, region: "Tournaments", kind: .tournament, shortCode: "USO", aliases: ["US Open Golf", "U.S. Open"]),
+        team("golf-the-open", "The Open", .golf, "Golf Major", "figure.golf", 0.22, 0.42, 0.32, region: "Tournaments", kind: .tournament, shortCode: "OPEN", aliases: ["British Open", "Open Championship", "The Open Championship"]),
         team("golf-ryder-cup", "Ryder Cup", .golf, "Golf Tournament", "figure.golf", 0.78, 0.18, 0.22, region: "Tournaments", kind: .tournament, shortCode: "RC")
     ]
 
@@ -957,16 +1009,16 @@ enum FavoriteTeamCatalog {
     // MARK: Leagues / Tournaments (text-only identities)
 
     private static let favoriteTournaments: [FavoriteTeam] = [
-        team("league-nba", "NBA", .basketball, "Basketball League", "basketball.fill", 0.22, 0.42, 0.72, region: "Leagues & Tournaments", kind: .tournament, shortCode: "NBA", aliases: ["National Basketball Association"]),
-        team("league-nfl", "NFL", .football, "Football League", "football.fill", 0.12, 0.32, 0.62, region: "Leagues & Tournaments", kind: .tournament, shortCode: "NFL", aliases: ["National Football League"]),
-        team("league-mlb", "MLB", .baseball, "Baseball League", "baseball.fill", 0.78, 0.12, 0.18, region: "Leagues & Tournaments", kind: .tournament, shortCode: "MLB", aliases: ["Major League Baseball"]),
-        team("league-mls", "MLS", .soccer, "Soccer League", "soccerball", 0.12, 0.48, 0.82, region: "Leagues & Tournaments", kind: .tournament, shortCode: "MLS", aliases: ["Major League Soccer"]),
-        team("league-premier-league", "Premier League", .soccer, "Soccer League", "soccerball", 0.42, 0.18, 0.62, region: "Leagues & Tournaments", kind: .tournament, shortCode: "PL"),
-        team("tournament-world-cup", "FIFA World Cup", .soccer, "Soccer Tournament", "soccerball", 0.12, 0.52, 0.28, region: "Leagues & Tournaments", kind: .tournament, shortCode: "FWC", aliases: ["World Cup"]),
-        team("tournament-champions-league", "Champions League", .soccer, "Soccer Tournament", "soccerball", 0.12, 0.22, 0.48, region: "Leagues & Tournaments", kind: .tournament, shortCode: "UCL", aliases: ["UEFA Champions League"]),
-        team("league-formula-one", "Formula 1", .racing, "Open Wheel", "flag.checkered.2.crossed.fill", 0.78, 0.12, 0.16, region: "Leagues & Tournaments", kind: .tournament, shortCode: "F1", aliases: ["F1"]),
-        team("tournament-march-madness", "March Madness", .ncaa, "College Basketball Tournament", "building.columns.fill", 0.12, 0.32, 0.72, region: "Leagues & Tournaments", kind: .tournament, shortCode: "MM"),
-        team("tournament-college-football-playoff", "College Football Playoff", .ncaa, "College Football Tournament", "building.columns.fill", 0.78, 0.42, 0.18, region: "Leagues & Tournaments", kind: .tournament, shortCode: "CFP")
+        team("league-nba", "NBA", .basketball, "Basketball League", "basketball.fill", 0.22, 0.42, 0.72, region: "Leagues & Tournaments", kind: .league, shortCode: "NBA", aliases: ["National Basketball Association"]),
+        team("league-nfl", "NFL", .football, "Football League", "football.fill", 0.12, 0.32, 0.62, region: "Leagues & Tournaments", kind: .league, shortCode: "NFL", aliases: ["National Football League"]),
+        team("league-mlb", "MLB", .baseball, "Baseball League", "baseball.fill", 0.78, 0.12, 0.18, region: "Leagues & Tournaments", kind: .league, shortCode: "MLB", aliases: ["Major League Baseball"]),
+        team("league-mls", "MLS", .soccer, "Soccer League", "soccerball", 0.12, 0.48, 0.82, region: "Leagues & Tournaments", kind: .league, shortCode: "MLS", aliases: ["Major League Soccer"]),
+        team("league-premier-league", "Premier League", .soccer, "Soccer League", "soccerball", 0.42, 0.18, 0.62, region: "Leagues & Tournaments", kind: .league, shortCode: "PL", aliases: ["EPL", "English Premier League"]),
+        team("tournament-world-cup", "FIFA World Cup", .soccer, "Soccer Tournament", "soccerball", 0.12, 0.52, 0.28, region: "Leagues & Tournaments", kind: .competition, shortCode: "FWC", aliases: ["World Cup"]),
+        team("tournament-champions-league", "Champions League", .soccer, "Soccer Tournament", "soccerball", 0.12, 0.22, 0.48, region: "Leagues & Tournaments", kind: .competition, shortCode: "UCL", aliases: ["UEFA Champions League", "UCL"]),
+        team("league-formula-one", "Formula 1", .racing, "Open Wheel", "flag.checkered.2.crossed.fill", 0.78, 0.12, 0.16, region: "Leagues & Tournaments", kind: .competition, shortCode: "F1", aliases: ["F1", "Formula 1 World Championship", "Formula One"]),
+        team("tournament-march-madness", "March Madness", .ncaa, "College Basketball Tournament", "building.columns.fill", 0.12, 0.32, 0.72, region: "Leagues & Tournaments", kind: .competition, shortCode: "MM", aliases: ["NCAA Men's Tournament", "NCAA Tournament", "Big Dance"]),
+        team("tournament-college-football-playoff", "College Football Playoff", .ncaa, "College Football Tournament", "building.columns.fill", 0.78, 0.42, 0.18, region: "Leagues & Tournaments", kind: .competition, shortCode: "CFP")
     ]
 
     private static func team(
@@ -1125,7 +1177,16 @@ enum FavoriteTeamsStore {
     }
 
     static func resolvedTeams(fromIDs ids: [String]) -> [FavoriteTeam] {
-        ids.compactMap { FavoriteTeamCatalog.team(id: $0) }
+        var seen = Set<String>()
+        var out: [FavoriteTeam] = []
+        out.reserveCapacity(ids.count)
+        for id in ids {
+            guard seen.insert(id).inserted else { continue }
+            if let team = FavoriteTeamCatalog.team(id: id) {
+                out.append(team)
+            }
+        }
+        return out
     }
 
     static func writeToAppStorage(_ ids: [String]) {

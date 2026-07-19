@@ -57,11 +57,18 @@ struct FollowingScreen: View {
     @State private var selectedGoingVenueTab: GoingVenueTab = .games
     @State private var selectedGoingGamesTab: GoingGamesTab = .playing
     @State private var selectedBusinessProGameFilter: BusinessProGameFilter = .all
+    /// Ephemeral Discover Today dashboard day scope (not persisted).
+    @State private var goingDayScope: GoingDayScope = .all
     @State private var cachedGoingVenueGameItems: [FollowingGoingDisplayItem] = []
     @State private var cachedPlayingGameCards: [PickupGameJoinRequestCardDisplay] = []
     @State private var goingTabPerf = GoingTabPerfState()
     @State private var followingHostingPickupLoadInFlight = false
     @State private var showFavoriteTeamsPicker = false
+
+    private enum GoingDayScope: Equatable {
+        case all
+        case today
+    }
 
     private struct GoingTabPerfState {
         var cachedManualSavedProGamesForDisplay: [SavedProGame] = []
@@ -75,10 +82,12 @@ struct FollowingScreen: View {
         var lastBackgroundRefreshAt: Date?
         var deferredBackgroundRefreshTask: Task<Void, Never>?
         var deferredSurfacePrepareTask: Task<Void, Never>?
+        var avatarPrefetchTask: Task<Void, Never>?
         var lastProGamesDisplayRebuildAt: Date?
         var proGamesDisplayRebuildTask: Task<Void, Never>?
         var proGamesDisplayRebuildInFlight = false
         var lastProGamesDisplayFingerprint: String?
+        var lastFollowingDisplayCachesFingerprint: String?
         var proGamesStatusIndicatorVisible = false
         var proGamesStatusIndicatorShowTask: Task<Void, Never>?
         var tabSelectionActivationGeneration: UInt64 = 0
@@ -191,6 +200,14 @@ struct FollowingScreen: View {
 
     private var followingLifecycleEventHandlers: some View {
         followingLifecycleTabOnChange
+            .background {
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+                    .onChange(of: viewModel.pendingDiscoverTodayDashboardNav) { _, _ in
+                        applyPendingDiscoverTodayDashboardNavIfNeeded()
+                    }
+            }
     }
 
     private var followingLifecycleOnChanges: some View {
@@ -332,16 +349,53 @@ struct FollowingScreen: View {
             AppPerfDebug.screenLoadStart(tab: "following", source: "tabVisible")
             prepareGoingTabSelectionGeneration()
             _ = runGoingTabSelectionActivationIfNeeded(source: "tabVisible")
+            applyPendingDiscoverTodayDashboardNavIfNeeded()
             Task { @MainActor in
                 await Task.yield()
                 TabPerf.tabSwitchRendered(tab: "following")
                 await fulfillProGameNotificationDeepLinkIfReady()
             }
         } else {
+            goingDayScope = .all
             goingTabPerf.firstPaintRecorded = false
+            cancelGoingTabDeferredWork(reason: "tabHidden")
             goingTabPerf.tabSelectionActivationActive = false
             goingTabPerf.handledTabSelectionActivationGeneration = 0
         }
+    }
+
+    /// Cancels deferred Going work when the tab is no longer selected. Does not clear cached display content.
+    private func cancelGoingTabDeferredWork(reason: String) {
+        var canceledDeferred = false
+        if let task = goingTabPerf.deferredSurfacePrepareTask {
+            task.cancel()
+            goingTabPerf.deferredSurfacePrepareTask = nil
+            canceledDeferred = true
+        }
+        if let task = goingTabPerf.deferredBackgroundRefreshTask {
+            task.cancel()
+            goingTabPerf.deferredBackgroundRefreshTask = nil
+            canceledDeferred = true
+        }
+        if let task = goingTabPerf.proGamesDisplayRebuildTask {
+            task.cancel()
+            goingTabPerf.proGamesDisplayRebuildTask = nil
+            canceledDeferred = true
+        }
+        if let task = goingTabPerf.avatarPrefetchTask {
+            task.cancel()
+            goingTabPerf.avatarPrefetchTask = nil
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=\(reason)")
+        }
+        // Invalidate any in-flight stage that still holds an older generation.
+        goingTabPerf.tabSelectionActivationGeneration &+= 1
+        if canceledDeferred {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=\(reason)")
+        }
+    }
+
+    private func isGoingTabSelectionGenerationCurrent(_ generation: UInt64) -> Bool {
+        isFollowingTabSelected && generation == goingTabPerf.tabSelectionActivationGeneration
     }
 
     /// Begins a new Going tab selection session (tab became visible).
@@ -571,11 +625,19 @@ struct FollowingScreen: View {
             TabPerf.duplicateRefreshCoalesced(name: "goingTabVisibleSurface")
             return
         }
+        let generation = goingTabPerf.tabSelectionActivationGeneration
         goingTabPerf.deferredSurfacePrepareTask = Task { @MainActor in
             await Task.yield()
             try? await Task.sleep(nanoseconds: GoingTabPerfState.deferredBackgroundRefreshDelayNs)
-            guard !Task.isCancelled else { return }
-            guard isFollowingTabSelected else { return }
+            guard !Task.isCancelled else {
+                DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=surfacePrepareCancelled")
+                return
+            }
+            guard isGoingTabSelectionGenerationCurrent(generation) else {
+                DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=leftBeforeSurfacePrepare")
+                goingTabPerf.deferredSurfacePrepareTask = nil
+                return
+            }
             await prepareGoingTabVisibleSurface(reason: reason)
             goingTabPerf.deferredSurfacePrepareTask = nil
         }
@@ -600,14 +662,24 @@ struct FollowingScreen: View {
             DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=going reason=\(reason) skipped=deferredScheduled")
             return
         }
+        let generation = goingTabPerf.tabSelectionActivationGeneration
         goingTabPerf.deferredBackgroundRefreshTask = Task { @MainActor in
             await Task.yield()
             try? await Task.sleep(nanoseconds: GoingTabPerfState.deferredBackgroundRefreshDelayNs)
-            guard !Task.isCancelled else { return }
-            guard isFollowingTabSelected else { return }
+            guard !Task.isCancelled else {
+                DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=backgroundRefreshCancelled")
+                return
+            }
+            guard isGoingTabSelectionGenerationCurrent(generation) else {
+                DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=leftBeforeBackgroundRefresh")
+                goingTabPerf.deferredBackgroundRefreshTask = nil
+                return
+            }
             DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=going reason=\(reason) started")
-            await performGoingTabBackgroundRefresh(reason: reason)
-            goingTabPerf.lastBackgroundRefreshAt = Date()
+            await performGoingTabBackgroundRefresh(reason: reason, selectionGeneration: generation)
+            if isGoingTabSelectionGenerationCurrent(generation) {
+                goingTabPerf.lastBackgroundRefreshAt = Date()
+            }
             DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=going reason=\(reason) finished")
             goingTabPerf.deferredBackgroundRefreshTask = nil
         }
@@ -622,7 +694,10 @@ struct FollowingScreen: View {
         sanitizeBusinessGoingModeIfNeeded()
 
         await prepareGoingTabVisibleSurface(reason: "proGameNotificationDeepLink")
-        await performGoingTabBackgroundRefresh(reason: "proGameNotificationDeepLink")
+        await performGoingTabBackgroundRefresh(
+            reason: "proGameNotificationDeepLink",
+            selectionGeneration: goingTabPerf.tabSelectionActivationGeneration
+        )
         await viewModel.refreshLiveMatchesForLiveTab(forceRefresh: false)
 
         if let match = viewModel.resolveLiveMatchForProGameNotificationDeepLink(matchID: matchID) {
@@ -949,7 +1024,7 @@ struct FollowingScreen: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 FanGeoPagePurposeHeader(
-                    title: "Going",
+                    title: L10n.t("going", languageCode: appLanguageRaw),
                     subtitle: goingHubHeaderSubtitle
                 )
                 .padding(.top, 8)
@@ -981,9 +1056,9 @@ struct FollowingScreen: View {
 
     private var goingHubHeaderSubtitle: String {
         if isBusinessProGamesOnly {
-            return "Saved live and scheduled pro games for your business account."
+            return L10n.t("going_tab_subtitle_business", languageCode: appLanguageRaw)
         }
-        return "Games, venues, and pickup plans you're part of."
+        return L10n.t("going_tab_subtitle", languageCode: appLanguageRaw)
     }
 
     private var goingInviteBellButton: some View {
@@ -1041,7 +1116,69 @@ struct FollowingScreen: View {
     }
 
     private var goingVenueGameItems: [FollowingGoingDisplayItem] {
-        cachedGoingVenueGameItems
+        let base = cachedGoingVenueGameItems
+        guard goingDayScope == .today else { return base }
+        return base.filter { isGoingVenueEventOnLocalToday($0.venueEvent) }
+    }
+
+    private func applyPendingDiscoverTodayDashboardNavIfNeeded() {
+        guard isFollowingTabSelected else { return }
+        guard let intent = viewModel.pendingDiscoverTodayDashboardNav else { return }
+        switch intent {
+        case .goingVenueGamesToday:
+            selectedGoingMode = .venueGames
+            selectedGoingVenueTab = .games
+            goingDayScope = .today
+            viewModel.clearPendingDiscoverTodayDashboardNav()
+#if DEBUG
+            print("[DiscoverTodayDashboard] applied goingVenueGamesToday")
+#endif
+        case .goingPickupGamesToday:
+            selectedGoingMode = .pickupGames
+            selectedGoingGamesTab = .playing
+            goingDayScope = .today
+            viewModel.clearPendingDiscoverTodayDashboardNav()
+#if DEBUG
+            print("[DiscoverTodayDashboard] applied goingPickupGamesToday")
+#endif
+        case .goingVenueGamesUpcoming:
+            selectedGoingMode = .venueGames
+            selectedGoingVenueTab = .games
+            goingDayScope = .all
+            viewModel.clearPendingDiscoverTodayDashboardNav()
+#if DEBUG
+            print("[DiscoverTodayDashboard] applied goingVenueGamesUpcoming")
+#endif
+        case .goingPickupGamesUpcoming:
+            selectedGoingMode = .pickupGames
+            selectedGoingGamesTab = .playing
+            goingDayScope = .all
+            viewModel.clearPendingDiscoverTodayDashboardNav()
+#if DEBUG
+            print("[DiscoverTodayDashboard] applied goingPickupGamesUpcoming")
+#endif
+        case .accountSuggestedFans, .chatFansLiveNow:
+            break
+        }
+    }
+
+    private func isGoingVenueEventOnLocalToday(_ row: VenueEventRow, now: Date = Date()) -> Bool {
+        if let start = FanGeoLiveEnergyTiming.parseScheduledStart(row.scheduled_start_at, eventId: row.id) {
+            return Calendar.current.isDate(start, inSameDayAs: now)
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd"
+        let todayYMD = formatter.string(from: now)
+        let eventYMD = (row.event_date ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard eventYMD.count >= 10 else { return false }
+        return String(eventYMD.prefix(10)) == todayYMD
+    }
+
+    private func isPickupStartOnLocalToday(_ rawStart: String, now: Date = Date()) -> Bool {
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(rawStart) else { return false }
+        return Calendar.current.isDate(start, inSameDayAs: now)
     }
 
     private func rebuildFollowingDisplayCaches(reason: String, prefetchAvatars: Bool = true) {
@@ -1053,8 +1190,7 @@ struct FollowingScreen: View {
                 .filter(\.isActiveGoingTabPlan)
                 .filter { GoingTabCompletedGameVisibility.isVenueGameVisibleInGoingTab(row: $0.venueEvent) }
         )
-        cachedGoingVenueGameItems = sorted
-        cachedPlayingGameCards = viewModel.myPickupGameJoinRequestCards.filter { card in
+        let playing = viewModel.myPickupGameJoinRequestCards.filter { card in
             switch card.pill {
             case .pending, .approved, .declined:
                 return true
@@ -1065,6 +1201,25 @@ struct FollowingScreen: View {
             guard let game = viewModel.pickupGamesFollowingTabCache[card.pickupGameId] else { return true }
             return GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(row: game)
         }
+        let fingerprint = followingDisplayCachesFingerprint(venueItems: sorted, playingCards: playing)
+        if fingerprint == goingTabPerf.lastFollowingDisplayCachesFingerprint {
+            DebugLogGate.goingTabPerfVerbose(
+                "[GoingTabPerf] displayPublishSkipped reason=unchangedFingerprint rebuildReason=\(reason)"
+            )
+            if prefetchAvatars {
+                prefetchVisibleGoingAvatars(reason: reason)
+            }
+#if DEBUG
+            let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+            DebugLogGate.goingTabPerfVerbose(
+                "[RenderPerf] view=FollowingScreen renderMs=\(String(format: "%.2f", ms)) rebuildReason=\(reason):skipped"
+            )
+#endif
+            return
+        }
+        cachedGoingVenueGameItems = sorted
+        cachedPlayingGameCards = playing
+        goingTabPerf.lastFollowingDisplayCachesFingerprint = fingerprint
         logGoingTabSortDebug(sorted)
         if prefetchAvatars {
             prefetchVisibleGoingAvatars(reason: reason)
@@ -1080,7 +1235,24 @@ struct FollowingScreen: View {
 #endif
     }
 
+    private func followingDisplayCachesFingerprint(
+        venueItems: [FollowingGoingDisplayItem],
+        playingCards: [PickupGameJoinRequestCardDisplay]
+    ) -> String {
+        let going = venueItems
+            .map { "\($0.id.uuidString):\($0.isServerGoing ? 1 : 0):\($0.isInterestedOnlyLocal ? 1 : 0)" }
+            .joined(separator: ",")
+        let playing = playingCards
+            .map { "\($0.id.uuidString):\($0.pill.rawValue)" }
+            .joined(separator: ",")
+        return "going=\(going);playing=\(playing)"
+    }
+
     private func prefetchVisibleGoingAvatars(reason: String) {
+        guard isFollowingTabSelected else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=notSelected:\(reason)")
+            return
+        }
         var seen = Set<URL>()
         var urls: [URL] = []
 
@@ -1122,13 +1294,64 @@ struct FollowingScreen: View {
             return
         }
 
-        Task {
+        goingTabPerf.avatarPrefetchTask?.cancel()
+        let generation = goingTabPerf.tabSelectionActivationGeneration
+        let candidateURLs = Array(urls.prefix(8))
+        goingTabPerf.avatarPrefetchTask = Task(priority: .utility) {
             let startedAt = Date()
-            await DiscoverMapImageCache.shared.prefetch(urls: urls, bucket: .avatar)
+            await Task.yield()
+            guard !Task.isCancelled else {
+                await MainActor.run {
+                    DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=taskCancelled:\(reason)")
+                }
+                return
+            }
+            let stillSelected = await MainActor.run { isGoingTabSelectionGenerationCurrent(generation) }
+            guard stillSelected else {
+                await MainActor.run {
+                    DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=leftTab:\(reason)")
+                    goingTabPerf.avatarPrefetchTask = nil
+                }
+                return
+            }
+            var uncached: [URL] = []
+            for url in candidateURLs {
+                if await DiscoverMapImageCache.shared.cachedImage(for: url, bucket: .avatar) == nil {
+                    uncached.append(url)
+                }
+            }
+            guard !uncached.isEmpty else {
+#if DEBUG
+                print("[SmoothPerf] operation=goingAvatarPrefetch skipped=alreadyCached durationMs=0 coalesced=false avatarCount=\(candidateURLs.count) reason=\(reason)")
+#endif
+                await MainActor.run { goingTabPerf.avatarPrefetchTask = nil }
+                return
+            }
+            guard !Task.isCancelled else {
+                await MainActor.run {
+                    DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=taskCancelledBeforeFetch:\(reason)")
+                    goingTabPerf.avatarPrefetchTask = nil
+                }
+                return
+            }
+            let stillOnGoing = await MainActor.run { isGoingTabSelectionGenerationCurrent(generation) }
+            guard stillOnGoing else {
+                await MainActor.run {
+                    DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] prefetchCanceled reason=leftBeforeFetch:\(reason)")
+                    goingTabPerf.avatarPrefetchTask = nil
+                }
+                return
+            }
+            await DiscoverMapImageCache.shared.prefetch(urls: uncached, bucket: .avatar)
 #if DEBUG
             let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-            print("[SmoothPerf] operation=goingAvatarPrefetch skipped=none durationMs=\(ms) coalesced=false avatarCount=\(urls.count) reason=\(reason)")
+            print("[SmoothPerf] operation=goingAvatarPrefetch skipped=none durationMs=\(ms) coalesced=false avatarCount=\(uncached.count) reason=\(reason)")
 #endif
+            await MainActor.run {
+                if goingTabPerf.avatarPrefetchTask != nil {
+                    goingTabPerf.avatarPrefetchTask = nil
+                }
+            }
         }
     }
 
@@ -1164,18 +1387,21 @@ struct FollowingScreen: View {
     private var goingModeSwitcher: some View {
         GameOnSegmentedControl(
             tabs: goingModeTabs,
-            selection: $selectedGoingMode
+            selection: $selectedGoingMode,
+            titleMinimumScaleFactor: 0.58,
+            tabHorizontalPadding: 5
         )
     }
 
     private var goingModeTabs: [GameOnSegmentedTab<GoingParticipationMode>] {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
         let proGames = GameOnSegmentedTab(
             id: GoingParticipationMode.proGames,
             title: GoingParticipationMode.proGames.title,
             systemImage: GoingParticipationMode.proGames.systemImage,
             badge: savedProGamesTabBadge,
-            tint: FGColor.accentGreen,
-            accessibilityLabel: "Saved pro games"
+            tint: GoingParticipationMode.proGames.tint,
+            accessibilityLabel: L10n.t("going_a11y_pro_games", languageCode: languageCode)
         )
         if isBusinessProGamesOnly {
             return [proGames]
@@ -1186,44 +1412,53 @@ struct FollowingScreen: View {
                 title: GoingParticipationMode.venueGames.title,
                 systemImage: GoingParticipationMode.venueGames.systemImage,
                 badge: venueGamesTabBadge,
-                tint: FGColor.accentGreen,
-                accessibilityLabel: "Venue-hosted games"
+                tint: GoingParticipationMode.venueGames.tint,
+                accessibilityLabel: L10n.t("going_a11y_watch", languageCode: languageCode)
             ),
             GameOnSegmentedTab(
                 id: GoingParticipationMode.pickupGames,
                 title: GoingParticipationMode.pickupGames.title,
                 systemImage: GoingParticipationMode.pickupGames.systemImage,
                 badge: pickupGamesTabBadge,
-                tint: FGColor.accentGreen,
+                tint: GoingParticipationMode.pickupGames.tint,
                 showsActivityDot: viewModel.pendingPickupGameJoinRequestCount > 0 || !viewModel.incomingPickupGameInvites.isEmpty,
-                accessibilityLabel: "Pickup and community games",
-                activityAccessibilityLabel: "Pickup activity waiting"
+                accessibilityLabel: L10n.t("going_a11y_play", languageCode: languageCode),
+                activityAccessibilityLabel: L10n.t("going_a11y_play_activity", languageCode: languageCode)
             ),
             proGames
         ]
     }
 
     private var goingVenueTabsGroup: some View {
-        goingTabbedPanel(title: "Venue Games", subtitle: "Venue-hosted games, sports bars, saved venues, and friends going later.") {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let gamesTitle = L10n.t("games_im_going_to", languageCode: languageCode)
+        let savedTitle = L10n.t("saved_spots", languageCode: languageCode)
+        return goingTabbedPanel(
+            title: L10n.t("watch_plans", languageCode: languageCode),
+            subtitle: L10n.t("watch_plans_description", languageCode: languageCode)
+        ) {
             GameOnSegmentedControl(
                 tabs: [
                     GameOnSegmentedTab(
                         id: GoingVenueTab.games,
-                        title: "I’m Going",
+                        title: gamesTitle,
                         systemImage: "checkmark.circle.fill",
                         badge: goingVenueGamesInnerTabBadge,
-                        tint: FGColor.accentGreen,
-                        accessibilityLabel: "I’m Going venue games"
+                        tint: FGColor.intentWatch,
+                        accessibilityLabel: gamesTitle
                     ),
                     GameOnSegmentedTab(
                         id: GoingVenueTab.saved,
-                        title: "Saved",
+                        title: savedTitle,
                         systemImage: "heart.fill",
                         badge: goingVenueSavedInnerTabBadge,
-                        tint: FGColor.accentGreen
+                        tint: FGColor.intentWatch,
+                        accessibilityLabel: savedTitle
                     )
                 ],
-                selection: $selectedGoingVenueTab
+                selection: $selectedGoingVenueTab,
+                titleMinimumScaleFactor: 0.62,
+                tabHorizontalPadding: 6
             )
         } content: {
             Group {
@@ -1246,12 +1481,16 @@ struct FollowingScreen: View {
     }
 
     private var goingGamesTabsGroup: some View {
-        goingTabbedPanel(title: "Pickup Games", subtitle: "Pickup, practice, and scrimmage activity.") {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return goingTabbedPanel(
+            title: L10n.t("play_plans", languageCode: languageCode),
+            subtitle: L10n.t("play_plans_description", languageCode: languageCode)
+        ) {
             GameOnSegmentedControl(
                 tabs: [
-                    GameOnSegmentedTab(id: GoingGamesTab.playing, title: "Playing", badge: pickupPlayingTabBadge, tint: FGColor.accentGreen),
-                    GameOnSegmentedTab(id: GoingGamesTab.hosting, title: "Hosting", badge: pickupHostingTabBadge, tint: Color.orange),
-                    GameOnSegmentedTab(id: GoingGamesTab.invites, title: "Invites", badge: pickupInvitesTabBadge, tint: FGColor.accentBlue)
+                    GameOnSegmentedTab(id: GoingGamesTab.playing, title: L10n.t("going_play_tab_playing", languageCode: languageCode), badge: pickupPlayingTabBadge, tint: FGColor.intentPlay),
+                    GameOnSegmentedTab(id: GoingGamesTab.hosting, title: L10n.t("going_play_tab_hosting", languageCode: languageCode), badge: pickupHostingTabBadge, tint: FGColor.intentPlay),
+                    GameOnSegmentedTab(id: GoingGamesTab.invites, title: L10n.t("going_play_tab_invites", languageCode: languageCode), badge: pickupInvitesTabBadge, tint: FGColor.intentPlay)
                 ],
                 selection: $selectedGoingGamesTab
             )
@@ -1272,7 +1511,12 @@ struct FollowingScreen: View {
     }
 
     private var goingProGamesGroup: some View {
-        goingTabbedPanel(title: "Pro Games", subtitle: proGamesPanelSubtitle) {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return goingTabbedPanel(
+            title: L10n.t("professional_games", languageCode: languageCode),
+            subtitle: L10n.t("professional_games_description", languageCode: languageCode),
+            headerStyle: .sectionIntroduction
+        ) {
             if isBusinessProGamesOnly {
                 businessProGamesFilterControl
             } else {
@@ -1345,12 +1589,6 @@ struct FollowingScreen: View {
         }
     }
 
-    private var proGamesPanelSubtitle: String {
-        isBusinessProGamesOnly
-            ? "Saved pro games and followed-team matches for your business."
-            : "Saved and favorite-team pro games to watch later."
-    }
-
     @ViewBuilder
     private var savedProGamesContent: some View {
         if isBusinessProGamesOnly {
@@ -1361,16 +1599,20 @@ struct FollowingScreen: View {
     }
 
     private var fanSavedProGamesContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 28) {
             VStack(alignment: .leading, spacing: 10) {
-                sectionEyebrow("Saved Games")
+                goingProGamesSectionHeader(
+                    title: L10n.t("saved_pro_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    description: L10n.t("saved_pro_games_description", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                )
                 goingSavedProGamesCompletedVisibilityNote
                 if manualSavedProGamesForDisplay.isEmpty {
                     goingRichEmptyCard(
-                        title: "📺 No saved pro games",
+                        title: "📺 \(L10n.t("no_saved_pro_sports_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))",
                         description: "Save live or upcoming games to follow them here.",
-                        buttonTitle: "Browse Pro Games",
-                        buttonAction: openCalendarProGamesFromGoing
+                        buttonTitle: L10n.t("browse_pro_sports_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        buttonAction: openCalendarProGamesFromGoing,
+                        buttonAccent: FGColor.intentProGames
                     )
                 } else {
                     VStack(spacing: 12) {
@@ -1387,14 +1629,19 @@ struct FollowingScreen: View {
             }
 
             VStack(alignment: .leading, spacing: 10) {
-                sectionEyebrow("Favorite Team Games")
+                goingProGamesSectionHeader(
+                    title: L10n.t("favorite_team_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    description: L10n.t("favorite_team_games_description", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                )
+                goingFavoriteTeamsSummaryRow
                 favoriteTeamAlertsToggleRow
                 if resolvedFavoriteTeamsForGoing.isEmpty {
                     goingRichEmptyCard(
                         title: "⭐ No favorite teams selected",
                         description: "Follow your favorite teams to receive kickoff, goal, and final-score alerts.",
                         buttonTitle: "Add Favorite Teams",
-                        buttonAction: { showFavoriteTeamsPicker = true }
+                        buttonAction: { showFavoriteTeamsPicker = true },
+                        buttonAccent: FGColor.intentProGames
                     )
                 } else if !favoriteTeamProGameAlertsEnabled {
                     goingRichEmptyCard(
@@ -1429,7 +1676,7 @@ struct FollowingScreen: View {
                 }
             }
         }
-        .padding(.top, 6)
+        .padding(.top, 10)
         .task(id: manualSavedProGamesForDisplay.map(\.stableKey).joined(separator: "|")) {
             guard goingTabPerf.deferredWorkReady || isFollowingTabSelected else { return }
             await Task.yield()
@@ -1441,7 +1688,7 @@ struct FollowingScreen: View {
     }
 
     private var businessProGamesContent: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 28) {
             if selectedBusinessProGameFilter == .all {
                 businessSavedProGamesSection
                 businessMyTeamsProGamesSection
@@ -1449,18 +1696,21 @@ struct FollowingScreen: View {
                 businessMyTeamsFilteredSection
             }
         }
-        .padding(.top, 6)
+        .padding(.top, 10)
     }
 
     private var businessSavedProGamesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionEyebrow("Saved Games")
+            goingProGamesSectionHeader(
+                title: L10n.t("Saved Games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                description: L10n.t("saved_pro_games_description", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+            )
             goingSavedProGamesCompletedVisibilityNote
             if manualSavedProGamesForDisplay.isEmpty {
                 emptyCard(
                     icon: "heart",
-                    title: "No saved pro games yet.",
-                    subtitle: "Save pro games you want your business to track."
+                    title: L10n.t("no_saved_pro_sports_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    subtitle: L10n.t("save_pro_sports_games_for_business", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
                 )
             } else {
                 VStack(spacing: 12) {
@@ -1479,15 +1729,21 @@ struct FollowingScreen: View {
 
     private var businessMyTeamsProGamesSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionEyebrow("My Teams")
-            businessMyTeamsProGameList(emptyTitle: "No upcoming pro games found for your followed teams.")
+            goingProGamesSectionHeader(
+                title: "My Teams",
+                description: "Games involving the teams you follow."
+            )
+            businessMyTeamsProGameList(emptyTitle: "No upcoming pro sports games found for your followed teams.")
         }
     }
 
     private var businessMyTeamsFilteredSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionEyebrow("My Teams")
-            businessMyTeamsProGameList(emptyTitle: "No My Teams pro games match right now.")
+            goingProGamesSectionHeader(
+                title: "My Teams",
+                description: "Games involving the teams you follow."
+            )
+            businessMyTeamsProGameList(emptyTitle: "No My Teams pro sports games match right now.")
         }
     }
 
@@ -1577,10 +1833,18 @@ struct FollowingScreen: View {
     }
 
     private func prepareGoingTabVisibleSurface(reason: String) async {
+        guard isFollowingTabSelected else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=prepareNotSelected")
+            return
+        }
         if goingTabPerf.screenAppearAt == nil {
             markGoingScreenAppear(source: reason)
         }
         await Task.yield()
+        guard isFollowingTabSelected else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=prepareLeftMidYield")
+            return
+        }
         let started = CFAbsoluteTimeGetCurrent()
         if viewModel.savedProGames.isEmpty, let userID = viewModel.currentUserAuthId {
             viewModel.reloadSavedProGamesFromStorage(for: userID)
@@ -1592,6 +1856,10 @@ struct FollowingScreen: View {
             )
         } else {
             await rebuildGoingProGamesDisplayCaches(reason: reason)
+        }
+        guard isFollowingTabSelected else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=prepareLeftBeforePublish")
+            return
         }
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
         AppPerfDebug.mainActorBlocked(ms: ms, tab: "following", source: "prepareGoingTabVisibleSurface")
@@ -1631,8 +1899,12 @@ struct FollowingScreen: View {
         )
     }
 
-    private func performGoingTabBackgroundRefresh(reason: String) async {
+    private func performGoingTabBackgroundRefresh(reason: String, selectionGeneration: UInt64) async {
         guard viewModel.isAuthenticatedForSocialFeatures else { return }
+        guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=backgroundStaleGeneration")
+            return
+        }
         if goingTabPerf.backgroundRefreshInFlight {
             TabPerf.duplicateRefreshCoalesced(name: "goingTabBackgroundRefresh")
             GoingPerfDebug.duplicateRefreshSkipped(source: reason, reason: "inFlight")
@@ -1653,7 +1925,9 @@ struct FollowingScreen: View {
                 "[GoingProPerf] backgroundWorkFinished durationMs=\(ms)"
             )
             GoingPerfDebug.refreshFinished(source: reason, durationMs: ms)
-            Task { await rebuildGoingProGamesDisplayCaches(reason: "refreshFinished:\(reason)") }
+            if isGoingTabSelectionGenerationCurrent(selectionGeneration) {
+                Task { await rebuildGoingProGamesDisplayCaches(reason: "refreshFinished:\(reason)") }
+            }
         }
 
         if isBusinessProGamesOnly {
@@ -1662,12 +1936,20 @@ struct FollowingScreen: View {
         }
 
         guard viewModel.canUseFollowingTab else { return }
+        guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=backgroundLeftEarly")
+            return
+        }
 
         if goingProDataRecentlyWarmedFromScheduleOrCalendar() {
             DebugLogGate.goingTabPerfVerbose(
                 "[GoingProPerf] refreshSkipped reason=calendarRecentlyRefreshed"
             )
-            await scheduleDeferredGoingTabWork(reason: reason, deferFavoriteTeamRefresh: true)
+            await scheduleDeferredGoingTabWork(
+                reason: reason,
+                deferFavoriteTeamRefresh: true,
+                selectionGeneration: selectionGeneration
+            )
             return
         }
 
@@ -1675,7 +1957,11 @@ struct FollowingScreen: View {
             AppPerfDebug.refreshSkipped(tab: "following", source: reason, reason: "tabPreloadRecent")
             GoingPerfDebug.duplicateRefreshSkipped(source: reason, reason: "tabPreloadRecent")
             await viewModel.fetchSavedProGames(reason: "goingDeferred:\(reason)")
-            await scheduleDeferredGoingTabWork(reason: reason, deferFavoriteTeamRefresh: true)
+            await scheduleDeferredGoingTabWork(
+                reason: reason,
+                deferFavoriteTeamRefresh: true,
+                selectionGeneration: selectionGeneration
+            )
             return
         }
 
@@ -1684,29 +1970,54 @@ struct FollowingScreen: View {
                 await Task.yield()
                 try? await Task.sleep(nanoseconds: 40_000_000)
                 if Task.isCancelled { return }
+                if !isGoingTabSelectionGenerationCurrent(selectionGeneration) { return }
             }
             GoingPerfDebug.duplicateRefreshSkipped(source: reason, reason: "awaitedTabPreload")
             if goingProDataRecentlyWarmedFromScheduleOrCalendar() {
                 DebugLogGate.goingTabPerfVerbose(
                     "[GoingProPerf] refreshSkipped reason=calendarRecentlyRefreshed"
                 )
-                await scheduleDeferredGoingTabWork(reason: reason, deferFavoriteTeamRefresh: true)
+                await scheduleDeferredGoingTabWork(
+                    reason: reason,
+                    deferFavoriteTeamRefresh: true,
+                    selectionGeneration: selectionGeneration
+                )
                 return
             }
             await viewModel.fetchSavedProGames(reason: "goingDeferred:\(reason)")
-            await scheduleDeferredGoingTabWork(reason: reason, deferFavoriteTeamRefresh: true)
+            await scheduleDeferredGoingTabWork(
+                reason: reason,
+                deferFavoriteTeamRefresh: true,
+                selectionGeneration: selectionGeneration
+            )
             return
         }
 
         await viewModel.refreshFollowingTabDataGloballyUnlessFresh()
+        guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=backgroundLeftAfterGlobal")
+            return
+        }
         rebuildFollowingDisplayCaches(reason: "backgroundRefresh:\(reason)", prefetchAvatars: false)
         await viewModel.fetchSavedProGames(reason: "goingBackground:\(reason)")
         await viewModel.loadMyPickupGameJoinRequestsForFollowing(reason: reason)
         await viewModel.loadIncomingPickupGameInvites()
-        await scheduleDeferredGoingTabWork(reason: reason, deferFavoriteTeamRefresh: false)
+        await scheduleDeferredGoingTabWork(
+            reason: reason,
+            deferFavoriteTeamRefresh: false,
+            selectionGeneration: selectionGeneration
+        )
     }
 
-    private func scheduleDeferredGoingTabWork(reason: String, deferFavoriteTeamRefresh: Bool) async {
+    private func scheduleDeferredGoingTabWork(
+        reason: String,
+        deferFavoriteTeamRefresh: Bool,
+        selectionGeneration: UInt64
+    ) async {
+        guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=deferredWorkStale")
+            return
+        }
         let hasCachedFavorite =
             !viewModel.favoriteTeamProGames.isEmpty
             || !goingTabPerf.cachedFavoriteTeamProGamesForDisplay.isEmpty
@@ -1720,9 +2031,17 @@ struct FollowingScreen: View {
             )
             try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
             guard !Task.isCancelled else { return }
+            guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+                DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=leftDuringFavoriteDefer")
+                return
+            }
         }
         GoingPerfDebug.deferredWork("favoriteTeamProGamesRefresh", source: reason)
         await refreshFavoriteTeamProGames(reason: reason)
+        guard isGoingTabSelectionGenerationCurrent(selectionGeneration) else {
+            DebugLogGate.goingTabPerfVerbose("[GoingTabPerf] deferredTaskCanceled reason=leftBeforeAvatarPrefetch")
+            return
+        }
         rebuildFollowingDisplayCaches(reason: "deferred:\(reason)", prefetchAvatars: false)
         GoingPerfDebug.deferredWork("goingAvatarPrefetch", source: reason)
         prefetchVisibleGoingAvatars(reason: "deferred:\(reason)")
@@ -1898,6 +2217,9 @@ struct FollowingScreen: View {
                 row: $0,
                 now: followingMyPickupClockTick
             )
+        }.filter { row in
+            guard goingDayScope == .today else { return true }
+            return isPickupStartOnLocalToday(row.game_start_at, now: followingMyPickupClockTick)
         }
     }
 
@@ -1910,15 +2232,13 @@ struct FollowingScreen: View {
     }
 
     private var businessAllProGamesBadge: String? {
-        let count = manualSavedProGamesForDisplay.count + businessMyTeamProGamesForDisplay.count
-        guard count > 0 else { return nil }
-        return count > 9 ? "9+" : "\(count)"
+        liveSubTabBadgeCount(manualSavedProGamesForDisplay.count + businessMyTeamProGamesForDisplay.count)
     }
 
     private var businessMyTeamsProGamesBadge: String? {
-        let count = businessMyTeamSavedProGamesForDisplay.count + businessMyTeamProGamesForDisplay.count
-        guard count > 0 else { return nil }
-        return count > 9 ? "9+" : "\(count)"
+        liveSubTabBadgeCount(
+            businessMyTeamSavedProGamesForDisplay.count + businessMyTeamProGamesForDisplay.count
+        )
     }
 
     private func favoriteTeamAutoFollowMatch(for game: SavedProGame) -> FavoriteTeamProGame? {
@@ -1961,7 +2281,7 @@ struct FollowingScreen: View {
     private var goingSavedProGamesCompletedVisibilityNote: some View {
         if goingSavedProGamesShowsCompletedVisibilityNote {
             Text("ⓘ Completed games remain visible for 48 hours after they finish.")
-                .font(FGTypography.caption)
+                .font(.footnote)
                 .foregroundStyle(FGColor.secondaryText(followingColorScheme))
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1972,12 +2292,155 @@ struct FollowingScreen: View {
         }
     }
 
-    private func sectionEyebrow(_ text: String) -> some View {
-        Text(text.uppercased())
-            .font(.caption2.weight(.bold))
-            .tracking(0.8)
-            .foregroundStyle(FGColor.mutedText(followingColorScheme))
+    /// Large section titles inside Pro Games (Saved Games / Favorite Team Games).
+    private func goingProGamesSectionHeader(title: String, description: String?) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.title3.weight(.bold))
+                .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                .accessibilityAddTraits(.isHeader)
+
+            if let description, !description.isEmpty {
+                Text(description)
+                    .font(.subheadline)
+                    .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var goingFavoriteTeamsSummaryLanguageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    /// Trailing scroll inset so the last favorite-team chip clears the fixed Edit chrome (~Edit width + fade).
+    private static let goingFavoriteTeamsEditTrailingInset: CGFloat = 92
+
+    /// Compact favorite-team chips above Team Alerts. Uses ``FavoriteTeamsStore`` / ``FavoriteTeam`` only.
+    @ViewBuilder
+    private var goingFavoriteTeamsSummaryRow: some View {
+        let teams = resolvedFavoriteTeamsForGoing
+        let languageCode = goingFavoriteTeamsSummaryLanguageCode
+        if teams.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(L10n.t("going_favorite_teams_empty", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Button {
+                    showFavoriteTeamsPicker = true
+                } label: {
+                    Text(L10n.t("going_favorite_teams_choose", languageCode: languageCode))
+                        .font(FGTypography.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.accentGreen)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("going_favorite_teams_choose", languageCode: languageCode))
+            }
             .padding(.horizontal, 2)
+            .accessibilityElement(children: .combine)
+        } else {
+            // Full-width chip scroll with a fixed trailing Edit chrome. Content inset keeps the
+            // last chip from stopping under Edit; clip is enabled so chips never paint behind it.
+            let trailingChromeBackground = FGColor.background(followingColorScheme)
+            ZStack(alignment: .trailing) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(teams.prefix(3))) { team in
+                            goingFavoriteTeamChip(team)
+                        }
+                        if teams.count > 3 {
+                            Text(
+                                String(
+                                    format: L10n.t("going_favorite_teams_more_format", languageCode: languageCode),
+                                    locale: Locale(identifier: languageCode),
+                                    teams.count - 3
+                                )
+                            )
+                            .font(FGTypography.metadata.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background {
+                                Capsule(style: .continuous)
+                                    .fill(FGColor.mutedText(followingColorScheme).opacity(followingColorScheme == .dark ? 0.18 : 0.10))
+                            }
+                            .accessibilityLabel(
+                                String(
+                                    format: L10n.t("going_favorite_teams_more_a11y_format", languageCode: languageCode),
+                                    locale: Locale(identifier: languageCode),
+                                    teams.count - 3
+                                )
+                            )
+                        }
+                    }
+                    .padding(.vertical, 1)
+                    .padding(.trailing, Self.goingFavoriteTeamsEditTrailingInset)
+                }
+
+                HStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [
+                            trailingChromeBackground.opacity(0),
+                            trailingChromeBackground
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: 28)
+                    .allowsHitTesting(false)
+
+                    Button {
+                        showFavoriteTeamsPicker = true
+                    } label: {
+                        Text(L10n.t("going_favorite_teams_edit", languageCode: languageCode))
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.accentGreen)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .background(trailingChromeBackground)
+                    .accessibilityLabel(L10n.t("going_favorite_teams_edit_a11y", languageCode: languageCode))
+                }
+            }
+            .padding(.horizontal, 2)
+            .accessibilityElement(children: .contain)
+        }
+    }
+
+    private func goingFavoriteTeamChip(_ team: FavoriteTeam) -> some View {
+        HStack(spacing: 6) {
+            SportsIdentityArtworkView(favoriteTeam: team, diameter: 22)
+            Text(team.name)
+                .font(FGTypography.metadata.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+        }
+        .padding(.leading, 4)
+        .padding(.trailing, 10)
+        .padding(.vertical, 4)
+        .background {
+            Capsule(style: .continuous)
+                .fill(FGColor.cardBackground(followingColorScheme))
+        }
+        .overlay {
+            Capsule(style: .continuous)
+                .strokeBorder(FGColor.divider(followingColorScheme).opacity(0.7), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(team.name)
     }
 
     private var favoriteTeamAlertsToggleRow: some View {
@@ -2073,6 +2536,9 @@ struct FollowingScreen: View {
 
     private var playingGamesContent: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if goingDayScope == .today {
+                goingTodayScopeBanner
+            }
             if !viewModel.canFanUsePickupGamesUI {
                 emptyCard(
                     icon: "figure.run",
@@ -2083,10 +2549,23 @@ struct FollowingScreen: View {
                 pickupSubtabLoadingCard(message: "Loading games…")
             } else if playingGameCards.isEmpty {
                 goingRichEmptyCard(
-                    title: "⚽ No pickup games joined yet",
-                    description: "Join local pickup games and track them here.",
-                    buttonTitle: "Find Pickup Games",
-                    buttonAction: openDiscoverForPickupGamesFromGoing
+                    title: goingDayScope == .today
+                        ? L10n.t("no_pickup_plans_today", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("no_pickup_plans", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    description: goingDayScope == .today
+                        ? L10n.t("no_pickup_plans_today_supporting", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("no_pickup_plans_supporting", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonTitle: goingDayScope == .today
+                        ? L10n.t("show_all", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("explore_discover", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonAction: {
+                        if goingDayScope == .today {
+                            goingDayScope = .all
+                        } else {
+                            openDiscoverForPickupGamesFromGoing()
+                        }
+                    },
+                    buttonAccent: FGColor.intentPlay
                 )
             } else {
                 joinedGamesListContent
@@ -2101,6 +2580,9 @@ struct FollowingScreen: View {
 
     private var hostingGamesContent: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if goingDayScope == .today {
+                goingTodayScopeBanner
+            }
             if !viewModel.canFanUsePickupGamesUI {
                 emptyCard(
                     icon: "figure.run",
@@ -2112,10 +2594,19 @@ struct FollowingScreen: View {
 
                 if shouldShowHostingPickupLoadingState {
                     pickupSubtabLoadingCard(message: "Loading games…")
-                } else if viewModel.myPickupGamesForSettings.isEmpty, viewModel.myRemovedPickupGamesForSettings.isEmpty {
+                } else if goingPickupHostingGamesForDisplay.isEmpty,
+                          (goingDayScope == .today || (viewModel.myPickupGamesForSettings.isEmpty
+                            && viewModel.myRemovedPickupGamesForSettings.isEmpty)) {
                     goingRichEmptyCard(
-                        title: "🏆 You're not hosting any games yet",
-                        description: "Create a pickup game and invite local players."
+                        title: goingDayScope == .today
+                            ? "No hosted games today"
+                            : "🏆 You're not hosting any games yet",
+                        description: goingDayScope == .today
+                            ? "You have no hosted pickup games for today."
+                            : "Create a pickup game and invite local players.",
+                        buttonTitle: goingDayScope == .today ? "Show all" : nil,
+                        buttonAction: goingDayScope == .today ? { goingDayScope = .all } : nil,
+                        buttonAccent: FGColor.intentPlay
                     )
                 } else {
                     hostedGamesListContent
@@ -2186,10 +2677,9 @@ struct FollowingScreen: View {
         .animation(.spring(response: 0.32, dampingFraction: 0.86), value: viewModel.incomingPickupGameInvites.count)
     }
 
+    /// Playing sub-tab: same filtered list as `playingGamesContent`.
     private var pickupPlayingTabBadge: String? {
-        let count = viewModel.pickupActivityCount
-        guard count > 0 else { return nil }
-        return count > 9 ? "9+" : "\(count)"
+        liveSubTabBadgeCount(playingGameCards.count)
     }
 
     private var goingVenueSavedVenuesForDisplay: [BarVenue] {
@@ -2217,11 +2707,11 @@ struct FollowingScreen: View {
     }
 
     private var goingVenueGamesInnerTabBadge: String? {
-        compactTabBadgeCount(goingVenueGamesVisibleCount)
+        liveSubTabBadgeCount(goingVenueGamesVisibleCount)
     }
 
     private var goingVenueSavedInnerTabBadge: String? {
-        compactTabBadgeCount(goingVenueSavedVisibleCount)
+        liveSubTabBadgeCount(goingVenueSavedVisibleCount)
     }
 
     private func logGoingVenueBadgeDebug(
@@ -2330,36 +2820,82 @@ struct FollowingScreen: View {
         return count > 9 ? "9+" : "\(count)"
     }
 
+    /// Second-level Going tabs always show a live count (including 0) for discoverability.
+    private func liveSubTabBadgeCount(_ count: Int) -> String {
+        count > 9 ? "9+" : "\(max(0, count))"
+    }
+
     private var playingGameCards: [PickupGameJoinRequestCardDisplay] {
-        cachedPlayingGameCards
+        let base = cachedPlayingGameCards
+        guard goingDayScope == .today else { return base }
+        return base.filter { isPickupStartOnLocalToday($0.game_start_at, now: followingMyPickupClockTick) }
     }
 
+    private var goingTodayScopeBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "calendar")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FGColor.accentBlue)
+            Text("Showing today")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(followingColorScheme))
+            Spacer(minLength: 0)
+            Button("Show all") {
+                goingDayScope = .all
+            }
+            .font(.system(size: 12, weight: .bold, design: .rounded))
+            .foregroundStyle(FGColor.accentBlue)
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(FGColor.accentBlue.opacity(followingColorScheme == .dark ? 0.16 : 0.10))
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Showing today. Show all.")
+    }
+
+    /// Hosting sub-tab: same filtered list as `hostingGamesContent` / `goingPickupHostingGamesForDisplay`.
     private var pickupHostingTabBadge: String? {
-        let count = viewModel.pendingPickupGameJoinRequestCount
-        guard count > 0 else { return nil }
-        return count > 9 ? "9+ Pending" : "\(count) Pending"
+        liveSubTabBadgeCount(goingPickupHostingGamesForDisplay.count)
     }
 
+    /// Invites sub-tab: same filtered list as `invitesGamesContent` / `goingPickupInvitesForDisplay`.
     private var pickupInvitesTabBadge: String? {
-        let count = viewModel.incomingPickupGameInvites.count
-        guard count > 0 else { return nil }
-        return count > 9 ? "9+" : "\(count)"
+        liveSubTabBadgeCount(goingPickupInvitesForDisplay.count)
+    }
+
+    private enum GoingTabbedPanelHeaderStyle {
+        /// Compact muted label used by Venue / Pickup panels.
+        case standard
+        /// Clearer section introduction used by Pro Games.
+        case sectionIntroduction
     }
 
     private func goingTabbedPanel<Tabs: View, Content: View>(
         title: String,
         subtitle: String,
+        headerStyle: GoingTabbedPanelHeaderStyle = .standard,
         @ViewBuilder tabs: () -> Tabs,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: headerStyle == .sectionIntroduction ? 16 : 14) {
+            VStack(alignment: .leading, spacing: headerStyle == .sectionIntroduction ? 5 : 3) {
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .tracking(1.0)
-                    .foregroundStyle(FGColor.mutedText(followingColorScheme))
+                    .font(headerStyle == .sectionIntroduction
+                          ? .headline.weight(.semibold)
+                          : .system(size: 12, weight: .semibold, design: .rounded))
+                    .tracking(headerStyle == .sectionIntroduction ? 0 : 1.0)
+                    .foregroundStyle(
+                        headerStyle == .sectionIntroduction
+                            ? FGColor.primaryText(followingColorScheme)
+                            : FGColor.mutedText(followingColorScheme)
+                    )
+                    .accessibilityAddTraits(.isHeader)
                 Text(subtitle)
-                    .font(FGTypography.caption)
+                    .font(headerStyle == .sectionIntroduction ? .subheadline : FGTypography.caption)
                     .foregroundStyle(FGColor.secondaryText(followingColorScheme))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -2368,7 +2904,7 @@ struct FollowingScreen: View {
 
             Divider()
                 .overlay(FGColor.divider(followingColorScheme).opacity(0.65))
-                .padding(.top, 2)
+                .padding(.top, headerStyle == .sectionIntroduction ? 4 : 2)
 
             content()
         }
@@ -2613,12 +3149,27 @@ struct FollowingScreen: View {
 
     private var venueGamesTabContent: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if goingDayScope == .today {
+                goingTodayScopeBanner
+            }
             if goingVenueGameItems.isEmpty {
                 goingRichEmptyCard(
-                    title: "🏟️ No venue games yet",
-                    description: "Discover sports bars, watch parties, and venue events near you.",
-                    buttonTitle: "Explore Discover",
-                    buttonAction: openDiscoverFromGoing
+                    title: goingDayScope == .today
+                        ? L10n.t("no_watch_plans_today", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("no_watch_plans", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    description: goingDayScope == .today
+                        ? L10n.t("no_watch_plans_today_supporting", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("no_watch_plans_supporting", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonTitle: goingDayScope == .today
+                        ? L10n.t("show_all", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))
+                        : L10n.t("explore_discover", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonAction: {
+                        if goingDayScope == .today {
+                            goingDayScope = .all
+                        } else {
+                            openDiscoverFromGoing()
+                        }
+                    }
                 )
             } else {
                 VStack(spacing: 12) {
@@ -2635,10 +3186,10 @@ struct FollowingScreen: View {
         VStack(alignment: .leading, spacing: 14) {
             if goingVenueSavedVenuesForDisplay.isEmpty {
                 goingRichEmptyCard(
-                    title: "❤️ No saved venues yet",
-                    description: "Save sports bars and watch spots to quickly find them later.",
-                    buttonTitle: "Find Watch Spots",
-                    buttonAction: openDiscoverFromGoing
+                    title: L10n.t("no_saved_spots", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    description: L10n.t("no_saved_spots_supporting", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonTitle: L10n.t("explore_watch_spots", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                    buttonAction: openDiscoverWatchSpotsFromGoing
                 )
             } else {
                 VStack(spacing: 12) {
@@ -3051,7 +3602,7 @@ struct FollowingScreen: View {
                 )
                 .buttonStyle(.plain)
                 .contentShape(Capsule(style: .continuous))
-                .accessibilityLabel("Clear completed pro game")
+                .accessibilityLabel("Clear completed pro sports game")
             } else {
                 Button {
                     clearSavedProGame(game)
@@ -3065,7 +3616,7 @@ struct FollowingScreen: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Circle())
-                .accessibilityLabel("Unsave pro game")
+                .accessibilityLabel(L10n.t("unsave_pro_sports_game_a11y", languageCode: appLanguageRaw))
             }
         }
     }
@@ -3084,7 +3635,7 @@ struct FollowingScreen: View {
         )
         .buttonStyle(.plain)
         .contentShape(Capsule(style: .continuous))
-        .accessibilityLabel("Clear completed favorite team pro game")
+        .accessibilityLabel("Clear completed favorite team pro sports game")
     }
 
     private func savedProGameScoreUpdatesControl(
@@ -3176,7 +3727,7 @@ struct FollowingScreen: View {
                 }
             }
             applyImmediateGoingProDisplayCacheAfterClear(reason: "manualClear")
-            viewModel.showSocialActionToast("Removed from Pro Games.", isError: false)
+            viewModel.showSocialActionToast(L10n.t("removed_from_pro_sports_games"), isError: false)
 #if DEBUG
             print("[GoingProClearDebug] optimisticRemoved=true")
             print("[GoingProClearDebug] persisted=true")
@@ -3197,7 +3748,7 @@ struct FollowingScreen: View {
             tokens.insert(completedFavoriteTeamProGameClearToken(for: displayGame, scope: scope))
             clearedCompletedFavoriteTeamProGamesRaw = tokens.sorted().joined(separator: "\n")
             applyImmediateGoingProDisplayCacheAfterClear(reason: "favoriteTeamClear:\(scope)")
-            viewModel.showSocialActionToast("Cleared completed Pro Game.", isError: false)
+            viewModel.showSocialActionToast(L10n.t("cleared_completed_pro_sports_game"), isError: false)
 #if DEBUG
             print("[GoingProClearDebug] optimisticRemoved=true")
             print("[GoingProClearDebug] persisted=true")
@@ -3942,7 +4493,7 @@ struct FollowingScreen: View {
                     .padding(.vertical, 10)
             }
             .buttonStyle(.borderedProminent)
-            .tint(FGColor.accentGreen)
+            .tint(FGColor.intentPlay)
             .padding(.top, 2)
             .accessibilityLabel("Create Game")
         }
@@ -4305,6 +4856,19 @@ struct FollowingScreen: View {
             backendSynced: true,
             rollback: false
         )
+        if target == .going {
+            // Optimistic Going path uses max(attendeeCount + 1, 1) when newly going,
+            // so followingTabGoingInterestCounts already includes the current user.
+            let total = viewModel.followingTabGoingInterestCounts[item.id]
+                ?? viewModel.interestCountForVenueEvent(item.id)
+            let includesSelf = viewModel.followingTabUserVenueEventInterestIDs.contains(item.id)
+                || viewModel.isInterestedInVenueEvent(item.id)
+            viewModel.presentGoingWowMoment(
+                totalGoingCount: total,
+                includesCurrentUser: includesSelf,
+                venueEventID: item.id
+            )
+        }
 #if DEBUG
         switch target {
         case .going:
@@ -4469,11 +5033,13 @@ struct FollowingScreen: View {
                         .foregroundStyle(FGColor.primaryText(followingColorScheme))
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
-                    GameFormatBadgeView(
-                        format: resolvedGame?.gameFormat ?? .pickup,
-                        colorScheme: followingColorScheme
-                    )
-                    pickupJoinStatusPill(card.pill)
+                    HStack(alignment: .center, spacing: 7) {
+                        GameFormatBadgeView(
+                            format: resolvedGame?.gameFormat ?? .pickup,
+                            colorScheme: followingColorScheme
+                        )
+                        pickupJoinStatusPill(card.pill)
+                    }
                     if isOrganizerCanceled {
                         Text("Canceled by organizer")
                             .font(FGTypography.caption.weight(.semibold))
@@ -4839,6 +5405,11 @@ struct FollowingScreen: View {
 #endif
     }
 
+    private func openDiscoverWatchSpotsFromGoing() {
+        viewModel.prepareDiscoverFavoriteSpotBrowsingContext()
+        selectedTab = .discover
+    }
+
     private func openDiscoverForPickupGamesFromGoing() {
         if viewModel.discoverMapContentMode != .pickupGames {
             viewModel.clearDiscoverMapContentSelectionsWhenSwitching(to: .pickupGames)
@@ -4866,7 +5437,8 @@ struct FollowingScreen: View {
         title: String,
         description: String,
         buttonTitle: String? = nil,
-        buttonAction: (() -> Void)? = nil
+        buttonAction: (() -> Void)? = nil,
+        buttonAccent: Color = FGColor.intentWatch
     ) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
@@ -4890,7 +5462,7 @@ struct FollowingScreen: View {
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 11)
                         .background(
-                            FGColor.accentGreen,
+                            buttonAccent,
                             in: RoundedRectangle(cornerRadius: 14, style: .continuous)
                         )
                         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -5237,9 +5809,18 @@ struct FollowingScreen: View {
                             .padding(.trailing, 36)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Open \(bar.name) on map")
+                    .accessibilityLabel(
+                        String(
+                            format: L10n.t("favorite_spot_open_in_discover_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            bar.name
+                        )
+                    )
 
-                    Label("Saved venue", systemImage: "building.2")
+                    Label(
+                        L10n.t("favorite_spot_card_subtitle", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        systemImage: "building.2"
+                    )
                         .font(FGTypography.caption.weight(.semibold))
                         .foregroundStyle(FGColor.secondaryText(followingColorScheme))
                         .labelStyle(.titleAndIcon)
@@ -5286,7 +5867,19 @@ struct FollowingScreen: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isFavorite ? "Remove from saved venues" : "Save venue")
+            .accessibilityLabel(
+                isFavorite
+                    ? String(
+                        format: L10n.t("favorite_spot_remove_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        bar.name
+                    )
+                    : String(
+                        format: L10n.t("favorite_spot_add_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        bar.name
+                    )
+            )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
@@ -5427,25 +6020,25 @@ private enum GoingParticipationMode: Hashable {
 
     var title: String {
         switch self {
-        case .venueGames: return "Venues"
-        case .pickupGames: return "Pickup"
-        case .proGames: return "Pro"
+        case .venueGames: return L10n.t("intent_watch")
+        case .pickupGames: return L10n.t("intent_play")
+        case .proGames: return L10n.t("pro_games")
         }
     }
 
     var systemImage: String {
         switch self {
-        case .venueGames: return "storefront.fill"
-        case .pickupGames: return "person.3.fill"
+        case .venueGames: return "sportscourt.fill"
+        case .pickupGames: return "figure.run"
         case .proGames: return "trophy.fill"
         }
     }
 
     var tint: Color {
         switch self {
-        case .venueGames: return FGColor.accentGreen
-        case .pickupGames: return FGColor.accentGreen
-        case .proGames: return FGColor.accentBlue
+        case .venueGames: return FGColor.intentWatch
+        case .pickupGames: return FGColor.intentPlay
+        case .proGames: return FGColor.intentProGames
         }
     }
 }

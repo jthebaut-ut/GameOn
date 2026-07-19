@@ -4378,15 +4378,16 @@
     "zh-Hans": "保存个人资料"
   },
   "Saved Games": {
-    "es": "Juegos guardados",
-    "fr": "Jeux sauvegardés",
+    "en": "Saved Games",
+    "es": "Partidos guardados",
+    "fr": "Matchs enregistrés",
     "pt": "Jogos salvos",
     "de": "Gespeicherte Spiele",
-    "it": "Giochi salvati",
-    "pl": "Zapisane gry",
-    "ru": "Сохраненные игры",
-    "sq": "Lojërat e ruajtura",
-    "zh-Hans": "保存的游戏"
+    "it": "Partite salvate",
+    "pl": "Zapisane mecze",
+    "ru": "Сохранённые матчи",
+    "sq": "Ndeshje të ruajtura",
+    "zh-Hans": "已保存的比赛"
   },
   "Saved games are available only when logged in as a user.": {
     "es": "Los juegos guardados están disponibles solo cuando inicias sesión como usuario.",
@@ -6213,5 +6214,113 @@
     "ru": "🚫 Заблокированные пользователи",
     "sq": "🚫 Përdorues të bllokuar",
     "zh-Hans": "🚫 被阻止的用户"
+  },
+  "No upcoming games at %@": {
+    "en": "No upcoming games at %@",
+    "es": "No hay próximos partidos en %@",
+    "fr": "Aucun match à venir à %@",
+    "pt": "Nenhum jogo próximo em %@",
+    "de": "Keine bevorstehenden Spiele in %@",
+    "it": "Nessuna partita in arrivo a %@",
+    "pl": "Brak nadchodzących meczów w %@",
+    "ru": "Нет предстоящих матчей в %@",
+    "sq": "Nuk ka ndeshje të ardhshme në %@",
+    "zh-Hans": "%@ 暂无即将到来的比赛"
+  },
+  "Add a game to turn this dashboard into a live fan hub.": {
+    "en": "Add a game to turn this dashboard into a live fan hub.",
+    "es": "Añade un partido para convertir este panel en un hub de fans en vivo.",
+    "fr": "Ajoutez un match pour faire de ce tableau de bord un hub de fans en direct.",
+    "pt": "Adicione um jogo para transformar este painel em um hub de fãs ao vivo.",
+    "de": "Füge ein Spiel hinzu, um dieses Dashboard zu einem Live-Fan-Hub zu machen.",
+    "it": "Aggiungi una partita per trasformare questa dashboard in un hub fan live.",
+    "pl": "Dodaj mecz, aby zamienić ten panel w żywy hub kibiców.",
+    "ru": "Добавьте матч, чтобы превратить эту панель в живой фанатский хаб.",
+    "sq": "Shto një ndeshje për ta kthyer këtë panel në një qendër live për fansat.",
+    "zh-Hans": "添加一场比赛，将此控制台变成实时球迷中心。"
+  },
+  "log_out": {
+    "en": "Log Out",
+    "es": "Cerrar sesión",
+    "fr": "Se déconnecter",
+    "pt": "Sair",
+    "de": "Abmelden",
+    "it": "Esci",
+    "pl": "Wyloguj się",
+    "ru": "Выйти",
+    "sq": "Dil",
+    "zh-Hans": "退出登录"
+  },
+  "Log Out": {
+    "en": "Log Out",
+    "es": "Cerrar sesión",
+    "fr": "Se déconnecter",
+    "pt": "Sair",
+    "de": "Abmelden",
+    "it": "Esci",
+    "pl": "Wyloguj się",
+    "ru": "Выйти",
+    "sq": "Dil",
+    "zh-Hans": "退出登录"
+  },
+  "Could not log out": {
+    "en": "Could not log out",
+    "es": "No se pudo cerrar sesión",
+    "fr": "Impossible de se déconnecter",
+    "pt": "Não foi possível sair",
+    "de": "Abmelden nicht möglich",
+    "it": "Impossibile uscire",
+    "pl": "Nie udało się wylogować",
+    "ru": "Не удалось выйти",
+    "sq": "Nuk u mund të dilni",
+    "zh-Hans": "无法退出登录"
+  },
+  "Could not log out. Please check your connection and try again.": {
+    "en": "Could not log out. Please check your connection and try again.",
+    "es": "No se pudo cerrar sesión. Comprueba tu conexión e inténtalo de nuevo.",
+    "fr": "Impossible de se déconnecter. Vérifiez votre connexion et réessayez.",
+    "pt": "Não foi possível sair. Verifique sua conexão e tente novamente.",
+    "de": "Abmelden nicht möglich. Bitte Verbindung prüfen und erneut versuchen.",
+    "it": "Impossibile uscire. Controlla la connessione e riprova.",
+    "pl": "Nie udało się wylogować. Sprawdź połączenie i spróbuj ponownie.",
+    "ru": "Не удалось выйти. Проверьте соединение и попробуйте снова.",
+    "sq": "Nuk u mund të dilni. Kontrolloni lidhjen dhe provoni përsëri.",
+    "zh-Hans": "无法退出登录。请检查网络后重试。"
+  },
+  "Open settings": {
+    "en": "Open settings",
+    "es": "Abrir configuración",
+    "fr": "Ouvrir les paramètres",
+    "pt": "Abrir configurações",
+    "de": "Einstellungen öffnen",
+    "it": "Apri impostazioni",
+    "pl": "Otwórz ustawienia",
+    "ru": "Открыть настройки",
+    "sq": "Hap cilësimet",
+    "zh-Hans": "打开设置"
+  },
+  "Confirm the address for this pin": {
+    "en": "Confirm the address for this pin",
+    "es": "Confirma la dirección de este pin",
+    "fr": "Confirmez l’adresse de cette épingle",
+    "pt": "Confirme o endereço deste pin",
+    "de": "Bestätige die Adresse für diesen Pin",
+    "it": "Conferma l’indirizzo di questo pin",
+    "pl": "Potwierdź adres dla tej pinezki",
+    "ru": "Подтвердите адрес для этой метки",
+    "sq": "Konfirmo adresën për këtë pin",
+    "zh-Hans": "请确认此图钉的地址"
+  },
+  "Confirm the address for the selected venue pin": {
+    "en": "Confirm the address for the selected venue pin",
+    "es": "Confirma la dirección del pin del local seleccionado",
+    "fr": "Confirmez l’adresse de l’épingle du lieu sélectionné",
+    "pt": "Confirme o endereço do pin do local selecionado",
+    "de": "Bestätige die Adresse für den ausgewählten Standort-Pin",
+    "it": "Conferma l’indirizzo del pin della sede selezionata",
+    "pl": "Potwierdź adres wybranej pinezki lokalizacji",
+    "ru": "Подтвердите адрес выбранной метки заведения",
+    "sq": "Konfirmo adresën për pin-in e vendit të zgjedhur",
+    "zh-Hans": "请确认所选场馆图钉的地址"
   }
 }

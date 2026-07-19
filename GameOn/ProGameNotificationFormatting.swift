@@ -3,7 +3,7 @@ import Foundation
 nonisolated enum ProGameNotificationFormatting {
     static let finalScoreTitle = "🏁 Final Score"
     static let kickoffStartingBody = "Starting now"
-    static let kickoffLeadBodyPrefix = "Your saved Pro Game starts in"
+    static let kickoffLeadBodyPrefix = "Your saved pro sports game starts in"
     static let halftimeTitle = "⏱ Halftime"
     static let predictionResultTitle = "Prediction Results"
 
@@ -34,7 +34,7 @@ nonisolated enum ProGameNotificationFormatting {
         let home = formattedTeam(homeTeam, source: source)
         let title: String
         if away.isEmpty, home.isEmpty {
-            title = "Saved Pro Game"
+            title = "Pro Sports Games"
         } else if away.isEmpty {
             title = home
         } else if home.isEmpty {
@@ -81,25 +81,36 @@ nonisolated enum ProGameNotificationFormatting {
         homeTeam: String?,
         scoringTeam: String? = nil
     ) {
+#if DEBUG
         let away = awayTeam?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let home = homeTeam?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        print("[PushFlagDebug] notificationType=\(notificationType)")
-        print("[PushFlagDebug] homeTeam=\(home)")
-        print("[PushFlagDebug] awayTeam=\(away)")
-        print("[PushFlagDebug] homeFlag=\(flagEmoji(for: home) ?? "")")
-        print("[PushFlagDebug] awayFlag=\(flagEmoji(for: away) ?? "")")
-        if !home.isEmpty, flagEmoji(for: home) == nil {
-            print("[PushFlagDebug] missingFlagFor=\(home)")
+        let homeFlag = flagEmoji(for: home)
+        let awayFlag = flagEmoji(for: away)
+
+        DebugLogGate.pushFlagVerbose("[PushFlagDebug] notificationType=\(notificationType)")
+        DebugLogGate.pushFlagVerbose("[PushFlagDebug] homeTeam=\(home)")
+        DebugLogGate.pushFlagVerbose("[PushFlagDebug] awayTeam=\(away)")
+        DebugLogGate.pushFlagVerbose("[PushFlagDebug] homeFlag=\(homeFlag ?? "")")
+        DebugLogGate.pushFlagVerbose("[PushFlagDebug] awayFlag=\(awayFlag ?? "")")
+
+        if !home.isEmpty, homeFlag == nil {
+            DebugLogGate.notificationWarning("[PushFlagDebug] unexpectedFallback team=\(home) type=\(notificationType)")
         }
-        if !away.isEmpty, flagEmoji(for: away) == nil {
-            print("[PushFlagDebug] missingFlagFor=\(away)")
+        if !away.isEmpty, awayFlag == nil {
+            DebugLogGate.notificationWarning("[PushFlagDebug] unexpectedFallback team=\(away) type=\(notificationType)")
         }
         if let scoringTeam {
             let cleaned = scoringTeam.trimmingCharacters(in: .whitespacesAndNewlines)
             if !cleaned.isEmpty, flagEmoji(for: cleaned) == nil {
-                print("[PushFlagDebug] missingFlagFor=\(cleaned)")
+                DebugLogGate.notificationWarning("[PushFlagDebug] unexpectedFallback team=\(cleaned) type=\(notificationType)")
             }
         }
+#else
+        _ = notificationType
+        _ = awayTeam
+        _ = homeTeam
+        _ = scoringTeam
+#endif
     }
 
     static func scoreline(awayTeam: String, awayScore: Int, homeTeam: String, homeScore: Int) -> String {

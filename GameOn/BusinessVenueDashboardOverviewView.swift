@@ -202,14 +202,15 @@ struct BusinessVenueDashboardOverviewView: View {
     let onPredictions: () -> Void
     let onAnalytics: () -> Void
     let onUsage: () -> Void
-    let favoriteTeamsCount: Int
+    let favoriteTeams: [FavoriteTeam]
     let onManageFavoriteTeams: () -> Void
     var onManageVenues: (() -> Void)?
     var onBusinessIdentity: (() -> Void)?
     var onEditApprovedVenue: ((UUID) -> Void)?
     let onCommentsReports: () -> Void
     let onViewAllGames: () -> Void
-    let onRefreshVenues: () -> Void
+    /// Batched managed-venues refresh (approved + pending). Awaitable so the header button can own loading state.
+    let onRefreshVenues: () async -> Void
     let onRefreshPendingVenue: (BusinessVenueDashboardPendingVenueItem) async -> Bool
     let onResendPendingVenue: (BusinessVenueDashboardPendingVenueItem) async -> Bool
     let onCancelPendingVenue: (BusinessVenueDashboardPendingVenueItem) async -> Bool
@@ -219,6 +220,11 @@ struct BusinessVenueDashboardOverviewView: View {
     let isHostedGameAllowed: Bool
     var isVenueHydrationReady: Bool = true
     var venueHydrationReason: String = "ready"
+
+    @State private var isRefreshingManagedVenues = false
+    @State private var isOpeningFavoriteTeamsEditor = false
+
+    private var favoriteTeamsCount: Int { favoriteTeams.count }
 
     private var hasManagedVenues: Bool {
         data.managedVenueCount > 0
@@ -262,6 +268,7 @@ struct BusinessVenueDashboardOverviewView: View {
                 pendingBusinessSetupCard
             }
             quickActions
+            favoriteTeamsSection
             tonightSection
             if showsManagedVenuesSection {
                 managedVenuesSection
@@ -607,6 +614,67 @@ struct BusinessVenueDashboardOverviewView: View {
 #endif
     }
 
+    private var favoriteTeamsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(L10n.t("favorite_teams", languageCode: appLanguageRaw))
+                    .font(FGTypography.cardTitle.weight(.bold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                if !favoriteTeams.isEmpty {
+                    Text("\(favoriteTeams.count)")
+                        .font(FGTypography.metadata.weight(.bold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.16 : 0.08))
+                        .clipShape(Capsule(style: .continuous))
+                }
+                Spacer(minLength: 0)
+                Button(action: openFavoriteTeamsEditor) {
+                    Text(L10n.t("edit", languageCode: appLanguageRaw))
+                        .font(FGTypography.caption.weight(.bold))
+                        .foregroundStyle(FGColor.accentBlue)
+                }
+                .buttonStyle(.plain)
+                .disabled(isOpeningFavoriteTeamsEditor)
+                .accessibilityLabel(
+                    "\(L10n.t("edit", languageCode: appLanguageRaw)) \(L10n.t("favorite_teams", languageCode: appLanguageRaw))"
+                )
+            }
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 10) {
+                    ForEach(favoriteTeams) { team in
+                        BusinessDashboardFavoriteTeamCard(team: team)
+                    }
+                    BusinessDashboardAddTeamCard(
+                        languageCode: appLanguageRaw,
+                        isDisabled: isOpeningFavoriteTeamsEditor,
+                        action: openFavoriteTeamsEditor
+                    )
+                }
+                .padding(.vertical, 2)
+                .padding(.trailing, 2)
+            }
+            .scrollClipDisabled()
+        }
+        .onAppear {
+#if DEBUG
+            print("[BusinessDashboardFavoriteTeams] sectionRendered count=\(favoriteTeams.count) addTeamCard=true")
+#endif
+        }
+    }
+
+    private func openFavoriteTeamsEditor() {
+        guard !isOpeningFavoriteTeamsEditor else { return }
+        isOpeningFavoriteTeamsEditor = true
+        onManageFavoriteTeams()
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            isOpeningFavoriteTeamsEditor = false
+        }
+    }
+
     private var tonightSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -682,6 +750,7 @@ struct BusinessVenueDashboardOverviewView: View {
                     .background(FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.16 : 0.08))
                     .clipShape(Capsule(style: .continuous))
                 Spacer(minLength: 0)
+                managedVenuesRefreshButton
             }
 
             VStack(alignment: .leading, spacing: 14) {
@@ -720,6 +789,48 @@ struct BusinessVenueDashboardOverviewView: View {
             }
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.20 : 0.05), radius: 12, y: 6)
         }
+    }
+
+    private var managedVenuesRefreshButton: some View {
+        Button {
+            Task { await refreshManagedVenuesFromHeader() }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.16 : 0.08))
+                    .frame(width: 32, height: 32)
+                if isRefreshingManagedVenues {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isRefreshingManagedVenues)
+        .accessibilityLabel(L10n.t("business_managed_venues_refresh_a11y", languageCode: appLanguageRaw))
+        .accessibilityHint(L10n.t("business_managed_venues_refresh_hint", languageCode: appLanguageRaw))
+    }
+
+    private func refreshManagedVenuesFromHeader() async {
+        guard !isRefreshingManagedVenues else { return }
+        isRefreshingManagedVenues = true
+        AccessibilityNotification.Announcement(
+            L10n.t("business_managed_venues_refreshing_a11y", languageCode: appLanguageRaw)
+        ).post()
+#if DEBUG
+        print("[BusinessManagedVenuesDebug] headerRefreshStarted=true")
+#endif
+        await onRefreshVenues()
+        isRefreshingManagedVenues = false
+#if DEBUG
+        print("[BusinessManagedVenuesDebug] headerRefreshFinished=true")
+#endif
     }
 
     private var managedVenuesLoadingPlaceholder: some View {
@@ -984,10 +1095,21 @@ struct BusinessVenueDashboardOverviewView: View {
 
     private var emptyTonightState: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(hasManagedVenues ? "No upcoming games at \(data.venueName)" : "No venue yet")
+            Text(
+                hasManagedVenues
+                    ? String(
+                        format: L10n.t("No upcoming games at %@", languageCode: appLanguageRaw),
+                        data.venueName
+                    )
+                    : L10n.t("No venue yet", languageCode: appLanguageRaw)
+            )
                 .font(FGTypography.cardTitle)
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-            Text(hasManagedVenues ? "Add a game to turn this dashboard into a live fan hub." : "Add your first venue to manage details and games.")
+            Text(
+                hasManagedVenues
+                    ? L10n.t("Add a game to turn this dashboard into a live fan hub.", languageCode: appLanguageRaw)
+                    : L10n.t("Add your first venue to manage details and games.", languageCode: appLanguageRaw)
+            )
                 .font(FGTypography.caption)
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
             Button {
@@ -1011,7 +1133,7 @@ struct BusinessVenueDashboardOverviewView: View {
                     .padding(.vertical, 8)
                     .background(FGColor.brandGradient)
                     .clipShape(Capsule())
-            }
+                }
             .buttonStyle(.plain)
             .fixedSize(horizontal: true, vertical: true)
         }
@@ -1200,6 +1322,191 @@ private struct BusinessVenueDashboardActionCard: View {
 
     private var actionCardStroke: Color {
         isPremium ? tint.opacity(colorScheme == .dark ? 0.42 : 0.30) : FGColor.divider(colorScheme)
+    }
+}
+
+/// Read-only favorite-team card for the Business Dashboard — profile card chrome without trophy / Make My Team / remove.
+private struct BusinessDashboardFavoriteTeamCard: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let team: FavoriteTeam
+
+    private var sportAccent: Color {
+        sportAccentColor(for: team.sport.chipTitle)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                PremiumTeamIdentityOrb(team: team, diameter: 62)
+                Spacer(minLength: 0)
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(team.name)
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .minimumScaleFactor(0.75)
+
+                sportBadge
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(width: 174, height: 148, alignment: .topLeading)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            team.badgeColor.opacity(0.96),
+                            FGColor.accentBlue.opacity(0.84),
+                            Color(red: 0.09, green: 0.12, blue: 0.18).opacity(0.92)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.34),
+                                    Color.white.opacity(0.08)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                }
+        }
+        .overlay(alignment: .topLeading) {
+            VStack(spacing: 0) {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                sportAccent.opacity(colorScheme == .dark ? 0.62 : 0.50),
+                                sportAccent.opacity(colorScheme == .dark ? 0.22 : 0.16),
+                                Color.white.opacity(0.02),
+                                Color.clear
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(height: 3)
+                    .shadow(color: sportAccent.opacity(colorScheme == .dark ? 0.30 : 0.18), radius: 8, y: 2)
+                Spacer(minLength: 0)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .shadow(
+            color: team.badgeColor.opacity(colorScheme == .dark ? 0.18 : 0.16),
+            radius: 14,
+            y: 8
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(team.name), \(team.sport.chipTitle)")
+    }
+
+    private var sportBadge: some View {
+        HStack(spacing: 5) {
+            Text(sportIcon(for: team.sport.chipTitle))
+                .font(.system(size: 13))
+            Text(team.sport.chipTitle)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+        }
+        .foregroundStyle(.white.opacity(0.84))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background {
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.13))
+                .overlay {
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.75)
+                }
+        }
+    }
+}
+
+/// Profile-style Add Team card — opens the existing business Favorite Teams editor.
+private struct BusinessDashboardAddTeamCard: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let languageCode: String
+    let isDisabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.11))
+                        .frame(width: 58, height: 58)
+                    Image(systemName: "plus")
+                        .font(.system(size: 21, weight: .bold))
+                        .foregroundStyle(FGColor.accentBlue)
+                        .accessibilityHidden(true)
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L10n.t("Add Team", languageCode: languageCode))
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(L10n.t("business_favorite_teams_add_supporting", languageCode: languageCode))
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(14)
+            .frame(width: 174, height: 148, alignment: .topLeading)
+            .contentShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.9))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .strokeBorder(
+                                LinearGradient(
+                                    colors: [
+                                        FGColor.accentBlue.opacity(colorScheme == .dark ? 0.22 : 0.16),
+                                        Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                lineWidth: 1
+                            )
+                    }
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(L10n.t("business_favorite_teams_add_a11y", languageCode: languageCode)). \(L10n.t("business_favorite_teams_add_supporting", languageCode: languageCode))"
+        )
+        .accessibilityHint(L10n.t("business_favorite_teams_add_hint", languageCode: languageCode))
+        .accessibilityAddTraits(.isButton)
     }
 }
 

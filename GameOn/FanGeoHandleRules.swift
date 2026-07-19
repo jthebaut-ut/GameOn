@@ -26,6 +26,11 @@ enum FanGeoHandleRules {
         if ReservedNameValidation.containsReservedTerm(raw) {
             return .reservedName
         }
+        return validateFormat(raw)
+    }
+
+    /// Format / length / character rules only (no reserved-name check). Used by edit-flow validators.
+    static func validateFormat(_ raw: String) -> ValidationIssue? {
         let stored = normalizeForStorage(raw)
         guard stored.count >= minLength, stored.count <= maxLength else {
             return .tooShortOrLong

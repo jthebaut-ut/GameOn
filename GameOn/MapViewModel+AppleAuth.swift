@@ -148,7 +148,7 @@ extension MapViewModel {
                 print("[BusinessSignup] appleSupabaseSignInStart=true")
             }
             await MainActor.run {
-                clearEmailVerificationPending()
+                clearEmailVerificationPending(clearFanDraft: true)
                 clearAppleAuthMessage(accountMode: accountMode, reason: "authorizationStarted")
             }
 
@@ -330,6 +330,7 @@ extension MapViewModel {
                 authErrorMessage = ""
                 bumpCurrentUserAvatarDisplayRefresh()
             }
+            FanGeoStartupGuidePreferences.migrateLegacyGlobalPreferenceIfNeeded(for: session.user.id)
         }
 
         guard await checkCurrentUserAdminStatus() else {

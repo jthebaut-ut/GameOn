@@ -11,27 +11,8 @@ struct FanSignupView: View {
 
     private enum SignupStep: Int, CaseIterable {
         case profile = 1
-        case teams = 2
-        case country = 3
-        case bio = 4
-
-        var title: String {
-            switch self {
-            case .profile: return "Create your fan profile"
-            case .teams: return "Pick your favorite teams"
-            case .country: return "Represent your country"
-            case .bio: return "Tell fans about yourself"
-            }
-        }
-
-        var subtitle: String {
-            switch self {
-            case .profile: return "Let's build your identity in the sports crowd."
-            case .teams: return "Choose the teams you support."
-            case .country: return "Which country do you represent?"
-            case .bio: return "Add a little context for your public fan profile."
-            }
-        }
+        case fanIdentity = 2
+        case bio = 3
 
         var next: SignupStep? {
             SignupStep(rawValue: rawValue + 1)
@@ -50,6 +31,9 @@ struct FanSignupView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.openURL) private var openURL
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    @StateObject private var onboardingWowOverlay = WowMomentOverlayManager()
 
     @State private var email = ""
     @State private var password = ""
@@ -77,11 +61,33 @@ struct FanSignupView: View {
     @State private var handleStatusIsPositive = false
     @State private var handleIsConfirmedAvailable = false
     @State private var availabilityTask: Task<Void, Never>?
+    @FocusState private var isBioFieldFocused: Bool
 
     private static let displayNameMaxLength = 40
     private static let bioCharacterLimit = 160
+    private static let bioFieldLabelKey = "onboarding_tell_fans_about_you"
+    private static let bioOptionalHelperKey = "onboarding_about_you_optional_helper"
+    private static let bioExamplePlaceholderKey = "onboarding_about_you_example_placeholder"
+    private static let bioEmptyAccessibilityKey = "onboarding_about_you_field_a11y_empty"
 
     var body: some View {
+        signupBodyCore
+            .onChange(of: favoriteTeamIDs) { oldValue, newValue in
+                let added = newValue.subtracting(oldValue)
+                guard let addedID = added.first,
+                      let team = FavoriteTeamCatalog.team(id: addedID) else { return }
+                presentOnboardingFavoriteAddedConfirmation(for: team)
+            }
+            .onDisappear {
+                onboardingWowOverlay.dismiss()
+                viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "sheetClosed")
+            }
+            .overlay {
+                WowMomentToastHost(manager: onboardingWowOverlay, bottomInset: 28)
+            }
+    }
+
+    private var signupBodyCore: some View {
         Group {
             if viewModel.pendingEmailVerificationKind == .fan {
                 ScrollView {
@@ -100,28 +106,45 @@ struct FanSignupView: View {
                     VStack(spacing: 24) {
                         onboardingTopBar
 
-                        FanGeoAuthTermsAcceptanceView(isAccepted: $termsAccepted)
-
                         if currentStep == .profile {
+                            profileStepValueProposition
+
+                            FanGeoAuthTermsAcceptanceView(isAccepted: $termsAccepted)
+
                             FanGeoAppleSignInButton(
                                 viewModel: viewModel,
                                 accountMode: .fan,
                                 entryPoint: .fanSignup,
                                 isEnabled: termsAccepted
                             )
-                                .padding(.top, 2)
-                        }
+                            .padding(.top, 2)
 
-                        if !viewModel.appleAuthFanMessage.isEmpty {
-                            SettingsSheetStatusBanner(
-                                title: viewModel.appleAuthFanMessageIsError ? "Apple Sign In" : nil,
-                                message: viewModel.appleAuthFanMessage,
-                                tint: viewModel.appleAuthFanMessageIsError ? FGColor.dangerRed : FGColor.accentBlue,
-                                systemImage: viewModel.appleAuthFanMessageIsError ? "exclamationmark.triangle.fill" : "person.crop.circle.badge.checkmark"
-                            )
-                        }
+                            if !viewModel.appleAuthFanMessage.isEmpty {
+                                SettingsSheetStatusBanner(
+                                    title: viewModel.appleAuthFanMessageIsError ? "Apple Sign In" : nil,
+                                    message: viewModel.appleAuthFanMessage,
+                                    tint: viewModel.appleAuthFanMessageIsError ? FGColor.dangerRed : FGColor.accentBlue,
+                                    systemImage: viewModel.appleAuthFanMessageIsError ? "exclamationmark.triangle.fill" : "person.crop.circle.badge.checkmark"
+                                )
+                            }
 
-                        onboardingStepContent
+                            profileStepAuthAndIdentityContent
+                        } else {
+                            if termsAccepted {
+                                FanGeoAuthTermsAcceptedStatusRow()
+                            }
+
+                            if !viewModel.appleAuthFanMessage.isEmpty {
+                                SettingsSheetStatusBanner(
+                                    title: viewModel.appleAuthFanMessageIsError ? "Apple Sign In" : nil,
+                                    message: viewModel.appleAuthFanMessage,
+                                    tint: viewModel.appleAuthFanMessageIsError ? FGColor.dangerRed : FGColor.accentBlue,
+                                    systemImage: viewModel.appleAuthFanMessageIsError ? "exclamationmark.triangle.fill" : "person.crop.circle.badge.checkmark"
+                                )
+                            }
+
+                            onboardingStepContent
+                        }
 
                         if !errorMessage.isEmpty {
                             SettingsSheetStatusBanner(
@@ -136,7 +159,7 @@ struct FanSignupView: View {
 
                         if currentStep == .profile {
                             Button(action: onSwitchToSignIn) {
-                                Text("Already have an account? Sign in")
+                                Text(L10n.t("Already have an account? Sign in", languageCode: appLanguageRaw))
                                     .font(FGTypography.caption.weight(.semibold))
                                     .foregroundStyle(FGColor.accentBlue)
                             }
@@ -237,9 +260,6 @@ struct FanSignupView: View {
         .onChange(of: viewModel.applePendingFanSignupDisplayName) { _, _ in
             applyApplePendingSignupState()
         }
-        .onDisappear {
-            viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "sheetClosed")
-        }
     }
 
     private var onboardingTopBar: some View {
@@ -265,9 +285,24 @@ struct FanSignupView: View {
 
                 Spacer()
 
-                Text("Step \(currentStep.rawValue) of \(SignupStep.allCases.count)")
+                Text(
+                    String(
+                        format: L10n.t("onboarding_step_of_format", languageCode: appLanguageRaw),
+                        locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                        currentStep.rawValue,
+                        SignupStep.allCases.count
+                    )
+                )
                     .font(FGTypography.metadata.weight(.bold))
                     .foregroundStyle(FGColor.accentBlue)
+                    .accessibilityLabel(
+                        String(
+                            format: L10n.t("onboarding_step_of_format", languageCode: appLanguageRaw),
+                            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            currentStep.rawValue,
+                            SignupStep.allCases.count
+                        )
+                    )
 
                 Spacer()
 
@@ -286,85 +321,132 @@ struct FanSignupView: View {
         }
     }
 
-    @ViewBuilder
-    private var onboardingStepContent: some View {
-        VStack(spacing: 18) {
-            VStack(spacing: 8) {
-                Text(currentStep.title)
-                    .font(.system(size: 30, weight: .heavy, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.78)
-                Text(currentStep.subtitle)
-                    .font(FGTypography.caption.weight(.medium))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .multilineTextAlignment(.center)
-            }
-            .padding(.horizontal, 18)
+    private var profileStepValueProposition: some View {
+        VStack(spacing: 8) {
+            Text(L10n.t("onboarding_step1_title", languageCode: appLanguageRaw))
+                .font(.system(size: 30, weight: .heavy, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+                .accessibilityAddTraits(.isHeader)
 
-            switch currentStep {
-            case .profile:
-                profileStepCard
-            case .teams:
-                favoriteTeamsStepCard
-            case .country:
-                nationalTeamStepCard
-            case .bio:
-                bioStepCard
+            Text(L10n.t("onboarding_step1_subtitle", languageCode: appLanguageRaw))
+                .font(FGTypography.caption.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 18)
+    }
+
+    @ViewBuilder
+    private var profileStepAuthAndIdentityContent: some View {
+        VStack(spacing: 16) {
+            if usesAppleSignupAuth {
+                appleSignedInBanner
+            } else {
+                orContinueWithEmailDivider
+                profileAccountDetailsGroup
             }
+
+            profileFanIdentityGroup
         }
     }
 
-    private var profileStepCard: some View {
-        VStack(spacing: 16) {
-            ZStack(alignment: .bottomTrailing) {
-                onboardingAvatarPreview
-                    .frame(width: 132, height: 132)
-                    .clipShape(Circle())
-                    .overlay {
-                        Circle()
-                            .strokeBorder(Color.white, lineWidth: 4)
-                            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.10), radius: 10, y: 4)
-                    }
+    private var orContinueWithEmailDivider: some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(FGColor.divider(colorScheme).opacity(0.85))
+                .frame(height: 1)
+            Text(L10n.t("onboarding_or_continue_with_email", languageCode: appLanguageRaw))
+                .font(FGTypography.metadata.weight(.bold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .textCase(.uppercase)
+                .tracking(0.6)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            Rectangle()
+                .fill(FGColor.divider(colorScheme).opacity(0.85))
+                .frame(height: 1)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityHidden(true)
+    }
 
-                PhotosPicker(selection: $selectedAvatarItem, matching: .images) {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 18, weight: .heavy))
-                        .foregroundStyle(.white)
-                        .frame(width: 46, height: 46)
-                        .background(FGColor.brandGradient)
-                        .clipShape(Circle())
-                        .shadow(color: FGColor.accentBlue.opacity(0.28), radius: 10, y: 5)
-                }
-                .disabled(isSubmitting)
-                .offset(x: -4, y: -6)
-            }
-            .padding(.top, 6)
+    private var profileAccountDetailsGroup: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            profileSectionHeader(
+                systemImage: "envelope.fill",
+                title: L10n.t("onboarding_account_details_title", languageCode: appLanguageRaw),
+                helper: L10n.t("onboarding_account_details_helper", languageCode: appLanguageRaw)
+            )
 
             VStack(spacing: 13) {
-                if usesAppleSignupAuth {
-                    appleSignedInBanner
-                } else {
-                    onboardingField(systemImage: "envelope", placeholder: "you@email.com", text: $email)
-                        .keyboardType(.emailAddress)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    if !emailError.isEmpty { fieldError(emailError) }
+                onboardingField(systemImage: "envelope", placeholder: "you@email.com", text: $email)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                if !emailError.isEmpty { fieldError(emailError) }
 
-                    passwordEntryField(
-                        placeholder: "Create a password",
-                        text: $password,
-                        isVisible: $showPassword
-                    )
-                    passwordEntryField(
-                        placeholder: "Confirm password",
-                        text: $confirmPassword,
-                        isVisible: $showConfirmPassword
-                    )
-                    if !passwordError.isEmpty { fieldError(passwordError) }
+                passwordEntryField(
+                    placeholder: "Create a password",
+                    text: $password,
+                    isVisible: $showPassword
+                )
+                passwordEntryField(
+                    placeholder: "Confirm password",
+                    text: $confirmPassword,
+                    isVisible: $showConfirmPassword
+                )
+                if !passwordError.isEmpty { fieldError(passwordError) }
+            }
+        }
+        .fanGeoGlassCard()
+    }
+
+    private var profileFanIdentityGroup: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            profileSectionHeader(
+                systemImage: "person.fill",
+                title: L10n.t("onboarding_fan_identity_title", languageCode: appLanguageRaw),
+                helper: L10n.t("onboarding_fan_identity_helper", languageCode: appLanguageRaw)
+            )
+
+            VStack(spacing: 10) {
+                ZStack(alignment: .bottomTrailing) {
+                    onboardingAvatarPreview
+                        .frame(width: 112, height: 112)
+                        .clipShape(Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.white, lineWidth: 3)
+                                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.10), radius: 8, y: 3)
+                        }
+
+                    PhotosPicker(selection: $selectedAvatarItem, matching: .images) {
+                        Image(systemName: "camera.fill")
+                            .font(.system(size: 14, weight: .heavy))
+                            .foregroundStyle(.white)
+                            .frame(width: 38, height: 38)
+                            .background(FGColor.brandGradient)
+                            .clipShape(Circle())
+                            .shadow(color: FGColor.accentBlue.opacity(0.28), radius: 8, y: 4)
+                    }
+                    .disabled(isSubmitting)
+                    .accessibilityLabel(L10n.t("onboarding_avatar_optional_label", languageCode: appLanguageRaw))
+                    .offset(x: -2, y: -2)
                 }
+                .frame(maxWidth: .infinity)
 
+                Text(L10n.t("onboarding_avatar_optional_label", languageCode: appLanguageRaw))
+                    .font(FGTypography.metadata.weight(.semibold))
+                    .foregroundStyle(FGColor.accentBlue)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityHidden(true)
+            }
+
+            VStack(spacing: 13) {
                 if !usesAppleProvidedDisplayName {
                     onboardingField(systemImage: "person", placeholder: "Display name", text: $displayNameDraft)
                         .textInputAutocapitalization(.words)
@@ -402,100 +484,254 @@ struct FanSignupView: View {
                 }
             }
         }
+        .fanGeoGlassCard()
     }
 
-    private var favoriteTeamsStepCard: some View {
-        VStack(spacing: 16) {
-            LazyVGrid(columns: onboardingGridColumns, spacing: 12) {
-                ForEach(onboardingTeamSuggestions) { team in
-                    onboardingFavoriteTeamCard(team)
-                }
+    private func profileSectionHeader(systemImage: String, title: String, helper: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(FGColor.accentBlue)
+                    .accessibilityHidden(true)
+                Text(title)
+                    .font(FGTypography.caption.weight(.heavy))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+            }
+            Text(helper)
+                .font(FGTypography.metadata.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
 
-                Button {
-                    showFavoriteTeamsPicker = true
-                } label: {
-                    VStack(spacing: 10) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 26, weight: .medium))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        Text("Add more")
-                            .font(FGTypography.caption.weight(.bold))
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
+    @ViewBuilder
+    private var onboardingStepContent: some View {
+        VStack(spacing: 18) {
+            VStack(spacing: 8) {
+                Text(currentStepTitle)
+                    .font(.system(size: 30, weight: .heavy, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.78)
+                    .accessibilityAddTraits(.isHeader)
+                Text(currentStepSubtitle)
+                    .font(FGTypography.caption.weight(.medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.horizontal, 18)
+
+            switch currentStep {
+            case .profile:
+                EmptyView()
+            case .fanIdentity:
+                fanIdentityStepCard
+            case .bio:
+                bioStepCard
+            }
+        }
+    }
+
+    private var currentStepTitle: String {
+        switch currentStep {
+        case .profile:
+            return L10n.t("onboarding_step1_title", languageCode: appLanguageRaw)
+        case .fanIdentity:
+            return L10n.t("onboarding_build_fan_identity_title", languageCode: appLanguageRaw)
+        case .bio:
+            return L10n.t("onboarding_tell_fans_about_yourself_title", languageCode: appLanguageRaw)
+        }
+    }
+
+    private var currentStepSubtitle: String {
+        switch currentStep {
+        case .profile:
+            return L10n.t("onboarding_step1_subtitle", languageCode: appLanguageRaw)
+        case .fanIdentity:
+            return L10n.t("onboarding_build_fan_identity_subtitle", languageCode: appLanguageRaw)
+        case .bio:
+            return L10n.t("onboarding_bio_subtitle", languageCode: appLanguageRaw)
+        }
+    }
+
+    private var fanIdentityStepCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 10) {
+                fanIdentitySectionHeader(
+                    title: L10n.t("Favorite Teams", languageCode: appLanguageRaw),
+                    helper: L10n.t("onboarding_favorite_teams_helper", languageCode: appLanguageRaw)
+                )
+
+                LazyVGrid(columns: onboardingGridColumns, spacing: 8) {
+                    ForEach(onboardingTeamSuggestions) { team in
+                        onboardingFavoriteTeamCard(team)
                     }
-                    .frame(maxWidth: .infinity, minHeight: 104)
-                    .background(FGColor.cardBackground(colorScheme))
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .strokeBorder(FGColor.divider(colorScheme).opacity(0.7), lineWidth: 1)
+
+                    Button {
+                        showFavoriteTeamsPicker = true
+                    } label: {
+                        VStack(spacing: 8) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 22, weight: .medium))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            Text(L10n.t("Add more", languageCode: appLanguageRaw))
+                                .font(FGTypography.caption.weight(.bold))
+                                .foregroundStyle(FGColor.primaryText(colorScheme))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 92)
+                        .background(FGColor.cardBackground(colorScheme))
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .strokeBorder(FGColor.divider(colorScheme).opacity(0.7), lineWidth: 1)
+                        }
+                        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.14 : 0.05), radius: 8, y: 3)
                     }
-                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.14 : 0.05), radius: 8, y: 3)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(L10n.t("Add more", languageCode: appLanguageRaw))
                 }
-                .buttonStyle(.plain)
             }
 
-            if !selectedFavoriteTeams.isEmpty {
-                Text("\(selectedFavoriteTeams.count) selected")
+            Rectangle()
+                .fill(FGColor.divider(colorScheme).opacity(0.55))
+                .frame(height: 1)
+                .padding(.vertical, 2)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 10) {
+                fanIdentitySectionHeader(
+                    title: L10n.t("onboarding_country_section", languageCode: appLanguageRaw),
+                    helper: L10n.t("onboarding_country_question", languageCode: appLanguageRaw)
+                )
+
+                HStack(spacing: 8) {
+                    ForEach(onboardingCountryOptions) { option in
+                        onboardingCountryChip(option)
+                    }
+
+                    Button {
+                        showNationalTeamPicker = true
+                    } label: {
+                        VStack(spacing: 6) {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .frame(width: 48, height: 48)
+                                .background(FGColor.cardBackground(colorScheme))
+                                .clipShape(Circle())
+                                .overlay {
+                                    Circle().strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+                                }
+                            Text(L10n.t("More", languageCode: appLanguageRaw))
+                                .font(FGTypography.metadata.weight(.semibold))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(L10n.t("More", languageCode: appLanguageRaw))
+                }
+                .frame(maxWidth: .infinity)
+
+                if let selectedNationalTeam {
+                    NationalTeamIdentityCard(
+                        identity: selectedNationalTeam,
+                        showsEditAffordance: true,
+                        compact: true,
+                        presentationStyle: .joiningTeam
+                    ) {
+                        showNationalTeamPicker = true
+                    }
+                }
+            }
+
+            if let summary = fanIdentitySelectionSummaryVisibleText {
+                Text(summary)
                     .font(FGTypography.caption.weight(.bold))
                     .foregroundStyle(FGColor.accentBlue)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(fanIdentitySelectionSummaryAccessibilityText)
             }
         }
     }
 
-    private var nationalTeamStepCard: some View {
-        VStack(spacing: 18) {
-            HStack(spacing: 14) {
-                ForEach(onboardingCountryOptions) { option in
-                    onboardingCountryChip(option)
-                }
-
-                Button {
-                    showNationalTeamPicker = true
-                } label: {
-                    VStack(spacing: 7) {
-                        Image(systemName: "ellipsis")
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .frame(width: 54, height: 54)
-                            .background(FGColor.cardBackground(colorScheme))
-                            .clipShape(Circle())
-                            .overlay {
-                                Circle().strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-                            }
-                        Text("More")
-                            .font(FGTypography.metadata.weight(.semibold))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-            .frame(maxWidth: .infinity)
-
-            if let selectedNationalTeam {
-                NationalTeamIdentityCard(identity: selectedNationalTeam, showsEditAffordance: true, compact: true) {
-                    showNationalTeamPicker = true
-                }
-            }
+    private func fanIdentitySectionHeader(title: String, helper: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(FGTypography.caption.weight(.heavy))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .accessibilityAddTraits(.isHeader)
+            Text(helper)
+                .font(FGTypography.metadata.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var bioStepCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Bio")
+            Text(L10n.t(Self.bioOptionalHelperKey, languageCode: appLanguageRaw))
+                .font(FGTypography.metadata.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(L10n.t(Self.bioFieldLabelKey, languageCode: appLanguageRaw))
                 .font(FGTypography.caption.weight(.heavy))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .textCase(.uppercase)
                 .tracking(0.8)
 
-            TextField("Tell fans about yourself (optional)", text: $bioDraft, axis: .vertical)
-                .lineLimit(4...6)
-                .font(FGTypography.body)
-                .fanGeoInputFieldStyle()
-                .onChange(of: bioDraft) { _, newValue in
-                    if newValue.count > Self.bioCharacterLimit {
-                        bioDraft = String(newValue.prefix(Self.bioCharacterLimit))
+            ZStack(alignment: .topLeading) {
+                // TextField + chrome first so the placeholder can sit *above* the input
+                // background. Previously the placeholder was under
+                // `FGInputFieldStyleModifier`'s ~0.97-opaque fill and looked invisible.
+                TextField("", text: $bioDraft, axis: .vertical)
+                    .lineLimit(4...6)
+                    .font(FGTypography.body)
+                    .fanGeoInputFieldStyle()
+                    .focused($isBioFieldFocused)
+                    .accessibilityLabel(bioFieldAccessibilityLabel)
+                    .accessibilityHint(
+                        shouldShowBioPlaceholder
+                            ? ""
+                            : L10n.t("onboarding_bio_subtitle", languageCode: appLanguageRaw)
+                    )
+                    .onChange(of: bioDraft) { _, newValue in
+                        if newValue.count > Self.bioCharacterLimit {
+                            bioDraft = String(newValue.prefix(Self.bioCharacterLimit))
+                        }
                     }
+
+                if shouldShowBioPlaceholder {
+                    Text(bioExamplePlaceholderText)
+                        .font(FGTypography.body)
+                        .foregroundStyle(Color.secondary.opacity(0.85))
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, FGSpacing.md)
+                        .padding(.top, 14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                        .zIndex(1)
                 }
+            }
 
             HStack {
                 Spacer()
@@ -508,7 +744,8 @@ struct FanSignupView: View {
     }
 
     private var onboardingBottomControls: some View {
-        VStack(spacing: 12) {
+        let isContinueDisabled = isPrimaryOnboardingActionDisabled
+        return VStack(spacing: 12) {
             Button {
                 Task { await advanceOnboarding() }
             } label: {
@@ -516,22 +753,37 @@ struct FanSignupView: View {
                     Spacer()
                     Text(primaryOnboardingButtonTitle)
                         .font(FGTypography.cardTitle.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
                     Image(systemName: currentStep == .bio ? "checkmark" : "arrow.right")
                         .font(.subheadline.weight(.heavy))
                     Spacer()
                 }
-                .foregroundStyle(.white)
+                .foregroundStyle(isContinueDisabled ? Color.gray : Color.white)
                 .padding(.vertical, 15)
-                .background(FGColor.brandGradient)
+                .padding(.horizontal, 12)
+                .background(
+                    isContinueDisabled
+                        ? AnyShapeStyle(Color.gray.opacity(0.35))
+                        : AnyShapeStyle(FGColor.brandGradient)
+                )
                 .clipShape(Capsule(style: .continuous))
-                .shadow(color: FGColor.accentBlue.opacity(0.28), radius: 12, y: 6)
+                .shadow(
+                    color: isContinueDisabled ? .clear : FGColor.accentBlue.opacity(0.28),
+                    radius: 12,
+                    y: 6
+                )
             }
             .buttonStyle(.plain)
-            .disabled(isSubmitting || (currentStep == .profile && !termsAccepted) || (currentStep == .bio && !canSubmit))
+            .disabled(isContinueDisabled)
+            .opacity(isContinueDisabled ? 0.7 : 1)
+            .accessibilityLabel(primaryOnboardingButtonTitle)
+            .accessibilityAddTraits(.isButton)
 
-            if currentStep == .teams || currentStep == .country {
-                Button("Skip for now") {
+            if currentStep == .fanIdentity {
+                Button(L10n.t("Skip for now", languageCode: appLanguageRaw)) {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
+                        // Preserve any in-progress selections; Skip only advances.
                         currentStep = currentStep.next ?? currentStep
                     }
                 }
@@ -543,19 +795,35 @@ struct FanSignupView: View {
         }
     }
 
+    /// Gates Step 1 Continue and final submit using the same field/Terms rules as `canSubmit`.
+    private var isPrimaryOnboardingActionDisabled: Bool {
+        if isSubmitting { return true }
+        switch currentStep {
+        case .profile, .bio:
+            return !canSubmit
+        case .fanIdentity:
+            return false
+        }
+    }
+
     private var primaryOnboardingButtonTitle: String {
         if currentStep == .bio { return submitButtonTitle }
-        return "Continue"
+        return L10n.t("Continue", languageCode: appLanguageRaw)
     }
 
     private var onboardingGridColumns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+        Array(repeating: GridItem(.flexible(), spacing: 8), count: 3)
     }
 
     private var onboardingTeamSuggestions: [FavoriteTeam] {
-        let preferredNames = ["France", "Real Madrid", "Juventus", "Lakers", "Utah Jazz", "Dallas Cowboys", "Manchester United", "Miami Heat"]
+        // Quick-pick chips only — full Sport/Region/Country browsing uses FavoriteTeamsPickerSheet → allEntities.
+        let preferredNames = [
+            "France", "Real Madrid", "Juventus", "Los Angeles Lakers", "Utah Jazz",
+            "Dallas Cowboys", "Manchester United", "Miami Heat",
+            "Flamengo", "Yomiuri Giants", "Real Madrid Basketball"
+        ]
         var selected = preferredNames.compactMap { preferred in
-            FavoriteTeamCatalog.all.first { team in
+            FavoriteTeamCatalog.allEntities.first { team in
                 team.name.localizedCaseInsensitiveCompare(preferred) == .orderedSame
                     || team.name.localizedCaseInsensitiveContains(preferred)
             }
@@ -579,37 +847,46 @@ struct FanSignupView: View {
                 favoriteTeamIDs.insert(team.id)
             }
         } label: {
-            VStack(spacing: 9) {
+            VStack(spacing: 7) {
                 ZStack(alignment: .topTrailing) {
-                    FavoriteTeamLogoBadge(team: team, diameter: 48)
+                    SportsIdentityArtworkView(favoriteTeam: team, diameter: 44)
+                        .accessibilityHidden(true)
                     if isSelected {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 22, weight: .bold))
+                            .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.white, FGColor.accentBlue)
-                            .offset(x: 12, y: -10)
+                            .offset(x: 6, y: -6)
+                            .accessibilityHidden(true)
                     }
                 }
 
                 Text(team.name)
-                    .font(FGTypography.caption.weight(.bold))
+                    .font(FGTypography.metadata.weight(.bold))
                     .foregroundStyle(isSelected ? Color.white : FGColor.primaryText(colorScheme))
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
                     .minimumScaleFactor(0.78)
             }
-            .frame(maxWidth: .infinity, minHeight: 104)
-            .padding(.horizontal, 5)
+            .frame(maxWidth: .infinity, minHeight: 92)
+            .padding(.horizontal, 4)
             .background {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .fill(isSelected ? FGColor.brandGradient : LinearGradient(colors: [FGColor.cardBackground(colorScheme), FGColor.cardBackground(colorScheme)], startPoint: .topLeading, endPoint: .bottomTrailing))
             }
             .overlay {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
                     .strokeBorder(isSelected ? Color.white.opacity(0.22) : FGColor.divider(colorScheme).opacity(0.6), lineWidth: 1)
             }
             .shadow(color: (isSelected ? FGColor.accentBlue : Color.black).opacity(isSelected ? 0.22 : (colorScheme == .dark ? 0.14 : 0.05)), radius: isSelected ? 12 : 8, y: isSelected ? 6 : 3)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(team.name)
+        .accessibilityValue(
+            isSelected
+                ? L10n.t("onboarding_favorite_team_selected_a11y", languageCode: appLanguageRaw)
+                : L10n.t("onboarding_favorite_team_unselected_a11y", languageCode: appLanguageRaw)
+        )
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     private func onboardingCountryChip(_ option: NationalTeamCountryOption) -> some View {
@@ -620,14 +897,17 @@ struct FanSignupView: View {
             supporterLabel: NationalTeamCopy.defaultSupporterLabelKey
         )
         let isSelected = selectedNationalTeam?.countryCode == option.code
+        let chipTitle = option.code == "US"
+            ? L10n.t("onboarding_country_chip_usa", languageCode: appLanguageRaw)
+            : option.name
         return Button {
             selectedNationalTeam = identity
         } label: {
-            VStack(spacing: 7) {
+            VStack(spacing: 6) {
                 ZStack(alignment: .bottomTrailing) {
                     Text(option.flag)
-                        .font(.system(size: 39))
-                        .frame(width: 58, height: 58)
+                        .font(.system(size: 32))
+                        .frame(width: 48, height: 48)
                         .background(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.92))
                         .clipShape(Circle())
                         .overlay {
@@ -636,18 +916,27 @@ struct FanSignupView: View {
                         }
                     if isSelected {
                         Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 20, weight: .bold))
+                            .font(.system(size: 16, weight: .bold))
                             .foregroundStyle(.white, FGColor.accentBlue)
                     }
                 }
-                Text(option.code == "US" ? "USA" : option.name)
+                Text(chipTitle)
                     .font(FGTypography.metadata.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             }
+            .frame(maxWidth: .infinity)
+            .frame(minHeight: 44)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(option.name)
+        .accessibilityValue(
+            isSelected
+                ? L10n.t("onboarding_country_selected_a11y", languageCode: appLanguageRaw)
+                : L10n.t("onboarding_country_unselected_a11y", languageCode: appLanguageRaw)
+        )
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     private func onboardingField(systemImage: String, placeholder: String, text: Binding<String>) -> some View {
@@ -707,7 +996,7 @@ struct FanSignupView: View {
                 avatarDisplayRefreshToken: UserAvatarView.placeholderRefreshToken,
                 displayName: displayNameDraft,
                 email: email,
-                size: 132,
+                size: 112,
                 fallbackStyle: .lightOnWhiteChrome,
                 imagePlaceholderTint: FGColor.accentBlue
             )
@@ -720,15 +1009,10 @@ struct FanSignupView: View {
         case .profile:
             guard await validateProfileStepBeforeContinue() else { return }
             withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                currentStep = .teams
+                currentStep = .fanIdentity
                 errorMessage = ""
             }
-        case .teams:
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
-                currentStep = .country
-                errorMessage = ""
-            }
-        case .country:
+        case .fanIdentity:
             withAnimation(.spring(response: 0.28, dampingFraction: 0.88)) {
                 currentStep = .bio
                 errorMessage = ""
@@ -778,8 +1062,8 @@ struct FanSignupView: View {
             return false
         }
         if let issue = FanGeoHandleRules.validate(handleDraft) {
-            errorMessage = FanGeoHandleRules.validationMessage(for: issue)
-            handleStatusMessage = errorMessage
+            // Keep ordinary handle format failures inline — do not surface the account-creation banner.
+            handleStatusMessage = FanGeoHandleRules.validationMessage(for: issue)
             handleStatusIsPositive = false
             return false
         }
@@ -796,7 +1080,6 @@ struct FanSignupView: View {
             print("[SignupUX] handleCheck username=\(stored) available=\(available)")
             print("[HandleValidationDebug] handleAvailable=\(available)")
             guard available else {
-                errorMessage = "That handle is already taken."
                 handleStatusMessage = "Already taken"
                 handleStatusIsPositive = false
                 handleIsConfirmedAvailable = false
@@ -1030,6 +1313,78 @@ struct FanSignupView: View {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
+    private var fanIdentitySelectionSummaryVisibleText: String? {
+        let teamCount = selectedFavoriteTeams.count
+        let countryName = selectedNationalTeam?.countryName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasCountry = !(countryName?.isEmpty ?? true)
+        let locale = Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw))
+
+        switch (teamCount, hasCountry) {
+        case (0, false):
+            return nil
+        case (0, true):
+            return String(
+                format: L10n.t("onboarding_fan_identity_summary_country_only_format", languageCode: appLanguageRaw),
+                locale: locale,
+                countryName ?? ""
+            )
+        case (1, false):
+            return L10n.t("onboarding_fan_identity_summary_one_team", languageCode: appLanguageRaw)
+        case (_, false):
+            return String(
+                format: L10n.t("onboarding_fan_identity_summary_teams_only_format", languageCode: appLanguageRaw),
+                locale: locale,
+                teamCount
+            )
+        case (1, true):
+            return String(
+                format: L10n.t("onboarding_fan_identity_summary_one_team_and_country_format", languageCode: appLanguageRaw),
+                locale: locale,
+                countryName ?? ""
+            )
+        default:
+            return String(
+                format: L10n.t("onboarding_fan_identity_summary_teams_and_country_format", languageCode: appLanguageRaw),
+                locale: locale,
+                teamCount,
+                countryName ?? ""
+            )
+        }
+    }
+
+    private var fanIdentitySelectionSummaryAccessibilityText: String {
+        fanIdentitySelectionSummaryVisibleText ?? ""
+    }
+
+    private var shouldShowBioPlaceholder: Bool {
+        bioDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var bioExamplePlaceholderText: String {
+        L10n.t(Self.bioExamplePlaceholderKey, languageCode: appLanguageRaw)
+    }
+
+    private var bioFieldAccessibilityLabel: String {
+        if shouldShowBioPlaceholder {
+            return L10n.t(Self.bioEmptyAccessibilityKey, languageCode: appLanguageRaw)
+        }
+        return L10n.t(Self.bioFieldLabelKey, languageCode: appLanguageRaw)
+    }
+
+    private func presentOnboardingFavoriteAddedConfirmation(for team: FavoriteTeam) {
+        let moment = WowMomentCopy.onboardingFavoriteAdded(
+            teamName: team.name,
+            sport: team.sport,
+            languageCode: appLanguageRaw,
+            dedupeKey: "onboarding-favorite:\(team.id)"
+        )
+        onboardingWowOverlay.presentFavoriteCoalesced(
+            moment,
+            recordAnalytics: false,
+            visibleDurationNanoseconds: WowMomentOverlayManager.onboardingFavoriteVisibleDurationNanoseconds
+        )
+    }
+
     private var submitButton: some View {
         FGPrimaryButton(
             title: submitButtonTitle,
@@ -1056,18 +1411,22 @@ struct FanSignupView: View {
     }
 
     private var canSubmit: Bool {
+        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let emailIsValid = !trimmedEmail.isEmpty
+            && OwnerBusinessEmail.isValidStrict(OwnerBusinessEmail.normalized(trimmedEmail))
+
         if profileRetryMode {
-            return profileFieldsValid && termsAccepted
+            return profileFieldsValid && emailIsValid && termsAccepted
         }
         if usesAppleSignupAuth {
             return profileFieldsValid
-                && !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && emailIsValid
                 && termsAccepted
         }
         return profileFieldsValid
-            && !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !password.isEmpty
-            && !confirmPassword.isEmpty
+            && emailIsValid
+            && !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !confirmPassword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && password == confirmPassword
             && termsAccepted
     }
@@ -1132,7 +1491,9 @@ struct FanSignupView: View {
         let trimmedName = effectiveDisplayNameForSignup
         return !trimmedName.isEmpty
             && trimmedName.count <= Self.displayNameMaxLength
+            && !ReservedNameValidation.containsReservedTerm(trimmedName)
             && FanGeoHandleRules.validate(handleDraft) == nil
+            && handleIsConfirmedAvailable
     }
 
     private func labeledField<Content: View>(
@@ -1288,7 +1649,9 @@ struct FanSignupView: View {
         }
 
         if let issue = FanGeoHandleRules.validate(handleDraft) {
-            errorMessage = FanGeoHandleRules.validationMessage(for: issue)
+            // Keep ordinary handle format failures inline — do not surface the account-creation banner.
+            handleStatusMessage = FanGeoHandleRules.validationMessage(for: issue)
+            handleStatusIsPositive = false
             print("[SignupUX] submitFailed step=validation error=handle")
             print("[HandleValidationDebug] handleRejected reason=\(issue)")
             print("[EmailConfirmDebug] formValidationFailed reason=invalid_handle")

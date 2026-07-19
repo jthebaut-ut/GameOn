@@ -1,7 +1,8 @@
 import SwiftUI
 
 /// Visual treatment for FanGeo favorite-team badges (no official league marks).
-enum FanGeoTeamIdentityStyle: String, Codable, Hashable {
+/// Pure domain style selection — nonisolated under default MainActor isolation.
+nonisolated enum FanGeoTeamIdentityStyle: String, Codable, Hashable, Sendable {
     case standard
     case hockeyIce
     case racingStripes
@@ -12,7 +13,8 @@ enum FanGeoTeamIdentityStyle: String, Codable, Hashable {
         case .hockey: return .hockeyIce
         case .racing: return .racingStripes
         case .ncaa: return .collegiateShield
-        case .soccer, .basketball, .football, .baseball, .tennis, .badminton, .golf, .combat, .dance: return .standard
+        case .soccer, .basketball, .football, .baseball, .tennis, .badminton, .golf, .combat, .dance, .cricket, .rugby, .olympics:
+            return .standard
         }
     }
 }

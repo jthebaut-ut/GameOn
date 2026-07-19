@@ -366,7 +366,7 @@ extension MapViewModel {
 #if DEBUG
             print("[CalendarProGamesDebug] selectedDateFetchFailed error=\(error.localizedDescription)")
 #endif
-            liveMatchesLoadError = "Couldn't refresh pro games. Showing the latest available results."
+            liveMatchesLoadError = L10n.t("couldnt_refresh_pro_sports_games")
             activeFeaturedEvents = await featuredEventsTask.value
         }
     }

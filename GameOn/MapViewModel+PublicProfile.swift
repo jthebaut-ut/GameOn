@@ -40,33 +40,72 @@ extension MapViewModel {
         )
     }
 
-    /// Opens the root-level public profile presenter for another user (never for self).
-    func presentPublicProfile(userId: UUID, context: String = "", activeSheet: String? = nil) {
-        guard userId != currentUserAuthId else { return }
+    /// Opens the root-level public profile presenter.
+    /// - Parameters:
+    ///   - userId: Profile to show.
+    ///   - context: Debug / sheet-hint context.
+    ///   - activeSheet: Optional active sheet name for debug.
+    ///   - isSelfPreview: When `true`, allows opening the signed-in user's own public profile for WYSIWYG preview.
+    func presentPublicProfile(
+        userId: UUID,
+        context: String = "",
+        activeSheet: String? = nil,
+        isSelfPreview: Bool = false
+    ) {
+        if userId == currentUserAuthId {
+            guard isSelfPreview else {
+                SuggestedFanProfileOpenDebug.failure("self_without_preview_context")
+                return
+            }
+        } else if isSelfPreview {
+            SuggestedFanProfileOpenDebug.failure("self_preview_id_mismatch")
+            return
+        }
 
         let sheetHint = activeSheet ?? context
+        let alreadyPresented = publicProfileSheetUserId == userId
 
+        if context.contains("suggested_fan") {
+            SuggestedFanProfileOpenDebug.presentationStarted(alreadyPresented: alreadyPresented)
+        }
+
+        publicProfileIsSelfPreview = isSelfPreview && userId == currentUserAuthId
         publicProfilePresentationContext = context
         publicProfileSheetUserId = userId
 
 #if DEBUG
-        print("[PublicProfileTapDebug] userId=\(userId.uuidString.lowercased()) context=\(context) authenticated=\(isAuthenticatedForSocialFeatures)")
+        print("[PublicProfileTapDebug] userId=\(userId.uuidString.lowercased()) context=\(context) authenticated=\(isAuthenticatedForSocialFeatures) selfPreview=\(publicProfileIsSelfPreview)")
         print("[PublicProfilePresentationDebug] tapContext=\(context)")
         print("[PublicProfilePresentationDebug] presenter=custom_overlay")
         print("[PublicProfilePresentationDebug] swiftUIModalUsed=false")
         print("[PublicProfilePresentationDebug] activeSheet=\(sheetHint)")
         print("[PublicProfilePresentationDebug] presentedImmediately=true")
         print("[PublicProfilePresentationDebug] queued=false")
+        print("[PublicProfilePresentationDebug] selfPreview=\(publicProfileIsSelfPreview)")
 #endif
+    }
+
+    /// Opens the public-profile overlay for the signed-in fan (same path as viewing another fan).
+    func presentOwnPublicProfilePreview() {
+        guard let authId = currentUserAuthId else { return }
+        presentPublicProfile(
+            userId: authId,
+            context: "own_public_profile_preview",
+            activeSheet: "Account",
+            isSelfPreview: true
+        )
     }
 
     func dismissPublicProfile() {
         publicProfileSheetUserId = nil
         publicProfilePresentationContext = nil
+        publicProfileIsSelfPreview = false
+        SuggestedFanProfileOpenDebug.sheetDismissed()
 #if DEBUG
         print("[PublicProfilePresentationDebug] presenter=custom_overlay")
         print("[PublicProfilePresentationDebug] swiftUIModalUsed=false")
         print("[PublicProfilePresentationDebug] overlayWindowUsed=false")
+        print("[PublicProfilePresentationDebug] selfPreview=false")
 #endif
     }
 }

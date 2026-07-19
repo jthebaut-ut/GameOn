@@ -645,7 +645,7 @@ extension MapViewModel {
     func toggleSavedProGame(_ match: LiveMatch) {
         if isProGameSaved(match) {
             unsaveProGame(id: SavedProGame.stableKey(for: match))
-            showSocialActionToast("Removed from Pro Games.", isError: false)
+            showSocialActionToast(L10n.t("removed_from_pro_sports_games"), isError: false)
         } else {
             saveProGame(match)
             showSocialActionToast("Saved to Going.", isError: false)

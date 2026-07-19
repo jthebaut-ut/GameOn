@@ -91,7 +91,10 @@ extension MapViewModel {
         let payloadMessage = trimmed.isEmpty ? nil : String(trimmed.prefix(280))
 #if DEBUG
         print("[PickupInviteDebug] createInvite gameId=\(game.id.uuidString.lowercased())")
+        print("[PickupInviteDebug] senderId=\(uid.uuidString.lowercased())")
         print("[PickupInviteDebug] inviteeCount=\(uniqueIds.count)")
+        print("[PickupInviteDebug] recipientIds=\(uniqueIds.map { $0.uuidString.lowercased() }.joined(separator: ","))")
+        print("[PickupInviteDebug] rpc=create_pickup_game_invites")
 #endif
         guard !uniqueIds.isEmpty else { return [] }
 
@@ -109,8 +112,20 @@ extension MapViewModel {
                 .value
             let created = rows.filter { $0.outcome == "created" }.count
             let duplicates = rows.filter { $0.outcome == "duplicate" }.count
+            let skipped = rows.filter { $0.outcome == "skipped" }.count
+            let maxReached = rows.filter { $0.outcome == "max_reached" }.count
 #if DEBUG
+            print("[PickupInviteDebug] backendResponseCount=\(rows.count)")
+            print("[PickupInviteDebug] insertedCount=\(created)")
             print("[PickupInviteDebug] duplicateSkipped=\(duplicates)")
+            print("[PickupInviteDebug] skippedCount=\(skipped)")
+            print("[PickupInviteDebug] maxReachedCount=\(maxReached)")
+            for row in rows {
+                print(
+                    "[PickupInviteDebug] outcome=\(row.outcome) invitee=\(row.invitee_user_id.uuidString.lowercased()) inviteId=\(row.invite_id?.uuidString.lowercased() ?? "nil")"
+                )
+            }
+            print("[PickupInviteDebug] returnedErrorMessage=nil")
 #endif
             if created > 0 {
                 let suffix = created == 1 ? "" : "s"
@@ -122,6 +137,11 @@ extension MapViewModel {
             }
             return rows
         } catch {
+#if DEBUG
+            print("[PickupInviteDebug] insertedCount=0")
+            print("[PickupInviteDebug] returnedErrorMessage=\(error.localizedDescription)")
+            print("[PickupInviteDebug] returnedErrorDetail=\(String(describing: error))")
+#endif
             showSocialActionToast(error.localizedDescription, isError: true)
             return []
         }

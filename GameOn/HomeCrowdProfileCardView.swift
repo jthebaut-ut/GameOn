@@ -493,20 +493,27 @@ struct HomeCrowdProfileCardView: View {
     }
 
     private var homeCrowdAccent: Color {
-        Color(red: 0.78, green: 0.62, blue: 1.0)
+        HomeCrowdCardStyle.accent
     }
 }
 
-// MARK: - Card chrome
+// MARK: - Shared Home Venue / Home Watch Spot visuals
 
-private extension View {
-    func homeCrowdCardChrome(colorScheme: ColorScheme, accent: Color) -> some View {
+enum HomeCrowdCardStyle {
+    static let accent = Color(red: 0.78, green: 0.62, blue: 1.0)
+    static let cornerRadius: CGFloat = 18
+    static let imageCornerRadius: CGFloat = 18
+}
+
+extension View {
+    /// Soft purple-accented premium chrome shared by Profile Home Venue and Public Profile Home Watch Spot.
+    func homeCrowdCardChrome(colorScheme: ColorScheme, accent: Color = HomeCrowdCardStyle.accent) -> some View {
         self
             .background {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous)
                     .fill(.ultraThinMaterial)
                     .background {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous)
                             .fill(
                                 LinearGradient(
                                     colors: [
@@ -520,9 +527,9 @@ private extension View {
                             )
                     }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous)
                     .strokeBorder(
                         LinearGradient(
                             colors: [

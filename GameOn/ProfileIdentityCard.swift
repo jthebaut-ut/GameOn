@@ -10,6 +10,7 @@ enum ProfilePhase1PersonalizationCache {
     static let ttlSeconds: TimeInterval = 600
 
     static var incomingPokesLoadedAtByAuthId: [UUID: Date] = [:]
+    static var incomingPokesByAuthId: [UUID: [ProfilePokeIncomingItem]] = [:]
     static var suggestedFansLoadedAtByAuthId: [UUID: Date] = [:]
     static var suggestedFansByAuthId: [UUID: [FriendSuggestionProfile]] = [:]
 
@@ -18,14 +19,27 @@ enum ProfilePhase1PersonalizationCache {
         suggestedFansByAuthId[authId]?.removeAll { $0.userID == dismissedUserId }
     }
 
+    static func invalidateSuggestedFans(for authId: UUID?) {
+        guard let authId else { return }
+        suggestedFansLoadedAtByAuthId.removeValue(forKey: authId)
+        suggestedFansByAuthId.removeValue(forKey: authId)
+    }
+
+    static func storeIncomingPokes(_ items: [ProfilePokeIncomingItem], for authId: UUID) {
+        incomingPokesByAuthId[authId] = items
+        incomingPokesLoadedAtByAuthId[authId] = Date()
+    }
+
     static func clear(for authId: UUID?) {
         guard let authId else {
             incomingPokesLoadedAtByAuthId.removeAll()
+            incomingPokesByAuthId.removeAll()
             suggestedFansLoadedAtByAuthId.removeAll()
             suggestedFansByAuthId.removeAll()
             return
         }
         incomingPokesLoadedAtByAuthId.removeValue(forKey: authId)
+        incomingPokesByAuthId.removeValue(forKey: authId)
         suggestedFansLoadedAtByAuthId.removeValue(forKey: authId)
         suggestedFansByAuthId.removeValue(forKey: authId)
     }
@@ -84,6 +98,7 @@ struct ProfileIdentityCard: View {
     @State private var showHandleSetup = false
     @State private var showIdentityEditor = false
     @State private var showFanIdentityEditor = false
+    @State private var showBioEmojiPicker = false
     @State private var selectedAvatarItem: PhotosPickerItem?
     @State private var editedDisplayName = ""
     @State private var editedUsername = ""
@@ -107,12 +122,19 @@ struct ProfileIdentityCard: View {
     @State private var incomingPokesMessage: String?
     @State private var showPokesHistorySheet = false
     @State private var showClearAllPokesConfirmation = false
+    @State private var pokeWaveBadgeDidPlayUnseenIntro = false
+    @State private var pokeWaveBadgeIntroScale: CGFloat = 1
     @State private var suggestedFans: [FriendSuggestionProfile] = []
     @State private var isLoadingSuggestedFans = false
     @State private var hasCompletedSuggestedFansLoad = false
     @State private var suggestedFansLoadStartedAt: Date?
     @State private var suggestedFansMessage: String?
+    @State private var suggestedFansLoadFailed = false
     @State private var sendingSuggestedFanRequestIds: Set<UUID> = []
+    @State private var suggestedFansSignalRefreshTask: Task<Void, Never>?
+    @State private var suggestedFansLoadTask: Task<Void, Never>?
+    @State private var lastSuggestedFansSignalFingerprint = ""
+    @State private var suggestedFansLoadGeneration: UInt64 = 0
     @State private var profileStatsCounts: ProfileStatsCounts?
     @State private var animatedTrophyTeamID: String?
     @State private var demotedTrophyTeamID: String?
@@ -133,13 +155,15 @@ struct ProfileIdentityCard: View {
     private static let incomingPokesHighlightsLimit = 50
     private static let suggestedFansDisplayLimit = 10
     private static let suggestedFansFetchLimit = 30
+    /// Scroll anchor for Discover Today dashboard → Suggested Fans.
+    static let suggestedFansScrollAnchorID = "profile.suggestedFans"
     private static let incomingPokesFreshnessIntervalSeconds: TimeInterval = 60
     private static let incomingPokesLiveRefreshIntervalSeconds = 20
     private static let incomingPokesLiveRefreshIntervalNs: UInt64 =
         UInt64(incomingPokesLiveRefreshIntervalSeconds) * 1_000_000_000
     /// Yields the first Account-tab paint before non-critical profile network extras.
     private static let profileExtrasFirstPaintDeferNanoseconds: UInt64 = 400_000_000
-    private static let profileHeroAvatarDiameter: CGFloat = 126
+    private static let profileHeroAvatarDiameter: CGFloat = 133
     private static let profileHeroAvatarRingWidth: CGFloat = 4
     private static let profileHeroAvatarOuterPadding: CGFloat = 4
     private static let profileHeroCameraButtonDiameter: CGFloat = 31
@@ -248,25 +272,31 @@ struct ProfileIdentityCard: View {
     }
 
     /// Persisted @handle without fan-since suffix (shown separately in compact identity rows).
+    /// Matches business header: `Handle: @username` via shared `handle` L10n key.
     private var handleLine: String {
+        let display: String
         let stored = viewModel.currentUserUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         if !viewModel.hasLoadedUserProfileForPresentation || viewModel.isUserProfileLoadingForPresentation {
             guard !stored.isEmpty else { return "" }
-            return FanGeoHandleRules.handleDisplayLine(
+            display = FanGeoHandleRules.handleDisplayLine(
                 base: FanGeoHandleRules.displayHandle(stored: stored),
                 profileCreatedAt: viewModel.currentUserProfileCreatedAt,
                 showFanSince: false
             )
+        } else {
+            let base = FanGeoHandleRules.publicHandleLine(
+                storedUsername: viewModel.currentUserUsername,
+                email: viewModel.currentUserEmail
+            )
+            display = FanGeoHandleRules.handleDisplayLine(
+                base: base,
+                profileCreatedAt: viewModel.currentUserProfileCreatedAt,
+                showFanSince: false
+            )
         }
-        let base = FanGeoHandleRules.publicHandleLine(
-            storedUsername: viewModel.currentUserUsername,
-            email: viewModel.currentUserEmail
-        )
-        return FanGeoHandleRules.handleDisplayLine(
-            base: base,
-            profileCreatedAt: viewModel.currentUserProfileCreatedAt,
-            showFanSince: false
-        )
+        let trimmed = display.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return "\(L10n.t("handle", languageCode: appLanguageRaw)): \(trimmed)"
     }
 
     private var shouldShowHandlePromptBanner: Bool {
@@ -457,6 +487,7 @@ struct ProfileIdentityCard: View {
                     profileSectionContainer(.secondary, accent: [FGColor.accentBlue, Self.profileTealAccent]) {
                         suggestedFansSection
                     }
+                    .id(Self.suggestedFansScrollAnchorID)
                 }
 
                 if profileBelowFoldSectionsReady, let slot = sponsoredProfileSlotContent {
@@ -499,16 +530,22 @@ struct ProfileIdentityCard: View {
                 print("[ProfileBioDebug] identityCardDisplayedBio=\(newValue.trimmingCharacters(in: .whitespacesAndNewlines))")
 #endif
             }
-            .onChange(of: viewModel.currentUserAuthId) { _, _ in
+            .onChange(of: viewModel.currentUserAuthId) { oldAuthId, _ in
+                ProfilePhase1PersonalizationCache.invalidateSuggestedFans(for: oldAuthId)
                 resetSuggestedFansLoadStateForAuthChange()
                 if showIdentityEditor {
                     resetIdentityDraft()
                 }
             }
             .onChange(of: viewModel.profileEditPresentationEvaluationKey) { _, _ in
+                // Only re-seed the draft when the sheet opens onto a freshly hydrated profile —
+                // never while the user is mid-edit or mid-save (wiping edits made Save look like a no-op).
                 guard showIdentityEditor,
+                      !isSavingIdentity,
                       viewModel.hasLoadedUserProfileForPresentation,
                       !viewModel.isUserProfileLoadingForPresentation else { return }
+                // Skip if the user has already typed beyond the last seeded values.
+                guard !identityDraftLooksDirty else { return }
                 resetIdentityDraft()
             }
             .onChange(of: isAccountTabActive) { _, isActive in
@@ -564,12 +601,23 @@ struct ProfileIdentityCard: View {
                     selectedIDs: Binding(
                         get: { selectedIDSet },
                         set: { newSet in
+                            let previous = selectedIDSet
+                            let addedIDs = newSet.subtracting(previous)
                             let sorted = Array(newSet).sorted()
                             let nextPrimary = FavoriteTeamsStore.normalizedPrimaryTeamID(primaryFavoriteTeamIDRaw, within: sorted)
                             favoriteTeamIDsRaw = FavoriteTeamsStore.encodeIDs(sorted)
                             primaryFavoriteTeamIDRaw = nextPrimary ?? ""
                             Task {
-                                await viewModel.syncFavoriteTeamsToSupabase(teamIDs: sorted, primaryTeamID: nextPrimary)
+                                let didSync = await viewModel.syncFavoriteTeamsToSupabase(teamIDs: sorted, primaryTeamID: nextPrimary)
+                                guard didSync else { return }
+                                // One toast max per save: prefer lexicographically last added id (stable when
+                                // multi-select order is unavailable from the Binding).
+                                guard let addedID = addedIDs.sorted().last else { return }
+                                let teams = FavoriteTeamsStore.resolvedTeams(fromIDs: [addedID])
+                                guard let team = teams.first else { return }
+                                await MainActor.run {
+                                    viewModel.presentFavoriteTeamWowMoment(team: team, languageCode: appLanguageRaw)
+                                }
                             }
                         }
                     )
@@ -621,7 +669,23 @@ struct ProfileIdentityCard: View {
                 let localEmpty = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).isEmpty
                 if localEmpty, viewModel.currentUserAuthId != nil {
                     await viewModel.loadFavoriteTeamsFromSupabase(forceRefresh: true)
+                    scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "favoriteTeamsHydrated")
+                } else {
+                    rememberSuggestedFansSignalFingerprint()
                 }
+            }
+            .onChange(of: favoriteTeamIDsRaw) { _, _ in
+                scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "favoriteTeamsChanged")
+            }
+            .onChange(of: viewModel.currentUserNationalTeam?.countryCode) { _, _ in
+                scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "nationalTeamChanged")
+            }
+            .onChange(of: viewModel.hasLoadedUserProfileForPresentation) { _, loaded in
+                guard loaded else { return }
+                scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "profilePresentationReady")
+            }
+            .onChange(of: viewModel.currentUserLocation?.latitude) { _, _ in
+                scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "locationAvailable")
             }
             .task(id: pokesLiveRefreshLoopToken) {
                 guard isAccountTabActive else { return }
@@ -916,87 +980,122 @@ struct ProfileIdentityCard: View {
     private var pokesHighlightsSection: some View {
         if shouldShowCompactPokesRow {
             let recentPokers = uniqueRecentPokersForAvatars
+            let peopleCount = recentPokers.count
+            let title = compactPokesCardTitle(peopleCount: peopleCount)
+            let body = compactPokesCardBody(recentPokers: recentPokers)
             Button {
 #if DEBUG
                 print("[PokeUIFlowDebug] openingFullPokeSheet=true")
 #endif
                 showPokesHistorySheet = true
             } label: {
-                HStack(spacing: 11) {
-                    ZStack(alignment: .bottomTrailing) {
-                        compactPokesAvatarStack(recentPokers: recentPokers)
-                        Image(systemName: "hand.wave.fill")
-                            .font(.system(size: 9.5, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 20, height: 20)
-                            .background(
-                                LinearGradient(
-                                    colors: [
-                                        Color.orange.opacity(0.95),
-                                        FGColor.accentGreen.opacity(0.92)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                in: Circle()
-                            )
-                            .overlay {
-                                Circle()
-                                    .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.18 : 0.92), lineWidth: 1)
-                            }
-                            .offset(x: 2, y: 2)
-                            .pokesUnseenWaveIconEmphasis(isActive: viewModel.hasUnseenPokes)
-                    }
+                HStack(spacing: 10) {
+                    compactPokesAvatarStack(recentPokers: recentPokers)
+                        .accessibilityHidden(true)
 
-                    VStack(alignment: .leading, spacing: 4) {
+                    compactPokesWaveBadge
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
-                            Text(compactPokesSummaryCopy(recentPokers: recentPokers))
+                            Text(title)
                                 .font(.system(size: 13.5, weight: .heavy, design: .rounded))
                                 .foregroundStyle(FGColor.primaryText(colorScheme))
                                 .lineLimit(1)
+                                .minimumScaleFactor(0.82)
 
-                            if viewModel.hasUnseenPokes {
-                                Text("New")
+                            if viewModel.hasUnseenPokes, viewModel.unseenPokesCount > 0 {
+                                Text(compactPokesNewBadgeCopy(count: viewModel.unseenPokesCount))
                                     .font(.system(size: 9, weight: .bold, design: .rounded))
                                     .foregroundStyle(.white)
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
                                     .background(Capsule(style: .continuous).fill(FGColor.accentBlue))
-                                    .pokesUnseenNewPillEmphasis(isActive: true)
+                                    .accessibilityHidden(true)
                             }
                         }
-                        .pokesUnseenTitleRowEmphasis(isActive: viewModel.hasUnseenPokes)
 
-                        Text("Tap to view fan interaction")
-                            .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                        Text(body)
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
                             .foregroundStyle(FGColor.mutedText(colorScheme))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.78)
                     }
 
-                    Spacer(minLength: 0)
+                    Spacer(minLength: 4)
 
-                    HStack(spacing: 5) {
-                        Text("History")
-                            .font(.system(size: 10, weight: .black, design: .rounded))
+                    HStack(spacing: 3) {
+                        Text(L10n.t("profile_pokes_view_history", languageCode: appLanguageRaw))
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 8.5, weight: .black))
+                            .font(.system(size: 8, weight: .bold))
                     }
-                    .foregroundStyle(FGColor.accentBlue)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.10), in: Capsule())
+                    .foregroundStyle(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.92 : 0.88))
+                    .accessibilityHidden(true)
                 }
-                .padding(.horizontal, 13)
+                .padding(.horizontal, 12)
                 .frame(height: 66)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                 .background {
                     pokesHighlightsCardBackground
                 }
                 .pokesUnseenHighlightsEmphasis(isActive: viewModel.hasUnseenPokes)
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(pokesHighlightsAccessibilityLabel(recentPokers: recentPokers))
-            .accessibilityHint("Opens Pokes history")
+            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985))
+            .accessibilityElement(children: .ignore)
+            .accessibilityAddTraits(.isButton)
+            .accessibilityLabel(pokesHighlightsAccessibilityLabel(title: title, body: body))
+            .accessibilityHint(L10n.t("profile_pokes_open_history_a11y", languageCode: appLanguageRaw))
+            .onAppear {
+                playPokeWaveBadgeUnseenIntroIfNeeded()
+            }
+            .onChange(of: viewModel.hasUnseenPokes) { _, hasUnseen in
+                if hasUnseen {
+                    playPokeWaveBadgeUnseenIntroIfNeeded()
+                } else {
+                    pokeWaveBadgeDidPlayUnseenIntro = false
+                    pokeWaveBadgeIntroScale = 1
+                }
+            }
+        }
+    }
+
+    private var compactPokesWaveBadge: some View {
+        Image(systemName: "hand.wave.fill")
+            .font(.system(size: 15.5, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: 34, height: 34)
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color.orange.opacity(0.95),
+                        FGColor.accentGreen.opacity(0.92)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: Circle()
+            )
+            .overlay {
+                Circle()
+                    .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.22 : 0.94), lineWidth: 1.25)
+            }
+            .shadow(color: Color.orange.opacity(colorScheme == .dark ? 0.28 : 0.18), radius: 4, y: 1)
+            .scaleEffect(pokeWaveBadgeIntroScale)
+    }
+
+    private func playPokeWaveBadgeUnseenIntroIfNeeded() {
+        guard viewModel.hasUnseenPokes, !pokeWaveBadgeDidPlayUnseenIntro else { return }
+        pokeWaveBadgeDidPlayUnseenIntro = true
+        pokeWaveBadgeIntroScale = 0.82
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.62)) {
+            pokeWaveBadgeIntroScale = 1.08
+        }
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.78).delay(0.16)) {
+            pokeWaveBadgeIntroScale = 1
         }
     }
 
@@ -1036,29 +1135,34 @@ struct ProfileIdentityCard: View {
             if recentPokers.isEmpty {
                 Circle()
                     .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.14 : 0.10))
-                    .frame(width: 38, height: 38)
+                    .frame(width: 34, height: 34)
                     .overlay {
                         Image(systemName: "hand.wave.fill")
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(FGColor.accentBlue)
                     }
                     .overlay {
                         Circle()
-                            .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.10 : 0.9), lineWidth: 1)
+                            .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.18 : 0.95), lineWidth: 1.5)
                     }
             } else {
-                let visiblePokers = Array(recentPokers.prefix(4))
+                let visiblePokers = Array(recentPokers.prefix(3))
                 ZStack(alignment: .leading) {
                     ForEach(Array(visiblePokers.enumerated()), id: \.element.id) { index, poke in
                         pokesAvatar(poke)
-                            .offset(x: CGFloat(index) * 15)
+                            .offset(x: CGFloat(index) * 14)
                             .zIndex(Double(visiblePokers.count - index))
                     }
                 }
-                .frame(width: CGFloat(visiblePokers.count - 1) * 15 + 30, height: 34, alignment: .leading)
+                .frame(
+                    width: CGFloat(max(visiblePokers.count - 1, 0)) * 14 + 30,
+                    height: 34,
+                    alignment: .leading
+                )
             }
         }
-        .frame(width: 74, alignment: .leading)
+        .frame(width: 58, alignment: .leading)
+        .accessibilityHidden(true)
     }
 
     private var uniqueRecentPokersForAvatars: [ProfilePokeIncomingItem] {
@@ -1076,9 +1180,9 @@ struct ProfileIdentityCard: View {
         pokeAvatarView(poke, size: 30)
         .overlay {
             Circle()
-                .strokeBorder(Color(.secondarySystemGroupedBackground), lineWidth: 2)
+                .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.92 : 1), lineWidth: 2)
         }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.12), radius: 4, y: 2)
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.10), radius: 3, y: 1)
     }
 
     @ViewBuilder
@@ -1113,38 +1217,84 @@ struct ProfileIdentityCard: View {
         incomingPokeTotalCount > 0
     }
 
-    private func compactPokesSummaryCopy(recentPokers: [ProfilePokeIncomingItem]) -> String {
-        let count = incomingPokeTotalCount
-        guard count > 0 else { return "" }
-        let firstName = recentPokers.first?.pokerDisplayName
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !firstName.isEmpty {
-            if count == 1 {
-                return "\(firstName) says hello"
-            }
-            return "\(firstName) and \(count - 1) \(count == 2 ? "other" : "others") said hello"
-        }
-        if count == 1 {
-            return "1 recent poke"
-        }
-        return "\(count) recent pokes"
+    private func compactPokesSafeDisplayName(_ poke: ProfilePokeIncomingItem?) -> String {
+        let trimmed = poke?.pokerDisplayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !trimmed.isEmpty { return trimmed }
+        return L10n.t("profile_pokes_fallback_fan_name", languageCode: appLanguageRaw)
     }
 
-    private func pokesHighlightsAccessibilityLabel(recentPokers: [ProfilePokeIncomingItem]) -> String {
-        "Pokes, \(compactPokesSummaryCopy(recentPokers: recentPokers))"
+    private func compactPokesCardTitle(peopleCount: Int) -> String {
+        if peopleCount <= 1 {
+            return L10n.t("profile_pokes_card_title_one", languageCode: appLanguageRaw)
+        }
+        return String(
+            format: L10n.t("profile_pokes_card_title_count_format", languageCode: appLanguageRaw),
+            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+            peopleCount
+        )
+    }
+
+    private func compactPokesCardBody(recentPokers: [ProfilePokeIncomingItem]) -> String {
+        let peopleCount = recentPokers.count
+        let firstName = compactPokesSafeDisplayName(recentPokers.first)
+        guard peopleCount > 0 else { return "" }
+        if peopleCount == 1 {
+            return String(
+                format: L10n.t("profile_pokes_card_body_one_format", languageCode: appLanguageRaw),
+                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                firstName
+            )
+        }
+        let others = peopleCount - 1
+        if others == 1 {
+            return String(
+                format: L10n.t("profile_pokes_card_body_one_other_format", languageCode: appLanguageRaw),
+                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                firstName
+            )
+        }
+        return String(
+            format: L10n.t("profile_pokes_card_body_many_others_format", languageCode: appLanguageRaw),
+            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+            firstName,
+            others
+        )
+    }
+
+    private func compactPokesNewBadgeCopy(count: Int) -> String {
+        let safe = max(count, 1)
+        if safe == 1 {
+            return L10n.t("profile_pokes_new", languageCode: appLanguageRaw)
+        }
+        return String(
+            format: L10n.t("profile_pokes_new_count_format", languageCode: appLanguageRaw),
+            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+            safe
+        )
+    }
+
+    private func pokesHighlightsAccessibilityLabel(title: String, body: String) -> String {
+        let combined = [title, body]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
+        if viewModel.hasUnseenPokes, viewModel.unseenPokesCount > 0 {
+            return "\(combined). \(compactPokesNewBadgeCopy(count: viewModel.unseenPokesCount))"
+        }
+        return combined
     }
 
     private var pokesHistorySheet: some View {
         NavigationStack {
             Group {
                 if isLoadingIncomingPokes && incomingPokes.isEmpty {
-                    ProgressView("Loading Pokes…")
+                    ProgressView(L10n.t("profile_pokes_loading", languageCode: appLanguageRaw))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if incomingPokes.isEmpty {
                     ContentUnavailableView(
-                        "No pokes yet",
+                        L10n.t("profile_pokes_empty_title", languageCode: appLanguageRaw),
                         systemImage: "hand.wave.fill",
-                        description: Text("When fans poke you, they’ll appear here.")
+                        description: Text(L10n.t("profile_pokes_empty_body", languageCode: appLanguageRaw))
                     )
                 } else {
                     List(incomingPokes) { poke in
@@ -1166,11 +1316,11 @@ struct ProfileIdentityCard: View {
                     .listStyle(.plain)
                 }
             }
-            .navigationTitle("Pokes")
+            .navigationTitle(L10n.t("profile_pokes_history_title", languageCode: appLanguageRaw))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { showPokesHistorySheet = false }
+                    Button(L10n.t("Done", languageCode: appLanguageRaw)) { showPokesHistorySheet = false }
                 }
                 ToolbarItem(placement: .primaryAction) {
                     HStack(spacing: 12) {
@@ -1180,12 +1330,12 @@ struct ProfileIdentityCard: View {
 #endif
                             showClearAllPokesConfirmation = true
                         } label: {
-                            Text("Clear")
+                            Text(L10n.t("Clear", languageCode: appLanguageRaw))
                                 .font(.system(size: 13, weight: .bold, design: .rounded))
                         }
                         .disabled(incomingPokes.isEmpty || isLoadingIncomingPokes || isClearingAllPokes)
                         .foregroundStyle(FGColor.dangerRed)
-                        .accessibilityLabel("Clear all Pokes")
+                        .accessibilityLabel(L10n.t("profile_pokes_clear_all_a11y", languageCode: appLanguageRaw))
 
                         Button {
                             Task { await forceRefreshIncomingPokes() }
@@ -1193,20 +1343,20 @@ struct ProfileIdentityCard: View {
                             Image(systemName: "arrow.clockwise")
                         }
                         .disabled(isLoadingIncomingPokes || isClearingAllPokes)
-                        .accessibilityLabel("Refresh Pokes")
+                        .accessibilityLabel(L10n.t("profile_pokes_refresh_a11y", languageCode: appLanguageRaw))
                     }
                 }
             }
-            .alert("Clear all pokes?", isPresented: $showClearAllPokesConfirmation) {
-                Button("Cancel", role: .cancel) {}
-                Button("Clear All", role: .destructive) {
+            .alert(L10n.t("profile_pokes_clear_all_title", languageCode: appLanguageRaw), isPresented: $showClearAllPokesConfirmation) {
+                Button(L10n.t("Cancel", languageCode: appLanguageRaw), role: .cancel) {}
+                Button(L10n.t("profile_pokes_clear_all_confirm", languageCode: appLanguageRaw), role: .destructive) {
 #if DEBUG
                     print("[FanPokesDebug] clearAllConfirmed=true")
 #endif
                     Task { await clearAllIncomingPokes() }
                 }
             } message: {
-                Text("This will remove all pokes from your list. This can’t be undone.")
+                Text(L10n.t("profile_pokes_clear_all_message", languageCode: appLanguageRaw))
             }
             .task {
                 await forceRefreshIncomingPokes()
@@ -1319,6 +1469,29 @@ struct ProfileIdentityCard: View {
             return
         }
 
+        // Coalesce with badge refresh so tab preload + Profile appear share one fetch.
+        await viewModel.refreshUnseenPokesBadgeIfNeeded()
+
+        if !ignoreCache,
+           let loadedAt = ProfilePhase1PersonalizationCache.incomingPokesLoadedAtByAuthId[authId],
+           Date().timeIntervalSince(loadedAt) < Self.incomingPokesFreshnessIntervalSeconds,
+           let cached = ProfilePhase1PersonalizationCache.incomingPokesByAuthId[authId] {
+            let age = Date().timeIntervalSince(loadedAt)
+#if DEBUG
+            TabPerfDebug.log("[TabPerfDebug] accountPokesRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
+            print("[SmoothPerf] operation=accountPokesRefresh coalescedOrFresh=true reason=\(reason)")
+#endif
+            await MainActor.run {
+                incomingPokes = cached
+                incomingPokeTotalCount = cached.count
+                incomingPokesMessage = nil
+                isLoadingIncomingPokes = false
+                lastIncomingPokesFingerprint = cached.map(\.id.uuidString).joined(separator: "|")
+            }
+            acknowledgePokesCardAfterSuccessfulLoad()
+            return
+        }
+
         if !ignoreCache,
            let loadedAt = ProfilePhase1PersonalizationCache.incomingPokesLoadedAtByAuthId[authId],
            Date().timeIntervalSince(loadedAt) < Self.incomingPokesFreshnessIntervalSeconds {
@@ -1344,6 +1517,7 @@ struct ProfileIdentityCard: View {
             let fingerprint = items.map(\.id.uuidString).joined(separator: "|")
 
             await MainActor.run {
+                ProfilePhase1PersonalizationCache.storeIncomingPokes(items, for: authId)
                 if fingerprint == lastIncomingPokesFingerprint,
                    incomingPokeTotalCount == items.count {
                     isLoadingIncomingPokes = false
@@ -1355,9 +1529,6 @@ struct ProfileIdentityCard: View {
                 incomingPokeTotalCount = items.count
                 incomingPokesMessage = nil
                 isLoadingIncomingPokes = false
-                if let authId = viewModel.currentUserAuthId {
-                    ProfilePhase1PersonalizationCache.incomingPokesLoadedAtByAuthId[authId] = Date()
-                }
                 viewModel.applyIncomingPokesFetch(items)
                 acknowledgePokesCardAfterSuccessfulLoad()
             }
@@ -1387,6 +1558,7 @@ struct ProfileIdentityCard: View {
             hasCompletedLoad: hasCompletedSuggestedFansLoad,
             isRefreshing: isLoadingSuggestedFans && !displayedSuggestedFans.isEmpty,
             message: suggestedFansMessage,
+            loadFailed: suggestedFansLoadFailed,
             sendingRequestIds: sendingSuggestedFanRequestIds,
             chipKind: { chatViewModel.chipKind(forOtherUserId: $0) },
             onAdd: { suggestion in
@@ -1397,8 +1569,50 @@ struct ProfileIdentityCard: View {
             },
             onDismiss: { suggestion in
                 Task { await dismissSuggestedFan(suggestion) }
+            },
+            onRetry: {
+                Task { await loadSuggestedFans(ignoreCache: true) }
             }
         )
+    }
+
+    private func suggestedFansSignalFingerprint() -> String {
+        let auth = viewModel.currentUserAuthId?.uuidString.lowercased() ?? "anonymous"
+        let teams = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).sorted().joined(separator: ",")
+        let country = viewModel.currentUserNationalTeam?.countryCode.uppercased() ?? ""
+        let hasLocation = viewModel.currentUserLocation != nil ? "1" : "0"
+        let profileReady = viewModel.hasLoadedUserProfileForPresentation ? "1" : "0"
+        return "\(auth)|teams=\(teams)|country=\(country)|loc=\(hasLocation)|ready=\(profileReady)"
+    }
+
+    @MainActor
+    private func rememberSuggestedFansSignalFingerprint() {
+        lastSuggestedFansSignalFingerprint = suggestedFansSignalFingerprint()
+    }
+
+    @MainActor
+    private func scheduleSuggestedFansRefreshAfterSignalsChanged(reason: String) {
+        guard canShowSuggestedFans, isAccountTabActive else { return }
+        let fingerprint = suggestedFansSignalFingerprint()
+        guard fingerprint != lastSuggestedFansSignalFingerprint || suggestedFansLoadFailed else {
+            return
+        }
+
+        suggestedFansSignalRefreshTask?.cancel()
+        suggestedFansSignalRefreshTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, isAccountTabActive, canShowSuggestedFans else { return }
+            let nextFingerprint = suggestedFansSignalFingerprint()
+            guard nextFingerprint != lastSuggestedFansSignalFingerprint || suggestedFansLoadFailed else {
+                return
+            }
+            lastSuggestedFansSignalFingerprint = nextFingerprint
+            ProfilePhase1PersonalizationCache.invalidateSuggestedFans(for: viewModel.currentUserAuthId)
+#if DEBUG
+            print("[SuggestedFansUI] signalRefresh reason=\(reason)")
+#endif
+            await loadSuggestedFans(ignoreCache: true)
+        }
     }
 
     private func loadSuggestedFans(ignoreCache: Bool = false) async {
@@ -1406,6 +1620,7 @@ struct ProfileIdentityCard: View {
             await MainActor.run {
                 suggestedFans = []
                 suggestedFansMessage = nil
+                suggestedFansLoadFailed = false
                 isLoadingSuggestedFans = false
                 hasCompletedSuggestedFansLoad = false
                 suggestedFansLoadStartedAt = nil
@@ -1422,20 +1637,54 @@ struct ProfileIdentityCard: View {
             await MainActor.run {
                 suggestedFans = cached
                 suggestedFansMessage = nil
+                suggestedFansLoadFailed = false
                 isLoadingSuggestedFans = false
                 hasCompletedSuggestedFansLoad = true
                 suggestedFansLoadStartedAt = nil
+                rememberSuggestedFansSignalFingerprint()
             }
 #if DEBUG
             print("[PerfPhase1C] profileCacheHit key=suggestedFans")
+            print("[SuggestedFansUI] loadCoalescedOrFresh reason=ttlHit")
             SuggestedFansDebug.loadingFinished(count: cached.count)
 #endif
             return
         }
 
+        if let inFlight = suggestedFansLoadTask, !ignoreCache {
+#if DEBUG
+            print("[SuggestedFansUI] loadCoalescedOrFresh reason=inFlight")
+#endif
+            await inFlight.value
+            return
+        }
+
+        if ignoreCache {
+            suggestedFansLoadTask?.cancel()
+            suggestedFansLoadTask = nil
+        }
+
+        suggestedFansLoadGeneration &+= 1
+        let generation = suggestedFansLoadGeneration
+        let task = Task { @MainActor in
+            await self.performSuggestedFansLoad(generation: generation)
+        }
+        suggestedFansLoadTask = task
+        await task.value
+        if suggestedFansLoadTask == task {
+            suggestedFansLoadTask = nil
+        }
+    }
+
+    private func performSuggestedFansLoad(generation: UInt64) async {
 #if DEBUG
         print("[SuggestedFansUI] load start")
 #endif
+        let favoritesCount = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).count
+        let countryCode = viewModel.currentUserNationalTeam?.countryCode
+        let coordinatesAvailable = viewModel.currentUserLocation != nil
+        let center = viewModel.currentUserLocation
+
         await MainActor.run {
             if suggestedFansLoadStartedAt == nil {
                 suggestedFansLoadStartedAt = Date()
@@ -1443,30 +1692,54 @@ struct ProfileIdentityCard: View {
             }
             isLoadingSuggestedFans = true
             suggestedFansMessage = nil
+            suggestedFansLoadFailed = false
+            SuggestedFansDebug.requestStarted(currentUserId: viewModel.currentUserAuthId)
+            SuggestedFansDebug.profileReady(
+                favoritesCount: favoritesCount,
+                countryCode: countryCode,
+                coordinatesAvailable: coordinatesAvailable
+            )
         }
 
         do {
             let suggestions = try await friendSuggestionsService.fetchSuggestions(
-                limit: Self.suggestedFansFetchLimit
+                limit: Self.suggestedFansFetchLimit,
+                radiusMiles: SuggestedFansProduct.nearbyRadiusMiles,
+                centerLat: center?.latitude,
+                centerLng: center?.longitude
             )
             let profileRowsById = await SuggestedFansEligibility.fetchProfileRows(
                 for: suggestions.map(\.userID)
             )
-            let filteredSuggestions = await SuggestedFansEligibility.filterSuggestions(
+            let (filteredSuggestions, summary) = await SuggestedFansEligibility.filterSuggestions(
                 suggestions,
                 viewerId: viewModel.currentUserAuthId,
                 profileRowsById: profileRowsById,
                 isBlocked: { chatViewModel.isEitherDirectionBlocked(with: $0) }
             )
+            SuggestedFansDebug.filterSummary(summary)
             await MainActor.run {
+                guard generation == suggestedFansLoadGeneration else {
+#if DEBUG
+                    print("[SuggestedFansUI] staleResultIgnored generation=\(generation)")
+#endif
+                    return
+                }
                 let startedAt = suggestedFansLoadStartedAt
                 suggestedFans = filteredSuggestions
                 suggestedFansMessage = nil
+                suggestedFansLoadFailed = false
                 isLoadingSuggestedFans = false
                 hasCompletedSuggestedFansLoad = true
+                rememberSuggestedFansSignalFingerprint()
                 if let authId = viewModel.currentUserAuthId {
-                    ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId] = Date()
-                    ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] = filteredSuggestions
+                    if filteredSuggestions.isEmpty {
+                        // Do not sticky-cache empty pools; new-user signals can arrive shortly after.
+                        ProfilePhase1PersonalizationCache.invalidateSuggestedFans(for: authId)
+                    } else {
+                        ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId] = Date()
+                        ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] = filteredSuggestions
+                    }
                 }
                 if let startedAt, !filteredSuggestions.isEmpty {
                     let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
@@ -1480,11 +1753,15 @@ struct ProfileIdentityCard: View {
 #endif
         } catch {
             await MainActor.run {
+                guard generation == suggestedFansLoadGeneration else { return }
                 suggestedFans = []
-                suggestedFansMessage = "More fan matches coming soon"
+                suggestedFansMessage = "Couldn't load fan suggestions"
+                suggestedFansLoadFailed = true
                 isLoadingSuggestedFans = false
                 hasCompletedSuggestedFansLoad = true
                 suggestedFansLoadStartedAt = nil
+                // Do not cache failures as empty matches.
+                ProfilePhase1PersonalizationCache.invalidateSuggestedFans(for: viewModel.currentUserAuthId)
                 SuggestedFansDebug.loadingFinished(count: 0)
             }
 #if DEBUG
@@ -1509,7 +1786,10 @@ struct ProfileIdentityCard: View {
                 }
                 isLoadingSuggestedFans = false
                 hasCompletedSuggestedFansLoad = true
+                suggestedFansLoadFailed = false
+                suggestedFansMessage = nil
                 suggestedFansLoadStartedAt = nil
+                rememberSuggestedFansSignalFingerprint()
 #if DEBUG
                 SuggestedFansDebug.loadingFinished(count: cached.count)
 #endif
@@ -1521,6 +1801,7 @@ struct ProfileIdentityCard: View {
                     suggestedFans = cached
                 }
                 hasCompletedSuggestedFansLoad = true
+                suggestedFansLoadFailed = false
                 if suggestedFansLoadStartedAt == nil {
                     suggestedFansLoadStartedAt = Date()
                     SuggestedFansDebug.loadingStarted()
@@ -1537,16 +1818,24 @@ struct ProfileIdentityCard: View {
             SuggestedFansDebug.loadingStarted()
         }
         isLoadingSuggestedFans = true
+        suggestedFansLoadFailed = false
         suggestedFansMessage = nil
     }
 
     @MainActor
     private func resetSuggestedFansLoadStateForAuthChange() {
+        suggestedFansSignalRefreshTask?.cancel()
+        suggestedFansSignalRefreshTask = nil
+        suggestedFansLoadTask?.cancel()
+        suggestedFansLoadTask = nil
+        suggestedFansLoadGeneration &+= 1
+        lastSuggestedFansSignalFingerprint = ""
         hasCompletedSuggestedFansLoad = false
         suggestedFansLoadStartedAt = nil
         suggestedFans = []
         isLoadingSuggestedFans = false
         suggestedFansMessage = nil
+        suggestedFansLoadFailed = false
         sendingSuggestedFanRequestIds = []
     }
 
@@ -1961,7 +2250,9 @@ struct ProfileIdentityCard: View {
 
     private func sponsoredProfileFallbackPromotion() -> SponsoredProfileFallbackPromotion? {
         guard viewModel.canUseFanSocialFeatures else { return nil }
-        return SponsoredProfileFallbackPromotion.businessGrowthCard()
+        return SponsoredProfileFallbackPromotion.businessGrowthCard(
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+        )
     }
 
     private func handleSponsoredProfileFallbackTap(_ promotion: SponsoredProfileFallbackPromotion) {
@@ -2210,7 +2501,7 @@ struct ProfileIdentityCard: View {
     }
 
     private var headerRow: some View {
-        HStack(alignment: .top, spacing: 16) {
+        HStack(alignment: .top, spacing: 14) {
             PhotosPicker(selection: $selectedAvatarItem, matching: .images) {
                 avatarStack
             }
@@ -2218,30 +2509,23 @@ struct ProfileIdentityCard: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Update profile photo")
 
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 8) {
                 Button {
                     presentIdentityEditor(focusedField: .displayName)
                 } label: {
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 6) {
-                            Text(displayName)
-                                .font(.system(size: 26, weight: .bold, design: .rounded))
-                                .foregroundStyle(FGColor.primaryText(colorScheme))
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.82)
-
-                            if reputation.privileges.isVerifiedOrganizer {
-                                Image(systemName: "checkmark.seal.fill")
-                                    .font(.system(size: 15, weight: .bold))
-                                    .foregroundStyle(FGColor.accentBlue)
-                            }
-                        }
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(displayName)
+                            .font(.system(size: 26, weight: .bold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.82)
 
                         Text(handleLine)
                             .font(.system(size: 13.5, weight: .semibold, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                             .lineLimit(1)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -2262,10 +2546,6 @@ struct ProfileIdentityCard: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(bioLine.isEmpty ? "Add bio" : "Edit bio")
-
-                if reputation.privileges.isVerifiedOrganizer {
-                    verifiedOrganizerHeroBadge
-                }
 
                 editProfileHeroButton
             }
@@ -2413,22 +2693,6 @@ struct ProfileIdentityCard: View {
                 Circle()
                     .fill(tint.opacity(colorScheme == .dark ? 0.2 : 0.12))
             }
-    }
-
-    private var verifiedOrganizerHeroBadge: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "checkmark.seal.fill")
-                .font(.system(size: 10, weight: .bold))
-            Text("VERIFIED ORGANIZER")
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .tracking(0.45)
-                .lineLimit(1)
-        }
-        .foregroundStyle(FGColor.accentGreen)
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.11))
-        .clipShape(Capsule())
     }
 
     private var profileHeroPokesBadgeVisible: Bool {
@@ -2601,10 +2865,30 @@ struct ProfileIdentityCard: View {
                                 }
                             }
 
-                        Text("\(editedBio.count)/\(Self.bioCharacterLimit)")
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        HStack(spacing: 8) {
+                            Button {
+                                FGInteractionHaptics.selection()
+                                showBioEmojiPicker = true
+                            } label: {
+                                Image(systemName: "face.smiling")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(FGColor.accentGreen)
+                                    .frame(width: 44, height: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L10n.t("Add emoji", languageCode: appLanguageRaw))
+
+                            Spacer(minLength: 0)
+
+                            Text("\(editedBio.count)/\(Self.bioCharacterLimit)")
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(
+                                    editedBio.count >= Self.bioCharacterLimit
+                                        ? Color.red.opacity(0.9)
+                                        : FGColor.secondaryText(colorScheme)
+                                )
+                        }
                     }
 
                     identityFieldCard(title: "Home City", subtitle: "Optional. Example: Lehi, Utah") {
@@ -2624,10 +2908,16 @@ struct ProfileIdentityCard: View {
                         .disabled(editedHomeCityDisplay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
 
+                    fanProfileAccountEmailCard
+
                     if !identityMessage.isEmpty {
                         Text(identityMessage)
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .foregroundStyle(identityMessage.contains("updated") || identityMessage == "Saved." ? FGColor.accentGreen : FGColor.secondaryText(colorScheme))
+                            .foregroundStyle(
+                                identityMessage.contains("updated") || identityMessage == "Saved."
+                                    ? FGColor.accentGreen
+                                    : Color.red
+                            )
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -2645,14 +2935,16 @@ struct ProfileIdentityCard: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(isSavingIdentity ? "Saving..." : "Save") {
+#if DEBUG
+                        print("[FanProfileSave] tap")
+                        print("[FanProfileSave] handleState=\(fanProfileSaveHandleStateDebug)")
+                        print("[FanProfileSave] profileLoaded=\(viewModel.hasLoadedUserProfileForPresentation) profileLoading=\(viewModel.isUserProfileLoadingForPresentation)")
+#endif
                         Task { await saveIdentity() }
                     }
-                    .disabled(
-                        isSavingIdentity
-                            || isUploadingAvatar
-                            || !viewModel.hasLoadedUserProfileForPresentation
-                            || viewModel.isUserProfileLoadingForPresentation
-                    )
+                    // Presentation-load flags are enforced inside `saveIdentity` with a visible message.
+                    // Disabling Save on those flags made taps silently no-op when hydration raced.
+                    .disabled(isSavingIdentity || isUploadingAvatar || !identityDraftLooksDirty)
                 }
             }
             .onAppear {
@@ -2661,6 +2953,28 @@ struct ProfileIdentityCard: View {
                     resetIdentityDraft()
                 }
             }
+            .sheet(isPresented: $showBioEmojiPicker) {
+                ProfileBioEmojiPickerSheet(languageCode: appLanguageRaw) { emoji in
+                    insertBioEmoji(emoji)
+                }
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
+            }
+        }
+    }
+
+    private func insertBioEmoji(_ emoji: String) {
+        var draft = editedBio
+        let inserted = ProfileBioEmojiInsertion.append(
+            emoji: emoji,
+            to: &draft,
+            limit: Self.bioCharacterLimit
+        )
+        if inserted {
+            editedBio = limitedBio(draft)
+            focusedIdentityField = .bio
+        } else {
+            FGInteractionHaptics.softImpact()
         }
     }
 
@@ -2682,6 +2996,63 @@ struct ProfileIdentityCard: View {
             content()
         }
         .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.86 : 0.98))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+                }
+        }
+    }
+
+    /// Read-only account email row (authenticated Supabase user). Presentation only.
+    private var fanProfileAccountEmailCard: some View {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let email = viewModel.currentUserEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayEmail = email.isEmpty ? "—" : email
+        let title = L10n.t("account", languageCode: languageCode)
+        let emailLabel = L10n.t("email_address", languageCode: languageCode)
+        let subtitle = L10n.t("account_email_subtitle", languageCode: languageCode)
+
+        return VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .accessibilityAddTraits(.isHeader)
+
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "envelope.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .frame(width: 22, height: 22)
+                    .padding(.top, 1)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(emailLabel)
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+
+                    Text(displayEmail)
+                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+
+                    Text(subtitle)
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(emailLabel). \(displayEmail). \(subtitle)")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.86 : 0.98))
@@ -2733,6 +3104,38 @@ struct ProfileIdentityCard: View {
         handleStatusIsPositive = false
     }
 
+    /// True when editor drafts differ from the currently hydrated profile (user has typed something).
+    private var identityDraftLooksDirty: Bool {
+        let nameDirty = editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            != displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let handleDirty = FanGeoHandleRules.normalizeForStorage(editedUsername)
+            != FanGeoHandleRules.normalizeForStorage(viewModel.currentUserUsername)
+        let bioDirty = limitedBio(editedBio) != limitedBio(viewModel.currentUserBio)
+        let cityDirty = editedHomeCity.trimmingCharacters(in: .whitespacesAndNewlines)
+            != viewModel.currentUserHomeCity.trimmingCharacters(in: .whitespacesAndNewlines)
+            || editedHomeRegion.trimmingCharacters(in: .whitespacesAndNewlines)
+            != viewModel.currentUserHomeRegion.trimmingCharacters(in: .whitespacesAndNewlines)
+            || editedHomeCountry.trimmingCharacters(in: .whitespacesAndNewlines)
+            != viewModel.currentUserHomeCountry.trimmingCharacters(in: .whitespacesAndNewlines)
+            || editedHomeCityDisplay.trimmingCharacters(in: .whitespacesAndNewlines)
+            != (ProfileHomeCityIdentity.displayLine(
+                city: viewModel.currentUserHomeCity,
+                region: viewModel.currentUserHomeRegion,
+                country: viewModel.currentUserHomeCountry
+            ) ?? viewModel.currentUserHomeCity).trimmingCharacters(in: .whitespacesAndNewlines)
+            || editedShowHomeCity != viewModel.currentUserShowHomeCity
+        return nameDirty || handleDirty || bioDirty || cityDirty
+    }
+
+#if DEBUG
+    private var fanProfileSaveHandleStateDebug: String {
+        let stored = FanGeoHandleRules.normalizeForStorage(viewModel.currentUserUsername)
+        let edited = FanGeoHandleRules.normalizeForStorage(editedUsername)
+        let status = handleStatusMessage.isEmpty ? "none" : handleStatusMessage.replacingOccurrences(of: " ", with: "_")
+        return "stored=\(stored) edited=\(edited) unchanged=\(stored == edited) uiStatus=\(status) positive=\(handleStatusIsPositive)"
+    }
+#endif
+
     private func limitedBio(_ raw: String) -> String {
         String(raw.prefix(Self.bioCharacterLimit))
     }
@@ -2758,10 +3161,24 @@ struct ProfileIdentityCard: View {
             return
         }
         let stored = FanGeoHandleRules.normalizeForStorage(raw)
+        let currentStored = FanGeoHandleRules.normalizeForStorage(viewModel.currentUserUsername)
         print("[HandleValidationDebug] normalizedHandle=\(stored)")
-        if let issue = FanGeoHandleRules.validate(raw) {
-            handleStatusMessage = "Invalid handle: \(FanGeoHandleRules.validationMessage(for: issue))"
-            print("[HandleValidationDebug] handleRejected reason=\(issue)")
+        if stored == currentStored {
+#if DEBUG
+            print("[FanProfileValidation] handleAvailabilityState=skippedUnchangedOwnHandle")
+#endif
+            return
+        }
+        if let editError = FanIdentityValidation.validateHandleForEdit(
+            raw,
+            original: viewModel.currentUserUsername
+        ) {
+            if FanGeoHandleRules.validateFormat(raw) != nil {
+                handleStatusMessage = "Invalid handle: \(editError)"
+            } else {
+                handleStatusMessage = editError
+            }
+            print("[HandleValidationDebug] handleRejected reason=editValidation")
             return
         }
 
@@ -2788,13 +3205,23 @@ struct ProfileIdentityCard: View {
 
     private func saveIdentity() async {
         guard viewModel.isLoggedIn else {
-            await MainActor.run { identityMessage = "Please sign in to edit your profile." }
+#if DEBUG
+            print("[FanProfileSave] validationPassed=false reason=notSignedIn")
+#endif
+            await MainActor.run {
+                identityMessage = "Please sign in to edit your profile."
+                viewModel.showSocialActionToast("Please sign in to edit your profile.", isError: true)
+            }
             return
         }
         guard viewModel.hasLoadedUserProfileForPresentation,
               !viewModel.isUserProfileLoadingForPresentation else {
+#if DEBUG
+            print("[FanProfileSave] validationPassed=false reason=profileStillLoading loaded=\(viewModel.hasLoadedUserProfileForPresentation) loading=\(viewModel.isUserProfileLoadingForPresentation)")
+#endif
             await MainActor.run {
                 identityMessage = "Your profile is still loading. Please try again in a moment."
+                viewModel.showSocialActionToast("Your profile is still loading. Please try again in a moment.", isError: true)
             }
             return
         }
@@ -2802,27 +3229,89 @@ struct ProfileIdentityCard: View {
         await MainActor.run { isSavingIdentity = true }
         defer { Task { @MainActor in isSavingIdentity = false } }
 
+        let originalDisplayName = viewModel.currentUserDisplayName
         let trimmed = editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let nextName = trimmed.isEmpty ? displayName : trimmed
+        let normalizedOriginalDisplayName = ReservedNameValidation.normalizeForComparison(originalDisplayName)
+        let normalizedDraftDisplayName = ReservedNameValidation.normalizeForComparison(nextName)
+        let displayNameChanged = normalizedOriginalDisplayName != normalizedDraftDisplayName
+
+        let originalHandle = viewModel.currentUserUsername
+        let normalizedOriginalHandle = FanGeoHandleRules.normalizeForStorage(originalHandle)
+        let normalizedDraftHandle = FanGeoHandleRules.normalizeForStorage(editedUsername)
+        let handleChanged = normalizedOriginalHandle != normalizedDraftHandle
+
+        let displayNameReservedError = FanIdentityValidation.validateDisplayNameForEdit(
+            nextName,
+            original: originalDisplayName
+        )
+        let handleReservedOrFormatError = handleChanged
+            ? FanIdentityValidation.validateHandleForEdit(editedUsername, original: originalHandle)
+            : nil
+
+#if DEBUG
+        print("[FanProfileValidation] originalDisplayName=\(originalDisplayName)")
+        print("[FanProfileValidation] draftDisplayName=\(nextName)")
+        print("[FanProfileValidation] normalizedOriginalDisplayName=\(normalizedOriginalDisplayName)")
+        print("[FanProfileValidation] normalizedDraftDisplayName=\(normalizedDraftDisplayName)")
+        print("[FanProfileValidation] displayNameChanged=\(displayNameChanged)")
+        print("[FanProfileValidation] originalHandle=\(originalHandle)")
+        print("[FanProfileValidation] draftHandle=\(editedUsername)")
+        print("[FanProfileValidation] normalizedOriginalHandle=\(normalizedOriginalHandle)")
+        print("[FanProfileValidation] normalizedDraftHandle=\(normalizedDraftHandle)")
+        print("[FanProfileValidation] handleChanged=\(handleChanged)")
+        print("[FanProfileValidation] reservedDisplayNameResult=\(displayNameReservedError != nil)")
+        print("[FanProfileValidation] reservedHandleResult=\(handleReservedOrFormatError == ReservedNameValidation.rejectionMessage)")
+#endif
+
         if ModerationService.containsProfanity(nextName) {
+#if DEBUG
+            print("[FanProfileSave] validationPassed=false reason=profanity")
+            print("[FanProfileValidation] saveAllowed=false")
+#endif
             await MainActor.run {
                 localAvatarPreviewImage = nil
                 identityMessage = ModerationService.profanityRejectionUserMessage()
+                viewModel.showSocialActionToast(ModerationService.profanityRejectionUserMessage(), isError: true)
             }
             return
         }
-        if ReservedNameValidation.containsReservedTerm(nextName) {
+        if let displayNameReservedError {
+#if DEBUG
+            print("[FanProfileSave] validationPassed=false reason=reservedName")
+            print("[FanProfileValidation] saveAllowed=false")
+#endif
             await MainActor.run {
                 localAvatarPreviewImage = nil
-                identityMessage = ReservedNameValidation.rejectionMessage
+                identityMessage = displayNameReservedError
+                viewModel.showSocialActionToast(displayNameReservedError, isError: true)
             }
             return
         }
-        if let issue = FanGeoHandleRules.validate(editedUsername) {
-            await MainActor.run { identityMessage = FanGeoHandleRules.validationMessage(for: issue) }
-            print("[HandleValidationDebug] handleRejected reason=\(issue)")
+        if let handleReservedOrFormatError {
+#if DEBUG
+            print("[FanProfileSave] validationPassed=false reason=handleInvalid")
+            print("[FanProfileSave] handleState=\(fanProfileSaveHandleStateDebug)")
+            print("[FanProfileValidation] handleAvailabilityState=skipped_invalid")
+            print("[FanProfileValidation] saveAllowed=false")
+#endif
+            await MainActor.run {
+                identityMessage = handleReservedOrFormatError
+                viewModel.showSocialActionToast(handleReservedOrFormatError, isError: true)
+            }
+            print("[HandleValidationDebug] handleRejected reason=editValidation")
             return
         }
+
+#if DEBUG
+        print("[FanProfileValidation] handleAvailabilityState=\(handleChanged ? "deferredToSaveUserProfile" : "skippedUnchangedOwnHandle")")
+        print("[FanProfileValidation] saveAllowed=true")
+        print("[FanProfileSave] validationPassed=true")
+        print("[FanProfileSave] handleState=\(fanProfileSaveHandleStateDebug)")
+        let nextBioPreview = limitedBio(editedBio)
+        print("[FanProfileSave] payload=displayNameLen=\(nextName.count) username=\(normalizedDraftHandle) bioLen=\(nextBioPreview.count) homeCity=\(editedHomeCity) region=\(editedHomeRegion) country=\(editedHomeCountry) showHomeCity=\(editedShowHomeCity)")
+        print("[FanProfileSave] requestStarted")
+#endif
 
         let nextBio = limitedBio(editedBio)
         if let err = await viewModel.saveUserProfile(
@@ -2832,9 +3321,21 @@ struct ProfileIdentityCard: View {
             username: editedUsername,
             bio: nextBio
         ) {
-            await MainActor.run { identityMessage = err }
+#if DEBUG
+            print("[FanProfileSave] requestFailed=\(err)")
+            print("[FanProfileSave] dismissed=false")
+            print("[FanProfileSave] profileRefreshed=false")
+#endif
+            await MainActor.run {
+                identityMessage = err
+                viewModel.showSocialActionToast(err, isError: true)
+            }
             return
         }
+
+#if DEBUG
+        print("[FanProfileSave] requestSucceeded identity")
+#endif
 
         if let err = await viewModel.saveUserProfileHomeCity(
             city: editedHomeCity,
@@ -2843,14 +3344,30 @@ struct ProfileIdentityCard: View {
             displayFallback: editedHomeCityDisplay,
             showOnProfile: editedShowHomeCity
         ) {
-            await MainActor.run { identityMessage = err }
+#if DEBUG
+            print("[FanProfileSave] requestFailed=\(err)")
+            print("[FanProfileSave] dismissed=false")
+            print("[FanProfileSave] profileRefreshed=partial_identity_saved")
+#endif
+            await MainActor.run {
+                identityMessage = err
+                viewModel.showSocialActionToast(err, isError: true)
+            }
             return
         }
+
+#if DEBUG
+        print("[FanProfileSave] requestSucceeded homeCity")
+#endif
 
         await MainActor.run {
             identityMessage = ""
             showIdentityEditor = false
             viewModel.showSocialActionToast("Saved.", isError: false)
+#if DEBUG
+            print("[FanProfileSave] dismissed=true")
+            print("[FanProfileSave] profileRefreshed=true")
+#endif
         }
     }
 
@@ -3054,7 +3571,7 @@ struct ProfileIdentityCard: View {
                     HStack(spacing: 4) {
                         Image(systemName: "pencil")
                             .font(.system(size: 9, weight: .bold))
-                        Text(teams.isEmpty ? "Add Teams" : "Edit Teams")
+                        Text(teams.isEmpty ? "Add Teams" : L10n.t("Edit Teams", languageCode: appLanguageRaw))
                             .font(.system(size: 10, weight: .semibold, design: .rounded))
                     }
                     .foregroundStyle(FGColor.accentBlue)
@@ -3924,13 +4441,13 @@ private struct SponsoredProfileFallbackPromotion: Identifiable {
 
     var stableIdentity: String { "fallback.\(id)" }
 
-    static func businessGrowthCard() -> SponsoredProfileFallbackPromotion {
+    static func businessGrowthCard(languageCode: String) -> SponsoredProfileFallbackPromotion {
         SponsoredProfileFallbackPromotion(
             id: "fangeo-house-business-growth",
-            eyebrow: "FanGeo for Venues",
-            title: "Grow Your Crowd",
-            subtitle: "Own a sports bar, club, or venue? Promote your watch parties on FanGeo.",
-            ctaLabel: "Learn More",
+            eyebrow: L10n.t("profile_venues_promo_eyebrow", languageCode: languageCode),
+            title: L10n.t("profile_venues_promo_title", languageCode: languageCode),
+            subtitle: L10n.t("profile_venues_promo_subtitle", languageCode: languageCode),
+            ctaLabel: L10n.t("profile_venues_promo_cta", languageCode: languageCode),
             systemImage: "megaphone.fill"
         )
     }
@@ -4507,31 +5024,98 @@ struct SuggestedFanCard: View {
     let onDismiss: (FriendSuggestionProfile) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.sizeCategory) private var sizeCategory
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @State private var showCancelRequestConfirmation = false
 
+    /// Shared layout tokens so every Suggested Fan card is identical in size and vertical alignment.
     enum Metrics {
         static let width: CGFloat = 130
-        static let minHeight: CGFloat = 166
         static let avatarSize: CGFloat = 50
+        static let avatarChromePadding: CGFloat = 2
+        static var avatarOuterSize: CGFloat { avatarSize + (avatarChromePadding * 2) }
         static let buttonHeight: CGFloat = 28
-        static let verticalSpacing: CGFloat = 6
-        static let infoHeight: CGFloat = 36
-        static let reasonRowHeight: CGFloat = 20
+        static let verticalSpacing: CGFloat = 5
+        static let nameLineHeight: CGFloat = 15
+        static let nameMaxLines: Int = 2
+        static var nameHeight: CGFloat { CGFloat(nameMaxLines) * nameLineHeight }
+        static let accessibilityNameLineHeight: CGFloat = 18
+        static var accessibilityNameHeight: CGFloat { CGFloat(nameMaxLines) * accessibilityNameLineHeight }
+        static let whyHeaderHeight: CGFloat = 11
+        static let whyRowHeight: CGFloat = 12
+        static let accessibilityWhyRowHeight: CGFloat = 14
+        static let whyMaxRows: Int = 3
+        static let whyRowSpacing: CGFloat = 1
+        static let whySectionSpacing: CGFloat = 2
         static let cardTopPadding: CGFloat = 9
         static let cardHorizontalPadding: CGFloat = 9
-        static let cardBottomPadding: CGFloat = 9
+        static let cardBottomPadding: CGFloat = 8
+        /// Derived once for standard Dynamic Type.
+        static let height: CGFloat = computedHeight(
+            nameHeight: nameHeight,
+            whyRowHeight: whyRowHeight
+        )
+        /// Shared taller height for accessibility text sizes (all cards still equal).
+        static let accessibilityHeight: CGFloat = computedHeight(
+            nameHeight: accessibilityNameHeight,
+            whyRowHeight: accessibilityWhyRowHeight
+        )
+
+        static func whyExplanationRowsHeight(rowHeight: CGFloat) -> CGFloat {
+            (CGFloat(whyMaxRows) * rowHeight) + (CGFloat(whyMaxRows - 1) * whyRowSpacing)
+        }
+
+        static func whyBlockHeight(rowHeight: CGFloat) -> CGFloat {
+            whyHeaderHeight + whySectionSpacing + whyExplanationRowsHeight(rowHeight: rowHeight)
+        }
+
+        static func computedHeight(nameHeight: CGFloat, whyRowHeight: CGFloat) -> CGFloat {
+            let whyBlock = whyBlockHeight(rowHeight: whyRowHeight)
+            // Outer VStack: [avatar+name+why] + spacing + Spacer(0) + spacing + button
+            return cardTopPadding
+                + avatarOuterSize
+                + verticalSpacing
+                + nameHeight
+                + verticalSpacing
+                + whyBlock
+                + verticalSpacing
+                + verticalSpacing
+                + buttonHeight
+                + cardBottomPadding
+        }
+
+        static func height(for sizeCategory: ContentSizeCategory) -> CGFloat {
+            sizeCategory.isAccessibilityCategory ? accessibilityHeight : height
+        }
+
+        static func nameAreaHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
+            sizeCategory.isAccessibilityCategory ? accessibilityNameHeight : nameHeight
+        }
+
+        static func whyRowHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
+            sizeCategory.isAccessibilityCategory ? accessibilityWhyRowHeight : whyRowHeight
+        }
     }
 
-    private static let allowedReasonLabels: Set<String> = [
-        "Same pickup game",
-        "Same watch party",
-        "Same team",
-        "Same venue",
-        "Mutual friends",
-        "Active fan",
-        "High reputation"
-    ]
+    private var whyExplanations: [SuggestedFanWhyExplanation] {
+        suggestion.whySuggestedExplanations(max: Metrics.whyMaxRows)
+    }
+
+    private var cardHeight: CGFloat {
+        Metrics.height(for: sizeCategory)
+    }
+
+    private var nameAreaHeight: CGFloat {
+        Metrics.nameAreaHeight(for: sizeCategory)
+    }
+
+    private var whyRowHeight: CGFloat {
+        Metrics.whyRowHeight(for: sizeCategory)
+    }
+
+    private var whyBlockHeight: CGFloat {
+        Metrics.whyBlockHeight(rowHeight: whyRowHeight)
+    }
 
     var body: some View {
         VStack(spacing: Metrics.verticalSpacing) {
@@ -4539,18 +5123,18 @@ struct SuggestedFanCard: View {
                 VStack(spacing: Metrics.verticalSpacing) {
                     avatar
 
-                    VStack(spacing: 3) {
-                        Text(displayName)
-                            .font(.system(size: 12.5, weight: .bold, design: .rounded))
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                    Text(displayName)
+                        .font(.system(size: 12.5, weight: .bold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(Metrics.nameMaxLines)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: nameAreaHeight, alignment: .top)
 
-                        reasonRow
-                    }
-                    .frame(height: Metrics.infoHeight, alignment: .top)
+                    whySuggestedSection
                 }
-                .frame(maxWidth: .infinity)
+                .frame(maxWidth: .infinity, alignment: .top)
                 .contentShape(Rectangle())
             }
 
@@ -4562,13 +5146,14 @@ struct SuggestedFanCard: View {
         .padding(.horizontal, Metrics.cardHorizontalPadding)
         .padding(.bottom, Metrics.cardBottomPadding)
         .frame(width: Metrics.width, alignment: .top)
-        .frame(height: Metrics.minHeight, alignment: .top)
+        .frame(height: cardHeight, alignment: .top)
         .background(cardBackground)
         .overlay(alignment: .topTrailing) {
             dismissButton
         }
         .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.10 : 0.055), radius: 8, y: 4)
         .accessibilityElement(children: .combine)
+        .accessibilityLabel(cardAccessibilityLabel)
         .confirmationDialog(
             "Cancel friend request?",
             isPresented: $showCancelRequestConfirmation,
@@ -4612,27 +5197,83 @@ struct SuggestedFanCard: View {
                     lineWidth: 2
                 )
         }
-        .padding(2)
+        .padding(Metrics.avatarChromePadding)
         .background(Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.96)))
     }
 
-    private var reasonRow: some View {
-        reasonBadge(mutualOrReasonLabel)
-            .frame(height: Metrics.reasonRowHeight)
+    /// Fixed-height why block so headings and Add buttons stay aligned across the carousel.
+    /// Unused reason rows stay empty (no placeholder bullets); content is top-aligned.
+    private var whySuggestedSection: some View {
+        Group {
+            if whyExplanations.isEmpty {
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: whyBlockHeight)
+                    .accessibilityHidden(true)
+            } else {
+                VStack(alignment: .leading, spacing: Metrics.whySectionSpacing) {
+                    Text(L10n.t("suggested_fan_why_title", languageCode: appLanguageRaw))
+                        .font(.system(size: 8.5, weight: .heavy, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .textCase(.uppercase)
+                        .tracking(0.2)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(height: Metrics.whyHeaderHeight, alignment: .center)
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: Metrics.whyRowSpacing) {
+                        ForEach(Array(whyExplanations.enumerated()), id: \.offset) { _, reason in
+                            whySuggestedRow(reason)
+                        }
+                    }
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: .topLeading
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .frame(height: whyBlockHeight, alignment: .top)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(whySuggestedAccessibilityLabel)
+            }
+        }
     }
 
-    private func reasonBadge(_ label: String) -> some View {
-        Text(label)
-            .font(.system(size: 8.8, weight: .bold, design: .rounded))
-            .foregroundStyle(FGColor.accentGreen)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background {
-                Capsule()
-                    .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.11))
-            }
+    private func whySuggestedRow(_ reason: SuggestedFanWhyExplanation) -> some View {
+        HStack(alignment: .top, spacing: 3) {
+            Image(systemName: reason.systemImage)
+                .font(.system(size: 7.5, weight: .semibold))
+                .foregroundStyle(FGColor.accentGreen)
+                .frame(width: 10, height: whyRowHeight, alignment: .center)
+                .accessibilityHidden(true)
+
+            Text(reason.localizedText(languageCode: appLanguageRaw))
+                .font(.system(size: 8.4, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: whyRowHeight, alignment: .center)
+        }
+        .frame(height: whyRowHeight, alignment: .center)
+        .accessibilityHidden(true)
+    }
+
+    private var whySuggestedAccessibilityLabel: String {
+        let title = L10n.t("suggested_fan_why_title_a11y", languageCode: appLanguageRaw)
+        let lines = whyExplanations.map { $0.localizedText(languageCode: appLanguageRaw) }
+        return ([title] + lines).joined(separator: ". ")
+    }
+
+    private var cardAccessibilityLabel: String {
+        var parts = [displayName]
+        if !whyExplanations.isEmpty {
+            parts.append(whySuggestedAccessibilityLabel)
+        }
+        parts.append(buttonState.title)
+        return parts.joined(separator: ". ")
     }
 
     private var addButton: some View {
@@ -4732,68 +5373,6 @@ struct SuggestedFanCard: View {
         return trimmed.isEmpty ? "Fan" : trimmed
     }
 
-    private var mutualOrReasonLabel: String {
-        if suggestion.mutualFriendCount > 0 {
-            return suggestion.mutualFriendCount == 1 ? "Mutual fan" : "Mutual fans"
-        }
-        return localizedReasonLabel(safeReasonLabel)
-    }
-
-    private var safeReasonLabel: String {
-        if let reasonLabel = suggestion.reasonLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
-           Self.allowedReasonLabels.contains(reasonLabel) {
-            return reasonLabel
-        }
-
-        let normalizedType = (suggestion.reasonType ?? "")
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-            .replacingOccurrences(of: " ", with: "_")
-
-        switch normalizedType {
-        case "pickup_game", "pickup", "shared_pickup", "pickup_player":
-            return "Same pickup game"
-        case "venue_event", "watch_party", "shared_event", "event_interest", "event":
-            return "Same watch party"
-        case "same_team", "shared_team", "team", "favorite_team", "favorite_teams":
-            return "Same team"
-        case "favorite_venue", "shared_venue", "venue":
-            return "Same venue"
-        case "mutual_friends", "mutual_friend":
-            return "Mutual friends"
-        case "recent_activity", "active_fan", "activity":
-            return "Active fan"
-        case "reputation", "fan_level", "high_reputation":
-            return "High reputation"
-        default:
-            if suggestion.sharedPickupGameCount > 0 { return "Same pickup game" }
-            if suggestion.sharedEventInterestCount > 0 { return "Same watch party" }
-            if suggestion.sharedFavoriteTeamsCount > 0 { return "Same team" }
-            return suggestion.score >= 400 ? "High reputation" : "Active fan"
-        }
-    }
-
-    private func localizedReasonLabel(_ label: String) -> String {
-        switch label {
-        case "Same pickup game":
-            return L10n.t("same_pickup_game", languageCode: appLanguageRaw)
-        case "Same watch party":
-            return L10n.t("same_watch_party", languageCode: appLanguageRaw)
-        case "Same team":
-            return L10n.t("same_team", languageCode: appLanguageRaw)
-        case "Same venue":
-            return L10n.t("same_venue", languageCode: appLanguageRaw)
-        case "Mutual friends":
-            return L10n.t("mutual_friends", languageCode: appLanguageRaw)
-        case "High reputation":
-            return L10n.t("high_reputation", languageCode: appLanguageRaw)
-        case "Active fan":
-            return L10n.t("active_fan", languageCode: appLanguageRaw)
-        default:
-            return label
-        }
-    }
-
     private var buttonState: ButtonState {
         if isSending {
             return ButtonState(
@@ -4861,30 +5440,39 @@ private struct ProfileSuggestedFansSection: View {
     let hasCompletedLoad: Bool
     let isRefreshing: Bool
     let message: String?
+    var loadFailed: Bool = false
     let sendingRequestIds: Set<UUID>
     let chipKind: (UUID) -> ChatViewModel.FriendshipChipKind
     let onAdd: (FriendSuggestionProfile) -> Void
     let onCancel: (FriendSuggestionProfile) -> Void
     let onDismiss: (FriendSuggestionProfile) -> Void
+    var onRetry: (() -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.sizeCategory) private var sizeCategory
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @State private var showHowItWorksSheet = false
 
     private enum CardMetrics {
-        static let width: CGFloat = 130
-        static let minHeight: CGFloat = 166
-        static let avatarSize: CGFloat = 50
+        /// Keep carousel chrome in sync with `SuggestedFanCard.Metrics`.
+        static let width: CGFloat = SuggestedFanCard.Metrics.width
+        static let cardHeight: CGFloat = SuggestedFanCard.Metrics.height
+        static let accessibilityCardHeight: CGFloat = SuggestedFanCard.Metrics.accessibilityHeight
+        static let avatarSize: CGFloat = SuggestedFanCard.Metrics.avatarSize
         static let mutualAvatarSize: CGFloat = 15
-        static let buttonHeight: CGFloat = 28
-        static let verticalSpacing: CGFloat = 6
+        static let buttonHeight: CGFloat = SuggestedFanCard.Metrics.buttonHeight
+        static let verticalSpacing: CGFloat = SuggestedFanCard.Metrics.verticalSpacing
         static let infoHeight: CGFloat = 36
         static let reasonRowHeight: CGFloat = 20
-        static let cardTopPadding: CGFloat = 9
-        static let cardHorizontalPadding: CGFloat = 9
-        static let cardBottomPadding: CGFloat = 9
+        static let cardTopPadding: CGFloat = SuggestedFanCard.Metrics.cardTopPadding
+        static let cardHorizontalPadding: CGFloat = SuggestedFanCard.Metrics.cardHorizontalPadding
+        static let cardBottomPadding: CGFloat = SuggestedFanCard.Metrics.cardBottomPadding
         static let rowTopPadding: CGFloat = 2
         static let rowBottomPadding: CGFloat = 8
-        static let rowMinHeight: CGFloat = minHeight + rowTopPadding + rowBottomPadding
+
+        static func rowMinHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
+            SuggestedFanCard.Metrics.height(for: sizeCategory) + rowTopPadding + rowBottomPadding
+        }
     }
 
     private static let allowedReasonLabels: Set<String> = [
@@ -4915,7 +5503,11 @@ private struct ProfileSuggestedFansSection: View {
             if !hasCompletedLoad && suggestions.isEmpty {
                 initialLoadingPlaceholder
             } else if suggestions.isEmpty {
-                emptyState
+                if loadFailed {
+                    loadFailedState
+                } else {
+                    emptyState
+                }
             } else {
                 if isRefreshing {
                     refreshingIndicator
@@ -4927,16 +5519,34 @@ private struct ProfileSuggestedFansSection: View {
         .task(id: suggestionsAvatarFingerprint) {
             await prefetchSuggestedFanAvatars()
         }
+        .sheet(isPresented: $showHowItWorksSheet) {
+            SuggestedFansHowItWorksSheet()
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .center, spacing: 8) {
+            HStack(alignment: .center, spacing: 4) {
                 Text(L10n.t("suggested_fans", languageCode: appLanguageRaw))
                     .font(.system(size: 11, weight: .heavy, design: .rounded))
                     .foregroundStyle(FGColor.accentBlue)
                     .textCase(.uppercase)
                     .tracking(0.78)
+                    .accessibilityAddTraits(.isHeader)
+
+                Button {
+                    showHowItWorksSheet = true
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.90 : 0.82))
+                        .frame(width: 44, height: 44, alignment: .center)
+                        .contentShape(Rectangle())
+                        .padding(.vertical, -12)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("suggested_fans_how_it_works", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
+                .accessibilityHint(L10n.t("suggested_fans_how_it_works_hint", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
 
                 Spacer(minLength: 0)
 
@@ -4947,6 +5557,13 @@ private struct ProfileSuggestedFansSection: View {
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
                         .background(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.10), in: Capsule())
+                        .accessibilityLabel(
+                            String(
+                                format: L10n.t("suggested_fans_count_format", languageCode: appLanguageRaw),
+                                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                                suggestions.count
+                            )
+                        )
                 }
             }
 
@@ -5010,6 +5627,37 @@ private struct ProfileSuggestedFansSection: View {
         .accessibilityLabel("More fan matches coming soon")
     }
 
+    private var loadFailedState: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FGColor.dangerRed.opacity(0.85))
+
+            Text(message?.isEmpty == false ? message! : "Couldn't load fan suggestions")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+            Spacer(minLength: 0)
+
+            if let onRetry {
+                Button("Retry", action: onRetry)
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .foregroundStyle(FGColor.accentBlue)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .background {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.78))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(Color.black.opacity(colorScheme == .dark ? 0.0 : 0.04), lineWidth: 0.75)
+                }
+        }
+        .accessibilityLabel(message ?? "Couldn't load fan suggestions")
+    }
+
     private var suggestionsRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 10) {
@@ -5022,7 +5670,7 @@ private struct ProfileSuggestedFansSection: View {
             .padding(.bottom, CardMetrics.rowBottomPadding)
             .padding(.trailing, 8)
         }
-        .frame(minHeight: CardMetrics.rowMinHeight, alignment: .top)
+        .frame(minHeight: CardMetrics.rowMinHeight(for: sizeCategory), alignment: .top)
     }
 
     private func prefetchSuggestedFanAvatars() async {
@@ -5433,7 +6081,7 @@ private extension View {
     }
 }
 
-private struct PremiumTeamIdentityOrb: View {
+struct PremiumTeamIdentityOrb: View {
     let team: FavoriteTeam
     let diameter: CGFloat
 

@@ -69,6 +69,11 @@ struct VenueDetailView: View {
     var onOpenVenueChat: (() async -> Void)? = nil
     /// Prefer this over ``bar.businessId`` for Chat visibility (approved claim ownership when venues.business_id is nil).
     var effectiveBusinessId: UUID? = nil
+    /// Discover unclaimed listing: show ownership explanation + Business-account claim onboarding entry.
+    var showsUnclaimedBusinessCallout: Bool = false
+    var onBeginUnclaimedVenueClaim: (() -> Void)? = nil
+    /// Aggregated unclaimed social-proof counts from already-loaded venue metrics (optional).
+    var unclaimedSocialProofMetrics: UnclaimedVenueSocialProofMetrics? = nil
 
     @State private var isHomeCrowdActionInFlight = false
     @State private var isVenueChatOpening = false
@@ -230,7 +235,7 @@ struct VenueDetailView: View {
     private var businessClaimStatusPillTitle: String {
         switch businessClaimStatus {
         case .unclaimed:
-            return "Unclaimed"
+            return L10n.t("venue_unclaimed")
         case .pendingReview:
             return "Under review"
         case .approved:
@@ -260,7 +265,7 @@ struct VenueDetailView: View {
     private var businessClaimHeadline: String {
         switch businessClaimStatus {
         case .unclaimed:
-            return "Claim this business"
+            return L10n.t("venue_own_this_business")
         case .pendingReview:
             return "Claim under review"
         case .approved:
@@ -275,7 +280,7 @@ struct VenueDetailView: View {
     private var businessClaimSubtitle: String {
         switch businessClaimStatus {
         case .unclaimed:
-            return "Claim requests are reviewed before owner tools are enabled."
+            return L10n.t("venue_business_account_required_message")
         case .pendingReview:
             return "Your ownership request is pending FanGeo review."
         case .approved:
@@ -294,6 +299,14 @@ struct VenueDetailView: View {
                     venueReportBannerView(venueReportBanner)
                 }
                 venueHeroSection
+                if showsUnclaimedBusinessCallout || (bar.isUnclaimedCommunityVenue && !isBusinessConfirmed) {
+                    UnclaimedBusinessStatusCard()
+                        .progressiveAppear(isVisible: contentRevealPhase >= 1)
+                    if let unclaimedSocialProofMetrics {
+                        UnclaimedVenueSocialProofRow(metrics: unclaimedSocialProofMetrics)
+                            .progressiveAppear(isVisible: contentRevealPhase >= 1)
+                    }
+                }
                 insideVenueSection
                     .progressiveAppear(isVisible: contentRevealPhase >= 2)
                 venueFeaturesSection
@@ -303,6 +316,12 @@ struct VenueDetailView: View {
                 if locksScheduledGameDetailsForGuest {
                     DiscoverGuestGameLockCard {
                         onGuestGameLoginCTA?()
+                    }
+                    .progressiveAppear(isVisible: contentRevealPhase >= 3)
+                }
+                if showsUnclaimedBusinessCallout, onBeginUnclaimedVenueClaim != nil, !showsBusinessOwnershipSection {
+                    UnclaimedBusinessClaimCallout {
+                        onBeginUnclaimedVenueClaim?()
                     }
                     .progressiveAppear(isVisible: contentRevealPhase >= 3)
                 }
@@ -704,6 +723,15 @@ struct VenueDetailView: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(isVenueChatOpening)
+                } else if bar.isUnclaimedCommunityVenue && !isBusinessConfirmed {
+                    actionCardContent(
+                        title: "Chat",
+                        subtitle: L10n.t("venue_messaging_available_after_claim"),
+                        icon: "message",
+                        tint: FGColor.mutedText(colorScheme)
+                    )
+                    .opacity(0.55)
+                    .accessibilityLabel(L10n.t("venue_messaging_available_after_claim"))
                 }
 
                 Button(action: onDirections) {
@@ -826,7 +854,7 @@ struct VenueDetailView: View {
                 if onClaimThisBusiness != nil {
                     switch businessClaimStatus {
                     case .unclaimed:
-                        FGSecondaryButton(title: "Claim this business", systemImage: "building.2.crop.circle") {
+                        FGSecondaryButton(title: L10n.t("venue_claim_this_venue"), systemImage: "building.2.crop.circle") {
                             showClaimConfirmation = true
                         }
                     case .pendingReview:
@@ -857,11 +885,35 @@ struct VenueDetailView: View {
             )
 
             if games.isEmpty {
-                FGEmptyState(
-                    title: "No upcoming games listed yet.",
-                    subtitle: "",
-                    systemImage: "tv"
-                )
+                if bar.isUnclaimedCommunityVenue && !isBusinessConfirmed {
+                    FGEmptyState(
+                        title: L10n.t("venue_no_games_unclaimed"),
+                        subtitle: L10n.t("venue_no_games_unclaimed_subtitle"),
+                        systemImage: "tv"
+                    )
+                    if onBeginUnclaimedVenueClaim != nil || onClaimThisBusiness != nil,
+                       !(showsUnclaimedBusinessCallout && onBeginUnclaimedVenueClaim != nil) {
+                        Button {
+                            if let onBeginUnclaimedVenueClaim {
+                                onBeginUnclaimedVenueClaim()
+                            } else {
+                                showClaimConfirmation = true
+                            }
+                        } label: {
+                            Text(L10n.t("venue_claim_this_venue"))
+                                .font(FGTypography.caption.weight(.bold))
+                                .foregroundStyle(FGColor.accentBlue)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 4)
+                    }
+                } else {
+                    FGEmptyState(
+                        title: "No upcoming games listed yet.",
+                        subtitle: "",
+                        systemImage: "tv"
+                    )
+                }
             } else {
                 let adInsertionPositions = VenueGamesAdInjector.insertedAfterGamePositions(gameCount: games.count)
                 VStack(spacing: FGSpacing.sm) {

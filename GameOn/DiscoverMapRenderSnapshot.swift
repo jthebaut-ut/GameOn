@@ -6,6 +6,7 @@ nonisolated struct DiscoverMapRenderSnapshotKey: Equatable, @unchecked Sendable 
     let selectedSport: String
     let mapDisplayMode: DiscoverMapDisplayMode
     let searchText: String
+    let venueIDFilterFingerprint: String
     let visibleLatitudeDeltaBucket: String
     let venueCount: Int
     let eventRowCount: Int
@@ -46,6 +47,7 @@ nonisolated struct DiscoverMapRenderSnapshot: @unchecked Sendable {
             selectedSport: "All",
             mapDisplayMode: .allSpots,
             searchText: "",
+            venueIDFilterFingerprint: "",
             visibleLatitudeDeltaBucket: "",
             venueCount: 0,
             eventRowCount: 0
@@ -63,6 +65,7 @@ private nonisolated struct DiscoverMapSnapshotDetachedInput: @unchecked Sendable
     let selectedSport: String
     let mapDisplayModeRawValue: String
     let searchQuery: String
+    let venueIDFilter: Set<UUID>?
     let visibleLatitudeDelta: Double
     let venueEventIDsByKey: [String: UUID]
     let venueEventInterestCounts: [UUID: Int]
@@ -217,6 +220,10 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
     private static func shouldShowVenueOnMap(_ venue: BarVenue, input: DiscoverMapSnapshotDetachedInput) throws -> Bool {
         guard venueIsActiveForMap(venue) else { return false }
         guard !venue.isPickupPlayPlace else { return false }
+
+        if let venueFilter = input.venueIDFilter {
+            return venueFilter.contains(venue.id)
+        }
 
         try checkCancellation(checkpoint: "venueLoop")
         let sportScopedEvents = try selectedDayEvents(for: venue, sportFilter: input.selectedSport, input: input)
@@ -499,6 +506,8 @@ extension MapViewModel {
         let capturedSearchText = debouncedDiscoverSearchText
         let capturedVisibleLatitudeDelta = visibleLatitudeDelta
         let capturedEventRowCount = venueEventRows.count
+        let capturedVenueIDFilter = discoverSearchVenueIDFilter
+        let capturedVenueIDFilterFingerprint = discoverSearchVenueIDFilterFingerprint(capturedVenueIDFilter)
         let input = DiscoverMapSnapshotDetachedInput(
             bars: bars,
             events: events,
@@ -506,6 +515,7 @@ extension MapViewModel {
             selectedSport: selectedSport,
             mapDisplayModeRawValue: mapDisplayMode.rawValue,
             searchQuery: effectiveDiscoverSearchQuery,
+            venueIDFilter: capturedVenueIDFilter,
             visibleLatitudeDelta: visibleLatitudeDelta,
             venueEventIDsByKey: venueEventIDsByKey,
             venueEventInterestCounts: venueEventInterestCounts,
@@ -556,6 +566,7 @@ extension MapViewModel {
                 selectedSport: capturedSelectedSport,
                 mapDisplayMode: capturedMapDisplayMode,
                 searchText: capturedSearchText,
+                venueIDFilterFingerprint: capturedVenueIDFilterFingerprint,
                 visibleLatitudeDeltaBucket: String(format: "%.5f", capturedVisibleLatitudeDelta),
                 venueCount: output.venueCount,
                 eventRowCount: capturedEventRowCount
@@ -592,6 +603,7 @@ extension MapViewModel {
             selectedSport: selectedSport,
             mapDisplayMode: mapDisplayMode,
             searchText: debouncedDiscoverSearchText,
+            venueIDFilterFingerprint: discoverSearchVenueIDFilterFingerprint(discoverSearchVenueIDFilter),
             visibleLatitudeDeltaBucket: String(format: "%.5f", visibleLatitudeDelta),
             venueCount: venueCount,
             eventRowCount: venueEventRows.count
@@ -603,5 +615,10 @@ extension MapViewModel {
         dayFormatter.dateFormat = "yyyy-MM-dd"
         dayFormatter.timeZone = TimeZone.current
         return dayFormatter.string(from: selectedDate)
+    }
+
+    private func discoverSearchVenueIDFilterFingerprint(_ filter: Set<UUID>?) -> String {
+        guard let filter else { return "" }
+        return filter.map(\.uuidString).sorted().joined(separator: ",")
     }
 }

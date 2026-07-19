@@ -3042,7 +3042,9 @@ struct VenueOwnerDashboardView: View {
                     showBusinessUsageSheet = true
                 }
             },
-            favoriteTeamsCount: viewModel.businessFavoriteTeamIDs.count,
+            favoriteTeams: FavoriteTeamsStore.resolvedTeams(
+                fromIDs: Array(viewModel.businessFavoriteTeamIDs).sorted()
+            ),
             onManageFavoriteTeams: {
                 showBusinessFavoriteTeamsSheet = true
             },
@@ -3792,6 +3794,11 @@ struct VenueOwnerDashboardView: View {
         venueLatitude = draft.latitude
         venueLongitude = draft.longitude
         venueFormattedAddress = draft.formattedAddress ?? draft.displayAddress
+#if DEBUG
+        print(
+            "[BusinessVenuePinSync] dashboardApply street=\(venueStreetAddress) city=\(venueCity) lat=\(venueLatitude.map { String($0) } ?? "nil") lon=\(venueLongitude.map { String($0) } ?? "nil") source=\(draft.updateSource.rawValue)"
+        )
+#endif
     }
 
     @MainActor
@@ -8840,7 +8847,7 @@ struct VenueOwnerDashboardView: View {
                 Spacer(minLength: 0)
             }
 
-            Text("Upcoming Pro Games that match your business favorite teams over the next 90 days.")
+            Text(L10n.t("pro_sports_upcoming_for_business"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -8857,7 +8864,7 @@ struct VenueOwnerDashboardView: View {
                 suggestedGamesEmptyState(
                     icon: "star.circle",
                     title: "No favorite teams selected",
-                    message: "Follow teams to receive recommended Pro Games.",
+                    message: L10n.t("pro_sports_follow_teams_for_recommendations"),
                     buttonTitle: "Manage Favorite Teams",
                     action: {
                         showBusinessFavoriteTeamsSheet = true

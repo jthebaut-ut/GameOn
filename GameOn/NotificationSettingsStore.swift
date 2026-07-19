@@ -40,6 +40,8 @@ nonisolated enum ProGameReminderTiming: String, CaseIterable, Identifiable {
         }
     }
 
+    var localizationKey: String { displayName }
+
     var schedulesKickoffReminder: Bool {
         self != .never
     }
@@ -126,6 +128,8 @@ nonisolated enum FanGeoCalendarAlertTiming: String, CaseIterable, Identifiable {
             return "1 day before"
         }
     }
+
+    var localizationKey: String { displayName }
 
     var relativeOffset: TimeInterval? {
         switch self {
@@ -368,7 +372,7 @@ final class NotificationSettingsStore: ObservableObject {
 
     func refreshGameNotificationAuthorizationState() async {
         if let authorizationRefreshTask {
-            print("[NotificationPerf] authorizationRefreshCoalesced=true")
+            DebugLogGate.debug("[NotificationPerf] authorizationRefreshCoalesced=true")
             await authorizationRefreshTask.value
             return
         }
@@ -383,7 +387,7 @@ final class NotificationSettingsStore: ObservableObject {
 
     private func performGameNotificationAuthorizationRefresh() async {
         let startedAt = Date()
-        print("[NotificationSettingsDebug] load authorizationState notifyBeforeGame=\(notifyBeforeGame) proGameKickoffAlertEnabled=\(proGameKickoffAlertEnabled) proGameReminderTiming=\(proGameReminderTiming.rawValue) reminderMinutesBefore=\(reminderMinutesBefore) repeatGameReminder=\(repeatGameReminder) repeatEveryMinutes=\(repeatEveryMinutes)")
+        DebugLogGate.debug("[NotificationSettingsDebug] load authorizationState notifyBeforeGame=\(notifyBeforeGame) proGameKickoffAlertEnabled=\(proGameKickoffAlertEnabled) proGameReminderTiming=\(proGameReminderTiming.rawValue) reminderMinutesBefore=\(reminderMinutesBefore) repeatGameReminder=\(repeatGameReminder) repeatEveryMinutes=\(repeatEveryMinutes)")
         let status = await gameReminderService.authorizationStatus()
         switch status {
         case .denied:
@@ -405,7 +409,7 @@ final class NotificationSettingsStore: ObservableObject {
         @unknown default:
             notificationPermissionMessage = "Could not read notification permission status."
         }
-        print("[NotificationPerf] authorizationRefreshFinished durationMs=\(Int(Date().timeIntervalSince(startedAt) * 1000))")
+        DebugLogGate.debug("[NotificationPerf] authorizationRefreshFinished durationMs=\(Int(Date().timeIntervalSince(startedAt) * 1000))")
     }
 
     func setGameNotificationsEnabled(_ enabled: Bool) async -> Bool {

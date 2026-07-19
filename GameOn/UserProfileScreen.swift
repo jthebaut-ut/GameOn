@@ -79,7 +79,7 @@ struct UserProfileScreen: View {
                     Button(isSaving ? "Saving..." : "Save") {
                         Task { await saveProfile() }
                     }
-                    .disabled(isSaving || isUploadingAvatar)
+                    .disabled(isSaving || isUploadingAvatar || !profileDraftLooksDirty)
                 }
             }
             .onAppear {
@@ -334,6 +334,15 @@ struct UserProfileScreen: View {
         return local.prefix(1).uppercased() + local.dropFirst()
     }
 
+    private var profileDraftLooksDirty: Bool {
+        let nameDirty = editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            != resolvedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let handleDirty = FanGeoHandleRules.normalizeForStorage(editedUsername)
+            != FanGeoHandleRules.normalizeForStorage(viewModel.currentUserUsername)
+        let bioDirty = limitedBio(editedBio) != limitedBio(viewModel.currentUserBio)
+        return nameDirty || handleDirty || bioDirty
+    }
+
     private func limitedBio(_ raw: String) -> String {
         String(raw.prefix(Self.bioCharacterLimit))
     }
@@ -389,13 +398,19 @@ struct UserProfileScreen: View {
             await MainActor.run { message = ModerationService.profanityRejectionUserMessage() }
             return
         }
-        if ReservedNameValidation.containsReservedTerm(nextName) {
-            await MainActor.run { message = ReservedNameValidation.rejectionMessage }
+        if let nameError = FanIdentityValidation.validateDisplayNameForEdit(
+            nextName,
+            original: viewModel.currentUserDisplayName
+        ) {
+            await MainActor.run { message = nameError }
             return
         }
-        if let issue = FanGeoHandleRules.validate(editedUsername) {
-            await MainActor.run { message = FanGeoHandleRules.validationMessage(for: issue) }
-            print("[HandleValidationDebug] handleRejected reason=\(issue)")
+        if let handleError = FanIdentityValidation.validateHandleForEdit(
+            editedUsername,
+            original: viewModel.currentUserUsername
+        ) {
+            await MainActor.run { message = handleError }
+            print("[HandleValidationDebug] handleRejected reason=editValidation")
             return
         }
         let nextBio = limitedBio(editedBio)
@@ -428,9 +443,19 @@ struct UserProfileScreen: View {
         }
         let stored = FanGeoHandleRules.normalizeForStorage(raw)
         print("[HandleValidationDebug] normalizedHandle=\(stored)")
-        if let issue = FanGeoHandleRules.validate(raw) {
-            handleStatusMessage = "Invalid handle: \(FanGeoHandleRules.validationMessage(for: issue))"
-            print("[HandleValidationDebug] handleRejected reason=\(issue)")
+        if stored == FanGeoHandleRules.normalizeForStorage(viewModel.currentUserUsername) {
+            return
+        }
+        if let editError = FanIdentityValidation.validateHandleForEdit(
+            raw,
+            original: viewModel.currentUserUsername
+        ) {
+            if FanGeoHandleRules.validateFormat(raw) != nil {
+                handleStatusMessage = "Invalid handle: \(editError)"
+            } else {
+                handleStatusMessage = editError
+            }
+            print("[HandleValidationDebug] handleRejected reason=editValidation")
             return
         }
 

@@ -110,6 +110,9 @@ extension MapViewModel {
         do {
             let items = try await service.fetchMyIncomingPokes(limit: Self.pokesBadgeRefreshLimit)
             applyIncomingPokesFetch(items)
+            if let authId {
+                ProfilePhase1PersonalizationCache.storeIncomingPokes(items, for: authId)
+            }
             lastUnseenPokesBadgeRefreshAt = Date()
             lastUnseenPokesBadgeRefreshUserId = authId
 #if DEBUG

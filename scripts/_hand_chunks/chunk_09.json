@@ -209,15 +209,16 @@
     "zh-Hans": "保存个人资料"
   },
   "Saved Games": {
-    "es": "Juegos guardados",
-    "fr": "Jeux sauvegardés",
+    "en": "Saved Games",
+    "es": "Partidos guardados",
+    "fr": "Matchs enregistrés",
     "pt": "Jogos salvos",
     "de": "Gespeicherte Spiele",
-    "it": "Giochi salvati",
-    "pl": "Zapisane gry",
-    "ru": "Сохраненные игры",
-    "sq": "Lojërat e ruajtura",
-    "zh-Hans": "保存的游戏"
+    "it": "Partite salvate",
+    "pl": "Zapisane mecze",
+    "ru": "Сохранённые матчи",
+    "sq": "Ndeshje të ruajtura",
+    "zh-Hans": "已保存的比赛"
   },
   "Saved games are available only when logged in as a user.": {
     "es": "Los juegos guardados están disponibles solo cuando inicias sesión como usuario.",

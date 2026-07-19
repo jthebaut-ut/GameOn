@@ -612,5 +612,10 @@ struct AddBusinessLocationRequestSheet: View {
         form.latitude = draft.latitude
         form.longitude = draft.longitude
         form.formattedAddress = draft.formattedAddress ?? draft.displayAddress
+#if DEBUG
+        print(
+            "[BusinessVenuePinSync] addLocationApply street=\(form.streetAddress) city=\(form.city) lat=\(form.latitude.map { String($0) } ?? "nil") lon=\(form.longitude.map { String($0) } ?? "nil") source=\(draft.updateSource.rawValue)"
+        )
+#endif
     }
 }

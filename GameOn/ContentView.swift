@@ -18,6 +18,8 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             Color.white
+                // Decorative root fill — edge-to-edge under status bar / home indicator.
+                // Keyboard-safe composer behavior is owned by DirectChatView + DM tab isolation.
                 .ignoresSafeArea()
 
             if shouldShowSplash {

@@ -9,26 +9,33 @@ struct ShareFanProfileSheet: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
-    @State private var selectedFriendIds: Set<UUID> = []
+    @State private var selectedRecipientIds: Set<UUID> = []
     @State private var searchText = ""
     @State private var isSending = false
     @State private var errorText: String?
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var sharePayload: FanProfileSharePayload? {
         FanProfileShareMessage.payload(
             from: profile,
             sharedByDisplayName: mapViewModel.currentUserDisplayName,
-            languageCode: appLanguageRaw
+            languageCode: languageCode
         )
     }
 
+    /// Supported destinations: fan DMs, friend rows, groups, and business venue DMs (same direct_messages path).
     private var eligibleRecipients: [ChatViewModel.FriendDisplay] {
         let me = mapViewModel.currentUserAuthId
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return chatViewModel.friends
             .filter { friend in
                 guard friend.id != me else { return false }
-                guard !chatViewModel.isEitherDirectionBlocked(with: friend.id) else { return false }
+                if friend.inboxKind == .direct || (!friend.isConversationBacked && !friend.isGroupConversation) {
+                    guard !chatViewModel.isEitherDirectionBlocked(with: friend.preview.id) else { return false }
+                }
                 guard query.isEmpty else {
                     let name = friend.preview.displayName.lowercased()
                     let handle = friend.preview.username?.lowercased() ?? ""
@@ -47,8 +54,12 @@ struct ShareFanProfileSheet: View {
             }
     }
 
+    private var selectedRecipients: [ChatViewModel.FriendDisplay] {
+        eligibleRecipients.filter { selectedRecipientIds.contains($0.id) }
+    }
+
     private var canSend: Bool {
-        !selectedFriendIds.isEmpty && !isSending && sharePayload != nil
+        !selectedRecipients.isEmpty && !isSending && sharePayload != nil
     }
 
     var body: some View {
@@ -56,14 +67,14 @@ struct ShareFanProfileSheet: View {
             VStack(spacing: 0) {
                 List {
                     Section {
-                        TextField("Search friends", text: $searchText)
+                        TextField(L10n.t("share_profile_search_friends", languageCode: languageCode), text: $searchText)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                     }
 
                     Section {
                         if eligibleRecipients.isEmpty {
-                            Text("No chats available yet")
+                            Text(L10n.t("share_profile_no_chats", languageCode: languageCode))
                                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                         } else {
                             ForEach(eligibleRecipients) { friend in
@@ -71,9 +82,14 @@ struct ShareFanProfileSheet: View {
                             }
                         }
                     } header: {
-                        Text("Chats & friends")
+                        Text(L10n.t("share_profile_chats_friends", languageCode: languageCode))
                     } footer: {
-                        Text("\(selectedFriendIds.count) selected")
+                        Text(
+                            String(
+                                format: L10n.t("share_profile_selected_count_format", languageCode: languageCode),
+                                selectedRecipientIds.count
+                            )
+                        )
                     }
                 }
                 .scrollContentBackground(.hidden)
@@ -88,11 +104,11 @@ struct ShareFanProfileSheet: View {
                 }
             }
             .fanGeoScreenBackground()
-            .navigationTitle("Share Fan Profile")
+            .navigationTitle(L10n.t("share_profile_sheet_title", languageCode: languageCode))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+                    Button(L10n.t("Close", languageCode: languageCode)) { dismiss() }
                         .disabled(isSending)
                 }
                 ToolbarItem(placement: .confirmationAction) {
@@ -101,8 +117,9 @@ struct ShareFanProfileSheet: View {
                     } label: {
                         if isSending {
                             ProgressView()
+                                .accessibilityLabel(L10n.t("share_profile_sharing", languageCode: languageCode))
                         } else {
-                            Text("Send")
+                            Text(L10n.t("Send", languageCode: languageCode))
                         }
                     }
                     .disabled(!canSend)
@@ -115,18 +132,38 @@ struct ShareFanProfileSheet: View {
     }
 
     private func shareRecipientRow(_ friend: ChatViewModel.FriendDisplay) -> some View {
-        let isSelected = selectedFriendIds.contains(friend.id)
+        let isSelected = selectedRecipientIds.contains(friend.id)
         return Button {
             toggleSelection(friend.id)
         } label: {
             HStack(spacing: 12) {
-                ProfileAvatarView(preview: friend.preview, size: 40)
+                if friend.isGroupConversation {
+                    Image(systemName: "person.3.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(FGColor.accentGreen)
+                        .frame(width: 40, height: 40)
+                        .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.10), in: Circle())
+                } else {
+                    ProfileAvatarView(preview: friend.preview, size: 40)
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     Text(friend.preview.displayName)
                         .font(.system(size: 15, weight: .semibold, design: .rounded))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(1)
-                    if let handle = friend.preview.username?.trimmingCharacters(in: .whitespacesAndNewlines), !handle.isEmpty {
+                    if friend.isGroupConversation {
+                        if friend.groupMemberCount > 0 {
+                            Text(
+                                String(
+                                    format: L10n.t("group_chat_member_count_format", languageCode: languageCode),
+                                    friend.groupMemberCount
+                                )
+                            )
+                            .font(.system(size: 12, weight: .medium, design: .rounded))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                        }
+                    } else if let handle = friend.preview.username?.trimmingCharacters(in: .whitespacesAndNewlines), !handle.isEmpty {
                         Text("@\(handle)")
                             .font(.system(size: 12, weight: .medium, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
@@ -146,36 +183,51 @@ struct ShareFanProfileSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(isSending)
     }
 
     private func toggleSelection(_ friendId: UUID) {
-        if selectedFriendIds.contains(friendId) {
-            selectedFriendIds.remove(friendId)
+        if selectedRecipientIds.contains(friendId) {
+            selectedRecipientIds.remove(friendId)
         } else {
-            selectedFriendIds.insert(friendId)
+            selectedRecipientIds.insert(friendId)
         }
     }
 
     private func sendShare() async {
         guard !isSending else { return }
         guard let payload = sharePayload else {
-            await MainActor.run { errorText = "This profile can't be shared right now." }
+            await MainActor.run { errorText = L10n.t("share_profile_unavailable", languageCode: languageCode) }
+            return
+        }
+
+        let recipients = selectedRecipients
+        guard !recipients.isEmpty else {
+            await MainActor.run { errorText = L10n.t("share_profile_choose_recipient", languageCode: languageCode) }
             return
         }
 
         let body = FanProfileShareMessage.encodeBody(payload: payload)
+        // Match DirectChat composer limit so shared cards remain renderable in DM threads.
         guard body.count <= 1000 else {
-            await MainActor.run { errorText = "Profile share payload is too large." }
+#if DEBUG
+            print("[ProfileShareDebug] payloadTooLarge bytes=\(body.count)")
+#endif
+            await MainActor.run { errorText = L10n.t("share_profile_payload_too_large", languageCode: languageCode) }
             return
         }
 
+#if DEBUG
         print("[ProfileShareDebug] sourceDisplayName=\(profile.displayName)")
+        print("[ProfileShareDebug] sourceUserId=\(profile.userId.uuidString.lowercased())")
         print("[ProfileShareDebug] sourceHandle=\(FanProfileShareMessage.sanitizedPublicHandle(profile.publicHandleLine) ?? "nil")")
-        let avatarURLs = FanProfileShareMessage.resolvedAvatarURLs(
-            thumbnail: profile.avatarThumbnailURL,
-            full: profile.avatarURL
-        )
-        print("[ProfileShareDebug] sourceAvatarURL=\(avatarURLs.thumbnail ?? avatarURLs.full ?? "nil")")
+        print("[ProfileShareDebug] recipientCount=\(recipients.count) kinds=\(recipients.map(\.inboxKind.rawValue))")
+        for recipient in recipients {
+            print(
+                "[ProfileShareDebug] recipient displayId=\(recipient.id.uuidString.lowercased()) peer=\(recipient.preview.id.uuidString.lowercased()) conversationId=\(recipient.conversationId?.uuidString.lowercased() ?? "nil") kind=\(recipient.inboxKind.rawValue)"
+            )
+        }
+#endif
 
         await MainActor.run {
             isSending = true
@@ -187,14 +239,14 @@ struct ShareFanProfileSheet: View {
 
         if let err = await chatViewModel.shareFanProfileMessage(
             body: body,
-            toRecipientUserIds: Array(selectedFriendIds)
+            toRecipients: recipients
         ) {
             await MainActor.run { errorText = err }
             return
         }
 
         await MainActor.run {
-            mapViewModel.showSocialActionToast("Profile shared.", isError: false)
+            mapViewModel.showSocialActionToast(L10n.t("share_profile_success", languageCode: languageCode), isError: false)
             dismiss()
         }
     }

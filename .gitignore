@@ -16,3 +16,6 @@ xcuserdata/
 
 Packages/
 
+
+*.trace/
+**/xcuserdata/

@@ -57,7 +57,6 @@ struct FanGeoTimeZoneSettingsView: View {
         .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
         .navigationTitle(L10n.t("time_zone", languageCode: appLanguageRaw))
         .navigationBarTitleDisplayMode(.inline)
-        .id(automaticPresentationToken)
         .onAppear {
             TimeZoneDebug.mainScreen(automaticSelected: selection.isAutomatic)
             TimeZoneDebug.recentCount(recentPresentations.count)

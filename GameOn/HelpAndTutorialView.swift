@@ -51,7 +51,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
         case .going:
             return "See all the professional games, watch parties, and pickup games you're planning to attend. Your personal sports agenda lives in one place."
         case .chat:
-            return "Chat with fans, coordinate watch parties, and stay connected with friends and venues. Message before and after the action."
+            return "Chat with fans and coordinate watch parties in FanGeo without sharing your phone number."
         case .profile:
             return "Choose favorite teams, set notifications, and customize how FanGeo works for you. Build your fan identity in one place."
         }
@@ -82,6 +82,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
 
 struct HelpAndTutorialView: View {
     var onContactSupport: () -> Void
+    var accountUserId: UUID? = nil
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var showOnboardingTour = false
@@ -103,7 +104,7 @@ struct HelpAndTutorialView: View {
         .navigationTitle("Help & Tutorial")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showOnboardingTour) {
-            DiscoverHelpSheet()
+            DiscoverHelpSheet(accountUserId: accountUserId)
         }
         .sheet(item: $selectedQuickGuide) { topic in
             FanGeoQuickGuideInfoSheet(topic: topic)

@@ -142,7 +142,7 @@ struct BusinessFavoriteTeamsManagementSheet: View {
             Text("No teams followed yet.")
                 .font(FGTypography.body.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-            Text("Add teams to power the business Pro Games My Teams filter.")
+            Text(L10n.t("pro_sports_business_my_teams_filter_helper"))
                 .font(FGTypography.caption)
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .multilineTextAlignment(.center)
@@ -155,7 +155,7 @@ struct BusinessFavoriteTeamsManagementSheet: View {
 
     private func selectedTeamRow(_ team: FavoriteTeam) -> some View {
         HStack(spacing: 12) {
-            FavoriteTeamLogoBadge(team: team, diameter: 44)
+            SportsIdentityArtworkView(favoriteTeam: team, diameter: 44)
             VStack(alignment: .leading, spacing: 3) {
                 Text(team.name)
                     .font(FGTypography.body.weight(.semibold))

@@ -37,6 +37,9 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
     var accent: Color = FGColor.accentGreen
     var animatesSelectionChanges: Bool = true
     var fillsWidth = true
+    /// Allows longer tab titles (e.g. Going → Venue Games) to fit without clipping.
+    var titleMinimumScaleFactor: CGFloat = 0.74
+    var tabHorizontalPadding: CGFloat = 8
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -83,20 +86,23 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
                             Image(systemName: systemImage)
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundStyle(isSelected ? tint : FGColor.secondaryText(colorScheme))
+                                .layoutPriority(1)
                         }
 
                         Text(tab.title)
                             .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium, design: .rounded))
                             .lineLimit(1)
-                            .minimumScaleFactor(0.74)
+                            .minimumScaleFactor(titleMinimumScaleFactor)
                             .allowsTightening(true)
+                            .layoutPriority(2)
                     }
                     .layoutPriority(0)
 
                     if let badge = tab.badge, !badge.isEmpty {
+                        let badgeTint = isSelected ? tint : FGColor.secondaryText(colorScheme)
                         Text(badge)
                             .font(.system(size: 10.5, weight: .heavy, design: .rounded))
-                            .foregroundStyle(Color.orange.opacity(colorScheme == .dark ? 0.98 : 0.95))
+                            .foregroundStyle(badgeTint.opacity(colorScheme == .dark ? 0.98 : 0.95))
                             .lineLimit(1)
                             .minimumScaleFactor(0.80)
                             .allowsTightening(true)
@@ -104,10 +110,10 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
                             .frame(minWidth: badgeMinWidth(for: badge), minHeight: 17, alignment: .center)
                             .padding(.horizontal, badgeHorizontalPadding(for: badge))
                             .padding(.vertical, 2.5)
-                            .background(Color.orange.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
+                            .background(badgeTint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: Capsule())
                             .overlay {
                                 Capsule(style: .continuous)
-                                    .strokeBorder(Color.orange.opacity(colorScheme == .dark ? 0.24 : 0.18), lineWidth: 0.65)
+                                    .strokeBorder(badgeTint.opacity(colorScheme == .dark ? 0.24 : 0.18), lineWidth: 0.65)
                             }
                             .accessibilityLabel(badge)
                             .layoutPriority(2)
@@ -129,7 +135,7 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
             }
             .frame(maxWidth: fillsWidth ? .infinity : nil)
             .frame(minHeight: 42)
-            .padding(.horizontal, 8)
+            .padding(.horizontal, tabHorizontalPadding)
             .padding(.vertical, 7)
             .background {
                 Capsule(style: .continuous)

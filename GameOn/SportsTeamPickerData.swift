@@ -71,7 +71,13 @@ enum SportsTeamPickerData {
     }
 
     static func preferredMode(for sportName: String) -> TeamPickerMode {
-        TeamPickerSport.resolve(sportName) == .soccer ? .countries : .teams
+        switch TeamPickerSport.resolve(sportName) {
+        case .soccer, .other:
+            // National-team–heavy sports (e.g. Handball) without a dedicated club catalog open on Countries.
+            return .countries
+        case .basketball, .baseball, .hockey, .football:
+            return .teams
+        }
     }
 
     static func regionGroups(
@@ -79,14 +85,41 @@ enum SportsTeamPickerData {
         mode: TeamPickerMode,
         query: String
     ) -> [TeamPickerRegionGroup] {
-        let sport = TeamPickerSport.resolve(sportName)
+        let resolvedSport = TeamPickerSport.resolve(sportName)
+        let catalogSport = catalogSport(for: resolvedSport, mode: mode)
         let q = normalize(query)
-        let filtered = allOptions.filter { option in
-            option.sport == sport
-                && option.mode == mode
-                && (q.isEmpty || normalize(option.searchableText).contains(q))
+        let source = allOptions.filter { $0.sport == catalogSport && $0.mode == mode }
+        let filtered = source.filter { option in
+            q.isEmpty || matchesSearch(option, normalizedQuery: q)
         }
-        return grouped(filtered, sport: sport)
+#if DEBUG
+        let tab = mode == .countries ? "countries" : "teams"
+        print(
+            "[ManualTeamPicker] sport=\(sportName) resolved=\(resolvedSport.rawValue) catalog=\(catalogSport.rawValue) tab=\(tab) sourceCount=\(source.count) filteredCount=\(filtered.count) queryLength=\(q.count)"
+        )
+#endif
+        return grouped(filtered, sport: catalogSport)
+    }
+
+    /// Unsupported venue sports (Handball, Rugby, …) have no dedicated picker rows.
+    /// Countries borrow the shared international national-team list (soccerCountries, includes France).
+    /// Teams stay empty unless that sport has its own club catalog — custom entry remains the fallback.
+    private static func catalogSport(for sport: TeamPickerSport, mode: TeamPickerMode) -> TeamPickerSport {
+        switch sport {
+        case .soccer, .basketball, .baseball, .hockey, .football:
+            return sport
+        case .other:
+            return mode == .countries ? .soccer : .other
+        }
+    }
+
+    private static func matchesSearch(_ option: TeamPickerOption, normalizedQuery: String) -> Bool {
+        if normalize(option.displayName).contains(normalizedQuery) { return true }
+        if let short = option.shortName, normalize(short).contains(normalizedQuery) { return true }
+        if let hint = option.themeHint, hint != "custom", normalize(hint).contains(normalizedQuery) { return true }
+        if normalize(option.leagueGroup).contains(normalizedQuery) { return true }
+        if normalize(option.region).contains(normalizedQuery) { return true }
+        return false
     }
 
     static func exactOption(named raw: String) -> TeamPickerOption? {

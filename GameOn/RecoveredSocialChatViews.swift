@@ -1,20 +1,5 @@
+import CoreLocation
 import SwiftUI
-
-private enum ChatRowTimeFormatters {
-    static let shortTime: DateFormatter = {
-        let df = DateFormatter()
-        df.timeStyle = .short
-        df.dateStyle = .none
-        return df
-    }()
-
-    static let monthDay: DateFormatter = {
-        let df = DateFormatter()
-        df.locale = .autoupdatingCurrent
-        df.setLocalizedDateFormatFromTemplate("MMM d")
-        return df
-    }()
-}
 
 private func friendsDirectoryCardSubtitle(for item: ChatViewModel.FriendDisplay) -> String {
     if item.preview.isBusinessVenueConversation {
@@ -42,7 +27,7 @@ nonisolated private func chatFansLiveNowCandidate(_ preview: UserPreview) -> Boo
     guard preview.businessVenueId == nil else { return false }
     guard !preview.isBusinessAccount else { return false }
     guard let lastSeen = chatFansLiveNowParsedLastSeen(preview.lastSeenAtRaw) else { return false }
-    return Date().timeIntervalSince(lastSeen) <= 120
+    return Date().timeIntervalSince(lastSeen) <= PresenceOnlineStatus.onlineWindowSeconds
 }
 
 nonisolated private func chatFansLiveNowParsedLastSeen(_ raw: String?) -> Date? {
@@ -238,15 +223,22 @@ struct FriendsTabView: View {
     var isTabSelected: Bool
 
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var selectedSection: ChatSection = .chats
     @State private var showingAddFriendSheet = false
     @State private var showingBlockedUsersSheet = false
+    @State private var showingNewMessageSheet = false
+    @State private var showingCreateGroupSheet = false
+    @State private var groupNavigationConversationId: UUID?
     @State private var manualFriendLookupDraft: String = ""
     @State private var friendDirectorySearchText = ""
     @State private var chatConversationFriendsSnapshot: [ChatViewModel.FriendDisplay] = []
     @State private var friendsDirectoryItemsSnapshot: [ChatViewModel.FriendDisplay] = []
     @State private var filteredFriendsDirectoryItemsSnapshot: [ChatViewModel.FriendDisplay] = []
+    /// Fingerprint of inputs to ``rebuildFriendDisplaySnapshots`` (ordering, unread, last message,
+    /// presence lastSeen, friendship chips, group membership/avatar keys, search query).
+    @State private var lastFriendDisplaySnapshotFingerprint = ""
     /// Populated after first paint from cached friend presence (see ``refreshFansLiveNowAfterFirstPaint``).
     @State private var fansLiveNowEntries: [ChatFansLiveNowEntry] = []
     /// Programmatic push (in-app DM banner → Chat tab → ``DirectChatView``).
@@ -266,7 +258,13 @@ struct FriendsTabView: View {
     }
 
     private var chatConversationFriends: [ChatViewModel.FriendDisplay] {
-        chatConversationFriendsSnapshot
+        let authoritative = viewModel.friends.filter(\.isConversationBacked)
+        // Prefer authoritative rows when the deferred snapshot has not caught up yet
+        // (avoids empty-state / blank Recent Chats flash after account switch).
+        if chatConversationFriendsSnapshot.isEmpty, !authoritative.isEmpty {
+            return authoritative
+        }
+        return chatConversationFriendsSnapshot
     }
 
     private var friendsDirectoryItems: [ChatViewModel.FriendDisplay] {
@@ -321,6 +319,16 @@ struct FriendsTabView: View {
                     }
                 )
             }
+            .sheet(isPresented: $showingNewMessageSheet) {
+                NewMessageFriendPickerSheet(chatViewModel: viewModel) { preview in
+                    dmBannerNavigationFriend = preview
+                }
+            }
+            .sheet(isPresented: $showingCreateGroupSheet) {
+                CreateGroupChatSheet(chatViewModel: viewModel) { conversationId in
+                    groupNavigationConversationId = conversationId
+                }
+            }
             .modifier(FriendsTabLifecycleModifier(
                 viewModel: viewModel,
                 mapViewModel: mapViewModel,
@@ -342,11 +350,24 @@ struct FriendsTabView: View {
                 },
                 onPendingDmOpen: consumePendingDmOpenPreviewIfNeeded,
                 onRequiresSignInChange: { logChatAuthGate(reason: "requiresSignInChanged") },
-                onChatUserAuthIdChange: { logChatAuthGate(reason: "chatUserAuthIdChanged") },
+                onChatUserAuthIdChange: {
+                    logChatAuthGate(reason: "chatUserAuthIdChanged")
+                    chatConversationFriendsSnapshot = []
+                    friendsDirectoryItemsSnapshot = []
+                    filteredFriendsDirectoryItemsSnapshot = []
+                    lastFriendDisplaySnapshotFingerprint = ""
+                    fansLiveNowEntries = []
+                    rebuildFriendDisplaySnapshots(reason: "chatAuthIdChanged")
+                },
                 onMapUserAuthIdChange: {
                     logChatAuthGate(reason: "mapUserAuthIdChanged")
+                    chatConversationFriendsSnapshot = []
+                    friendsDirectoryItemsSnapshot = []
+                    filteredFriendsDirectoryItemsSnapshot = []
+                    lastFriendDisplaySnapshotFingerprint = ""
                     fansLiveNowEntries = []
                     ChatFansLiveNowSessionCache.clear(authId: nil)
+                    rebuildFriendDisplaySnapshots(reason: "mapAuthIdChanged")
                 },
                 onBusinessAccountChange: {
                     logChatAuthGate(reason: "businessAccountChanged")
@@ -360,6 +381,14 @@ struct FriendsTabView: View {
             }
             .onChange(of: mapViewModel.hasAuthenticatedVenueOwnerSession) { _, _ in
                 normalizeChatSectionForAccountType()
+            }
+            .background {
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+                    .onChange(of: mapViewModel.pendingDiscoverTodayDashboardNav) { _, _ in
+                        applyPendingDiscoverTodayDashboardChatNavIfNeeded()
+                    }
             }
             .modifier(ChatErrorAlertsModifier(viewModel: viewModel))
             .alert(
@@ -403,6 +432,20 @@ struct FriendsTabView: View {
                 .background(chatRootBackground)
                 .navigationDestination(item: $dmBannerNavigationFriend) { friend in
                     DirectChatView(friend: friend)
+                        .environmentObject(viewModel)
+                        .environmentObject(mapViewModel)
+                }
+                .navigationDestination(isPresented: Binding(
+                    get: { groupNavigationConversationId != nil },
+                    set: { if !$0 { groupNavigationConversationId = nil } }
+                )) {
+                    if let groupNavigationConversationId {
+                        GroupChatView(
+                            conversationId: groupNavigationConversationId,
+                            chatViewModel: viewModel
+                        )
+                        .environmentObject(mapViewModel)
+                    }
                 }
                 .navigationDestination(isPresented: $openSupportChat) {
                     FanGeoSupportHubView(
@@ -434,6 +477,7 @@ struct FriendsTabView: View {
         guard on else { return }
         AppPerfDebug.screenLoadStart(tab: "chat", source: "tabSelected")
         UIPerformanceDiagnostics.signpost("DM inbox open", "source=tabSelected")
+        applyPendingDiscoverTodayDashboardChatNavIfNeeded()
         consumePendingDmOpenPreviewIfNeeded()
         Task { @MainActor in
             await Task.yield()
@@ -453,6 +497,16 @@ struct FriendsTabView: View {
         }
     }
 
+    private func applyPendingDiscoverTodayDashboardChatNavIfNeeded() {
+        guard isTabSelected else { return }
+        guard mapViewModel.pendingDiscoverTodayDashboardNav == .chatFansLiveNow else { return }
+        selectedSection = .chats
+        mapViewModel.clearPendingDiscoverTodayDashboardNav()
+#if DEBUG
+        print("[DiscoverTodayDashboard] applied chatFansLiveNow")
+#endif
+    }
+
     private func handleAppear() {
 #if DEBUG
         let started = CFAbsoluteTimeGetCurrent()
@@ -470,6 +524,7 @@ struct FriendsTabView: View {
         viewModel.mapViewModel = mapViewModel
         logChatAuthGate(reason: "appear")
         normalizeChatSectionForAccountType()
+        applyPendingDiscoverTodayDashboardChatNavIfNeeded()
         consumePendingDmOpenPreviewIfNeeded()
         if chatNeedsInboxBodyLoad {
             viewModel.prepareInboxLoadUIStateIfNeeded()
@@ -483,7 +538,11 @@ struct FriendsTabView: View {
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear skipped=\(chatSkipInboxRefreshReason)")
             } else {
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear started")
-                await viewModel.refreshInboxSummariesIfNeeded()
+                if viewModel.hasCompletedInitialInboxLoad {
+                    await viewModel.refreshInboxSummariesIfNeeded()
+                } else {
+                    await viewModel.beginInitialInboxLoadIfNeeded(source: "tab")
+                }
                 if showsChatSocialSections {
                     Task { await viewModel.refreshFriendRequestListsOnly() }
                 }
@@ -534,11 +593,19 @@ struct FriendsTabView: View {
         let started = CFAbsoluteTimeGetCurrent()
 #endif
         let friends = viewModel.friends
+        let query = friendDirectorySearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let fingerprint = friendDisplaySnapshotFingerprint(friends: friends, query: query)
+        if fingerprint == lastFriendDisplaySnapshotFingerprint,
+           !chatConversationFriendsSnapshot.isEmpty || friends.isEmpty {
+            DebugLogGate.tabSwitchPerfVerbose(
+                "[ChatLoadPerf] snapshotRebuildSkipped reason=fingerprintUnchanged trigger=\(reason)"
+            )
+            return
+        }
         let conversations = friends.filter(\.isConversationBacked)
         let directory = deduplicatedFriendsDirectory(from: friends) { userId in
             viewModel.chipKind(forOtherUserId: userId) == .friends
         }
-        let query = friendDirectorySearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let filtered: [ChatViewModel.FriendDisplay]
         if query.isEmpty {
             filtered = directory
@@ -551,6 +618,7 @@ struct FriendsTabView: View {
         chatConversationFriendsSnapshot = conversations
         friendsDirectoryItemsSnapshot = directory
         filteredFriendsDirectoryItemsSnapshot = filtered
+        lastFriendDisplaySnapshotFingerprint = fingerprint
         prefetchChatInboxAvatars(reason: reason, rows: conversations)
 #if DEBUG
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
@@ -558,6 +626,45 @@ struct FriendsTabView: View {
             "[RenderPerf] view=FriendsTabView renderMs=\(String(format: "%.2f", ms)) rebuildReason=\(reason)"
         )
 #endif
+    }
+
+    /// Inputs: friend id/order, unread, last message time/body, presence lastSeen, conversation/group
+    /// flags, group member avatar keys, friendship chip kind, and directory search query.
+    private func friendDisplaySnapshotFingerprint(
+        friends: [ChatViewModel.FriendDisplay],
+        query: String
+    ) -> String {
+        let rows = friends.map { item -> String in
+            let chip: String = {
+                switch viewModel.chipKind(forOtherUserId: item.preview.id) {
+                case .addFriend: return "add"
+                case .pendingOutgoing: return "out"
+                case .pendingIncoming: return "in"
+                case .friends: return "friends"
+                case .declinedOutgoing: return "declined"
+                }
+            }()
+            let groupKey: String = {
+                guard item.isGroupConversation, let conversationId = item.conversationId else { return "-" }
+                let members = (viewModel.groupInboxAvatarMemberIdsByConversationId[conversationId] ?? [])
+                    .map { $0.uuidString.lowercased() }
+                    .joined(separator: ",")
+                return "\(conversationId.uuidString.lowercased()):\(members):\(item.groupMemberCount):\(item.isGroupMuted ? 1 : 0)"
+            }()
+            return [
+                item.id.uuidString.lowercased(),
+                item.preview.id.uuidString.lowercased(),
+                "\(item.unreadCount)",
+                "\(item.lastMessageAt?.timeIntervalSince1970 ?? 0)",
+                item.subtitle ?? "",
+                item.preview.lastSeenAtRaw ?? "",
+                item.isConversationBacked ? "1" : "0",
+                item.inboxKind.rawValue,
+                chip,
+                groupKey
+            ].joined(separator: "|")
+        }.joined(separator: ";")
+        return "q=\(query);rows=\(rows)"
     }
 
     private func prefetchChatInboxAvatars(reason: String, rows: [ChatViewModel.FriendDisplay]) {
@@ -628,8 +735,8 @@ struct FriendsTabView: View {
     private var chatHeader: some View {
         HStack(alignment: .top, spacing: 14) {
             FanGeoPagePurposeHeader(
-                title: "Chat",
-                subtitle: "Connect with fans, friends, and venues."
+                title: L10n.t("Chat", languageCode: appLanguageRaw),
+                subtitle: L10n.t("chat_tab_subtitle", languageCode: appLanguageRaw)
             )
 
             Spacer(minLength: 0)
@@ -649,6 +756,22 @@ struct FriendsTabView: View {
 
     private var chatOptionsMenu: some View {
         Menu {
+            if showsChatSocialSections, mapViewModel.canUsePrivateChat {
+                Button {
+                    showingNewMessageSheet = true
+                } label: {
+                    Label(L10n.t("new_message", languageCode: appLanguageRaw), systemImage: "square.and.pencil")
+                }
+
+                Button {
+                    showingCreateGroupSheet = true
+                } label: {
+                    Label(L10n.t("create_a_group", languageCode: appLanguageRaw), systemImage: "person.3.fill")
+                }
+
+                Divider()
+            }
+
             Button {
                 openSupportChat = true
             } label: {
@@ -864,6 +987,12 @@ struct FriendsTabView: View {
     /// because the preview is already non-nil when this view appears—drain it here so programmatic DM opens still navigate.
     private func consumePendingDmOpenPreviewIfNeeded() {
         guard !viewModel.requiresSignIn else { return }
+        if let groupId = viewModel.pendingGroupOpenConversationId {
+            selectedSection = .chats
+            groupNavigationConversationId = groupId
+            viewModel.pendingGroupOpenConversationId = nil
+            return
+        }
         guard let preview = viewModel.pendingDmOpenPreview else { return }
         selectedSection = .chats
         dmBannerNavigationFriend = preview
@@ -879,28 +1008,134 @@ struct FriendsTabView: View {
         Task { @MainActor in
             await Task.yield()
             let authId = mapViewModel.currentUserAuthId
-            let suggestedFans = authId.flatMap { ProfilePhase1PersonalizationCache.suggestedFansByAuthId[$0] } ?? []
-            let entries = ChatFansLiveNowSessionCache.resolve(
+            let languageCode = L10n.normalizedLanguageCode(
+                UserDefaults.standard.string(forKey: L10n.appLanguageKey) ?? L10n.defaultLanguageCode
+            )
+            var entries = ChatFansLiveNowSessionCache.resolve(
                 authId: authId,
                 friends: viewModel.friends,
-                suggestedFans: suggestedFans
+                languageCode: languageCode
+            )
+            // Fail closed: clear prior Nearby labels before the authoritative membership refresh.
+            entries = ChatFansLiveNowSessionCache.applyingNearbyLabels(
+                authId: authId,
+                entries: entries,
+                nearbyIds: [],
+                languageCode: languageCode
             )
             fansLiveNowEntries = entries
 #if DEBUG
             print("[FansLiveNow] refresh reason=\(reason) count=\(entries.count)")
+            print("[ChatNearbyTest] candidateCount=\(entries.count)")
             if !entries.isEmpty, let ms = ChatLoadPerf.elapsedMsSinceLoadStarted() {
                 ChatLoadPerf.liveFansVisibleMs(ms)
+            }
+#endif
+            guard !entries.isEmpty else { return }
+            // Candidate IDs must be profile/user IDs (`UserPreview.id`), never conversation/friendship IDs.
+            let candidateIds = entries.map(\.preview.id)
+#if DEBUG
+            print("[ChatNearby] candidates count=\(candidateIds.count) idSource=preview")
+#endif
+            // Ensure requester center is available for the among-RPC (no new permission prompt).
+            if mapViewModel.currentUserLocation == nil {
+                _ = await mapViewModel.refreshCurrentUserLocationIfAuthorized(timeoutSeconds: 4)
+            }
+            if let coordinate = mapViewModel.currentUserLocation {
+                PresenceService.shared.updateHeartbeatLocation(
+                    latitude: coordinate.latitude,
+                    longitude: coordinate.longitude
+                )
+#if DEBUG
+                print("[ChatNearbyTest] heartbeat requester=success")
+#endif
+            } else {
+#if DEBUG
+                print("[ChatNearbyTest] heartbeat requester=missing")
+                print("[ChatNearbyTest] excluded reason=missingLocation")
+#endif
+            }
+            let nearbyIds = await FansNearbyService.shared.nearbyIdsAmong(
+                authId: authId,
+                isBusinessAccount: mapViewModel.currentUserIsBusinessAccount
+                    || mapViewModel.isVenueOwnerLoggedIn,
+                center: mapViewModel.currentUserLocation,
+                candidateIds: candidateIds,
+                force: true,
+                reason: "fansLiveNow:\(reason)"
+            )
+            guard !Task.isCancelled, selectedSection == .chats else { return }
+            entries = ChatFansLiveNowSessionCache.applyingNearbyLabels(
+                authId: authId,
+                entries: entries,
+                nearbyIds: nearbyIds,
+                languageCode: languageCode
+            )
+            fansLiveNowEntries = entries
+#if DEBUG
+            let labeled = entries.filter(\.isNearby).count
+            print("[ChatNearby] entries rebuilt nearbyCount=\(labeled)")
+            print("[ChatNearbyTest] rpc nearbyCount=\(nearbyIds.count)")
+            for entry in entries {
+                print("[ChatNearby] subtitle nearby=\(entry.isNearby ? "true" : "false")")
+                print("[ChatNearbyTest] entry nearby=\(entry.isNearby ? "true" : "false")")
             }
 #endif
         }
     }
 
+    /// Conversation fetch in flight (initial or background). Presentation only — does not change fetch lifecycle.
+    private var isLoadingConversations: Bool {
+        viewModel.isInboxInitialLoadInFlight || viewModel.isInboxBackgroundRefreshInFlight
+    }
+
+    /// Authoritative conversation rows from the view model (not the deferred UI snapshot).
+    private var authoritativeConversationFriends: [ChatViewModel.FriendDisplay] {
+        viewModel.friends.filter(\.isConversationBacked)
+    }
+
+    /// Cached/loaded conversation list or a completed initial load (including empty inbox).
+    private var hasConversationContent: Bool {
+        !authoritativeConversationFriends.isEmpty || !chatConversationFriends.isEmpty
+    }
+
+    /// First-load pending for this account — never treat as the true empty state.
+    private var isInitialInboxLoadPending: Bool {
+        !shouldShowChatSignInRequired
+            && !viewModel.hasCompletedInitialInboxLoad
+            && authoritativeConversationFriends.isEmpty
+    }
+
+    /// Full-screen / section loader only when opening with nothing to show yet.
     private var shouldShowChatInboxLoadingState: Bool {
-        viewModel.isInboxInitialLoadInFlight && chatConversationFriends.isEmpty
+        if viewModel.initialInboxLoadFailed && !hasConversationContent {
+            return false
+        }
+        if isInitialInboxLoadPending {
+            return true
+        }
+        return isLoadingConversations && !hasConversationContent
+    }
+
+    /// Compact inline refresh above Recent Chats when existing content stays on screen.
+    private var shouldShowInlineConversationRefresh: Bool {
+        isLoadingConversations && hasConversationContent
     }
 
     private var shouldShowChatInboxEmptyState: Bool {
-        viewModel.hasCompletedInitialInboxLoad && chatConversationFriends.isEmpty
+        viewModel.hasCompletedInitialInboxLoad
+            && !viewModel.initialInboxLoadFailed
+            && authoritativeConversationFriends.isEmpty
+            && chatConversationFriends.isEmpty
+            && !shouldShowChatInboxLoadingState
+            && !isLoadingConversations
+    }
+
+    private var shouldShowChatInboxLoadFailureState: Bool {
+        viewModel.initialInboxLoadFailed
+            && !viewModel.hasCompletedInitialInboxLoad
+            && !hasConversationContent
+            && !isLoadingConversations
     }
 
     private var chatInboxUpdatingIndicator: some View {
@@ -912,8 +1147,9 @@ struct FriendsTabView: View {
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Updating conversations…")
     }
 
     private var chatInboxLoadingCard: some View {
@@ -924,6 +1160,30 @@ struct FriendsTabView: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
             Spacer(minLength: 0)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96))
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(FGColor.divider(colorScheme).opacity(0.55), lineWidth: 1)
+        }
+        .softCardShadow()
+    }
+
+    private var chatInboxLoadFailureCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Couldn't load conversations")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+            Text("Pull to try again, or reopen Chat.")
+                .font(.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            Button("Try again") {
+                Task { await viewModel.beginInitialInboxLoadIfNeeded(source: "tab") }
+            }
+            .font(.subheadline.weight(.semibold))
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -948,11 +1208,27 @@ struct FriendsTabView: View {
                     .padding(.bottom, 110)
                 }
                 .background(chatRootBackground)
+            } else if shouldShowChatInboxLoadFailureState {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        chatInboxLoadFailureCard
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                    .padding(.bottom, 110)
+                }
+                .background(chatRootBackground)
+                .refreshable {
+                    await viewModel.beginInitialInboxLoadIfNeeded(source: "tab")
+                }
             } else if shouldShowChatInboxEmptyState {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         if shouldShowFansLiveNowStrip {
                             fansLiveNowStrip
+                        }
+                        if shouldShowInlineConversationRefresh {
+                            chatInboxUpdatingIndicator
                         }
                         chatEmptyState
                     }
@@ -964,13 +1240,12 @@ struct FriendsTabView: View {
             } else {
                 GeometryReader { layoutGeo in
                     VStack(spacing: 8) {
-                        if viewModel.isInboxBackgroundRefreshInFlight {
-                            chatInboxUpdatingIndicator
-                        }
+                        // Fans Live Now stays mounted during conversation refresh (not displaced by the loader).
                         if shouldShowFansLiveNowStrip {
                             fansLiveNowStrip
                                 .padding(.horizontal, 16)
                                 .fixedSize(horizontal: false, vertical: true)
+                                .layoutPriority(1)
                         }
                         chatsInboxList(layoutWidth: layoutGeo.size.width)
                     }
@@ -1002,17 +1277,29 @@ struct FriendsTabView: View {
 
     private func chatsInboxList(layoutWidth: CGFloat) -> some View {
         let inboxItems = ChatInboxAdPlacement.listItems(for: chatConversationFriends)
+#if DEBUG
+        let _ = logChatAdsInvestigation(
+            conversations: chatConversationFriends,
+            inboxItems: inboxItems,
+            adLoaded: nil,
+            phase: "listBuild"
+        )
+#endif
         return List {
             Section {
                 ForEach(inboxItems) { item in
                     chatInboxListRow(item, layoutWidth: layoutWidth)
                 }
             } header: {
-                chatListHeader(
-                    title: "Recent Chats",
-                    count: chatConversationFriends.count,
-                    trailingTitle: chatConversationFriends.count > 3 ? "See all" : nil
-                )
+                VStack(alignment: .leading, spacing: 6) {
+                    if shouldShowInlineConversationRefresh {
+                        chatInboxUpdatingIndicator
+                    }
+                    chatListHeader(
+                        title: L10n.t("recent_conversations", languageCode: appLanguageRaw),
+                        count: chatConversationFriends.count
+                    )
+                }
             }
         }
         .listStyle(.plain)
@@ -1022,13 +1309,29 @@ struct FriendsTabView: View {
         .onAppear {
             viewModel.clearActiveVisibleConversationId(reason: "chat_list_visible")
             logChatInboxAdPlacement()
+#if DEBUG
+            logChatAdsInvestigation(
+                conversations: chatConversationFriends,
+                inboxItems: inboxItems,
+                adLoaded: nil,
+                phase: "listAppear"
+            )
+#endif
         }
         .onChange(of: chatConversationFriends.count) { _, _ in
             logChatInboxAdPlacement()
+#if DEBUG
+            logChatAdsInvestigation(
+                conversations: chatConversationFriends,
+                inboxItems: ChatInboxAdPlacement.listItems(for: chatConversationFriends),
+                adLoaded: nil,
+                phase: "conversationCountChanged"
+            )
+#endif
         }
     }
 
-    private func chatListHeader(title: String, count: Int = 0, trailingTitle: String?) -> some View {
+    private func chatListHeader(title: String, count: Int = 0) -> some View {
         HStack {
             HStack(spacing: 0) {
                 Text(title)
@@ -1042,15 +1345,10 @@ struct FriendsTabView: View {
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                 }
             }
-            Spacer()
-            if let trailingTitle {
-                Text(trailingTitle)
-                    .font(.caption.weight(.bold))
-                    .textCase(nil)
-                    .foregroundStyle(FGColor.accentGreen)
-            }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 0)
+        .accessibilityElement(children: .combine)
     }
 
     private var supportInboxCardButton: some View {
@@ -1070,19 +1368,21 @@ struct FriendsTabView: View {
     }
 
     private var chatEmptyState: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return VStack(alignment: .leading, spacing: 14) {
             Image(systemName: "bubble.left.and.bubble.right.fill")
                 .font(.system(size: 28, weight: .semibold))
                 .foregroundStyle(FGColor.accentGreen)
                 .frame(width: 52, height: 52)
                 .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.10), in: Circle())
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Start a conversation with fans, friends, or venues.")
+                Text(L10n.t("chat_empty_title", languageCode: languageCode))
                     .font(.headline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
-                Text("Find local fans or explore sports venues to start planning your next game day.")
+                Text(L10n.t("chat_empty_privacy_message", languageCode: languageCode))
                     .font(.subheadline)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
@@ -1124,33 +1424,29 @@ struct FriendsTabView: View {
                 .strokeBorder(FGColor.divider(colorScheme).opacity(0.55), lineWidth: 1)
         }
         .softCardShadow()
+        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
     private func chatInboxListRow(_ item: ChatInboxListItem, layoutWidth: CGFloat) -> some View {
         switch item {
         case .conversation(let friend):
-            Button {
-                dmBannerNavigationFriend = friend.preview
-            } label: {
-                friendRow(friend)
-            }
-            .buttonStyle(.plain)
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button(role: .destructive) {
-                    Task {
-                        await viewModel.clearInboxConversation(
-                            peerUserId: friend.preview.id,
-                            conversationId: friend.conversationId
-                        )
+            friendRow(friend)
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) {
+                        Task {
+                            await viewModel.clearInboxConversation(
+                                peerUserId: friend.preview.id,
+                                conversationId: friend.conversationId
+                            )
+                        }
+                    } label: {
+                        Label("Delete", systemImage: "trash")
                     }
-                } label: {
-                    Label("Delete", systemImage: "trash")
                 }
-            }
-            .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
         case .nativeAd(let slot):
             if isTabSelected {
                 let _ = logChatNativeAdInserted(slot)
@@ -1158,9 +1454,30 @@ struct FriendsTabView: View {
                     placement: "chat.inboxFeed",
                     hostTabRaw: "chat",
                     slotIndex: slot.slotIndex,
-                    layoutWidth: max(280, layoutWidth)
+                    layoutWidth: max(280, layoutWidth),
+                    onAdLoaded: {
+#if DEBUG
+                        logChatAdsInvestigation(
+                            conversations: chatConversationFriends,
+                            inboxItems: ChatInboxAdPlacement.listItems(for: chatConversationFriends),
+                            adLoaded: true,
+                            phase: "adLoaded slot=\(slot.slotIndex)"
+                        )
+#endif
+                    },
+                    onAdFailed: { error in
+#if DEBUG
+                        logChatAdsInvestigation(
+                            conversations: chatConversationFriends,
+                            inboxItems: ChatInboxAdPlacement.listItems(for: chatConversationFriends),
+                            adLoaded: false,
+                            phase: "adFailed slot=\(slot.slotIndex) error=\(error.localizedDescription)"
+                        )
+#endif
+                    }
                 )
                 .frame(maxWidth: .infinity)
+                .frame(height: CompactNativeAdLayout.preferredHeight)
                 .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
@@ -1194,6 +1511,51 @@ struct FriendsTabView: View {
         print("[ChatInboxAdDebug] enabled=true")
         print("[ChatInboxAdDebug] dmThreadAds=false")
     }
+
+#if DEBUG
+    /// Temporary investigation logger for Chat inbox sponsored ads. Do not keep permanently.
+    private func logChatAdsInvestigation(
+        conversations: [ChatViewModel.FriendDisplay],
+        inboxItems: [ChatInboxListItem],
+        adLoaded: Bool?,
+        phase: String
+    ) {
+        let conversationCount = conversations.count
+        let eligible = FanGeoAdPolicy.shouldInsertAdsInFeeds()
+            && ChatInboxAdPlacement.shouldInsertNativeAd(conversationCount: conversationCount)
+        let insertionIndexes = ChatInboxAdPlacement.insertionPositions(for: conversationCount)
+        let insertAttempted = eligible && !insertionIndexes.isEmpty
+        let rowTypes = inboxItems.map { item -> String in
+            switch item {
+            case .conversation: return "Conversation"
+            case .nativeAd: return "SponsoredAd"
+            }
+        }
+        let suppression = FanGeoAdPolicy.adsSuppressionReason ?? "none"
+        let mount = FanGeoAdPolicy.shouldMountAdViews()
+        let tabOffscreen = AdDebugContext.isTabOffscreenPreserved(tabRaw: "chat")
+        let adLoadedText: String = {
+            if let adLoaded { return "\(adLoaded)" }
+            return "pending/unknown"
+        }()
+
+        print(
+            """
+            ===== CHAT ADS =====
+            phase: \(phase)
+            Conversations loaded: \(conversationCount)
+            Eligible for ads: \(eligible) (policyInsert=\(FanGeoAdPolicy.shouldInsertAdsInFeeds()) suppression=\(suppression) mount=\(mount) tabOffscreen=\(tabOffscreen) isTabSelected=\(isTabSelected))
+            Ad loaded: \(adLoadedText)
+            Insert attempted: \(insertAttempted)
+            Insert index: \(insertionIndexes.first.map(String.init) ?? "none")
+            Final row count: \(inboxItems.count)
+            Final row types: [\(rowTypes.joined(separator: ", "))]
+            note: CompactNativeAdCard uses height=0/opacity=0 until load; chat row does not reserve preferredHeight (unlike Live).
+            ===================
+            """
+        )
+    }
+#endif
 
     private func logChatNativeAdInserted(_ slot: ChatInboxNativeAdSlot) {
         guard AdDiagnostics.enabled else { return }
@@ -1330,8 +1692,45 @@ struct FriendsTabView: View {
     }
 
     private func friendRow(_ item: ChatViewModel.FriendDisplay) -> some View {
-        ChatFriendInboxRow(item: item, timeLabel: Self.inboxTimeLabel(item.lastMessageAt))
-            .equatable()
+        let conversationKey = item.conversationId ?? item.id
+        let memberIds = viewModel.groupInboxAvatarMemberIdsByConversationId[conversationKey] ?? []
+        let watchSpotVenueId = item.inboxKind == .business ? item.preview.businessVenueId : nil
+        return ChatFriendInboxRow(
+            item: item,
+            timeLabel: Self.inboxTimeLabel(item.lastMessageAt, languageCode: appLanguageRaw),
+            languageCode: appLanguageRaw,
+            groupAvatarMemberIds: memberIds,
+            groupMemberPreviews: viewModel.groupMemberPreviewByUserId,
+            onOpenConversation: {
+                openInboxConversation(item)
+            },
+            onOpenWatchSpotInDiscover: watchSpotVenueId.map { venueId in
+                { openWatchSpotInDiscover(from: item, venueId: venueId) }
+            }
+        )
+        .id(
+            "inbox-\(item.inboxKind.rawValue)-\(conversationKey.uuidString.lowercased())-\(memberIds.map { $0.uuidString.lowercased() }.joined(separator: "."))"
+        )
+    }
+
+    private func openInboxConversation(_ friend: ChatViewModel.FriendDisplay) {
+#if DEBUG
+        print("[DirectChatNav] rowTap conversationPresent=\(friend.conversationId != nil) kind=\(friend.inboxKind.rawValue)")
+#endif
+        if friend.isGroupConversation {
+            groupNavigationConversationId = friend.conversationId ?? friend.id
+        } else {
+            dmBannerNavigationFriend = friend.preview
+        }
+    }
+
+    private func openWatchSpotInDiscover(from friend: ChatViewModel.FriendDisplay, venueId: UUID) {
+#if DEBUG
+        print(
+            "[ChatWatchSpotNavigation] kind=\(friend.inboxKind.rawValue) venueId=\(venueId.uuidString.lowercased()) focusRequested=true context=watch+allSpots+allSports"
+        )
+#endif
+        mapViewModel.requestDiscoverFocusForVenueId(venueId)
     }
 
     private func friendDirectoryCard(_ item: ChatViewModel.FriendDisplay) -> some View {
@@ -1359,8 +1758,14 @@ struct FriendsTabView: View {
     private func openMessage(from item: ChatViewModel.FriendDisplay) {
 #if DEBUG
         print("[FriendsDirectoryDebug] messageTapped=\(item.id.uuidString.lowercased())")
+        print("[DirectChatNav] rowTap conversationPresent=\(item.conversationId != nil)")
 #endif
         dmBannerNavigationFriend = item.preview
+#if DEBUG
+        print(
+            "[DirectChatNav] setActive peerPresent=true conversationPresent=\(item.conversationId != nil || item.preview.dmConversationId != nil)"
+        )
+#endif
     }
 
     private func openFriendProfile(from item: ChatViewModel.FriendDisplay) {
@@ -1466,14 +1871,8 @@ struct FriendsTabView: View {
         }
     }
 
-    private static func inboxTimeLabel(_ date: Date?) -> String {
-        guard let date else { return "" }
-        let cal = Calendar.current
-        if cal.isDateInToday(date) {
-            return ChatRowTimeFormatters.shortTime.string(from: date)
-        }
-        if cal.isDateInYesterday(date) { return "Yesterday" }
-        return ChatRowTimeFormatters.monthDay.string(from: date)
+    private static func inboxTimeLabel(_ date: Date?, languageCode: String) -> String {
+        ChatInboxTimestampFormatting.label(for: date, languageCode: languageCode)
     }
 }
 
@@ -1568,78 +1967,316 @@ private struct ChatInboxBusinessConversationAvatar: View {
     }
 }
 
-private struct ChatFriendInboxRow: View, Equatable {
+/// Subtle type chip for Chat inbox title row. Private (`.direct`) has no badge.
+private struct ChatInboxConversationTypeBadge: View {
+    enum Kind {
+        case group
+        case watchSpot
+    }
+
+    let kind: Kind
+    let languageCode: String
+    @Environment(\.colorScheme) private var colorScheme
+    @ScaledMetric(relativeTo: .caption2) private var fontSize: CGFloat = 10
+    @ScaledMetric(relativeTo: .caption2) private var horizontalPadding: CGFloat = 5
+    @ScaledMetric(relativeTo: .caption2) private var verticalPadding: CGFloat = 2
+    @ScaledMetric(relativeTo: .caption2) private var iconTextSpacing: CGFloat = 3
+
+    var body: some View {
+        HStack(spacing: iconTextSpacing) {
+            Image(systemName: systemImage)
+                .font(.system(size: fontSize, weight: .semibold))
+            Text(label)
+                .font(.system(size: fontSize, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, horizontalPadding)
+        .padding(.vertical, verticalPadding)
+        .foregroundStyle(foreground)
+        .background(background, in: Capsule(style: .continuous))
+        .accessibilityHidden(true)
+    }
+
+    private var systemImage: String {
+        switch kind {
+        case .group: return "person.2.fill"
+        case .watchSpot: return "building.2.fill"
+        }
+    }
+
+    private var label: String {
+        switch kind {
+        case .group:
+            return L10n.t("chat_inbox_badge_group", languageCode: languageCode)
+        case .watchSpot:
+            return L10n.t("chat_inbox_badge_watch_spot", languageCode: languageCode)
+        }
+    }
+
+    private var foreground: Color {
+        switch kind {
+        case .group:
+            return FGColor.secondaryText(colorScheme)
+        case .watchSpot:
+            return FGColor.accentGreen
+        }
+    }
+
+    private var background: Color {
+        switch kind {
+        case .group:
+            return FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.18 : 0.12)
+        case .watchSpot:
+            return FGColor.accentGreen.opacity(colorScheme == .dark ? 0.22 : 0.14)
+        }
+    }
+}
+
+private struct ChatInboxWatchSpotAffordanceButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.92 : 1)
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .animation(.easeInOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+private struct ChatFriendInboxRow: View {
     let item: ChatViewModel.FriendDisplay
     let timeLabel: String
+    var languageCode: String = L10n.defaultLanguageCode
+    var groupAvatarMemberIds: [UUID] = []
+    var groupMemberPreviews: [UUID: UserPreview] = [:]
+    let onOpenConversation: () -> Void
+    /// Authoritative Watch Spot venue focus. Nil when not venue-linked or venue id missing.
+    var onOpenWatchSpotInDiscover: (() -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
-    @ScaledMetric(relativeTo: .caption2) private var unreadCapsuleMinSize: CGFloat = 21
+    @ScaledMetric(relativeTo: .caption2) private var unreadCapsuleMinSize: CGFloat = 22
 
     private var isUnread: Bool { item.unreadCount > 0 }
 
-    static func == (lhs: ChatFriendInboxRow, rhs: ChatFriendInboxRow) -> Bool {
-        lhs.item == rhs.item && lhs.timeLabel == rhs.timeLabel
+    private var unreadBadgeText: String {
+        item.unreadCount > 99 ? "99+" : "\(item.unreadCount)"
+    }
+
+    /// Authoritative inbox metadata only — never inferred from title/avatar text.
+    private var conversationTypeBadgeKind: ChatInboxConversationTypeBadge.Kind? {
+        switch item.inboxKind {
+        case .direct:
+            return nil
+        case .group:
+            return .group
+        case .business:
+            return .watchSpot
+        }
+    }
+
+    private var conversationTypeAccessibilityPhrase: String {
+        switch item.inboxKind {
+        case .direct:
+            return L10n.t("chat_inbox_a11y_private_conversation", languageCode: languageCode)
+        case .group:
+            return L10n.t("chat_inbox_a11y_group_conversation", languageCode: languageCode)
+        case .business:
+            return L10n.t("chat_inbox_a11y_watch_spot_conversation", languageCode: languageCode)
+        }
+    }
+
+    private var openConversationAccessibilityLabel: String {
+        var parts = [
+            String(
+                format: L10n.t("chat_inbox_a11y_open_conversation_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                item.preview.displayName
+            ),
+            conversationTypeAccessibilityPhrase
+        ]
+        if isUnread {
+            parts.append(
+                String(
+                    format: L10n.t("chat_unread_count_a11y", languageCode: languageCode),
+                    item.unreadCount
+                )
+            )
+        }
+        let preview = chatPreviewLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !preview.isEmpty {
+            parts.append(preview)
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private var viewWatchSpotAccessibilityLabel: String {
+        String(
+            format: L10n.t("chat_inbox_a11y_view_watch_spot_in_discover_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            item.preview.displayName
+        )
     }
 
     var body: some View {
         HStack(spacing: 12) {
-            inboxAvatar
+            watchSpotOrStaticAvatar
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(item.preview.displayName)
-                        .font(.subheadline.weight(isUnread ? .semibold : .medium))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(1)
-
-                    Spacer(minLength: 4)
-
-                    if !timeLabel.isEmpty {
-                        Text(timeLabel)
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                HStack(alignment: .center, spacing: 6) {
+                    Button(action: onOpenConversation) {
+                        Text(item.preview.displayName)
+                            .font(.subheadline.weight(isUnread ? .bold : .medium))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
                             .lineLimit(1)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .layoutPriority(0)
+                    .accessibilityLabel(openConversationAccessibilityLabel)
+
+                    if let badgeKind = conversationTypeBadgeKind {
+                        watchSpotBadgeOrStatic(badgeKind)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .layoutPriority(1)
+                    }
+
+                    Button(action: onOpenConversation) {
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 4)
+
+                            if !timeLabel.isEmpty {
+                                Text(timeLabel)
+                                    .font(.caption2.weight(isUnread ? .bold : .medium))
+                                    .foregroundStyle(isUnread ? FGColor.accentGreen : FGColor.secondaryText(colorScheme))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+
+                            if isUnread {
+                                Text(unreadBadgeText)
+                                    .font(.caption2.weight(.black))
+                                    .foregroundStyle(Color.white)
+                                    .frame(minWidth: unreadCapsuleMinSize, minHeight: unreadCapsuleMinSize)
+                                    .padding(.horizontal, item.unreadCount > 99 ? 6 : 0)
+                                    .background(FGColor.accentGreen, in: Capsule())
+                                    .accessibilityHidden(true)
+                            }
+
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(FGColor.mutedText(colorScheme))
+                                .accessibilityHidden(true)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHidden(true)
                 }
 
-                if let businessName = item.preview.businessVenueBusinessName,
-                   !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Text(businessName)
-                        .font(.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                Button(action: onOpenConversation) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if item.isGroupConversation, item.groupMemberCount > 0 {
+                            Text(
+                                String(
+                                    format: L10n.t("group_chat_member_count_format", languageCode: languageCode),
+                                    item.groupMemberCount
+                                )
+                            )
+                                .font(.caption)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else if let businessName = item.preview.businessVenueBusinessName,
+                           !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Text(businessName)
+                                .font(.caption)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
 
-                Text(chatPreviewLine)
-                    .font(.caption.weight(isUnread ? .semibold : .medium))
-                    .foregroundStyle(isUnread ? FGColor.primaryText(colorScheme) : FGColor.secondaryText(colorScheme))
-                    .lineLimit(1)
+                        Text(chatPreviewLine)
+                            .font(.caption.weight(isUnread ? .semibold : .regular))
+                            .foregroundStyle(isUnread ? FGColor.primaryText(colorScheme) : FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHidden(true)
             }
-
-            if isUnread {
-                Text(item.unreadCount > 99 ? "99+" : "\(item.unreadCount)")
-                    .font(.caption2.weight(.black))
-                    .foregroundStyle(Color.white)
-                    .frame(minWidth: unreadCapsuleMinSize, minHeight: unreadCapsuleMinSize)
-                    .padding(.horizontal, item.unreadCount > 99 ? 5 : 0)
-                    .background(FGColor.accentGreen, in: Capsule())
-            }
-
-            Image(systemName: "chevron.right")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(FGColor.mutedText(colorScheme))
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96))
+        .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(alignment: .leading) {
+            if isUnread {
+                Capsule()
+                    .fill(FGColor.accentGreen)
+                    .frame(width: 3.5)
+                    .padding(.vertical, 10)
+                    .padding(.leading, 3)
+                    .accessibilityHidden(true)
+            }
+        }
         .overlay {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.34 : 0.48), lineWidth: 1)
+                .strokeBorder(
+                    isUnread
+                        ? FGColor.accentGreen.opacity(colorScheme == .dark ? 0.38 : 0.28)
+                        : FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.34 : 0.48),
+                    lineWidth: 1
+                )
         }
         .softCardShadow()
         .animation(.spring(response: 0.26, dampingFraction: 0.86), value: isUnread)
+        .accessibilityElement(children: .contain)
+#if DEBUG
+        .onAppear {
+            if item.inboxKind == .business, onOpenWatchSpotInDiscover == nil {
+                print(
+                    "[ChatWatchSpotNavigation] kind=business venueId=nil focusRequested=false reason=missingVenueId conversationId=\(item.conversationId?.uuidString.lowercased() ?? "nil")"
+                )
+            }
+        }
+#endif
+    }
+
+    @ViewBuilder
+    private var watchSpotOrStaticAvatar: some View {
+        if let onOpenWatchSpotInDiscover {
+            Button(action: onOpenWatchSpotInDiscover) {
+                inboxAvatar
+            }
+            .buttonStyle(ChatInboxWatchSpotAffordanceButtonStyle())
+            .accessibilityLabel(viewWatchSpotAccessibilityLabel)
+            .accessibilityHint(L10n.t("chat_inbox_a11y_view_watch_spot_hint", languageCode: languageCode))
+        } else {
+            inboxAvatar
+        }
+    }
+
+    @ViewBuilder
+    private func watchSpotBadgeOrStatic(_ kind: ChatInboxConversationTypeBadge.Kind) -> some View {
+        let badge = ChatInboxConversationTypeBadge(kind: kind, languageCode: languageCode)
+        if kind == .watchSpot, let onOpenWatchSpotInDiscover {
+            // Same action as avatar; hide from VoiceOver to avoid duplicate controls.
+            Button(action: onOpenWatchSpotInDiscover) {
+                badge
+            }
+            .buttonStyle(ChatInboxWatchSpotAffordanceButtonStyle())
+            .accessibilityHidden(true)
+        } else {
+            badge
+        }
+    }
+
+    private var rowBackground: Color {
+        if isUnread {
+            return FGColor.accentGreen.opacity(colorScheme == .dark ? 0.14 : 0.08)
+        }
+        return FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96)
     }
 
     @ViewBuilder
@@ -1647,7 +2284,16 @@ private struct ChatFriendInboxRow: View, Equatable {
         let fanAvatarSize: CGFloat = 52
         let businessIconSize: CGFloat = 44
 
-        if item.preview.isBusinessVenueConversation || item.preview.isBusinessAccount {
+        if item.isGroupConversation {
+            GroupInboxMemberAvatarCluster(
+                memberIds: groupAvatarMemberIds,
+                memberCount: item.groupMemberCount,
+                previewsByUserId: groupMemberPreviews,
+                size: fanAvatarSize,
+                languageCode: languageCode,
+                colorScheme: colorScheme
+            )
+        } else if item.preview.isBusinessVenueConversation || item.preview.isBusinessAccount {
             ChatInboxBusinessConversationAvatar(size: businessIconSize)
                 .frame(width: fanAvatarSize, height: fanAvatarSize, alignment: .center)
         } else {
@@ -1657,7 +2303,136 @@ private struct ChatFriendInboxRow: View, Equatable {
 
     private var chatPreviewLine: String {
         let raw = item.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return raw.isEmpty ? "Start the conversation" : raw
+        return raw.isEmpty
+            ? ChatInboxPreviewFormatting.emptyConversationPlaceholder(languageCode: languageCode)
+            : raw
+    }
+}
+
+/// Compact overlapping member avatars for group conversation rows in Chat Inbox.
+private struct GroupInboxMemberAvatarCluster: View {
+    let memberIds: [UUID]
+    let memberCount: Int
+    let previewsByUserId: [UUID: UserPreview]
+    let size: CGFloat
+    let languageCode: String
+    let colorScheme: ColorScheme
+
+    private let maxVisible = 3
+    private let avatarSize: CGFloat = 26
+
+    private var visibleIds: [UUID] {
+        Array(memberIds.prefix(maxVisible))
+    }
+
+    private var placeholderCount: Int {
+        min(maxVisible, max(1, memberCount))
+    }
+
+    var body: some View {
+        let ids = visibleIds
+        let count = ids.isEmpty ? placeholderCount : ids.count
+        HStack(spacing: -avatarSize * 0.34) {
+            if ids.isEmpty {
+                ForEach(0..<count, id: \.self) { index in
+                    placeholderAvatar(seedIndex: index)
+                }
+            } else {
+                ForEach(ids, id: \.self) { userId in
+                    memberAvatar(for: userId)
+                }
+            }
+        }
+        .frame(width: size, height: size, alignment: .center)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabelText)
+    }
+
+    @ViewBuilder
+    private func memberAvatar(for userId: UUID) -> some View {
+        let preview = previewsByUserId[userId] ?? UserPreview(
+            id: userId,
+            displayName: L10n.t("Fan", languageCode: languageCode),
+            avatarURL: nil,
+            avatarThumbnailURL: nil
+        )
+        SocialAvatarRenderer.socialAvatarView(for: preview, size: avatarSize)
+            .frame(width: avatarSize, height: avatarSize)
+            .clipShape(Circle())
+            .overlay {
+                Circle()
+                    .strokeBorder(
+                        colorScheme == .dark ? Color.black.opacity(0.55) : Color.white,
+                        lineWidth: 1.2
+                    )
+            }
+            .accessibilityHidden(true)
+    }
+
+    private func placeholderAvatar(seedIndex: Int) -> some View {
+        let preview = UserPreview(
+            id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", seedIndex + 1)) ?? UUID(),
+            displayName: L10n.t("Fan", languageCode: languageCode),
+            avatarURL: nil,
+            avatarThumbnailURL: nil
+        )
+        return SocialAvatarRenderer.socialAvatarView(for: preview, size: avatarSize)
+            .frame(width: avatarSize, height: avatarSize)
+            .clipShape(Circle())
+            .overlay {
+                Circle()
+                    .strokeBorder(
+                        colorScheme == .dark ? Color.black.opacity(0.55) : Color.white,
+                        lineWidth: 1.2
+                    )
+            }
+            .accessibilityHidden(true)
+    }
+
+    private var accessibilityLabelText: String {
+        let names = visibleIds.map { id in
+            let preview = previewsByUserId[id]
+            let trimmed = preview?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty { return trimmed }
+            if let username = preview?.username?.trimmingCharacters(in: .whitespacesAndNewlines), !username.isEmpty {
+                return username
+            }
+            return L10n.t("Fan", languageCode: languageCode)
+        }
+        let totalOthersOrMembers = max(memberIds.count, names.count)
+        if names.isEmpty {
+            return String(
+                format: L10n.t("group_chat_inbox_avatars_a11y_count_format", languageCode: languageCode),
+                max(1, memberCount)
+            )
+        }
+        if names.count == 1 {
+            return String(
+                format: L10n.t("group_chat_inbox_avatars_a11y_one_format", languageCode: languageCode),
+                names[0]
+            )
+        }
+        if names.count == 2, totalOthersOrMembers <= 2 {
+            return String(
+                format: L10n.t("group_chat_inbox_avatars_a11y_two_format", languageCode: languageCode),
+                names[0],
+                names[1]
+            )
+        }
+        let remaining = max(0, memberIds.count - names.count)
+        if remaining <= 0 {
+            return String(
+                format: L10n.t("group_chat_inbox_avatars_a11y_two_format", languageCode: languageCode),
+                names[0],
+                names[1]
+            )
+        }
+        return String(
+            format: L10n.t("group_chat_inbox_avatars_a11y_many_format", languageCode: languageCode),
+            names[0],
+            names[1],
+            remaining
+        )
     }
 }
 
@@ -2024,6 +2799,8 @@ private struct AddFriendSearchResultRow: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .frame(minHeight: 44, alignment: .center)
+            .contentShape(Rectangle())
             .background(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(
@@ -2174,6 +2951,7 @@ private struct AddFriendGlassSheet: View {
     @State private var searchTask: Task<Void, Never>?
     @State private var venuePickerTarget: AddFriendSearchTarget?
     @State private var venuePickerOptions: [BusinessVenueMessageTarget] = []
+    @State private var selectedDetent: PresentationDetent = .medium
 
     private var normalizedDraft: String {
         FriendshipService.normalizedFriendLookupQuery(lookupDraft)
@@ -2217,8 +2995,6 @@ private struct AddFriendGlassSheet: View {
                         .padding(.vertical, 4)
                 }
 
-                searchResultsList
-
                 if let successMessage {
                     Text(successMessage)
                         .font(.caption.weight(.semibold))
@@ -2234,10 +3010,11 @@ private struct AddFriendGlassSheet: View {
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.red)
                 }
+
+                searchResultsList
             }
             .padding(.horizontal, 18)
-
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .padding(.top, 12)
         .onChange(of: lookupDraft) { _, newValue in
@@ -2245,6 +3022,10 @@ private struct AddFriendGlassSheet: View {
             inlineWarning = nil
             successMessage = nil
             selectedTarget = nil
+            let normalized = FriendshipService.normalizedFriendLookupQuery(newValue)
+            if !normalized.isEmpty, selectedDetent != .large {
+                selectedDetent = .large
+            }
             searchTask?.cancel()
             searchTask = Task {
                 try? await Task.sleep(nanoseconds: 320_000_000)
@@ -2266,7 +3047,7 @@ private struct AddFriendGlassSheet: View {
                 inlineWarning = nil
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium, .large], selection: $selectedDetent)
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(34)
         .presentationBackground(.ultraThinMaterial)
@@ -2305,6 +3086,7 @@ private struct AddFriendGlassSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Spacer(minLength: 0)
         } else {
             ScrollView {
                 LazyVStack(spacing: 6) {
@@ -2317,8 +3099,10 @@ private struct AddFriendGlassSheet: View {
                         }
                     }
                 }
+                .padding(.bottom, 12)
             }
-            .frame(maxHeight: 220)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .scrollDismissesKeyboard(.never)
         }
     }
 
@@ -2386,28 +3170,62 @@ private enum ChatFansLiveNowMetrics {
     static let ringSize: CGFloat = 66
     static let profileLabelSpacing: CGFloat = 3
     static let nameSubtitleSpacing: CGFloat = 1
+    /// Per-line budget; cards may use up to ``nameMaxLines``.
     static let nameLineHeight: CGFloat = 16
-    static let subtitleLineHeight: CGFloat = 14
+    static let nameMaxLines: Int = 2
+    /// "Online Fan" status line.
+    static let statusLineHeight: CGFloat = 14
+    static let statusNearbySpacing: CGFloat = 1
+    /// Optional second line (`📍 Nearby`); included in row height so Nearby never clips.
+    static let nearbyLineHeight: CGFloat = 14
     static let chatButtonTopSpacing: CGFloat = 3
     static let chatButtonHeight: CGFloat = 30
+
+    static let minCardWidth: CGFloat = ringSize + 8
+    static let maxCardWidthCompact: CGFloat = 102
+    static let maxCardWidthRegular: CGFloat = 168
+
     static let rowHeight: CGFloat =
         ringSize
         + profileLabelSpacing
-        + nameLineHeight
+        + (nameLineHeight * CGFloat(nameMaxLines))
         + nameSubtitleSpacing
-        + subtitleLineHeight
+        + statusLineHeight
+        + statusNearbySpacing
+        + nearbyLineHeight
         + chatButtonTopSpacing
         + chatButtonHeight
+
+    /// Adaptive card width from strip container size — computed outside cell `body` layouts.
+    static func cardWidth(
+        containerWidth: CGFloat,
+        horizontalSizeClass: UserInterfaceSizeClass?
+    ) -> CGFloat {
+        let width = max(0, containerWidth)
+        if horizontalSizeClass == .regular {
+            // iPad / regular width: use available space without becoming a full-width tile.
+            let proposed = width * 0.18
+            return min(maxCardWidthRegular, max(118, proposed))
+        }
+        let proposed = max(minCardWidth, min(maxCardWidthCompact, width * 0.22))
+        return proposed
+    }
 }
 
 struct ChatFansLiveNowEntry: Identifiable, Hashable {
     let id: UUID
     let preview: UserPreview
-    let subtitle: String
+    /// Line 1 under the name — always "Online Fan" (localized).
+    let statusLine: String
+    /// Line 2 when Nearby — e.g. "📍 Nearby". Nil for non-nearby (no blank gap).
+    let nearbyLine: String?
+    /// VoiceOver status without decorative pin/emoji.
+    let accessibilitySubtitle: String
+    let isNearby: Bool
 }
 
 enum ChatFansLiveNowSessionCache {
-    static let displayLimit = 12
+    static let displayLimit = FansNearbyProduct.amongCandidateCap
 
     private static var entriesByAuthId: [UUID: [ChatFansLiveNowEntry]] = [:]
     private static var presenceSignatureByAuthId: [UUID: String] = [:]
@@ -2425,32 +3243,57 @@ enum ChatFansLiveNowSessionCache {
     static func resolve(
         authId: UUID?,
         friends: [ChatViewModel.FriendDisplay],
-        suggestedFans: [FriendSuggestionProfile]
+        languageCode: String
     ) -> [ChatFansLiveNowEntry] {
         guard let authId else { return [] }
-        let signature = onlinePresenceSignature(friends)
+        let signature = onlinePresenceSignature(friends) + "|lang:\(languageCode)"
         if let cached = entriesByAuthId[authId], presenceSignatureByAuthId[authId] == signature {
             return cached
         }
-        let built = buildEntries(friends: friends, suggestedFans: suggestedFans)
+        let built = buildEntries(friends: friends, languageCode: languageCode)
         entriesByAuthId[authId] = built
         presenceSignatureByAuthId[authId] = signature
         return built
     }
 
+    /// Applies Nearby membership labels to already-built Live Now entries (outside SwiftUI `body`).
+    /// Matches RPC `user_id` against ``UserPreview/id`` (never conversation / friendship IDs).
+    static func applyingNearbyLabels(
+        authId: UUID?,
+        entries: [ChatFansLiveNowEntry],
+        nearbyIds: Set<UUID>,
+        languageCode: String
+    ) -> [ChatFansLiveNowEntry] {
+        let updated = entries.map { entry in
+            let isNearby = nearbyIds.contains(entry.preview.id)
+            let labels = subtitleLabels(isNearby: isNearby, languageCode: languageCode)
+            return ChatFansLiveNowEntry(
+                id: entry.preview.id,
+                preview: entry.preview,
+                statusLine: labels.statusLine,
+                nearbyLine: labels.nearbyLine,
+                accessibilitySubtitle: labels.accessibilitySubtitle,
+                isNearby: isNearby
+            )
+        }
+        if let authId, presenceSignatureByAuthId[authId] != nil {
+            entriesByAuthId[authId] = updated
+        }
+        return updated
+    }
+
     private static func onlinePresenceSignature(_ friends: [ChatViewModel.FriendDisplay]) -> String {
         friends
             .filter { chatFansLiveNowCandidate($0.preview) }
-            .map { "\($0.id.uuidString.lowercased()):\($0.preview.lastSeenAtRaw ?? "")" }
+            .map { "\($0.preview.id.uuidString.lowercased()):\($0.preview.lastSeenAtRaw ?? "")" }
             .sorted()
             .joined(separator: "|")
     }
 
     private static func buildEntries(
         friends: [ChatViewModel.FriendDisplay],
-        suggestedFans: [FriendSuggestionProfile]
+        languageCode: String
     ) -> [ChatFansLiveNowEntry] {
-        let suggestionByUserId = Dictionary(uniqueKeysWithValues: suggestedFans.map { ($0.userID, $0) })
         var seen = Set<UUID>()
 
         let onlineFriends = friends
@@ -2464,14 +3307,20 @@ enum ChatFansLiveNowSessionCache {
 
         var entries: [ChatFansLiveNowEntry] = []
         entries.reserveCapacity(min(displayLimit, onlineFriends.count))
+        let onlineLabels = subtitleLabels(isNearby: false, languageCode: languageCode)
 
         for friend in onlineFriends {
-            guard seen.insert(friend.id).inserted else { continue }
+            // `FriendDisplay.id` is often a conversation/friendship id; RPC expects profile/user id.
+            let profileId = friend.preview.id
+            guard seen.insert(profileId).inserted else { continue }
             entries.append(
                 ChatFansLiveNowEntry(
-                    id: friend.id,
+                    id: profileId,
                     preview: friend.preview,
-                    subtitle: subtitle(for: friend.preview, suggestion: suggestionByUserId[friend.id])
+                    statusLine: onlineLabels.statusLine,
+                    nearbyLine: onlineLabels.nearbyLine,
+                    accessibilitySubtitle: onlineLabels.accessibilitySubtitle,
+                    isNearby: false
                 )
             )
             if entries.count >= displayLimit { break }
@@ -2479,49 +3328,79 @@ enum ChatFansLiveNowSessionCache {
         return entries
     }
 
-    private static func subtitle(for preview: UserPreview, suggestion: FriendSuggestionProfile?) -> String {
-        if let suggestion {
-            if let label = suggestion.reasonLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !label.isEmpty {
-                return label
-            }
-            if suggestion.sharedFavoriteTeamsCount > 0 { return "Same Team" }
-            if suggestion.sharedEventInterestCount > 0 { return "Same watch party" }
-            if suggestion.sharedPickupGameCount > 0 { return "Same pickup game" }
-            if suggestion.mutualFriendCount > 0 { return "Mutual friends" }
+    private static func subtitleLabels(
+        isNearby: Bool,
+        languageCode: String
+    ) -> (statusLine: String, nearbyLine: String?, accessibilitySubtitle: String) {
+        let status = L10n.t("chat_fans_live_now_online_fan", languageCode: languageCode)
+        if isNearby {
+            return (
+                status,
+                L10n.t("chat_fans_live_now_nearby_line", languageCode: languageCode),
+                L10n.t("chat_fans_live_now_online_fan_nearby_a11y", languageCode: languageCode)
+            )
         }
-        return "Active Fan"
+        return (
+            status,
+            nil,
+            L10n.t("chat_fans_live_now_online_fan_a11y", languageCode: languageCode)
+        )
     }
 }
 
 private struct ChatFansLiveNowStripView: View {
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @State private var showNearbyInfo = false
 
     let entries: [ChatFansLiveNowEntry]
     let onSeeAll: () -> Void
     let onOpenProfile: (UUID) -> Void
     let onOpenChat: (UserPreview) -> Void
 
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
+            HStack(spacing: 6) {
                 Text("Fans Live Now")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
+                Button {
+                    showNearbyInfo = true
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("chat_fans_live_now_nearby_info_a11y", languageCode: languageCode))
                 Spacer()
                 Button("See all", action: onSeeAll)
                     .font(.caption.weight(.bold))
                     .foregroundStyle(FGColor.accentGreen)
             }
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(alignment: .top, spacing: 14) {
-                    ForEach(entries) { entry in
-                        ChatFansLiveNowCell(
-                            entry: entry,
-                            onOpenProfile: onOpenProfile,
-                            onOpenChat: onOpenChat
-                        )
+            GeometryReader { geo in
+                let cardWidth = ChatFansLiveNowMetrics.cardWidth(
+                    containerWidth: geo.size.width,
+                    horizontalSizeClass: horizontalSizeClass
+                )
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 14) {
+                        ForEach(entries) { entry in
+                            ChatFansLiveNowCell(
+                                entry: entry,
+                                cardWidth: cardWidth,
+                                onOpenProfile: onOpenProfile,
+                                onOpenChat: onOpenChat
+                            )
+                        }
                     }
                 }
             }
@@ -2530,6 +3409,32 @@ private struct ChatFansLiveNowStripView: View {
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Fans live now")
+        .sheet(isPresented: $showNearbyInfo) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(L10n.t("chat_fans_live_now_nearby_info_title", languageCode: languageCode))
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                    Text(L10n.t("chat_fans_live_now_nearby_info_body", languageCode: languageCode))
+                        .font(.body)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .background(FGColor.background(colorScheme).ignoresSafeArea())
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button(L10n.t("chat_fans_live_now_nearby_info_done", languageCode: languageCode)) {
+                            showNearbyInfo = false
+                        }
+                        .fontWeight(.semibold)
+                    }
+                }
+            }
+            .presentationDetents([.medium])
+        }
     }
 }
 
@@ -2565,6 +3470,7 @@ private struct ChatFansLiveNowCell: View {
     @Environment(\.colorScheme) private var colorScheme
 
     let entry: ChatFansLiveNowEntry
+    let cardWidth: CGFloat
     let onOpenProfile: (UUID) -> Void
     let onOpenChat: (UserPreview) -> Void
 
@@ -2598,22 +3504,44 @@ private struct ChatFansLiveNowCell: View {
             Text(entry.preview.displayName)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-                .lineLimit(1)
-                .frame(width: ringSize + 8)
+                .multilineTextAlignment(.center)
+                .lineLimit(ChatFansLiveNowMetrics.nameMaxLines)
+                .minimumScaleFactor(0.88)
+                .truncationMode(.tail)
+                .frame(width: cardWidth, alignment: .top)
+                .frame(minHeight: ChatFansLiveNowMetrics.nameLineHeight, alignment: .top)
                 .padding(.bottom, ChatFansLiveNowMetrics.nameSubtitleSpacing)
+                .accessibilityLabel(entry.preview.displayName)
 
-            Text(entry.subtitle)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .lineLimit(1)
-                .frame(width: ringSize + 8)
+            VStack(spacing: ChatFansLiveNowMetrics.statusNearbySpacing) {
+                Text(entry.statusLine)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let nearbyLine = entry.nearbyLine {
+                    Text(nearbyLine)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(FGColor.accentGreen)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(width: cardWidth)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(entry.accessibilitySubtitle)
 
             ChatFansLiveNowCompactChatButton {
                 onOpenChat(entry.preview)
             }
-            .frame(maxWidth: ringSize + 8, alignment: .center)
+            .frame(maxWidth: cardWidth, alignment: .center)
             .padding(.top, ChatFansLiveNowMetrics.chatButtonTopSpacing)
         }
+        .frame(width: cardWidth)
         .accessibilityElement(children: .contain)
     }
 }

@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 
 /// Composition root: presents Discover, Live, Schedule, Going, Chat, and Account tabs using shared view models from the root container.
@@ -85,6 +86,8 @@ struct MainTabView: View {
             .overlay {
                 FanXPRewardOverlayHost(manager: viewModel.fanXPRewardOverlay)
                     .id(ObjectIdentifier(viewModel.fanXPRewardOverlay))
+                WowMomentToastHost(manager: viewModel.wowMomentOverlay)
+                    .id(ObjectIdentifier(viewModel.wowMomentOverlay))
             }
             .background {
                 FanGeoAnnouncementMainTabRouter(viewModel: viewModel) { tabRaw in
@@ -123,8 +126,12 @@ struct MainTabView: View {
     private var tabShellWithLifecycleModifiers: some View {
         ZStack {
             if selectedTab == .chat {
+                // Keep this ZStack child mounted so toggling DM open does not reshuffle tab roots.
                 chatTabRootBackground
                     .ignoresSafeArea()
+                    .opacity(chatViewModel.hidesFloatingTabBarForDirectChat ? 0 : 1)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
 
             lazyPreservedRoot(tab: .discover) {
@@ -162,21 +169,13 @@ struct MainTabView: View {
             }
 
             lazyPreservedRoot(tab: .chat) {
-                FriendsTabView(
-                    mapViewModel: viewModel,
-                    viewModel: chatViewModel,
-                    isTabSelected: selectedTab == .chat
-                )
-                .padding(
-                    .bottom,
-                    chatViewModel.hidesFloatingTabBarForDirectChat ? 0 : Self.floatingTabBarStackHeight
-                )
-                .background(chatTabRootBackground.ignoresSafeArea())
+                chatTabRoot
             }
 
             lazyPreservedRoot(tab: .account) {
                 SettingsScreen(
                     viewModel: viewModel,
+                    selectedTab: selectedTabBinding,
                     isAccountTabSelected: selectedTab == .account
                 )
             }
@@ -221,6 +220,14 @@ struct MainTabView: View {
                 print("[StartupDiscover] selectedTab=\(AppTab.discover.rawValue)")
 #endif
             }
+#if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-SettingsNavSequentialValidation") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    selectTab(.account, animated: false, reason: "settingsNavSequentialValidation")
+                    print("[SettingsNavigationDebug] sequentialValidationForcedAccountTab=true")
+                }
+            }
+#endif
             logBottomTabStructure()
             updateDirectChatReadStateVisibility()
             evaluateBlockingFanIdentitySetupPresentation(reason: "mainTabOnAppear")
@@ -228,6 +235,7 @@ struct MainTabView: View {
             if selectedTab == .chat, viewModel.isAuthenticatedForSocialFeatures {
                 Task { await startChatSocialRealtimeIfNeeded(reason: "launchVisibleChatTab") }
             }
+            syncPresenceHeartbeatLocation()
             PresenceService.shared.startIfNeeded(
                 userID: viewModel.currentUserAuthId,
                 isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
@@ -235,12 +243,19 @@ struct MainTabView: View {
             )
 
             schedulePostAuthBadgeRefresh(reason: "mainTabOnAppear")
+            routePostSignupDiscoverWelcomeGuideIfReady(reason: "mainTabOnAppear")
         }
         .animation(.spring(response: 0.38, dampingFraction: 0.88), value: chatViewModel.hidesFloatingTabBarForDirectChat)
         .onChange(of: viewModel.switchToAccountForVenueClaim) { _, shouldSwitch in
             guard shouldSwitch else { return }
             viewModel.switchToAccountForVenueClaim = false
             selectTab(.account, reason: "switchToAccountForVenueClaim")
+        }
+        .task(id: viewModel.postSignupPresentation) {
+            routePostSignupDiscoverWelcomeGuideIfReady(reason: "postSignupPresentationTask")
+        }
+        .task(id: viewModel.postAccountCreationLanguageSelectorRevision) {
+            routePostAccountCreationLanguageSelectorIfReady(reason: "postAccountCreationLanguageTask")
         }
         // Splash timeout fallback: finish critical path only; warm preload handles the rest.
         .task {
@@ -279,6 +294,7 @@ struct MainTabView: View {
                 LaunchWarmPreloadCoordinator.shared.cancel()
                 UserPreferencesWarmCacheCoordinator.shared.cancel()
                 PresenceService.shared.stop(reason: "authUnavailable")
+                FansNearbyService.shared.clear(reason: "signedOut")
                 chatViewModel.clearForSignOut()
             } else {
                 scheduleDeferredChatSocialRealtimeStartupIfNeeded()
@@ -294,18 +310,42 @@ struct MainTabView: View {
                     forceRefresh: true
                 )
                 Task { await viewModel.ensurePickupInviteRealtimeIfNeeded() }
+                syncPresenceHeartbeatLocation()
                 PresenceService.shared.startIfNeeded(
                     userID: viewModel.currentUserAuthId,
                     isAuthenticated: true,
                     reason: "authBecameAvailable"
                 )
                 schedulePostAuthBadgeRefresh(reason: "authBecameAvailable", force: true)
+                // Private Chat was cleared on sign-out; start B's inbox without waiting for the Chat tab.
+                Task { @MainActor in
+                    await chatViewModel.beginInitialInboxLoadIfNeeded(source: "login")
+                }
             }
         }
-        .onChange(of: viewModel.currentUserAuthId) { _, newValue in
+        .onChange(of: viewModel.currentUserAuthId) { oldValue, newValue in
             if newValue == nil || newValue != lastAutoPresentedFanIdentitySetupUserId {
                 lastAutoPresentedFanIdentitySetupUserId = nil
             }
+            FansNearbyService.shared.clear(reason: "accountSwitch")
+            if oldValue != newValue {
+                ChatFansLiveNowSessionCache.clear(authId: nil)
+                if newValue == nil {
+                    chatViewModel.resetForAccountChange(newAuthId: nil, reason: "currentUserCleared")
+                } else if oldValue != nil {
+                    // Authenticated A → B without relying on a signed-out gap.
+                    chatViewModel.resetForAccountChange(newAuthId: newValue, reason: "accountSwitch")
+                    Task { @MainActor in
+                        await chatViewModel.beginInitialInboxLoadIfNeeded(source: "login")
+                    }
+                } else {
+                    // nil → B after sign-in; state already cleared on logout.
+                    Task { @MainActor in
+                        await chatViewModel.beginInitialInboxLoadIfNeeded(source: "login")
+                    }
+                }
+            }
+            syncPresenceHeartbeatLocation()
             PresenceService.shared.startIfNeeded(
                 userID: newValue,
                 isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
@@ -315,6 +355,8 @@ struct MainTabView: View {
                 cancelPostAuthBadgeRefresh(reason: "currentUserCleared")
             } else {
                 schedulePostAuthBadgeRefresh(reason: "currentUserChanged", force: true)
+                routePostAccountCreationLanguageSelectorIfReady(reason: "currentUserAuthIdChanged")
+                routePostSignupDiscoverWelcomeGuideIfReady(reason: "currentUserAuthIdChanged")
             }
         }
         .onChange(of: viewModel.privateSessionClearNonce) { _, _ in
@@ -515,6 +557,42 @@ struct MainTabView: View {
         } else {
             selectedTabStorage = tab.rawValue
         }
+    }
+
+    /// Selects Discover for a newly completed fan signup unless a higher-priority pending route exists.
+    private func routePostSignupDiscoverWelcomeGuideIfReady(reason: String) {
+        guard viewModel.hasPostSignupDiscoverWelcomeGuide else { return }
+        if chatViewModel.pendingDmOpenPreview != nil {
+#if DEBUG
+            print("[PostSignupRoute] deferDiscover reason=pendingDm source=\(reason)")
+#endif
+            return
+        }
+        if viewModel.switchToAccountForVenueClaim {
+#if DEBUG
+            print("[PostSignupRoute] deferDiscover reason=venueClaim source=\(reason)")
+#endif
+            return
+        }
+        selectTab(.discover, animated: true, reason: "postSignupWelcomeGuide:\(reason)")
+    }
+
+    /// Selects Discover so the post-account-creation language selector can present (fans and businesses).
+    private func routePostAccountCreationLanguageSelectorIfReady(reason: String) {
+        guard viewModel.hasPendingPostAccountCreationLanguageSelector else { return }
+        if chatViewModel.pendingDmOpenPreview != nil {
+#if DEBUG
+            print("[FirstLaunchLanguage] deferDiscover reason=pendingDm source=\(reason)")
+#endif
+            return
+        }
+        if viewModel.switchToAccountForVenueClaim {
+#if DEBUG
+            print("[FirstLaunchLanguage] deferDiscover reason=venueClaim source=\(reason)")
+#endif
+            return
+        }
+        selectTab(.discover, animated: true, reason: "postAccountCreationLanguage:\(reason)")
     }
 
     private func beginTabSwitch(to tab: AppTab, reason: String) {
@@ -814,7 +892,10 @@ struct MainTabView: View {
     }
 
     private func handlePendingDmOpenPreviewChange(_ preview: UserPreview?) {
-        guard preview != nil else { return }
+        guard preview != nil else {
+            routePostSignupDiscoverWelcomeGuideIfReady(reason: "pendingDmCleared")
+            return
+        }
         if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
             Task { await selectChatTabAfterDeviceAuth() }
         } else {
@@ -934,25 +1015,27 @@ struct MainTabView: View {
         )
     }
 
+    private func syncPresenceHeartbeatLocation() {
+        guard let coordinate = viewModel.currentUserLocation else { return }
+        PresenceService.shared.updateHeartbeatLocation(
+            latitude: coordinate.latitude,
+            longitude: coordinate.longitude
+        )
+    }
+
     private func schedulePostAuthBadgeRefresh(reason: String, force: Bool = false) {
         guard viewModel.isAuthenticatedForSocialFeatures,
               let userId = viewModel.currentUserAuthId else {
-            print("[NotificationPerf] badgeRefreshSkipped reason=noAuthenticatedUser trigger=\(reason)")
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] skipped because no authenticated user reason=\(reason)")
-#endif
+            DebugLogGate.debug("[NotificationPerf] badgeRefreshSkipped reason=noAuthenticatedUser trigger=\(reason)")
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] skipped because no authenticated user reason=\(reason)")
             return
         }
 
-#if DEBUG
-        print("[BadgeLoginRefreshDebug] auth event/session restored reason=\(reason) userId=\(userId.uuidString.lowercased())")
-#endif
+        DebugLogGate.debug("[BadgeLoginRefreshDebug] auth event/session restored reason=\(reason) userId=\(userId.uuidString.lowercased())")
 
         if postAuthBadgeRefreshTask != nil, postAuthBadgeRefreshUserId == userId {
-            print("[NotificationPerf] badgeRefreshCoalesced trigger=\(reason) userId=\(userId.uuidString.lowercased())")
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] coalesced reason=\(reason) userId=\(userId.uuidString.lowercased())")
-#endif
+            DebugLogGate.debug("[NotificationPerf] badgeRefreshCoalesced trigger=\(reason) userId=\(userId.uuidString.lowercased())")
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] coalesced reason=\(reason) userId=\(userId.uuidString.lowercased())")
             return
         }
 
@@ -960,15 +1043,13 @@ struct MainTabView: View {
            lastPostAuthBadgeRefreshUserId == userId,
            let lastPostAuthBadgeRefreshAt,
            Date().timeIntervalSince(lastPostAuthBadgeRefreshAt) < Self.postAuthBadgeRefreshThrottleInterval {
-            print("[NotificationPerf] badgeRefreshSkipped reason=throttled trigger=\(reason) userId=\(userId.uuidString.lowercased())")
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] throttled reason=\(reason) userId=\(userId.uuidString.lowercased())")
-#endif
+            DebugLogGate.debug("[NotificationPerf] badgeRefreshSkipped reason=throttled trigger=\(reason) userId=\(userId.uuidString.lowercased())")
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] throttled reason=\(reason) userId=\(userId.uuidString.lowercased())")
             return
         }
 
         postAuthBadgeRefreshTask?.cancel()
-        print("[NotificationPerf] badgeRefreshScheduled trigger=\(reason) force=\(force)")
+        DebugLogGate.debug("[NotificationPerf] badgeRefreshScheduled trigger=\(reason) force=\(force)")
         postAuthBadgeRefreshUserId = userId
         postAuthBadgeRefreshTask = Task { @MainActor in
             do {
@@ -989,30 +1070,24 @@ struct MainTabView: View {
         postAuthBadgeRefreshTask?.cancel()
         postAuthBadgeRefreshTask = nil
         postAuthBadgeRefreshUserId = nil
-#if DEBUG
-        print("[BadgeLoginRefreshDebug] cancelled reason=\(reason)")
-#endif
+        DebugLogGate.debug("[BadgeLoginRefreshDebug] cancelled reason=\(reason)")
     }
 
     private func runPostAuthBadgeRefresh(userId: UUID, reason: String) async {
         guard viewModel.isAuthenticatedForSocialFeatures,
               viewModel.currentUserAuthId == userId else {
-            print("[NotificationPerf] badgeRefreshSkipped reason=sessionChanged trigger=\(reason)")
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] skipped because no authenticated user reason=\(reason)")
-#endif
+            DebugLogGate.debug("[NotificationPerf] badgeRefreshSkipped reason=sessionChanged trigger=\(reason)")
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] skipped because no authenticated user reason=\(reason)")
             return
         }
 
         let startedAt = Date()
         lastPostAuthBadgeRefreshAt = Date()
         lastPostAuthBadgeRefreshUserId = userId
-        print("[NotificationPerf] badgeRefreshStarted trigger=\(reason)")
+        DebugLogGate.debug("[NotificationPerf] badgeRefreshStarted trigger=\(reason)")
 
         await chatViewModel.refreshFriendRequestListsOnly()
-#if DEBUG
-        print("[BadgeLoginRefreshDebug] pending friend requests count=\(chatViewModel.pendingBadgeCount)")
-#endif
+        DebugLogGate.debug("[BadgeLoginRefreshDebug] pending friend requests count=\(chatViewModel.pendingBadgeCount)")
 
         await chatViewModel.refreshUnreadDirectMessageCount()
         await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
@@ -1025,22 +1100,16 @@ struct MainTabView: View {
             )
             await viewModel.loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: true)
             await viewModel.ensurePickupInviteRealtimeIfNeeded()
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] pending pickup invites count=\(viewModel.incomingPickupGameInvites.count)")
-#endif
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] pending pickup invites count=\(viewModel.incomingPickupGameInvites.count)")
         } else {
-#if DEBUG
-            print("[BadgeLoginRefreshDebug] pending pickup invites count=0")
-#endif
+            DebugLogGate.debug("[BadgeLoginRefreshDebug] pending pickup invites count=0")
         }
 
-#if DEBUG
-        print(
+        DebugLogGate.debug(
             "[BadgeLoginRefreshDebug] tab badge updated friendRequests=\(chatViewModel.pendingBadgeCount) dmUnread=\(chatViewModel.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count) hostedPickupRequests=\(viewModel.pendingPickupGameJoinRequestCount) playingPickupCards=\(viewModel.myPickupGameJoinRequestCards.count)"
         )
-#endif
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[NotificationPerf] badgeRefreshFinished trigger=\(reason) durationMs=\(ms) friendRequests=\(chatViewModel.pendingBadgeCount) dmUnread=\(chatViewModel.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count)")
+        DebugLogGate.debug("[NotificationPerf] badgeRefreshFinished trigger=\(reason) durationMs=\(ms) friendRequests=\(chatViewModel.pendingBadgeCount) dmUnread=\(chatViewModel.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count)")
     }
 
     private func logBottomTabStructure() {
@@ -1191,13 +1260,35 @@ struct MainTabView: View {
         @ViewBuilder content: () -> Content
     ) -> some View {
         let isSelected = selectedTab == tab
+        // While a DM thread is open, collapse only inactive tab roots so the custom ZStack tab shell
+        // does not expand under the keyboard. Never branch the active Chat root — that recreates
+        // FriendsTabView/NavigationStack and pops Direct Chat.
+        let collapseInactiveForDirectChat =
+            chatViewModel.hidesFloatingTabBarForDirectChat && !isSelected
         content()
             .environment(\.hostTabAdInteractionEnabled, isSelected)
             .opacity(isSelected ? 1 : 0)
             .allowsHitTesting(isSelected)
             .accessibilityHidden(!isSelected)
             .zIndex(isSelected ? 1 : 0)
-            .animation(.easeInOut(duration: 0.18), value: isSelected)
+            .animation(collapseInactiveForDirectChat ? nil : .easeInOut(duration: 0.18), value: isSelected)
+            .modifier(DirectChatInactiveTabCollapseModifier(collapse: collapseInactiveForDirectChat))
+            .id(tab)
+    }
+
+    /// Chat tab content keeps a single stable modifier chain so NavigationStack identity
+    /// (and the Direct Chat destination) survives floating-tab hide toggles.
+    private var chatTabRoot: some View {
+        FriendsTabView(
+            mapViewModel: viewModel,
+            viewModel: chatViewModel,
+            isTabSelected: selectedTab == .chat
+        )
+        .padding(
+            .bottom,
+            chatViewModel.hidesFloatingTabBarForDirectChat ? 0 : Self.floatingTabBarStackHeight
+        )
+        .background(chatTabRootBackground.ignoresSafeArea())
     }
     
     private var isBusinessAccountTabContext: Bool {
@@ -1576,7 +1667,9 @@ struct MainTabView: View {
 
         let hasSession = await viewModel.hasValidSession()
         if !hasSession {
-            if viewModel.isAuthSessionRestoringForProfilePresentation || viewModel.authSessionState == .loadingSession {
+            if viewModel.isAuthSessionRestoringForProfilePresentation
+                || viewModel.authSessionState == .loadingSession
+                || viewModel.resolvingEmailConfirmation {
 #if DEBUG
                 print("[BusinessSessionRestoreDebug] forceLogoutSuppressedDuringRestore=true reason=foregroundInvalidSession")
 #endif
@@ -1622,6 +1715,7 @@ struct MainTabView: View {
 
         guard viewModel.isAuthenticatedForSocialFeatures else { return }
         await PushNotificationRegistrationService.shared.refreshPushTokenRegistration(reason: "foreground")
+        syncPresenceHeartbeatLocation()
         PresenceService.shared.startIfNeeded(
             userID: viewModel.currentUserAuthId,
             isAuthenticated: true,
@@ -1790,5 +1884,23 @@ struct MainTabView: View {
             }
             .shadow(color: Color.orange.opacity(0.24), radius: 4, y: 1)
             .accessibilityHidden(true)
+    }
+}
+
+/// Collapses inactive tab roots only while Direct Chat is open.
+/// Active Chat tab always uses `collapse == false`, so its NavigationStack identity stays stable.
+private struct DirectChatInactiveTabCollapseModifier: ViewModifier {
+    let collapse: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if collapse {
+            content
+                .frame(maxWidth: 0, maxHeight: 0)
+                .clipped()
+        } else {
+            // No frame/clip — preserves Discover edge-to-edge map rendering.
+            content
+        }
     }
 }

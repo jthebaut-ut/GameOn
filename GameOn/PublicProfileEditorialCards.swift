@@ -6,11 +6,11 @@ enum PublicProfileSheetLayout {
     /// Vertical gap between hero, actions, and stacked cards.
     static let sectionSpacing: CGFloat = 14
     /// Vertical gap between Home Crowd, Open To, and Mutual Fans cards.
-    static let gridCardSpacing: CGFloat = 14
+    static let gridCardSpacing: CGFloat = 12
     /// Default editorial card corner (hero, grid shells).
-    static let editorialCardRadius: CGFloat = 24
+    static let editorialCardRadius: CGFloat = 16
     /// Grid section card corners (Open To, Mutual Fans).
-    static let gridCardRadius: CGFloat = 20
+    static let gridCardRadius: CGFloat = 16
     /// Centered readable column on iPad regular width class (landscape / wide portrait).
     static let maxContentWidth: CGFloat = 980
     /// Open To icon grid: fixed tile width so icons do not stretch on wide cards.
@@ -837,7 +837,7 @@ struct PublicProfileEditorialHero: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            FavoriteTeamLogoBadge(team: team, diameter: 52)
+            SportsIdentityArtworkView(favoriteTeam: team, diameter: 52)
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)
@@ -1033,7 +1033,7 @@ struct PublicProfileFavoriteTeamsCard: View {
 
         return VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .top, spacing: 10) {
-                FavoriteTeamLogoBadge(team: team, diameter: 42)
+                SportsIdentityArtworkView(favoriteTeam: team, diameter: 42)
                 Spacer(minLength: 0)
                 Image(systemName: isPrimary ? "trophy.fill" : "trophy")
                     .font(.system(size: 16, weight: .heavy))
@@ -1317,7 +1317,7 @@ struct PublicProfileGridMutualFansCard: View {
                 if !sharedTeamLogos.isEmpty {
                     HStack(spacing: 4) {
                         ForEach(sharedTeamLogos.prefix(4)) { team in
-                            FavoriteTeamLogoBadge(team: team, diameter: 28)
+                            SportsIdentityArtworkView(favoriteTeam: team, diameter: 28)
                         }
                     }
                 }

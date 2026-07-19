@@ -1,0 +1,145 @@
+{
+  "lastUpdatedLabel": "Last updated: June 18, 2026",
+  "documents": {
+    "privacyPolicy": [
+      {
+        "heading": "Overview",
+        "body": "This Privacy Policy explains how FanGeo collects, uses, shares, and retains information when you use the FanGeo app."
+      },
+      {
+        "heading": "Account and profile data",
+        "body": "We collect information you provide or create for your account, such as email address, display name, username, bio, avatar, authentication identifiers, favorite teams, saved venues, saved games, attendance/interest signals, notification preferences, live visibility settings, blocks, reports, and similar profile or preference data."
+      },
+      {
+        "heading": "Location and discovery",
+        "body": "FanGeo may use your device location, map region, searched city, or venue location to show nearby sports bars, games, pickup activity, and local fan activity. You can control device location access in iOS Settings. Venue and business listings may include addresses, coordinates, photos, hours, contact details, and claim or ownership information submitted by venue owners."
+      },
+      {
+        "heading": "Messages, Fan Chats, and user content",
+        "body": "FanGeo processes user-generated content such as direct messages, private conversations, Fan Chats, comments, venue/event posts, photos, reports, and related metadata so the app can deliver conversations, preserve thread context, enforce safety rules, investigate abuse, and maintain service integrity."
+      },
+      {
+        "heading": "Reports and moderation",
+        "body": "When you report a user, comment, message, conversation, venue, or other content, we process your report, selected reason, optional details, reported content, message or conversation context where supported, timestamps, account identifiers, and moderation status. Moderation records may be retained to protect users, enforce rules, and comply with legal or App Store obligations."
+      },
+      {
+        "heading": "Ads, analytics, and diagnostics",
+        "body": "FanGeo uses Google AdMob to show ads. AdMob may receive device, ad interaction, approximate location, and advertising identifier information depending on your device settings and consent choices. FanGeo may also use app diagnostics, logs, performance data, and crash-related information to debug, prevent abuse, and improve reliability. Debug logs are intended for operations and testing, not for selling personal information."
+      },
+      {
+        "heading": "Third-party services",
+        "body": "FanGeo relies on service providers such as Supabase for authentication, database, storage, realtime features, and edge functions; Google AdMob for ads; Apple platform services; and sports data providers such as TheSportsDB for schedules and live match data. These providers process data as needed to provide their services."
+      },
+      {
+        "heading": "Account deletion",
+        "body": "Deleting your account removes or anonymizes your public profile and personal preferences. Some messages, comments, reports, and moderation records may be retained and shown as \"Deleted User\" to preserve conversation integrity, safety, and legal/compliance records. Deleted accounts cannot log back in unless FanGeo support restores or reactivates the account."
+      },
+      {
+        "heading": "Data retention",
+        "body": "We keep account and app data while needed to operate FanGeo, provide requested features, prevent abuse, resolve disputes, comply with law, and maintain safety records. Retention periods vary by data type. Public or shared content may remain after deletion when necessary to preserve conversations, reports, moderation history, venue records, business claims, or legal/compliance records."
+      },
+      {
+        "heading": "Contact",
+        "body": "For privacy or deletion questions, contact support@fangeosports.com or use the support channel available in the app."
+      }
+    ],
+    "termsOfService": [
+      {
+        "heading": "Overview",
+        "body": "These Terms of Service govern your use of FanGeo. By using the app, creating an account, posting content, sending messages, submitting reports, claiming a venue, or managing a business listing, you agree to follow these terms."
+      },
+      {
+        "heading": "Community Standards and Acceptable Use",
+        "body": "FanGeo has zero tolerance for objectionable content or abusive users. Users may not post, upload, send, or share content that includes harassment, hate speech, threats, bullying, sexual exploitation, illegal content, spam, impersonation, abusive behavior, or other objectionable material.\n\nUsers may report objectionable content or abusive users in the app. FanGeo may remove content, restrict access, suspend accounts, or permanently terminate accounts that violate these Terms or Community Guidelines."
+      },
+      {
+        "heading": "Acceptable use",
+        "body": "Use FanGeo only for lawful, personal, and legitimate business-listing purposes. Do not misuse the service, spam, scrape, crawl, harvest data, manipulate attendance or ratings, interfere with app security, bypass access controls, or attempt to access accounts, messages, reports, admin tools, venue tools, or data you are not authorized to use."
+      },
+      {
+        "heading": "User content",
+        "body": "You are responsible for content you create, upload, send, or submit, including profile details, avatars, Fan Chats, direct messages, reports, pickup activity, venue photos, business information, and venue game schedules. You keep your ownership rights, but you give FanGeo permission to host, display, store, moderate, reproduce, and distribute your content as needed to operate, improve, and protect the service."
+      },
+      {
+        "heading": "No harassment or unsafe conduct",
+        "body": "Sports rivalry and spirited debate are welcome. Harassment, threats, hate speech, doxxing, sexual exploitation, targeted abuse, impersonation, stalking, scams, and encouragement of illegal or unsafe behavior are not allowed. Do not use FanGeo to organize unsafe meetups or pressure users to share private information."
+      },
+      {
+        "heading": "Venue and business claims",
+        "body": "If you claim or manage a venue, business account, or location, you confirm that you are authorized to do so and that the information you submit is accurate. FanGeo may review, reject, approve, archive, remove, or limit venue and business claims or listings that are inaccurate, fraudulent, duplicate, unsafe, inactive, or violate these terms."
+      },
+      {
+        "heading": "Moderation and enforcement",
+        "body": "FanGeo may review reports, remove or hide content, restrict features, block access, suspend accounts, delete accounts, preserve records, or take other action when we believe these terms, Community Guidelines, safety rules, law, or App Store requirements have been violated. We may also preserve content or records where needed for safety, compliance, dispute resolution, or legal reasons."
+      },
+      {
+        "heading": "App limitations",
+        "body": "FanGeo is provided as-is to the extent allowed by law. We do not guarantee uninterrupted service, exact venue data, complete sports schedules, ad availability, report outcomes, or that every user or venue will act safely. Features may change, be limited, or be discontinued."
+      }
+    ],
+    "communityGuidelines": [
+      {
+        "heading": "Sports rivalry is fine; abuse is not",
+        "body": "Cheer hard, debate teams, and talk trash about the scoreboard, but do not target people with harassment, threats, hate speech, slurs, bullying, stalking, sexual comments, or repeated unwanted contact."
+      },
+      {
+        "heading": "Not allowed",
+        "body": "- Harassment, bullying, threats, or targeted abuse\n- Hate speech, racism, slurs, or discrimination\n- Doxxing, sharing private information, or pressuring users to reveal personal details\n- Impersonating users, venues, teams, leagues, FanGeo, or public figures\n- Spam, scams, phishing, fake promotions, scraping, or repeated disruptive posts\n- Unsafe meetup behavior, coercion, stalking, or encouraging violence or illegal acts\n- Sexual exploitation, explicit content, or content involving minors"
+      },
+      {
+        "heading": "Fan Chats and comments",
+        "body": "Keep Fan Chats and venue/event comments useful for the local sports crowd. Do not derail threads with spam, personal attacks, false venue information, or coordinated abuse. Comments may be hidden, removed, or reviewed when reported or when they appear to violate these guidelines."
+      },
+      {
+        "heading": "DMs and friend interactions",
+        "body": "Direct messages are for respectful conversation with people who accepted a friend connection. Do not send abusive, threatening, sexual, scam, spam, or repeated unwanted messages. If someone asks you to stop, stop."
+      },
+      {
+        "heading": "Report and block",
+        "body": "Report abusive users, comments, messages, or conversations using the in-app report tools where available. Block users who should not contact you. Reports help FanGeo review safety issues, but they should be truthful and made in good faith."
+      },
+      {
+        "heading": "Enforcement",
+        "body": "FanGeo may warn users, remove content, hide comments, restrict messaging, suspend accounts, delete accounts, preserve reports, or take other action depending on severity, context, and repeat behavior."
+      },
+      {
+        "heading": "Your agreement",
+        "body": "By using FanGeo, you agree to follow these guidelines and help maintain a respectful sports community."
+      }
+    ],
+    "safetyReporting": [
+      {
+        "heading": "Overview",
+        "body": "Your safety matters. FanGeo provides reporting and blocking tools for abusive behavior, UGC, DMs, Fan Chats, comments, conversations, and venue-related issues where supported in the app. Reports are reviewed under FanGeo's Community Guidelines."
+      },
+      {
+        "heading": "What you can report",
+        "body": "Use in-app report or flag actions where available, including user reports, Fan Chat comments, direct messages, conversations, venue listings, and venue/event content. Clear, accurate details help moderators understand what happened."
+      },
+      {
+        "heading": "Comments & fan updates",
+        "body": "Each user can have one active report per comment. You can remove an accidental report by tapping the red flag again before thresholds apply. Multiple unique active reports may trigger automatic hiding from public view while content is reviewed. If a comment was already auto-hidden, removing a report does not automatically restore it."
+      },
+      {
+        "heading": "Private conversation reporting",
+        "body": "From a direct chat, you can report the conversation or supported message content for moderator review. DM reports may include the selected review window only, along with related metadata needed to evaluate the report. Submitting a report does not automatically ban a user, delete messages, hide the chat, or notify the person you reported. FanGeo may apply cooldowns, duplicate-report limits, and abuse-prevention checks."
+      },
+      {
+        "heading": "Blocking",
+        "body": "Users can block other users from interacting with them where blocking is supported, including direct chat surfaces. Blocking limits unwanted contact in FanGeo; it does not prevent someone from contacting you outside FanGeo."
+      },
+      {
+        "heading": "Moderation review",
+        "body": "Moderation review may include report details, reporter and reported account identifiers, timestamps, selected reasons, reported comments or messages, limited surrounding context, moderation decisions, and records needed for safety or compliance. Moderation records may be retained for safety. Moderators may warn users, hide or delete content, restrict features, restrict abusive users, suspend accounts, delete accounts, or preserve records depending on severity and repeat behavior."
+      },
+      {
+        "heading": "App Store compliance",
+        "body": "FanGeo includes in-app reporting and moderation escalation mechanisms for UGC and private messaging. Users can block other users from interacting with them where blocking is supported in the app."
+      },
+      {
+        "heading": "Emergencies",
+        "body": "If you or someone else is in immediate danger, contact your local emergency services right away. FanGeo is not a crisis service and cannot replace police, medical, or other emergency responders."
+      }
+    ]
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "lastUpdatedLabel": "Zuletzt aktualisiert: 18. Juni 2026",
+  "documents": {
+    "privacyPolicy": [
+      {
+        "heading": "Überblick",
+        "body": "Diese Datenschutzerklärung erläutert, wie FanGeo Informationen erhebt, verwendet, weitergibt und aufbewahrt, wenn Sie die FanGeo-App nutzen."
+      },
+      {
+        "heading": "Konto- und Profildaten",
+        "body": "Wir erheben die Informationen, die Sie für Ihr Konto angeben oder erstellen, wie E-Mail-Adresse, Anzeigename, Benutzername, Bio, Avatar, Authentifizierungskennungen, Lieblingsteams, gespeicherte Locations, gespeicherte Spiele, Teilnahme- oder Interessensignale, Benachrichtigungseinstellungen, Live-Sichtbarkeitseinstellungen, Blockierungen, Meldungen und ähnliche Profil- oder Präferenzdaten."
+      },
+      {
+        "heading": "Standort und Entdeckung",
+        "body": "FanGeo kann Ihren Gerätestandort, den Kartenausschnitt, die gesuchte Stadt oder den Standort einer Location verwenden, um Ihnen nahegelegene Sportbars, Spiele, Pickup-Aktivitäten und lokale Fan-Aktivitäten anzuzeigen. Den Zugriff auf den Gerätestandort können Sie in den iOS-Einstellungen steuern. Location- und Geschäftseinträge können Adressen, Koordinaten, Fotos, Öffnungszeiten, Kontaktdaten sowie von den Location-Inhabern übermittelte Beanspruchungs- oder Eigentümerinformationen enthalten."
+      },
+      {
+        "heading": "Nachrichten, Fan Chats und Nutzerinhalte",
+        "body": "FanGeo verarbeitet von Nutzern erstellte Inhalte wie Direktnachrichten, private Unterhaltungen, Fan Chats, Kommentare, Location-/Event-Beiträge, Fotos, Meldungen und zugehörige Metadaten, damit die App Unterhaltungen bereitstellen, den Kontext von Threads bewahren, Sicherheitsregeln durchsetzen, Missbrauch untersuchen und die Integrität des Dienstes aufrechterhalten kann."
+      },
+      {
+        "heading": "Meldungen und Moderation",
+        "body": "Wenn Sie einen Nutzer, einen Kommentar, eine Nachricht, eine Unterhaltung, eine Location oder andere Inhalte melden, verarbeiten wir Ihre Meldung, den gewählten Grund, optionale Angaben, den gemeldeten Inhalt, den Nachrichten- oder Unterhaltungskontext, sofern unterstützt, Zeitstempel, Kontokennungen und den Moderationsstatus. Moderationsaufzeichnungen können aufbewahrt werden, um Nutzer zu schützen, Regeln durchzusetzen und rechtlichen oder App-Store-Pflichten nachzukommen."
+      },
+      {
+        "heading": "Werbung, Analyse und Diagnose",
+        "body": "FanGeo verwendet Google AdMob, um Werbung anzuzeigen. AdMob kann je nach Ihren Geräteeinstellungen und Einwilligungsentscheidungen Informationen über das Gerät, die Werbeinteraktion, den ungefähren Standort und die Werbe-ID erhalten. FanGeo kann außerdem App-Diagnosen, Protokolle, Leistungsdaten und absturzbezogene Informationen verwenden, um Fehler zu beheben, Missbrauch zu verhindern und die Zuverlässigkeit zu verbessern. Debug-Protokolle sind für Betrieb und Tests bestimmt, nicht für den Verkauf personenbezogener Daten."
+      },
+      {
+        "heading": "Dienste von Drittanbietern",
+        "body": "FanGeo stützt sich auf Dienstleister wie Supabase für Authentifizierung, Datenbank, Speicher, Echtzeitfunktionen und Edge-Funktionen; Google AdMob für Werbung; Apple-Plattformdienste; sowie Sportdatenanbieter wie TheSportsDB für Spielpläne und Live-Spieldaten. Diese Anbieter verarbeiten Daten im erforderlichen Umfang, um ihre Dienste zu erbringen."
+      },
+      {
+        "heading": "Kontolöschung",
+        "body": "Durch das Löschen Ihres Kontos werden Ihr öffentliches Profil und Ihre persönlichen Einstellungen entfernt oder anonymisiert. Einige Nachrichten, Kommentare, Meldungen und Moderationsaufzeichnungen können aufbewahrt und als „Deleted User“ angezeigt werden, um die Integrität von Unterhaltungen, die Sicherheit sowie rechtliche bzw. Compliance-Aufzeichnungen zu wahren. Gelöschte Konten können sich nicht erneut anmelden, es sei denn, der FanGeo-Support stellt das Konto wieder her oder reaktiviert es."
+      },
+      {
+        "heading": "Datenaufbewahrung",
+        "body": "Wir bewahren Konto- und App-Daten so lange auf, wie dies erforderlich ist, um FanGeo zu betreiben, angeforderte Funktionen bereitzustellen, Missbrauch zu verhindern, Streitigkeiten beizulegen, dem Gesetz zu entsprechen und Sicherheitsaufzeichnungen zu führen. Die Aufbewahrungsfristen variieren je nach Datenart. Öffentliche oder geteilte Inhalte können nach der Löschung bestehen bleiben, wenn dies erforderlich ist, um Unterhaltungen, Meldungen, den Moderationsverlauf, Location-Aufzeichnungen, Geschäftsbeanspruchungen oder rechtliche bzw. Compliance-Aufzeichnungen zu wahren."
+      },
+      {
+        "heading": "Kontakt",
+        "body": "Bei Fragen zum Datenschutz oder zur Löschung wenden Sie sich an support@fangeosports.com oder nutzen Sie den in der App verfügbaren Support-Kanal."
+      }
+    ],
+    "termsOfService": [
+      {
+        "heading": "Überblick",
+        "body": "Diese Nutzungsbedingungen regeln Ihre Nutzung von FanGeo. Indem Sie die App nutzen, ein Konto erstellen, Inhalte veröffentlichen, Nachrichten senden, Meldungen einreichen, eine Location beanspruchen oder einen Geschäftseintrag verwalten, erklären Sie sich damit einverstanden, diese Bedingungen einzuhalten."
+      },
+      {
+        "heading": "Gemeinschaftsstandards und akzeptable Nutzung",
+        "body": "FanGeo hat null Toleranz gegenüber anstößigen Inhalten oder missbräuchlichen Nutzern. Nutzer dürfen keine Inhalte veröffentlichen, hochladen, senden oder teilen, die Belästigung, Hassrede, Drohungen, Mobbing, sexuelle Ausbeutung, illegale Inhalte, Spam, Identitätsvortäuschung, missbräuchliches Verhalten oder sonstiges anstößiges Material enthalten.\n\nNutzer können anstößige Inhalte oder missbräuchliche Nutzer in der App melden. FanGeo kann Inhalte entfernen, den Zugriff einschränken, Konten sperren oder Konten dauerhaft kündigen, die gegen diese Bedingungen oder die Community-Richtlinien verstoßen."
+      },
+      {
+        "heading": "Akzeptable Nutzung",
+        "body": "Nutzen Sie FanGeo nur zu rechtmäßigen, persönlichen und legitimen Zwecken im Zusammenhang mit Geschäftseinträgen. Missbrauchen Sie den Dienst nicht, versenden Sie keinen Spam, betreiben Sie kein Scraping, Crawling oder Sammeln von Daten, manipulieren Sie keine Besucherzahlen oder Bewertungen, greifen Sie nicht in die Sicherheit der App ein, umgehen Sie keine Zugriffskontrollen und versuchen Sie nicht, auf Konten, Nachrichten, Meldungen, Admin-Tools, Location-Tools oder Daten zuzugreifen, zu deren Nutzung Sie nicht berechtigt sind."
+      },
+      {
+        "heading": "Nutzerinhalte",
+        "body": "Sie sind für die Inhalte verantwortlich, die Sie erstellen, hochladen, senden oder einreichen, einschließlich Profildaten, Avatare, Fan Chats, Direktnachrichten, Meldungen, Pickup-Aktivitäten, Location-Fotos, Geschäftsinformationen und Location-Spielpläne. Sie behalten Ihre Eigentumsrechte, erteilen FanGeo jedoch die Erlaubnis, Ihre Inhalte in dem Umfang zu hosten, anzuzeigen, zu speichern, zu moderieren, zu vervielfältigen und zu verbreiten, wie dies zum Betreiben, Verbessern und Schützen des Dienstes erforderlich ist."
+      },
+      {
+        "heading": "Keine Belästigung oder unsicheres Verhalten",
+        "body": "Sportliche Rivalität und leidenschaftliche Debatten sind willkommen. Belästigung, Drohungen, Hassrede, Doxxing, sexuelle Ausbeutung, gezielter Missbrauch, Identitätsvortäuschung, Stalking, Betrug und die Aufforderung zu illegalem oder unsicherem Verhalten sind nicht erlaubt. Nutzen Sie FanGeo nicht, um unsichere Treffen zu organisieren oder Nutzer dazu zu drängen, private Informationen preiszugeben."
+      },
+      {
+        "heading": "Location- und Geschäftsbeanspruchungen",
+        "body": "Wenn Sie eine Location, ein Geschäftskonto oder einen Standort beanspruchen oder verwalten, bestätigen Sie, dass Sie dazu berechtigt sind und dass die von Ihnen übermittelten Informationen zutreffend sind. FanGeo kann Location- und Geschäftsbeanspruchungen oder -einträge, die unzutreffend, betrügerisch, doppelt, unsicher oder inaktiv sind oder gegen diese Bedingungen verstoßen, prüfen, ablehnen, genehmigen, archivieren, entfernen oder einschränken."
+      },
+      {
+        "heading": "Moderation und Durchsetzung",
+        "body": "FanGeo kann Meldungen prüfen, Inhalte entfernen oder ausblenden, Funktionen einschränken, den Zugriff sperren, Konten aussetzen, Konten löschen, Aufzeichnungen aufbewahren oder andere Maßnahmen ergreifen, wenn wir der Auffassung sind, dass gegen diese Bedingungen, die Community-Richtlinien, Sicherheitsregeln, das Gesetz oder App-Store-Anforderungen verstoßen wurde. Wir können Inhalte oder Aufzeichnungen auch dann aufbewahren, wenn dies aus Gründen der Sicherheit, der Compliance, der Streitbeilegung oder aus rechtlichen Gründen erforderlich ist."
+      },
+      {
+        "heading": "Einschränkungen der App",
+        "body": "FanGeo wird im gesetzlich zulässigen Umfang „wie besehen“ bereitgestellt. Wir garantieren keinen unterbrechungsfreien Dienst, keine exakten Location-Daten, keine vollständigen Sport-Spielpläne, keine Werbeverfügbarkeit, keine Ergebnisse von Meldungen und nicht, dass jeder Nutzer oder jede Location sicher handelt. Funktionen können geändert, eingeschränkt oder eingestellt werden."
+      }
+    ],
+    "communityGuidelines": [
+      {
+        "heading": "Sportliche Rivalität ist okay; Missbrauch nicht",
+        "body": "Feuern Sie kräftig an, diskutieren Sie über Teams und lästern Sie über den Spielstand, aber greifen Sie keine Personen mit Belästigung, Drohungen, Hassrede, Beleidigungen, Mobbing, Stalking, sexuellen Kommentaren oder wiederholtem unerwünschtem Kontakt an."
+      },
+      {
+        "heading": "Nicht erlaubt",
+        "body": "- Belästigung, Mobbing, Drohungen oder gezielter Missbrauch\n- Hassrede, Rassismus, Beleidigungen oder Diskriminierung\n- Doxxing, Weitergabe privater Informationen oder Druck auf Nutzer, persönliche Daten preiszugeben\n- Vortäuschung der Identität von Nutzern, Locations, Teams, Ligen, FanGeo oder Personen des öffentlichen Lebens\n- Spam, Betrug, Phishing, gefälschte Werbeaktionen, Scraping oder wiederholte störende Beiträge\n- Unsicheres Verhalten bei Treffen, Nötigung, Stalking oder Aufforderung zu Gewalt oder illegalen Handlungen\n- Sexuelle Ausbeutung, explizite Inhalte oder Inhalte, an denen Minderjährige beteiligt sind"
+      },
+      {
+        "heading": "Fan Chats und Kommentare",
+        "body": "Halten Sie Fan Chats sowie Location-/Event-Kommentare nützlich für die lokale Sportgemeinschaft. Bringen Sie Threads nicht mit Spam, persönlichen Angriffen, falschen Location-Informationen oder koordiniertem Missbrauch vom Thema ab. Kommentare können ausgeblendet, entfernt oder geprüft werden, wenn sie gemeldet werden oder gegen diese Richtlinien zu verstoßen scheinen."
+      },
+      {
+        "heading": "DMs und Freundesinteraktionen",
+        "body": "Direktnachrichten dienen dem respektvollen Austausch mit Personen, die eine Freundschaftsverbindung akzeptiert haben. Senden Sie keine missbräuchlichen, bedrohlichen, sexuellen, betrügerischen, Spam- oder wiederholt unerwünschten Nachrichten. Wenn jemand Sie bittet aufzuhören, hören Sie auf."
+      },
+      {
+        "heading": "Melden und blockieren",
+        "body": "Melden Sie missbräuchliche Nutzer, Kommentare, Nachrichten oder Unterhaltungen über die In-App-Meldefunktionen, sofern verfügbar. Blockieren Sie Nutzer, die Sie nicht kontaktieren sollten. Meldungen helfen FanGeo, Sicherheitsprobleme zu prüfen, sie sollten jedoch wahrheitsgemäß und in gutem Glauben erfolgen."
+      },
+      {
+        "heading": "Durchsetzung",
+        "body": "FanGeo kann Nutzer verwarnen, Inhalte entfernen, Kommentare ausblenden, das Versenden von Nachrichten einschränken, Konten aussetzen, Konten löschen, Meldungen aufbewahren oder andere Maßnahmen ergreifen, abhängig von Schwere, Kontext und wiederholtem Verhalten."
+      },
+      {
+        "heading": "Ihre Zustimmung",
+        "body": "Durch die Nutzung von FanGeo erklären Sie sich damit einverstanden, diese Richtlinien zu befolgen und dazu beizutragen, eine respektvolle Sportgemeinschaft zu erhalten."
+      }
+    ],
+    "safetyReporting": [
+      {
+        "heading": "Überblick",
+        "body": "Ihre Sicherheit ist uns wichtig. FanGeo bietet Melde- und Blockierfunktionen für missbräuchliches Verhalten, UGC, DMs, Fan Chats, Kommentare, Unterhaltungen und Location-bezogene Probleme, sofern in der App unterstützt. Meldungen werden nach den Community-Richtlinien von FanGeo geprüft."
+      },
+      {
+        "heading": "Was Sie melden können",
+        "body": "Nutzen Sie die In-App-Melde- oder Kennzeichnungsaktionen, sofern verfügbar, einschließlich Nutzermeldungen, Fan-Chat-Kommentaren, Direktnachrichten, Unterhaltungen, Location-Einträgen und Location-/Event-Inhalten. Klare, genaue Angaben helfen Moderatoren zu verstehen, was passiert ist."
+      },
+      {
+        "heading": "Kommentare und Fan-Updates",
+        "body": "Jeder Nutzer kann pro Kommentar eine aktive Meldung haben. Eine versehentliche Meldung können Sie zurücknehmen, indem Sie erneut auf die rote Flagge tippen, bevor Schwellenwerte greifen. Mehrere eindeutige aktive Meldungen können ein automatisches Ausblenden aus der öffentlichen Ansicht auslösen, während der Inhalt geprüft wird. Wenn ein Kommentar bereits automatisch ausgeblendet wurde, wird er durch das Zurücknehmen einer Meldung nicht automatisch wiederhergestellt."
+      },
+      {
+        "heading": "Meldung privater Unterhaltungen",
+        "body": "In einem Direktchat können Sie die Unterhaltung oder unterstützte Nachrichteninhalte zur Prüfung durch einen Moderator melden. DM-Meldungen können nur das ausgewählte Prüffenster sowie die zugehörigen Metadaten enthalten, die zur Bewertung der Meldung erforderlich sind. Das Einreichen einer Meldung sperrt nicht automatisch einen Nutzer, löscht keine Nachrichten, blendet den Chat nicht aus und benachrichtigt nicht die gemeldete Person. FanGeo kann Wartezeiten, Grenzen für doppelte Meldungen und Prüfungen zur Missbrauchsprävention anwenden."
+      },
+      {
+        "heading": "Blockieren",
+        "body": "Nutzer können andere Nutzer daran hindern, mit ihnen zu interagieren, sofern das Blockieren unterstützt wird, einschließlich der Direktchat-Oberflächen. Das Blockieren begrenzt unerwünschten Kontakt in FanGeo; es hindert jemanden nicht daran, Sie außerhalb von FanGeo zu kontaktieren."
+      },
+      {
+        "heading": "Moderationsprüfung",
+        "body": "Die Moderationsprüfung kann Meldungsdetails, Kontokennungen der meldenden und der gemeldeten Person, Zeitstempel, ausgewählte Gründe, gemeldete Kommentare oder Nachrichten, einen begrenzten umgebenden Kontext, Moderationsentscheidungen sowie für Sicherheit oder Compliance erforderliche Aufzeichnungen umfassen. Moderationsaufzeichnungen können aus Sicherheitsgründen aufbewahrt werden. Moderatoren können Nutzer verwarnen, Inhalte ausblenden oder löschen, Funktionen einschränken, missbräuchliche Nutzer einschränken, Konten aussetzen, Konten löschen oder Aufzeichnungen aufbewahren, abhängig von Schwere und wiederholtem Verhalten."
+      },
+      {
+        "heading": "App-Store-Konformität",
+        "body": "FanGeo enthält In-App-Melde- und Moderations-Eskalationsmechanismen für UGC und private Nachrichten. Nutzer können andere Nutzer daran hindern, mit ihnen zu interagieren, sofern das Blockieren in der App unterstützt wird."
+      },
+      {
+        "heading": "Notfälle",
+        "body": "Wenn Sie oder eine andere Person in unmittelbarer Gefahr sind, wenden Sie sich sofort an Ihre örtlichen Notdienste. FanGeo ist kein Krisendienst und kann Polizei, medizinische oder andere Notfallhelfer nicht ersetzen."
+      }
+    ]
+  }
+}

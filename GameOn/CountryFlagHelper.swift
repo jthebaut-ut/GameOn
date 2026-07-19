@@ -1,8 +1,11 @@
 import Foundation
 
 nonisolated enum CountryFlagHelper {
-    /// Off by default; enable only when investigating missing calendar flags.
-    static var calendarFlagVerboseLogging = false
+    /// Off by default; mirrors ``DebugLogGate/calendarFlagDiagnosticsEnabled``.
+    static var calendarFlagVerboseLogging: Bool {
+        get { DebugLogGate.calendarFlagDiagnosticsEnabled }
+        set { DebugLogGate.calendarFlagDiagnosticsEnabled = newValue }
+    }
 
     private struct NationalTeamFlagEntry {
         let code: String
@@ -32,6 +35,7 @@ nonisolated enum CountryFlagHelper {
         NationalTeamFlagEntry(code: "HT", names: ["Haiti"], providerCodes: ["HAI"]),
         NationalTeamFlagEntry(code: "TT", names: ["Trinidad and Tobago"], providerCodes: ["TRI"]),
         NationalTeamFlagEntry(code: "CU", names: ["Cuba"], providerCodes: ["CUB"]),
+        NationalTeamFlagEntry(code: "DO", names: ["Dominican Republic"], providerCodes: ["DOM"]),
         // South America
         NationalTeamFlagEntry(code: "BR", names: ["Brazil", "Brasil"], providerCodes: ["BRA"]),
         NationalTeamFlagEntry(code: "AR", names: ["Argentina"], providerCodes: ["ARG"]),
@@ -70,6 +74,9 @@ nonisolated enum CountryFlagHelper {
         NationalTeamFlagEntry(code: "GR", names: ["Greece"], providerCodes: ["GRE"]),
         NationalTeamFlagEntry(code: "SK", names: ["Slovakia"], providerCodes: ["SVK"]),
         NationalTeamFlagEntry(code: "SI", names: ["Slovenia"], providerCodes: ["SVN"]),
+        NationalTeamFlagEntry(code: "LT", names: ["Lithuania"], providerCodes: ["LTU"]),
+        NationalTeamFlagEntry(code: "LV", names: ["Latvia"], providerCodes: ["LVA"]),
+        NationalTeamFlagEntry(code: "EE", names: ["Estonia"], providerCodes: ["EST"]),
         NationalTeamFlagEntry(code: "BA", names: ["Bosnia and Herzegovina", "Bosnia"], providerCodes: ["BIH"]),
         NationalTeamFlagEntry(code: "AL", names: ["Albania"], providerCodes: ["ALB"]),
         NationalTeamFlagEntry(code: "IS", names: ["Iceland"], providerCodes: ["ISL"]),
@@ -87,6 +94,7 @@ nonisolated enum CountryFlagHelper {
         NationalTeamFlagEntry(code: "TN", names: ["Tunisia"], providerCodes: ["TUN"]),
         NationalTeamFlagEntry(code: "DZ", names: ["Algeria", "Algérie", "Algerie"], providerCodes: ["ALG", "DZA"]),
         NationalTeamFlagEntry(code: "ZA", names: ["South Africa"], providerCodes: ["RSA"]),
+        NationalTeamFlagEntry(code: "SS", names: ["South Sudan"], providerCodes: ["SSD"]),
         NationalTeamFlagEntry(code: "ML", names: ["Mali"], providerCodes: ["MLI"]),
         NationalTeamFlagEntry(code: "CD", names: [
             "DR Congo",
@@ -123,17 +131,25 @@ nonisolated enum CountryFlagHelper {
         NationalTeamFlagEntry(code: "UZ", names: ["Uzbekistan"], providerCodes: ["UZB"]),
         NationalTeamFlagEntry(code: "CN", names: ["China", "PR China"], providerCodes: ["CHN"]),
         NationalTeamFlagEntry(code: "ID", names: ["Indonesia"], providerCodes: ["IDN"]),
+        NationalTeamFlagEntry(code: "PH", names: ["Philippines"], providerCodes: ["PHI"]),
         NationalTeamFlagEntry(code: "NZ", names: ["New Zealand"], providerCodes: ["NZL"]),
         NationalTeamFlagEntry(code: "FJ", names: ["Fiji"], providerCodes: ["FIJ"]),
         NationalTeamFlagEntry(code: "PF", names: ["Tahiti", "French Polynesia"], providerCodes: ["TAH"]),
         NationalTeamFlagEntry(code: "SB", names: ["Solomon Islands"], providerCodes: ["SOL"]),
         NationalTeamFlagEntry(code: "IN", names: ["India"], providerCodes: ["IND"]),
+        NationalTeamFlagEntry(code: "PK", names: ["Pakistan"], providerCodes: ["PAK"]),
+        NationalTeamFlagEntry(code: "BD", names: ["Bangladesh"], providerCodes: ["BAN"]),
+        NationalTeamFlagEntry(code: "AF", names: ["Afghanistan"], providerCodes: ["AFG"]),
+        NationalTeamFlagEntry(code: "LK", names: ["Sri Lanka"], providerCodes: ["SL", "SRI"]),
         NationalTeamFlagEntry(code: "TH", names: ["Thailand"], providerCodes: ["THA"]),
         NationalTeamFlagEntry(code: "VN", names: ["Vietnam", "Viet Nam"], providerCodes: ["VIE"]),
         NationalTeamFlagEntry(code: "HK", names: ["Hong Kong", "Hong Kong SAR"], providerCodes: ["HKG"]),
         NationalTeamFlagEntry(code: "PS", names: ["Palestine", "Palestinian Territories"], providerCodes: ["PLE", "PSE"]),
         NationalTeamFlagEntry(code: "XK", names: ["Kosovo"], providerCodes: ["KOS", "KVX"]),
         NationalTeamFlagEntry(code: "TW", names: ["Chinese Taipei", "Taiwan"], providerCodes: ["TPE", "TWN"]),
+        NationalTeamFlagEntry(code: "PR", names: ["Puerto Rico"], providerCodes: ["PUR", "PRI"]),
+        NationalTeamFlagEntry(code: "WS", names: ["Samoa"], providerCodes: ["SAM"]),
+        NationalTeamFlagEntry(code: "TO", names: ["Tonga"], providerCodes: ["TGA"]),
     ]
 
     private static let aliasesByRegionCode: [String: [String]] = {
@@ -230,7 +246,7 @@ nonisolated enum CountryFlagHelper {
 
     static func logCalendarFlagDebug(teamName: String, source: String = "AppleCalendar") {
 #if DEBUG
-        guard calendarFlagVerboseLogging else { return }
+        guard DebugLogGate.calendarFlagDiagnosticsEnabled else { return }
         let trimmed = teamName.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedName = normalizedTeamName(trimmed)
         let countryCode = countryCode(for: trimmed)
@@ -249,7 +265,7 @@ nonisolated enum CountryFlagHelper {
         source: String = "AppleCalendar"
     ) {
 #if DEBUG
-        guard CountryFlagHelper.calendarFlagVerboseLogging else { return }
+        guard DebugLogGate.calendarFlagDiagnosticsEnabled else { return }
         let away = awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let home = homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
         let awayCode = countryCode(for: away)
@@ -284,6 +300,7 @@ nonisolated enum CountryFlagHelper {
     }
 
     static func logSupportedNationalTeamAliasAudit(source: String = "CountryFlagHelperAudit") {
+        guard DebugLogGate.calendarFlagDiagnosticsEnabled else { return }
         let audited = auditSupportedNationalTeamAliases()
         print("[CalendarFlagDebug] aliasAudit source=\(source) entryCount=\(audited.count)")
         for entry in audited {
@@ -373,9 +390,13 @@ nonisolated enum CountryFlagHelper {
             }
         }
         if missing.isEmpty {
-            print("[CountryFlagDebug] worldCupValidation=passed count=\(CountryFlagHelperWorldCupValidation.teams.count)")
+            DebugLogGate.calendarFlagVerbose(
+                "[CalendarFlagDebug] worldCupValidation=passed count=\(CountryFlagHelperWorldCupValidation.teams.count)"
+            )
         } else {
-            print("[CountryFlagDebug] worldCupValidation=failed missingCount=\(missing.count) missing=\(missing.joined(separator: ", "))")
+            DebugLogGate.notificationWarning(
+                "[CalendarFlagDebug] validationFailed missing=\(missing.joined(separator: ",")) count=\(missing.count)"
+            )
         }
         return missing
     }
@@ -391,9 +412,13 @@ nonisolated enum CountryFlagHelper {
             }
         }
         if missing.isEmpty {
-            print("[CountryFlagDebug] subdivisionSuggestionsValidation=passed count=\(CountryFlagHelperWorldCupValidation.subdivisionSearchTeams.count) source=\(source)")
+            DebugLogGate.calendarFlagVerbose(
+                "[CalendarFlagDebug] subdivisionSuggestionsValidation=passed count=\(CountryFlagHelperWorldCupValidation.subdivisionSearchTeams.count) source=\(source)"
+            )
         } else {
-            print("[CountryFlagDebug] subdivisionSuggestionsValidation=failed missingCount=\(missing.count) missing=\(missing.joined(separator: ", ")) source=\(source)")
+            DebugLogGate.notificationWarning(
+                "[CalendarFlagDebug] validationFailed missing=\(missing.joined(separator: ",")) count=\(missing.count)"
+            )
         }
         return missing
     }
@@ -484,9 +509,10 @@ nonisolated enum CountryFlagHelper {
         let normalizedName = normalize(rawName)
         let key = "\(normalizedName)|\(source ?? "unspecified")"
         guard loggedMissingFlags.insert(key).inserted else { return }
-        print("[CountryFlagDebug] missingFlagFor=\(rawName)")
-        print("[CountryFlagDebug] normalizedName=\(normalizedName)")
-        print("[CountryFlagDebug] source=\(source ?? "unspecified")")
+        DebugLogGate.notificationWarning("[CalendarFlagDebug] unexpectedFallback team=\(rawName)")
+        DebugLogGate.calendarFlagVerbose("[CalendarFlagDebug] missingFlagFor=\(rawName)")
+        DebugLogGate.calendarFlagVerbose("[CalendarFlagDebug] normalizedName=\(normalizedName)")
+        DebugLogGate.calendarFlagVerbose("[CalendarFlagDebug] source=\(source ?? "unspecified")")
         #else
         _ = rawName
         _ = source

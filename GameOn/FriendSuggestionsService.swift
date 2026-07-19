@@ -150,11 +150,109 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         if let reasonType, !reasonType.isEmpty { signals.append("primary:\(reasonType)") }
         return signals.isEmpty ? "none" : signals.joined(separator: ",")
     }
+
+    /// Client-only “Why suggested?” rows from already-decoded overlap counts.
+    /// Never invents reasons and never surfaces score, distance, or private fields.
+    func whySuggestedExplanations(max: Int = 3) -> [SuggestedFanWhyExplanation] {
+        SuggestedFanWhyExplanation.make(from: self, max: max)
+    }
+
+    fileprivate var indicatesSimilarVenueOverlap: Bool {
+        if sharedEventInterestCount > 0 { return true }
+        let normalizedType = (reasonType ?? "")
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        switch normalizedType {
+        case "favorite_venue", "shared_venue", "venue",
+             "venue_event", "watch_party", "shared_event", "event_interest", "event":
+            return true
+        default:
+            break
+        }
+        let label = (reasonLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return label == "Same venue" || label == "Same watch party"
+    }
+}
+
+/// Compact public-safe explanation derived from existing Suggested Fans overlap fields.
+enum SuggestedFanWhyExplanation: Equatable, Hashable, Sendable {
+    case sharedFavoriteTeams(Int)
+    case similarPickupGames
+    case similarVenues
+    case mutualFans(Int)
+
+    static func make(from profile: FriendSuggestionProfile, max: Int = 3) -> [SuggestedFanWhyExplanation] {
+        guard max > 0 else { return [] }
+        var ordered: [SuggestedFanWhyExplanation] = []
+
+        // Priority matches product guidance — stop at `max`.
+        if profile.sharedFavoriteTeamsCount > 0 {
+            ordered.append(.sharedFavoriteTeams(profile.sharedFavoriteTeamsCount))
+        }
+        if profile.sharedPickupGameCount > 0 {
+            ordered.append(.similarPickupGames)
+        }
+        if profile.indicatesSimilarVenueOverlap {
+            ordered.append(.similarVenues)
+        }
+        if profile.mutualFriendCount > 0 {
+            ordered.append(.mutualFans(profile.mutualFriendCount))
+        }
+
+        return Array(ordered.prefix(max))
+    }
+
+    var systemImage: String {
+        switch self {
+        case .sharedFavoriteTeams: return "sportscourt.fill"
+        case .similarPickupGames: return "figure.run"
+        case .similarVenues: return "building.2.fill"
+        case .mutualFans: return "person.2.fill"
+        }
+    }
+
+    func localizedText(languageCode: String) -> String {
+        let language = L10n.normalizedLanguageCode(languageCode)
+        let locale = Locale(identifier: language)
+        switch self {
+        case .sharedFavoriteTeams(let count):
+            let safe = max(count, 1)
+            let countText = safe.formatted(.number.locale(locale))
+            let key = safe == 1
+                ? "suggested_fan_why_shared_teams_one_format"
+                : "suggested_fan_why_shared_teams_other_format"
+            return String(
+                format: L10n.t(key, languageCode: language),
+                locale: locale,
+                countText
+            )
+        case .similarPickupGames:
+            return L10n.t("suggested_fan_why_similar_pickup", languageCode: language)
+        case .similarVenues:
+            return L10n.t("suggested_fan_why_similar_venues", languageCode: language)
+        case .mutualFans(let count):
+            let safe = max(count, 1)
+            let countText = safe.formatted(.number.locale(locale))
+            let key = safe == 1
+                ? "suggested_fan_why_mutual_one_format"
+                : "suggested_fan_why_mutual_other_format"
+            return String(
+                format: L10n.t(key, languageCode: language),
+                locale: locale,
+                countText
+            )
+        }
+    }
 }
 
 /// Service-only wrapper for profile friend suggestions. UI and friendship flows remain separate.
 final class FriendSuggestionsService {
     private let client: SupabaseClient
+
+    /// Authoritative nearby radius for location-backed ranking (miles).
+    /// Prefer ``SuggestedFansProduct/nearbyRadiusMiles``; kept identical for call-site clarity.
+    nonisolated static let nearbyRadiusMiles = SuggestedFansProduct.nearbyRadiusMiles
 
     init(client: SupabaseClient = supabase) {
         self.client = client
@@ -165,15 +263,14 @@ final class FriendSuggestionsService {
 
     func fetchSuggestions(
         limit: Int = defaultFetchPoolLimit,
-        radiusMiles: Double = 45,
+        radiusMiles: Double = SuggestedFansProduct.nearbyRadiusMiles,
         centerLat: Double? = nil,
         centerLng: Double? = nil
     ) async throws -> [FriendSuggestionProfile] {
         #if DEBUG
-        let centerLatDescription = centerLat.map { String($0) } ?? "nil"
-        let centerLngDescription = centerLng.map { String($0) } ?? "nil"
+        let coordinatesAvailable = centerLat != nil && centerLng != nil
         print(
-            "[FriendSuggestionsService] fetch start limit=\(limit) radiusMiles=\(radiusMiles) centerLat=\(centerLatDescription) centerLng=\(centerLngDescription)"
+            "[FriendSuggestionsService] fetch start limit=\(limit) radiusMiles=\(radiusMiles) coordinatesAvailable=\(coordinatesAvailable)"
         )
         #endif
 
@@ -184,13 +281,16 @@ final class FriendSuggestionsService {
             let p_center_lng: Double?
         }
 
+        // Always send p_radius_miles explicitly so SQL DEFAULT 20 is never used.
+        let resolvedRadiusMiles = radiusMiles > 0 ? radiusMiles : SuggestedFansProduct.nearbyRadiusMiles
+
         do {
             let rows: [FriendSuggestionProfile] = try await client
                 .rpc(
                     "get_profile_friend_suggestions",
                     params: Params(
                         p_limit: limit,
-                        p_radius_miles: radiusMiles,
+                        p_radius_miles: resolvedRadiusMiles,
                         p_center_lat: centerLat,
                         p_center_lng: centerLng
                     )

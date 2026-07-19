@@ -333,17 +333,24 @@ private enum SettingsPickupGameListCardStatus: Equatable {
     }
 }
 
-// MARK: - Organizer pickup roster (Settings → My pickup games)
+// MARK: - Organizer pickup roster (Settings → My pickup games / Going Hosting)
 
-private struct PickupOrganizerApprovedRosterStripView: View {
+/// Compact named participant rows for approved joiners already loaded on the host card.
+/// Status comes from `pickup_game_requests.status == approved` (not inferred from avatars).
+private struct PickupOrganizerParticipantSummaryView: View {
     @ObservedObject var viewModel: MapViewModel
     let game: PickupGameRow
     let colorScheme: ColorScheme
     let approvedUserIds: [UUID]
-    var onAvatarTapped: (UUID) -> Void
+    var pendingJoinCount: Int = 0
+    var languageCode: String = L10n.defaultLanguageCode
+    var onParticipantTapped: (UUID) -> Void
+    var onViewAllPlayers: (() -> Void)? = nil
 
-    private let avatarDiameter: CGFloat = 34
-    private var avatarOverlapInset: CGFloat { -(avatarDiameter - 12) }
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .body) private var avatarDiameter: CGFloat = 34
+
+    private let maxVisibleRows = 3
 
     private var organizerStatsApproved: Int {
         viewModel.pickupOrganizerJoinStatsByGameId[game.id]?.approved ?? 0
@@ -353,50 +360,69 @@ private struct PickupOrganizerApprovedRosterStripView: View {
         max(approvedUserIds.count, game.approvedJoinCount, organizerStatsApproved)
     }
 
-    private var visibleFaceUserIds: [UUID] {
-        if approvedUserIds.count <= 5 { return approvedUserIds }
-        return Array(approvedUserIds.prefix(5))
+    private var visibleUserIds: [UUID] {
+        Array(approvedUserIds.prefix(maxVisibleRows))
     }
 
-    private var overflowCountLabel: String? {
-        guard approvedUserIds.count > 5 else { return nil }
-        return "+\(approvedUserIds.count - 5)"
+    private var showsViewAll: Bool {
+        approvedUserIds.count > maxVisibleRows
+    }
+
+    private var stackStatusUnderName: Bool {
+        dynamicTypeSize.isAccessibilitySize
     }
 
     var body: some View {
-        HStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 8) {
             if totalApproved > 0, approvedUserIds.isEmpty {
-                ProgressView()
-                    .scaleEffect(0.85)
-                    .padding(.trailing, 8)
-            }
-
-            HStack(spacing: avatarOverlapInset) {
-                ForEach(Array(visibleFaceUserIds.enumerated()), id: \.element) { idx, uid in
-                    rosterFace(for: uid)
-                        .zIndex(Double(idx))
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.85)
+                    Text(L10n.t("pickup_host_participants_loading", languageCode: languageCode))
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
                 }
-                if let overflowCountLabel {
-                    overflowChip(text: overflowCountLabel)
-                        .zIndex(Double(visibleFaceUserIds.count))
+            } else if approvedUserIds.isEmpty {
+                // Pending waiters already have a dedicated callout on the card — avoid duplicate empty copy.
+                if pendingJoinCount == 0 {
+                    Text(L10n.t("pickup_host_no_players_joined", languageCode: languageCode))
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else {
+                ForEach(visibleUserIds, id: \.self) { userId in
+                    participantRow(for: userId)
+                }
+                if showsViewAll, let onViewAllPlayers {
+                    Button(action: onViewAllPlayers) {
+                        Text(
+                            String(
+                                format: L10n.t("pickup_host_view_all_players_format", languageCode: languageCode),
+                                locale: Locale(identifier: languageCode),
+                                totalApproved
+                            )
+                        )
+                        .font(FGTypography.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.accentBlue)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
             }
-
-            Spacer(minLength: 0)
         }
-        .padding(.top, 4)
+        .padding(.top, 2)
         .accessibilityElement(children: .contain)
         .onAppear { logPickupRosterUI(reason: "appear") }
         .onChange(of: approvedUserIds.count) { _, _ in logPickupRosterUI(reason: "idsCount") }
         .onChange(of: game.approved_join_count ?? -1) { _, _ in logPickupRosterUI(reason: "approvedJoinCount") }
-        .onChange(of: game.pickupOpenSlotsRemaining) { _, _ in logPickupRosterUI(reason: "openSlots") }
     }
 
     @ViewBuilder
-    private func rosterFace(for userId: UUID) -> some View {
+    private func participantRow(for userId: UUID) -> some View {
         let profile = viewModel.pickupJoinRequesterProfileByUserId[userId]
         let profileName = profile?.display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let displayName = profileName.isEmpty ? "Player" : profileName
+        let displayName = profileName.isEmpty ? L10n.t("pickup_host_participant_fallback_name", languageCode: languageCode) : profileName
         let emailLine = (profile?.email ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let thumbRaw = ImageDisplayURL.canonicalStorageURLString(profile?.avatar_thumbnail_url)
         let fullRaw = ImageDisplayURL.canonicalStorageURLString(profile?.avatar_url)
@@ -408,52 +434,112 @@ private struct PickupOrganizerApprovedRosterStripView: View {
             avatarURL: full
         )
         let fallback: UserAvatarView.FallbackStyle = colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome
+        let statusTitle = L10n.t("pickup_host_participant_status_approved", languageCode: languageCode)
+        let a11yLabel = String(
+            format: L10n.t("pickup_host_participant_a11y_approved_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            displayName
+        )
 
         Button {
-            onAvatarTapped(userId)
+            onParticipantTapped(userId)
         } label: {
-            UserAvatarView(
-                avatarThumbnailURL: thumb,
-                avatarURL: full,
-                avatarDisplayRefreshToken: token,
-                displayName: displayName,
-                email: emailLine,
-                size: avatarDiameter,
-                fallbackStyle: fallback,
-                imagePlaceholderTint: colorScheme == .dark ? .white.opacity(0.75) : nil
-            )
-            .overlay(
-                Circle()
-                    .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.35 : 0.72), lineWidth: 1.5)
-            )
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.12), radius: 3, x: 0, y: 1)
+            Group {
+                if stackStatusUnderName {
+                    HStack(alignment: .center, spacing: 10) {
+                        avatarView(
+                            thumb: thumb,
+                            full: full,
+                            token: token,
+                            displayName: displayName,
+                            emailLine: emailLine,
+                            fallback: fallback
+                        )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(displayName)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(FGColor.primaryText(colorScheme))
+                                .lineLimit(1)
+                            statusBadge(title: statusTitle)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                } else {
+                    HStack(alignment: .center, spacing: 10) {
+                        avatarView(
+                            thumb: thumb,
+                            full: full,
+                            token: token,
+                            displayName: displayName,
+                            emailLine: emailLine,
+                            fallback: fallback
+                        )
+                        Text(displayName)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(1)
+                            .layoutPriority(1)
+                        Spacer(minLength: 4)
+                        statusBadge(title: statusTitle)
+                            .layoutPriority(0)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Joined player \(displayName)")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(a11yLabel)
     }
 
-    private func overflowChip(text: String) -> some View {
-        ZStack {
-            Circle()
-                .fill(Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.1))
-            Text(text)
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .foregroundStyle(FGColor.primaryText(colorScheme))
-        }
-        .frame(width: avatarDiameter, height: avatarDiameter)
+    private func avatarView(
+        thumb: String?,
+        full: String,
+        token: UUID,
+        displayName: String,
+        emailLine: String,
+        fallback: UserAvatarView.FallbackStyle
+    ) -> some View {
+        UserAvatarView(
+            avatarThumbnailURL: thumb,
+            avatarURL: full,
+            avatarDisplayRefreshToken: token,
+            displayName: displayName,
+            email: emailLine,
+            size: avatarDiameter,
+            fallbackStyle: fallback,
+            imagePlaceholderTint: colorScheme == .dark ? .white.opacity(0.75) : nil
+        )
         .overlay(
             Circle()
                 .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.35 : 0.72), lineWidth: 1.5)
         )
-        .accessibilityLabel("\(text) more players")
+        .accessibilityHidden(true)
+    }
+
+    private func statusBadge(title: String) -> some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(FGColor.accentGreen)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(
+                FGColor.accentGreen.opacity(colorScheme == .dark ? 0.2 : 0.12),
+                in: Capsule(style: .continuous)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.35 : 0.22), lineWidth: 1)
+            )
+            .fixedSize(horizontal: true, vertical: false)
+            .accessibilityHidden(true)
     }
 
     private func logPickupRosterUI(reason: String) {
 #if DEBUG
-        let visFaces = visibleFaceUserIds.count + (overflowCountLabel != nil ? 1 : 0)
         print("[PickupRosterUI] gameId=\(game.id.uuidString.lowercased()) reason=\(reason)")
         print("[PickupRosterUI] approvedCount=\(totalApproved)")
-        print("[PickupRosterUI] visibleAvatars=\(visFaces)")
+        print("[PickupRosterUI] visibleNamedRows=\(visibleUserIds.count)")
 #endif
     }
 }
@@ -467,6 +553,7 @@ struct SettingsPickupMyGameListCard: View {
     let now: Date
     let colorScheme: ColorScheme
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     var onEdit: () -> Void
     var onDelete: () -> Void
     var onManageRequests: () -> Void
@@ -477,6 +564,10 @@ struct SettingsPickupMyGameListCard: View {
 
     @State private var rosterActionUserId: UUID?
     @State private var showRosterPlayerActions: Bool = false
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var approvedJoinerUserIds: [UUID] {
         viewModel.pickupOrganizerApprovedJoinerUserIdsByGameId[row.id] ?? []
@@ -599,15 +690,18 @@ struct SettingsPickupMyGameListCard: View {
                 .opacity(usesExpiredArchivedStyle ? 0.48 : 1)
 
                 VStack(alignment: .leading, spacing: isFollowingCompact ? 4 : 6) {
-                    HStack(alignment: .top, spacing: 10) {
-                        Text(row.title)
-                            .font(isFollowingCompact ? .headline.weight(.bold) : .title3.weight(.bold))
-                            .foregroundStyle(cardPrimaryTextColor)
-                            .lineLimit(isFollowingCompact ? 2 : 3)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(row.title)
+                        .font(isFollowingCompact ? .headline.weight(.bold) : .title3.weight(.bold))
+                        .foregroundStyle(cardPrimaryTextColor)
+                        .lineLimit(isFollowingCompact ? 2 : 3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .opacity(cardTextOpacity)
+                        .contentShape(Rectangle())
+                        .onTapGesture { handleCardMapTap() }
+
+                    HStack(alignment: .center, spacing: 7) {
+                        GameFormatBadgeView(format: row.gameFormat, colorScheme: colorScheme)
                             .opacity(cardTextOpacity)
-                            .contentShape(Rectangle())
-                            .onTapGesture { handleCardMapTap() }
 
                         Text(status.pillTitle)
                             .font(.caption.weight(.semibold))
@@ -625,9 +719,6 @@ struct SettingsPickupMyGameListCard: View {
                             .fixedSize(horizontal: true, vertical: false)
                             .accessibilityLabel("Status: \(status.pillTitle)")
                     }
-
-                    GameFormatBadgeView(format: row.gameFormat, colorScheme: colorScheme)
-                        .opacity(cardTextOpacity)
 
                     if !isFollowingCompact {
                         PickupCreatorTrustLineView(stats: viewModel.pickupCreatorTrustStats(for: row.creator_user_id))
@@ -685,23 +776,33 @@ struct SettingsPickupMyGameListCard: View {
                 }
                 SettingsPickupCardMetaRow(systemImage: "person.3", title: "Players", value: playersSummaryLine)
                     .opacity(cardTextOpacity)
-                SettingsPickupCardMetaRow(systemImage: "person.2.fill", title: "Welcome", value: row.participantAudienceDisplayTitle)
-                    .opacity(cardTextOpacity)
                 if !usesExpiredArchivedStyle {
-                    PickupOrganizerApprovedRosterStripView(
+                    PickupOrganizerParticipantSummaryView(
                         viewModel: viewModel,
                         game: row,
                         colorScheme: colorScheme,
                         approvedUserIds: approvedJoinerUserIds,
-                        onAvatarTapped: { uid in
+                        pendingJoinCount: pendingJoinCount,
+                        languageCode: languageCode,
+                        onParticipantTapped: { uid in
                             viewModel.presentPublicProfile(
                                 userId: uid,
                                 context: "pickup_roster_avatar",
                                 activeSheet: "settings_pickup_games"
                             )
+                        },
+                        onViewAllPlayers: {
+                            if let onOpenDetails {
+                                onOpenDetails()
+                            } else {
+                                onManageRequests()
+                            }
                         }
                     )
+                    .opacity(cardTextOpacity)
                 }
+                SettingsPickupCardMetaRow(systemImage: "person.2.fill", title: "Welcome", value: row.participantAudienceDisplayTitle)
+                    .opacity(cardTextOpacity)
                 if !isFollowingCompact {
                     SettingsPickupCardMetaRow(systemImage: "chart.bar", title: "Skill", value: row.skillLevelEnum.displayTitle)
                         .opacity(cardTextOpacity)

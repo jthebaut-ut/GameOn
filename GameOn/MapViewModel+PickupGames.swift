@@ -17,6 +17,8 @@ private struct PickupGameCalendarRow: Decodable {
     let remove_after_at: String?
     let status: String?
     let is_visible: Bool?
+    let latitude: Double?
+    let longitude: Double?
 }
 
 /// DEBUG-only: minimal columns for ``logPickupGamesAnonDiagnosticProbeUnfiltered`` (not used for UI).
@@ -305,16 +307,20 @@ extension MapViewModel {
             }
             guard pickupDiscoverCoordinatorDirty else { return }
             if pickupGamesForDiscoverMap.isEmpty {
-                setDiscoverMapStatus("Updating map…", isLoading: true)
+                setDiscoverMapStatus(discoverMapRefreshLookingToastText(), isLoading: true)
+            } else {
+                setDiscoverMapStatus(discoverMapRefreshUpdatingToastText(), isLoading: true)
             }
+            let refreshToast = mapStatusText
             await refreshPickupGamesForDiscoverMap()
-            if mapStatusText == "Updating map…" {
+            if mapStatusText == refreshToast {
                 setDiscoverMapStatus(nil, isLoading: false)
             }
         }
     }
 
-    /// Distinct local calendar days with at least one visible pickup game in ``dateMin``…``dateMax`` (inclusive by day), respecting ``selectedSport``.
+    /// Distinct local calendar days with at least one **map-eligible** pickup game in ``dateMin``…``dateMax``
+    /// that falls inside the **current Discover map viewport** (same geographic meaning as Watch venue dots).
     func fetchPickupGameCalendarDotDatesForDiscoverRange(dateMin: Date, dateMax: Date) async throws -> Set<Date> {
         let cal = Calendar.current
         let rangeStart = cal.startOfDay(for: dateMin)
@@ -327,9 +333,16 @@ extension MapViewModel {
         let startISO = PickupGameModels.encodeSupabaseTimestamptz(rangeQueryStart)
         let endISO = PickupGameModels.encodeSupabaseTimestamptz(endExclusive)
 
+        guard let bounds = currentMapRegionBounds() else {
+#if DEBUG
+            print("[DiscoverPickupDiag] op=calendarDotMonth skipped reason=noMapBounds")
+#endif
+            return []
+        }
+
         var query = supabase
             .from("pickup_games")
-            .select("id,title,sport,game_start_at,remove_after_at,status,is_visible")
+            .select("id,title,sport,game_start_at,remove_after_at,status,is_visible,latitude,longitude")
             .gte("game_start_at", value: startISO)
             .lt("game_start_at", value: endISO)
             .or(pickupGamesDiscoverRemoveAfterOrFilter(nowISO: nowISO))
@@ -348,6 +361,9 @@ extension MapViewModel {
         var dates: Set<Date> = []
         dates.reserveCapacity(min(rows.count, 500))
         var droppedClientRemNotFuture = 0
+        var droppedMissingCoords = 0
+        var droppedOutOfBounds = 0
+        var includedInBounds = 0
         for row in rows {
             guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
             if let remStr = row.remove_after_at,
@@ -356,24 +372,25 @@ extension MapViewModel {
                 droppedClientRemNotFuture += 1
                 continue
             }
+            guard let lat = row.latitude, let lon = row.longitude,
+                  CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon)) else {
+                droppedMissingCoords += 1
+                continue
+            }
+            guard lat >= bounds.minLat, lat <= bounds.maxLat,
+                  lon >= bounds.minLon, lon <= bounds.maxLon else {
+                droppedOutOfBounds += 1
+                continue
+            }
+            includedInBounds += 1
             dates.insert(cal.startOfDay(for: start))
         }
 #if DEBUG
         let sportFilter = selectedSport == "All" ? "(none)" : selectedSport
         print(
-            "[DiscoverPickupDiag] op=calendarDotMonth table=pickup_games dateMin=\(pickupDebugYMD(rangeStart)) dateMax=\(pickupDebugYMD(lastDayStart)) rangeStartISO=\(startISO) rangeEndExclusiveISO=\(endISO) nowISO=\(nowISO) selectedSport=\(selectedSport) sqlFilters=status:active is_visible:true game_start_at:[\(startISO),\(endISO)) remove_after_at:(is.null OR gt(\(nowISO))) sport:\(sportFilter) rawRowCount=\(rows.count) dotDatesAfterClientFilter=\(dates.count) droppedByClientRemoveAfterPast=\(droppedClientRemNotFuture)"
+            "[DiscoverPickupDiag] op=calendarDotMonth scope=mapViewport table=pickup_games dateMin=\(pickupDebugYMD(rangeStart)) dateMax=\(pickupDebugYMD(lastDayStart)) bounds=\(String(format: "%.3f|%.3f|%.3f|%.3f", bounds.minLat, bounds.maxLat, bounds.minLon, bounds.maxLon)) selectedSport=\(selectedSport) sqlFilters=status:active is_visible:true game_start_at:[\(startISO),\(endISO)) sport:\(sportFilter) rawRowCount=\(rows.count) includedInBounds=\(includedInBounds) droppedMissingCoords=\(droppedMissingCoords) droppedOutOfBounds=\(droppedOutOfBounds) droppedByClientRemoveAfterPast=\(droppedClientRemNotFuture) dotDatesAfterClientFilter=\(dates.count)"
         )
-        print("[DiscoverPickupDiag] NOTE remove_after_at uses PostgREST or(remove_after_at.is.null,remove_after_at.gt.now).")
-        for (i, row) in rows.prefix(5).enumerated() {
-            let tid = row.id?.uuidString ?? "nil"
-            let tit = (row.title ?? "?").replacingOccurrences(of: "\n", with: " ")
-            let sp = row.sport ?? "?"
-            print("[DiscoverPickupDiag] rawRow[\(i)] id=\(tid) title=\(tit) sport=\(sp) game_start_at=\(row.game_start_at) status=\(row.status ?? "nil") is_visible=\(row.is_visible.map(String.init(describing:)) ?? "nil") remove_after_at=\(row.remove_after_at ?? "nil")")
-        }
-        if rows.isEmpty {
-            await logPickupDiagnosticProbeUnfiltered(context: "calendarDotMonth_emptyWindow")
-        }
-        print("[DiscoverPickupPublic] monthWindowPickupDotDateCount=\(dates.count) sport=\(selectedSport) rangeStartISO=\(startISO)")
+        print("[DiscoverPickupPublic] monthWindowPickupDotDateCount=\(dates.count) sport=\(selectedSport) rangeStartISO=\(startISO) scope=mapViewport")
 #endif
         return dates
     }

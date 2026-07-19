@@ -6,9 +6,10 @@ import UserNotifications
 #endif
 
 enum PresenceOnlineStatus {
-    static let onlineWindowSeconds: TimeInterval = 120
+    /// Canonical online-now window (Chat, Fans Nearby, presence). Safe from nonisolated contexts.
+    nonisolated static let onlineWindowSeconds: TimeInterval = 120
 
-    static func parse(_ raw: String?) -> Date? {
+    nonisolated static func parse(_ raw: String?) -> Date? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return nil }
 
@@ -33,8 +34,32 @@ final class PresenceService {
     private var activeUserID: UUID?
     private var lastSentAt: Date?
     private var heartbeatTask: Task<Void, Never>?
+    /// Optional coarse presence location for Fans nearby (server snaps before storage).
+    private var latestHeartbeatLatitude: Double?
+    private var latestHeartbeatLongitude: Double?
 
     private init() {}
+
+    /// Updates optional When-In-Use location used by the next presence heartbeat.
+    /// Does not request Always permission and does not write immediately by itself.
+    func updateHeartbeatLocation(latitude: Double?, longitude: Double?) {
+        if let latitude, let longitude,
+           latitude >= -90, latitude <= 90,
+           longitude >= -180, longitude <= 180 {
+            latestHeartbeatLatitude = latitude
+            latestHeartbeatLongitude = longitude
+        }
+    }
+
+    func clearHeartbeatLocation() {
+        latestHeartbeatLatitude = nil
+        latestHeartbeatLongitude = nil
+    }
+
+    /// Whether a coarse location is staged for the next nearby presence write.
+    var hasStagedHeartbeatLocation: Bool {
+        latestHeartbeatLatitude != nil && latestHeartbeatLongitude != nil
+    }
 
     func startIfNeeded(userID: UUID?, isAuthenticated: Bool, reason: String) {
         guard isAuthenticated, let userID else {
@@ -67,42 +92,142 @@ final class PresenceService {
         heartbeatTask = nil
         activeUserID = nil
         lastSentAt = nil
+        clearHeartbeatLocation()
 #if DEBUG
         print("[PresenceDebug] heartbeatStopped reason=\(reason)")
 #endif
     }
 
     func sendHeartbeat(reason: String, force: Bool = false) {
-        guard let userID = activeUserID else { return }
+        guard let userID = activeUserID else {
+#if DEBUG
+            print("[FansNearby] heartbeat write result=skipped reason=presenceNotRunning")
+#endif
+            return
+        }
         let now = Date()
         if !force,
            let lastSentAt,
            now.timeIntervalSince(lastSentAt) < Self.minimumWriteSpacingSeconds {
 #if DEBUG
             print("[PresenceDebug] heartbeatSkipped reason=throttled userId=\(userID.uuidString.lowercased())")
+            print("[FansNearby] heartbeat write result=skipped reason=throttled")
 #endif
             return
         }
         lastSentAt = now
 
         let timestamp = Self.isoTimestamp(now)
+        let lat = latestHeartbeatLatitude
+        let lng = latestHeartbeatLongitude
 #if DEBUG
-        print("[PresenceDebug] heartbeatSent userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp) reason=\(reason)")
+        print("[PresenceDebug] heartbeatSent userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp) reason=\(reason) hasNearbyCoords=\(lat != nil && lng != nil)")
 #endif
         Task.detached(priority: .utility) {
-            do {
+            _ = await Self.performHeartbeatWrite(userID: userID, timestamp: timestamp, lat: lat, lng: lng)
+        }
+    }
+
+    /// Awaited heartbeat used after discoverability turns on so Nearby can use a fresh coarse location.
+    @discardableResult
+    func sendHeartbeatAwaitingWrite(reason: String, force: Bool = true) async -> String {
+        guard let userID = activeUserID else {
+#if DEBUG
+            print("[FansNearby] heartbeat write result=skipped reason=presenceNotRunning")
+            print("[ChatNearbyTest] heartbeat requester=missing")
+#endif
+            return "missing"
+        }
+        let now = Date()
+        if !force,
+           let lastSentAt,
+           now.timeIntervalSince(lastSentAt) < Self.minimumWriteSpacingSeconds {
+#if DEBUG
+            print("[FansNearby] heartbeat write result=skipped reason=throttled")
+            print("[ChatNearbyTest] heartbeat requester=stale")
+#endif
+            return "stale"
+        }
+        lastSentAt = now
+        let timestamp = Self.isoTimestamp(now)
+        let lat = latestHeartbeatLatitude
+        let lng = latestHeartbeatLongitude
+#if DEBUG
+        print("[PresenceDebug] heartbeatSent userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp) reason=\(reason) hasNearbyCoords=\(lat != nil && lng != nil)")
+#endif
+        let result = await Self.performHeartbeatWrite(userID: userID, timestamp: timestamp, lat: lat, lng: lng)
+#if DEBUG
+        print("[ChatNearbyTest] heartbeat requester=\(result)")
+#endif
+        return result
+    }
+
+    private nonisolated static func performHeartbeatWrite(
+        userID: UUID,
+        timestamp: String,
+        lat: Double?,
+        lng: Double?
+    ) async -> String {
+        do {
+            if let lat, let lng {
+                struct Params: Encodable {
+                    let p_lat: Double
+                    let p_lng: Double
+                }
+                let _: String = try await supabase
+                    .rpc("touch_user_nearby_location", params: Params(p_lat: lat, p_lng: lng))
+                    .execute()
+                    .value
+#if DEBUG
+                print("[FansNearby] heartbeat write result=success")
+                print("[PresenceDebug] updateSuccess userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp)")
+#endif
+                return "success"
+            } else {
                 let _: String = try await supabase
                     .rpc("touch_user_presence")
                     .execute()
                     .value
 #if DEBUG
+                print("[FansNearby] heartbeat write result=skipped reason=noLocation")
                 print("[PresenceDebug] updateSuccess userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp)")
 #endif
-            } catch {
-#if DEBUG
-                print("[PresenceDebug] updateFailure userId=\(userID.uuidString.lowercased()) error=\(error.localizedDescription)")
-#endif
+                return "missing"
             }
+        } catch {
+            if lat != nil, lng != nil {
+#if DEBUG
+                let text = String(describing: error).lowercased()
+                let nearbyMissing = text.contains("pgrst202")
+                    || text.contains("could not find the function")
+                    || text.contains("touch_user_nearby_location")
+                if nearbyMissing {
+                    print("[FansNearby] heartbeat write result=skipped reason=rpcMissing")
+                } else {
+                    print("[FansNearby] heartbeat write result=skipped reason=rpcError")
+                }
+#endif
+                do {
+                    let _: String = try await supabase
+                        .rpc("touch_user_presence")
+                        .execute()
+                        .value
+#if DEBUG
+                    print("[PresenceDebug] updateSuccessFallbackPresence userId=\(userID.uuidString.lowercased())")
+#endif
+                    return "missing"
+                } catch {
+#if DEBUG
+                    print("[PresenceDebug] updateFailure userId=\(userID.uuidString.lowercased()) error=\(error.localizedDescription)")
+#endif
+                    return "missing"
+                }
+            }
+#if DEBUG
+            print("[FansNearby] heartbeat write result=skipped reason=rpcError")
+            print("[PresenceDebug] updateFailure userId=\(userID.uuidString.lowercased()) error=\(error.localizedDescription)")
+#endif
+            return "missing"
         }
     }
 
@@ -116,8 +241,6 @@ final class PresenceService {
 // MARK: - Lightweight user surface (DM header, friend rows, navigation)
 
 struct UserPreview: Identifiable, Hashable, Codable {
-    private static let onlineWindowSeconds: TimeInterval = 120
-
     let id: UUID
     let displayName: String
     /// Stored without `@`, lowercase — nil when unset.
@@ -237,7 +360,7 @@ struct UserPreview: Identifiable, Hashable, Codable {
               let lastSeen = PresenceOnlineStatus.parse(lastSeenAtRaw) else {
             return false
         }
-        return Date().timeIntervalSince(lastSeen) <= Self.onlineWindowSeconds
+        return Date().timeIntervalSince(lastSeen) <= PresenceOnlineStatus.onlineWindowSeconds
     }
 
     /// Public @handle line — uses stored username or temporary email-prefix fallback (never persisted).

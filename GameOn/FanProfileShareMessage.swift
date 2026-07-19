@@ -62,7 +62,8 @@ enum FanProfileShareMessage {
         sharedByDisplayName: String,
         languageCode: String
     ) -> FanProfileSharePayload? {
-        guard profile.isPubliclyVisible else { return nil }
+        // New public distribution requires global discoverability — not friend-only visibility.
+        guard profile.isPubliclyVisible, profile.isDiscoverableByFans else { return nil }
 
         let trimmedName = profile.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty, !isGenericDisplayName(trimmedName) else { return nil }

@@ -755,13 +755,14 @@ extension MapViewModel {
     }
 
     private func pickupGameCalendarDotCacheKey(
+        boundsBucket: String,
         monthStart: Date,
         dateMin: Date,
         dateMax: Date,
         sport: String
     ) -> String {
         let fmt = DiscoverVenueGameDateFormatting.sqlDate
-        return "p:\(fmt.string(from: monthStart))|r:\(fmt.string(from: dateMin))...\(fmt.string(from: dateMax))|s:\(sport)"
+        return "p:b:\(boundsBucket)|m:\(fmt.string(from: monthStart))|r:\(fmt.string(from: dateMin))...\(fmt.string(from: dateMax))|s:\(sport)"
     }
 
     /// Start-of-day normalized dates inside the Discover calendar-dot fetch window (inclusive).
@@ -881,14 +882,14 @@ extension MapViewModel {
         defer { lastVenueCalendarDotBoundsBucket = bucket }
         guard lastVenueCalendarDotBoundsBucket != bucket else { return }
         venueGameCalendarDotDates = []
+        pickupGameCalendarDotDates = []
 #if DEBUG
-        print("[CalendarDotsFix] cleared venue dots for bounds bucket change prev=\(lastVenueCalendarDotBoundsBucket ?? "nil") next=\(bucket)")
+        print("[CalendarDotsFix] cleared venue+pickup dots for bounds bucket change prev=\(lastVenueCalendarDotBoundsBucket ?? "nil") next=\(bucket)")
 #endif
     }
 
-    /// Debounced venue dot reload after ``bars`` / ``mapVisibleBars`` reflect a new Discover viewport (map pan or search).
+    /// Debounced calendar-dot reload after the Discover map viewport changes (Watch venue dots or Play pickup dots).
     func scheduleDiscoverVenueCalendarDotRefreshAfterMapViewportChange() {
-        guard discoverMapContentMode == .venues else { return }
         noticeVenueCalendarDotBoundsBucketChangeIfNeeded()
         discoverVenueCalendarDotPreloadTask?.cancel()
         discoverVenueCalendarDotPreloadTask = Task { @MainActor [weak self] in
@@ -945,6 +946,7 @@ extension MapViewModel {
     }
 
     /// Selected-day pickup rows already on the map can still imply a dot on that day when the broader Supabase dot query returns nothing (e.g. RLS nuance).
+    /// Only count rows that would show as map pins in the **current viewport** (coords + bounds).
     private func discoverPickupCalendarDotDatesFromLoadedPickupRows(
         dateMin: Date,
         dateMax: Date,
@@ -955,6 +957,7 @@ extension MapViewModel {
         let dMax = cal.startOfDay(for: dateMax)
         let sportFilter = sport.trimmingCharacters(in: .whitespacesAndNewlines)
         let now = Date()
+        let bounds = currentMapRegionBounds()
         var out = Set<Date>()
         for row in pickupGamesForDiscoverMap {
             if sportFilter != "All", row.sport != sportFilter { continue }
@@ -967,6 +970,18 @@ extension MapViewModel {
                 continue
             }
             guard row.is_visible, row.status.lowercased() == "active" else { continue }
+            guard let lat = row.latitude, let lon = row.longitude,
+                  CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon)) else {
+                continue
+            }
+            if let bounds {
+                guard lat >= bounds.minLat, lat <= bounds.maxLat,
+                      lon >= bounds.minLon, lon <= bounds.maxLon else {
+                    continue
+                }
+            } else {
+                continue
+            }
             out.insert(day)
         }
         return out
@@ -1055,6 +1070,7 @@ extension MapViewModel {
     func hasFreshPickupGameCalendarDotCache(for month: Date) -> Bool {
         let range = discoverCalendarDotRange(around: month)
         let cacheKey = pickupGameCalendarDotCacheKey(
+            boundsBucket: discoverBoundsBucketString(),
             monthStart: range.monthStart,
             dateMin: range.dateMin,
             dateMax: range.dateMax,
@@ -1358,7 +1374,9 @@ extension MapViewModel {
         let range = discoverCalendarDotRange(around: month)
         let monthStart = range.monthStart
         let sport = selectedSport
+        let boundsBucket = discoverBoundsBucketString()
         let cacheKey = pickupGameCalendarDotCacheKey(
+            boundsBucket: boundsBucket,
             monthStart: monthStart,
             dateMin: range.dateMin,
             dateMax: range.dateMax,
@@ -1368,7 +1386,7 @@ extension MapViewModel {
         #if DEBUG
         let fmtLog = DiscoverVenueGameDateFormatting.sqlDate
         let pickupCacheKeyHit = pickupGameCalendarDotDatesCache[cacheKey] != nil
-        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots start reason=\(reason) monthAround=\(fmtLog.string(from: month)) pickupGamesForDiscoverMap=\(pickupGamesForDiscoverMap.count) cacheKeyHit=\(pickupCacheKeyHit)")
+        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots start reason=\(reason) monthAround=\(fmtLog.string(from: month)) boundsBucket=\(boundsBucket) pickupGamesForDiscoverMap=\(pickupGamesForDiscoverMap.count) cacheKeyHit=\(pickupCacheKeyHit)")
         #endif
 
         if logIfOpeningBeforeReady && (isLoadingPickupCalendarDots || hasFreshPickupGameCalendarDotCache(for: monthStart) == false) {
@@ -1847,7 +1865,7 @@ extension MapViewModel {
                 await loadVenuesFromSupabase()
             }
             guard discoverSelectedDayRefreshRequestID == requestID else { return }
-            setDiscoverMapStatus("Updated just now", isLoading: false, autoClearAfter: 2.2)
+            setDiscoverMapStatus(discoverMapRefreshUpdatedJustNowText(), isLoading: false, autoClearAfter: 2.2)
             return
         }
 
@@ -1892,7 +1910,7 @@ extension MapViewModel {
                 #endif
                 return
             }
-            setDiscoverMapStatus("Updated just now", isLoading: false, autoClearAfter: 2.2)
+            setDiscoverMapStatus(discoverMapRefreshUpdatedJustNowText(), isLoading: false, autoClearAfter: 2.2)
             #if DEBUG
             print("[CalendarPerf] Background date refresh completed date=\(selectedDay) sport=\(selectedSportSnapshot)")
             #endif
@@ -1925,7 +1943,7 @@ extension MapViewModel {
                 return
             }
             appliedCachedRows = true
-            setDiscoverMapStatus("Showing cached results", isLoading: true)
+            setDiscoverMapStatus(discoverMapRefreshUpdatingToastText(), isLoading: true)
             #if DEBUG
             print("[CalendarPerf] Cached selected-day events applied date=\(selectedDay) rows=\(cached.rows.count)")
             #endif
@@ -1982,7 +2000,7 @@ extension MapViewModel {
                 return
             }
 
-            setDiscoverMapStatus("Updated just now", isLoading: false, autoClearAfter: 2.2)
+            setDiscoverMapStatus(discoverMapRefreshUpdatedJustNowText(), isLoading: false, autoClearAfter: 2.2)
             #if DEBUG
             print("[CalendarPerf] Background date refresh completed date=\(selectedDay) rows=\(fetchedVenueEventRows.count)")
             #endif
@@ -2002,11 +2020,21 @@ extension MapViewModel {
             #if DEBUG
             print("[DiscoverDatePerf] selected-day refresh error date=\(selectedDay) error=\(error)")
             #endif
-            eventLoadError = "Couldn't refresh games for this date. Showing your last results."
+            eventLoadError = discoverMapRefreshCouldNotUpdateText()
             if appliedCachedRows {
-                setDiscoverMapStatus("Showing cached results", isLoading: false, autoClearAfter: 2.2)
+                setDiscoverMapStatus(
+                    discoverMapRefreshShowingAvailableText(),
+                    isLoading: false,
+                    isError: true,
+                    autoClearAfter: 2.8
+                )
             } else if discoverSelectedDayRefreshRequestID == requestID {
-                setDiscoverMapStatus(nil, isLoading: false)
+                setDiscoverMapStatus(
+                    discoverMapRefreshCouldNotUpdateText(),
+                    isLoading: false,
+                    isError: true,
+                    autoClearAfter: 3.2
+                )
             }
         }
     }
@@ -2107,6 +2135,7 @@ extension MapViewModel {
             let monthStart = range.monthStart
             let sport = self.selectedSport
             let cacheKey = self.pickupGameCalendarDotCacheKey(
+                boundsBucket: self.discoverBoundsBucketString(),
                 monthStart: monthStart,
                 dateMin: range.dateMin,
                 dateMax: range.dateMax,

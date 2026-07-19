@@ -184,6 +184,40 @@ struct CalendarScreen: View {
 #endif
     }
 
+#if DEBUG
+    private func logScheduleDateRefresh(
+        _ message: String,
+        previousDate: Date? = nil,
+        cacheHit: Bool? = nil,
+        sourceCount: Int? = nil,
+        filteredCount: Int? = nil,
+        renderedCount: Int? = nil,
+        networkSkipped: Bool? = nil
+    ) {
+        let day = Self.calendarProGamesRefreshDebugDateFormatter.string(from: viewModel.calendarTabSelectedDate)
+        let prev: String = {
+            guard let previousDate else { return "-" }
+            return Self.calendarProGamesRefreshDebugDateFormatter.string(from: previousDate)
+        }()
+        let featured = calendarFeaturedEventFilterSlug ?? "nil"
+        var parts = [
+            "[ScheduleDateRefresh] \(message)",
+            "selectedDate=\(day)",
+            "previousDate=\(prev)",
+            "mode=\(effectiveCalendarGameFilter.rawValue)",
+            "sport=\(calendarProGamesSportFilter)",
+            "featured=\(featured)",
+            "sourceLiveMatches=\(sourceCount ?? viewModel.liveMatches.count)",
+            "filtered=\(filteredCount ?? -1)",
+            "rendered=\(renderedCount ?? calendarProGamesPerf.cachedDisplayedProMatches.count)",
+            "cacheKey=\(calendarProGamesDisplayCacheKey())"
+        ]
+        if let cacheHit { parts.append("cacheHit=\(cacheHit)") }
+        if let networkSkipped { parts.append("networkSkipped=\(networkSkipped)") }
+        print(parts.joined(separator: " "))
+    }
+#endif
+
     private func logScheduleTapProtectedIfNeeded() {
         if viewModel.liveSportsDataRefreshInFlight || viewModel.isLiveMatchesNetworkRefreshInFlight {
             print("[LiveSchedulePerf] scheduleTapProtected=true")
@@ -370,11 +404,19 @@ struct CalendarScreen: View {
     private func applyCalendarProGamesDisplayCacheIfAvailable(reason: String) -> Bool {
         guard isProGamesSelected, !isCalendarSearchModeActive else { return false }
         let key = calendarProGamesDisplayCacheKey()
-        if let cached = calendarProGamesPerf.displayCacheByKey[key] {
+        // Empty entries are not authoritative — they often mean "not fetched yet" and must not
+        // block an immediate rebuild or a later network merge from painting the list.
+        if let cached = calendarProGamesPerf.displayCacheByKey[key], !cached.isEmpty {
             calendarProGamesPerf.cachedDisplayedProMatchesKey = key
             calendarProGamesPerf.cachedDisplayedProMatches = cached
             logScheduleTapPerfDisplayedCacheUpdated(count: cached.count, reason: reason)
 #if DEBUG
+            logScheduleDateRefresh(
+                "cacheApplyHit reason=\(reason)",
+                cacheHit: true,
+                filteredCount: cached.count,
+                renderedCount: cached.count
+            )
             ProSchedulePerf.totalGamesFetched(viewModel.liveMatches.count)
             ProSchedulePerf.logHydrationDeferredCount(
                 cached.filter(\.supportsProGamePredictions).count
@@ -385,6 +427,14 @@ struct CalendarScreen: View {
         if calendarProGamesPerf.cachedDisplayedProMatchesKey != key {
             calendarProGamesPerf.cachedDisplayedProMatchesKey = key
             calendarProGamesPerf.cachedDisplayedProMatches = []
+#if DEBUG
+            logScheduleDateRefresh(
+                "cacheApplyMissClearedDisplay reason=\(reason)",
+                cacheHit: false,
+                filteredCount: 0,
+                renderedCount: 0
+            )
+#endif
         }
         return false
     }
@@ -392,8 +442,11 @@ struct CalendarScreen: View {
     private func updateCalendarProGamesDisplayCache(reason: String) {
         guard isProGamesSelected, !isCalendarSearchModeActive else { return }
         let key = calendarProGamesDisplayCacheKey()
+        // Only skip when we already painted a non-empty list for this exact key.
         if calendarProGamesPerf.cachedDisplayedProMatchesKey == key,
-           calendarProGamesPerf.displayCacheByKey[key] != nil {
+           let existing = calendarProGamesPerf.displayCacheByKey[key],
+           !existing.isEmpty,
+           calendarProGamesPerf.cachedDisplayedProMatches.count == existing.count {
             return
         }
         calendarProGamesPerf.displayCacheRebuildInFlight = true
@@ -408,6 +461,12 @@ struct CalendarScreen: View {
         calendarProGamesPerf.cachedDisplayedProMatches = matches
         logScheduleTapPerfDisplayedCacheUpdated(count: matches.count, reason: reason)
 #if DEBUG
+        logScheduleDateRefresh(
+            "displayCacheRebuilt reason=\(reason)",
+            cacheHit: false,
+            filteredCount: matches.count,
+            renderedCount: matches.count
+        )
         print("[CalendarProGamesPerf] displayCacheUpdated reason=\(reason) count=\(matches.count)")
         ProSchedulePerf.totalGamesFetched(viewModel.liveMatches.count)
         ProSchedulePerf.logHydrationDeferredCount(
@@ -485,7 +544,11 @@ struct CalendarScreen: View {
     private var scheduleProHasCachedGamesVisible: Bool {
         guard isProGamesSelected else { return false }
         if !displayedProMatches.isEmpty { return true }
-        return calendarProGamesPerf.displayCacheByKey[calendarProGamesDisplayCacheKey()] != nil
+        if let cached = calendarProGamesPerf.displayCacheByKey[calendarProGamesDisplayCacheKey()],
+           !cached.isEmpty {
+            return true
+        }
+        return false
     }
 
     private var calendarProGamesStatusIndicatorMessage: String {
@@ -620,15 +683,31 @@ struct CalendarScreen: View {
 
         if let lastRequest = calendarProGamesPerf.lastNetworkRefreshRequestedAt,
            Date().timeIntervalSince(lastRequest) < CalendarProGamesPerfState.networkCoalesceInterval {
+            // Date changes to a day with no loaded matches must still fetch — dots can exist
+            // while `liveMatches` has never been day-scoped for that date.
+            let mustFetchUnloadedDay = reason == "calendar_selected_date_change" && !selectedDayHasLoadedMatches
+            if !mustFetchUnloadedDay {
 #if DEBUG
-            logCalendarProGamesNetworkRefreshDecision(
-                reason: reason,
-                selectedDay: day,
-                selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
-                skipped: true
+                logCalendarProGamesNetworkRefreshDecision(
+                    reason: reason,
+                    selectedDay: day,
+                    selectedDayHasLoadedMatches: selectedDayHasLoadedMatches,
+                    skipped: true
+                )
+                logScheduleDateRefresh(
+                    "networkCoalesceSkip reason=\(reason)",
+                    filteredCount: calendarProGamesPerf.cachedDisplayedProMatches.count,
+                    networkSkipped: true
+                )
+#endif
+                return true
+            }
+#if DEBUG
+            logScheduleDateRefresh(
+                "networkCoalesceBypassedForUnloadedDay reason=\(reason)",
+                networkSkipped: false
             )
 #endif
-            return true
         }
 
         let dayKey = calendarProGamesDayKey(for: day)
@@ -893,6 +972,7 @@ struct CalendarScreen: View {
             .sheet(isPresented: $showCalendarLeagueCountryFilterSheet) {
                 CalendarLeagueCountryFilterSheet(
                     countries: calendarLeagueCountryOptions,
+                    suggestedNearYouCountry: calendarNearYouSuggestedCountry,
                     selectedCountries: Binding(
                         get: { selectedCalendarLeagueCountries },
                         set: { updateSelectedCalendarLeagueCountries($0) }
@@ -965,6 +1045,12 @@ struct CalendarScreen: View {
                 if filter != .proGames {
                     handleCalendarProGamesIndicatorSurfaceHidden(reason: "tabChanged")
                 }
+            }
+            .onChange(of: viewModel.pendingScheduleProGameNav) { _, _ in
+                applyPendingScheduleProGameNavIfNeeded()
+            }
+            .onAppear {
+                applyPendingScheduleProGameNavIfNeeded()
             }
     }
 
@@ -1548,9 +1634,11 @@ struct CalendarScreen: View {
 
     private func handleCalendarAppear() {
         sanitizeBusinessCalendarFilterIfNeeded()
+        applyCalendarLeagueCountryFilterFirstUseDefaultIfNeeded()
         refreshCurrentDayCalendarSearchForLoadedDataChange()
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "appearInstant")
         scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_appear")
+        applyPendingScheduleProGameNavIfNeeded()
         guard isCalendarTabSelected else {
 #if DEBUG
             print("[PerfPhase1D] deferredCalendarWork reason=calendarScreenOnAppearPickupRefresh")
@@ -1560,6 +1648,7 @@ struct CalendarScreen: View {
         Task { @MainActor in
             await Task.yield()
             scheduleCalendarProGamesDeferredRefresh(reason: "calendar_tab_appear")
+            applyPendingScheduleProGameNavIfNeeded()
             guard viewModel.canFanUsePickupGamesUI else { return }
             guard !shouldDeferCalendarPickupRefreshAfterTabPreload() else {
                 AppPerfDebug.refreshSkipped(
@@ -1570,6 +1659,44 @@ struct CalendarScreen: View {
                 return
             }
             await viewModel.refreshCalendarTabPickupSources(reason: "calendar_tab_appear")
+        }
+    }
+
+    private func applyPendingScheduleProGameNavIfNeeded() {
+        guard let intent = viewModel.pendingScheduleProGameNav else { return }
+        viewModel.clearPendingScheduleProGameNav()
+
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        gameSearchText = ""
+        debouncedGameSearchText = ""
+        calendarProGamesSportFilter = "All"
+        calendarFeaturedEventFilterSlug = nil
+
+        viewModel.calendarTabSelectedDate = Calendar.current.startOfDay(for: intent.startTime)
+        viewModel.calendarTabGameFilter = .proGames
+        applyCalendarProGamesDisplayCacheIfAvailable(reason: "scheduleProGameNav")
+
+        if let resolved = viewModel.resolveLiveMatchForScheduleProGameNav(intent) {
+            let key = SavedProGame.stableKey(for: resolved)
+            viewModel.scheduleProGameHighlightStableKey = key
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2.8))
+                if viewModel.scheduleProGameHighlightStableKey == key {
+                    viewModel.clearScheduleProGameHighlight()
+                }
+            }
+#if DEBUG
+            print("[ScheduleProGameNav] resolved stableKey=\(key)")
+#endif
+        } else {
+            viewModel.scheduleProGameHighlightStableKey = nil
+            viewModel.showSocialActionToast(
+                L10n.t("discover_pro_game_schedule_unavailable", languageCode: languageCode),
+                isError: false
+            )
+#if DEBUG
+            print("[ScheduleProGameNav] unresolved matchId=\(intent.matchId) stableKey=\(intent.stableKey)")
+#endif
         }
     }
 
@@ -1633,8 +1760,10 @@ struct CalendarScreen: View {
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "tabSelectedInstant")
         scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_selected")
         scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_selected")
+        applyPendingScheduleProGameNavIfNeeded()
         Task { @MainActor in
             await Task.yield()
+            applyPendingScheduleProGameNavIfNeeded()
             guard shouldDeferCalendarPickupRefreshAfterTabPreload() else {
                 refreshCalendarPickupSourcesIfNeeded(reason: "calendar_tab_selected")
                 return
@@ -1669,8 +1798,29 @@ struct CalendarScreen: View {
     }
 
     private func handleCalendarSelectedDateChange() {
+        let previousRendered = calendarProGamesPerf.cachedDisplayedProMatches.count
         beginCalendarWatchPartiesDayTransition(reason: "selectedDateChanged", preserveVisibleCards: true)
-        applyCalendarProGamesDisplayCacheIfAvailable(reason: "selectedDateInstant")
+        let cacheHit = applyCalendarProGamesDisplayCacheIfAvailable(reason: "selectedDateInstant")
+#if DEBUG
+        logScheduleDateRefresh(
+            "selectedDateCommitted cacheHit=\(cacheHit)",
+            cacheHit: cacheHit,
+            filteredCount: calendarBaseDisplayedProMatches().count,
+            renderedCount: calendarProGamesPerf.cachedDisplayedProMatches.count
+        )
+#endif
+        if isProGamesSelected, !isCalendarSearchModeActive {
+            // Paint immediately from any already-loaded matches for this day/filters.
+            // Do not wait for deferred work or network when the source already has the games.
+            updateCalendarProGamesDisplayCache(reason: "selectedDateImmediateRebuild")
+#if DEBUG
+            logScheduleDateRefresh(
+                "selectedDateImmediateRebuildDone previousRendered=\(previousRendered)",
+                filteredCount: calendarProGamesPerf.cachedDisplayedProMatches.count,
+                renderedCount: calendarProGamesPerf.cachedDisplayedProMatches.count
+            )
+#endif
+        }
         scheduleCalendarInteractionDeferredWork(reason: "calendar_selected_date_change")
     }
 
@@ -1809,6 +1959,9 @@ struct CalendarScreen: View {
     }
 
     private func handleCalendarDatePickerDone() {
+#if DEBUG
+        logScheduleDateRefresh("datePickerDoneDismiss")
+#endif
         withAnimation(.spring()) {
             viewModel.selectedBar = nil
             viewModel.selectedEvent = nil
@@ -1822,6 +1975,12 @@ struct CalendarScreen: View {
             Task {
                 await viewModel.refreshCalendarTabPickupSources(forceRefresh: true, reason: "calendar_tab_sheet_done")
             }
+            // Pro Games date was already committed on day tap; ensure list is painted for the
+            // committed day even if the sheet dismissed without another date onChange.
+            if isProGamesSelected, !isCalendarSearchModeActive {
+                updateCalendarProGamesDisplayCache(reason: "datePickerDoneImmediateRebuild")
+                scheduleCalendarInteractionDeferredWork(reason: "calendar_selected_date_change")
+            }
             showDatePicker = false
         }
     }
@@ -1834,8 +1993,8 @@ struct CalendarScreen: View {
 
     private var header: some View {
         FanGeoPagePurposeHeader(
-            title: "Schedule",
-            subtitle: "Find games, watch parties, and pickup games."
+            title: L10n.t("Schedule", languageCode: appLanguageRaw),
+            subtitle: ""
         )
         .padding(.horizontal)
     }
@@ -1843,17 +2002,31 @@ struct CalendarScreen: View {
     private var gameTypeFilter: some View {
         GameOnSegmentedControl(
             tabs: calendarVisibleGameFilters.map { filter in
-                GameOnSegmentedTab(
+                let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+                let accessibility: String = {
+                    switch filter {
+                    case .venueGames:
+                        return L10n.t("schedule_a11y_watch", languageCode: languageCode)
+                    case .pickupGames:
+                        return L10n.t("schedule_a11y_play", languageCode: languageCode)
+                    case .proGames:
+                        return L10n.t("schedule_a11y_pro_games", languageCode: languageCode)
+                    }
+                }()
+                let tint: Color = filter.intentTint
+                return GameOnSegmentedTab(
                     id: filter,
                     title: filter.segmentTitle,
                     systemImage: calendarSegmentSystemImage(for: filter),
                     badge: calendarSegmentBadge(for: filter),
-                    tint: FGColor.accentGreen,
-                    accessibilityLabel: "Show \(filter.segmentTitle)"
+                    tint: tint,
+                    accessibilityLabel: accessibility
                 )
             },
             selection: calendarGameFilterBinding,
-            animatesSelectionChanges: false
+            animatesSelectionChanges: false,
+            titleMinimumScaleFactor: 0.62,
+            tabHorizontalPadding: 5
         )
         .padding(.horizontal)
     }
@@ -1861,9 +2034,9 @@ struct CalendarScreen: View {
     private func calendarSegmentSystemImage(for filter: CalendarTabGameFilter) -> String {
         switch filter {
         case .venueGames:
-            return "storefront.fill"
+            return "sportscourt.fill"
         case .pickupGames:
-            return "person.3.fill"
+            return "figure.run"
         case .proGames:
             return "trophy.fill"
         }
@@ -1887,14 +2060,16 @@ struct CalendarScreen: View {
     }
 
     private var teamScheduleButton: some View {
-        Button {
+        let title = L10n.t("Team Schedule", languageCode: appLanguageRaw)
+        return Button {
             presentTeamScheduleSheet()
         } label: {
-            Label("Team Schedule", systemImage: "magnifyingglass")
+            Label(title, systemImage: "magnifyingglass")
                 .font(.caption.weight(.heavy))
                 .lineLimit(1)
+                .minimumScaleFactor(0.78)
                 .foregroundStyle(FGColor.accentGreen)
-                .padding(.horizontal, 12)
+                .padding(.horizontal, 10)
                 .frame(height: 44)
                 .background(Color(.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1904,7 +2079,7 @@ struct CalendarScreen: View {
                 }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Team Schedule")
+        .accessibilityLabel(title)
     }
 
     private var calendarDateStrip: some View {
@@ -2035,7 +2210,7 @@ struct CalendarScreen: View {
         hasPickupGames: Bool
     ) -> String {
         var label = calendarDateStripAccessibilityFormatter.string(from: date)
-        if hasVenueEvents { label += ", venue games" }
+        if hasVenueEvents { label += ", watch parties" }
         if hasPickupGames { label += ", pickup games" }
         return label
     }
@@ -2048,7 +2223,7 @@ struct CalendarScreen: View {
     }
 
     private var calendarVenueGamesRegionNotice: some View {
-        Text("Only games in your current Discover area are shown.")
+        Text(L10n.t("watch_parties_discover_area_region_notice", languageCode: calendarScheduleLanguageCode))
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -2056,13 +2231,29 @@ struct CalendarScreen: View {
     }
 
     private var eventsHeader: some View {
-        HStack {
-            Text(eventsHeaderTitle)
-                .font(.headline)
-                .fontWeight(.bold)
-                .foregroundStyle(.primary)
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(eventsHeaderTitle)
+                    .font(.headline)
+                    .fontWeight(.bold)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
 
-            Spacer()
+                if let summary = calendarScheduleHeaderCountrySummary {
+                    Text(summary)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityHidden(true)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(calendarScheduleHeaderAccessibilityLabel)
+            .accessibilityAddTraits(.isHeader)
+
+            Spacer(minLength: 0)
 
             if !isProGamesSelected {
                 if viewModel.isLoadingEvents
@@ -2138,29 +2329,192 @@ struct CalendarScreen: View {
         return calendarSelectedDateMatchesTitle
     }
 
+    private var calendarScheduleLanguageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    /// Same Option 3 place mode as Live: inline single place, compact summary for multi-select.
+    private var calendarScheduleHeaderPlaceMode: LiveLeagueCountryFilterPresentation.LiveHeaderPlaceMode {
+        guard isProGamesSelected else { return .none }
+        return LiveLeagueCountryFilterPresentation.liveHeaderPlaceMode(
+            for: selectedCalendarLeagueCountries,
+            languageCode: calendarScheduleLanguageCode
+        )
+    }
+
+    private var calendarScheduleHeaderCountrySummary: String? {
+        guard !isCalendarSearchModeActive else { return nil }
+        if case .summary(let summary) = calendarScheduleHeaderPlaceMode {
+            return summary
+        }
+        return nil
+    }
+
+    private var calendarNearYouSuggestedCountry: String? {
+        LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
+            homeCountry: viewModel.currentUserHomeCountry,
+            homeRegion: viewModel.currentUserHomeRegion,
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+    }
+
+    /// Sport label for Schedule headings when a specific sport chip is selected (not All / featured).
+    private var calendarProGamesHeadingSportLabel: String? {
+        guard isProGamesSelected, selectedCalendarFeaturedEvent == nil else { return nil }
+        let selection = calendarProGamesSportFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty, !DiscoverSportFilterRowLayout.selectionTokensMatch(selection, "All") else {
+            return nil
+        }
+        if let display = calendarProVisibleSportFilters.first(where: {
+            DiscoverSportFilterRowLayout.selectionTokensMatch($0.selection, selection)
+        })?.display {
+            return display
+        }
+        return selection.prefix(1).uppercased() + selection.dropFirst()
+    }
+
     private var calendarSelectedDateMatchesTitle: String {
+        let languageCode = calendarScheduleLanguageCode
+        let locale = Locale(identifier: languageCode)
         let calendar = Calendar.current
         let selectedDay = calendar.startOfDay(for: viewModel.calendarTabSelectedDate)
         let today = calendar.startOfDay(for: Date())
+        let sport = calendarProGamesHeadingSportLabel
         let noun = calendarSectionTitleNoun
+        let inlinePlace: String? = {
+            guard effectiveCalendarGameFilter == .proGames else { return nil }
+            if case .inline(let place) = calendarScheduleHeaderPlaceMode {
+                return place
+            }
+            return nil
+        }()
+
         if selectedDay == today {
-            return "Today’s \(noun)"
+            if let place = inlinePlace {
+                if let sport {
+                    return String(
+                        format: L10n.t("schedule_todays_sport_matches_in_place_format", languageCode: languageCode),
+                        locale: locale,
+                        sport,
+                        place
+                    )
+                }
+                return String(
+                    format: L10n.t("schedule_todays_matches_in_place_format", languageCode: languageCode),
+                    locale: locale,
+                    place
+                )
+            }
+            if let sport, effectiveCalendarGameFilter == .proGames {
+                return String(
+                    format: L10n.t("schedule_todays_sport_matches_format", languageCode: languageCode),
+                    locale: locale,
+                    sport
+                )
+            }
+            return String(
+                format: L10n.t("schedule_todays_noun_format", languageCode: languageCode),
+                locale: locale,
+                noun
+            )
         }
         if let tomorrow = calendar.date(byAdding: .day, value: 1, to: today),
            selectedDay == tomorrow {
-            return "Tomorrow’s \(noun)"
+            if let place = inlinePlace {
+                if let sport {
+                    return String(
+                        format: L10n.t("schedule_tomorrows_sport_matches_in_place_format", languageCode: languageCode),
+                        locale: locale,
+                        sport,
+                        place
+                    )
+                }
+                return String(
+                    format: L10n.t("schedule_tomorrows_matches_in_place_format", languageCode: languageCode),
+                    locale: locale,
+                    place
+                )
+            }
+            if let sport, effectiveCalendarGameFilter == .proGames {
+                return String(
+                    format: L10n.t("schedule_tomorrows_sport_matches_format", languageCode: languageCode),
+                    locale: locale,
+                    sport
+                )
+            }
+            return String(
+                format: L10n.t("schedule_tomorrows_noun_format", languageCode: languageCode),
+                locale: locale,
+                noun
+            )
         }
-        return "\(compactCalendarDateTitle) \(noun)"
+
+        let dateLabel = compactCalendarDateTitle
+        if let place = inlinePlace {
+            if let sport {
+                return String(
+                    format: L10n.t("schedule_date_sport_matches_in_place_format", languageCode: languageCode),
+                    locale: locale,
+                    dateLabel,
+                    sport,
+                    place
+                )
+            }
+            return String(
+                format: L10n.t("schedule_date_matches_in_place_format", languageCode: languageCode),
+                locale: locale,
+                dateLabel,
+                place
+            )
+        }
+        if let sport, effectiveCalendarGameFilter == .proGames {
+            return String(
+                format: L10n.t("schedule_date_sport_matches_format", languageCode: languageCode),
+                locale: locale,
+                dateLabel,
+                sport
+            )
+        }
+        return String(
+            format: L10n.t("schedule_date_noun_format", languageCode: languageCode),
+            locale: locale,
+            dateLabel,
+            noun
+        )
+    }
+
+    private var calendarScheduleHeaderAccessibilityLabel: String {
+        if isCalendarSearchModeActive {
+            return eventsHeaderTitle
+        }
+        let languageCode = calendarScheduleLanguageCode
+        let locale = Locale(identifier: languageCode)
+        let title = eventsHeaderTitle
+        switch calendarScheduleHeaderPlaceMode {
+        case .summary:
+            let spokenPlaces = LiveLeagueCountryFilterPresentation.multiCountryAccessibilitySummary(
+                for: selectedCalendarLeagueCountries,
+                languageCode: languageCode
+            )
+            return String(
+                format: L10n.t("schedule_header_a11y_with_selection_format", languageCode: languageCode),
+                locale: locale,
+                title,
+                spokenPlaces
+            )
+        case .none, .inline:
+            return title
+        }
     }
 
     private var calendarSectionTitleNoun: String {
         switch effectiveCalendarGameFilter {
         case .venueGames:
-            return "Watch Parties"
+            return L10n.t("schedule_noun_watch_parties", languageCode: calendarScheduleLanguageCode)
         case .pickupGames:
-            return "Pickup Games"
+            return L10n.t("schedule_noun_pickup_games", languageCode: calendarScheduleLanguageCode)
         case .proGames:
-            return "Matches"
+            return L10n.t("professional_games", languageCode: calendarScheduleLanguageCode)
         }
     }
 
@@ -2198,11 +2552,11 @@ struct CalendarScreen: View {
     }
 
     private var calendarPickupGamesEmptyStateTitle: String {
-        "⚽ No pickup games scheduled for \(compactCalendarDateTitle)"
+        L10n.t("no_pickup_games_found", languageCode: calendarScheduleLanguageCode)
     }
 
     private var calendarWatchPartiesEmptyStateTitle: String {
-        "No watch parties found in this Discover area."
+        L10n.t("no_watch_parties_in_discover_area", languageCode: calendarScheduleLanguageCode)
     }
 
     private var calendarPickupGamesEmptyState: some View {
@@ -2212,7 +2566,7 @@ struct CalendarScreen: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(calendarColorScheme))
 
-                Text("No pickup games found in the current map area. Move the map, zoom out, or search another city to discover more.")
+                Text(L10n.t("no_pickup_games_found_supporting", languageCode: calendarScheduleLanguageCode))
                     .font(.subheadline)
                     .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -2221,14 +2575,14 @@ struct CalendarScreen: View {
             Button {
                 openDiscoverForPickupGames()
             } label: {
-                Text("Open Discover")
+                Text(L10n.t("open_discover", languageCode: calendarScheduleLanguageCode))
                     .font(.subheadline.weight(.bold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 11)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
-            .background(FGColor.accentGreen, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(FGColor.intentPlay, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2244,7 +2598,7 @@ struct CalendarScreen: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(calendarColorScheme))
 
-                Text("Move the map or search another city to find venue games.")
+                Text(L10n.t("watch_parties_discover_area_description", languageCode: calendarScheduleLanguageCode))
                     .font(.subheadline)
                     .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -2253,14 +2607,14 @@ struct CalendarScreen: View {
             Button {
                 openDiscoverForVenueGames()
             } label: {
-                Text("Open Discover")
+                Text(L10n.t("open_discover", languageCode: calendarScheduleLanguageCode))
                     .font(.subheadline.weight(.bold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 11)
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
-            .background(FGColor.accentGreen, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(FGColor.intentWatch, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2271,6 +2625,20 @@ struct CalendarScreen: View {
 
     private func updateSelectedCalendarLeagueCountries(_ countries: Set<String>) {
         calendarLeagueCountryFilterRaw = LiveLeagueCountryFilterPreference.encode(countries)
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
+    private func applyCalendarLeagueCountryFilterFirstUseDefaultIfNeeded() {
+        let resolved = LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
+            homeCountry: viewModel.currentUserHomeCountry,
+            homeRegion: viewModel.currentUserHomeRegion,
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+        guard let encoded = LiveLeagueCountryFilterPreference.firstUseDefaultEncodedSelection(
+            currentRaw: calendarLeagueCountryFilterRaw,
+            resolvedCountry: resolved
+        ) else { return }
+        calendarLeagueCountryFilterRaw = encoded
     }
 
     private var gameSearchBar: some View {
@@ -2377,7 +2745,8 @@ struct CalendarScreen: View {
                     .padding(.horizontal)
                     .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .top)
             } else {
-                ScrollView {
+                ScrollViewReader { proxy in
+                    ScrollView {
                     Group {
                         if isProGamesSelected {
                             let proMatches = displayedProMatches
@@ -2394,6 +2763,7 @@ struct CalendarScreen: View {
                                         CalendarProGameLazyCard { deferExpensiveSections in
                                             calendarProGameCard(match, deferExpensiveSections: deferExpensiveSections)
                                         }
+                                        .id(SavedProGame.stableKey(for: match))
                                     }
                                 }
                                 .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .top)
@@ -2423,6 +2793,15 @@ struct CalendarScreen: View {
                     }
                     .padding(.horizontal)
                     .padding(.bottom, 100)
+                    }
+                    .onChange(of: viewModel.scheduleProGameHighlightStableKey) { _, key in
+                        guard let key, !key.isEmpty else { return }
+                        DispatchQueue.main.async {
+                            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                                proxy.scrollTo(key, anchor: .center)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2581,13 +2960,12 @@ struct CalendarScreen: View {
                 ForEach(calendarProVisibleSportFilters, id: \.selection) { item in
                     proGamesSportChip(selection: item.selection, displayTitle: item.display)
                     if item.selection == "All" {
+                        proGamesLeagueCountryChip
                         ForEach(calendarFeaturedEvents) { featuredEvent in
                             calendarFeaturedEventChip(featuredEvent)
                         }
                     }
                 }
-
-                proGamesLeagueCountryChip
 
                 SportFilterChip(sport: "More", isSelected: false, isCompact: true) {
                     showCalendarSportMoreSheet = true
@@ -2775,6 +3153,8 @@ struct CalendarScreen: View {
         let featuredEvent = calendarFeaturedEvent(for: match)
         let isSaved = viewModel.isProGameSaved(match)
         let watchPartyCount = watchPartyCount(for: match)
+        let stableKey = SavedProGame.stableKey(for: match)
+        let isHighlighted = viewModel.scheduleProGameHighlightStableKey == stableKey
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 14) {
             VStack(alignment: .leading, spacing: 10) {
@@ -2877,14 +3257,18 @@ struct CalendarScreen: View {
         .overlay {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(
-                    FGColor.divider(calendarColorScheme).opacity(
-                        isInactiveCompleted
-                            ? (calendarColorScheme == .dark ? 0.42 : 0.56)
-                            : (calendarColorScheme == .dark ? 0.28 : 0.38)
-                    ),
-                    lineWidth: 1
+                    isHighlighted
+                        ? FGColor.intentProGames.opacity(calendarColorScheme == .dark ? 0.95 : 0.88)
+                        : FGColor.divider(calendarColorScheme).opacity(
+                            isInactiveCompleted
+                                ? (calendarColorScheme == .dark ? 0.42 : 0.56)
+                                : (calendarColorScheme == .dark ? 0.28 : 0.38)
+                        ),
+                    lineWidth: isHighlighted ? 2.25 : 1
                 )
         }
+        .scaleEffect(isHighlighted ? 1.015 : 1)
+        .animation(.spring(response: 0.32, dampingFraction: 0.84), value: isHighlighted)
         .saturation(isInactiveCompleted ? 0.84 : 1)
         .opacity(isInactiveCompleted ? 0.94 : 1)
         .shadow(
@@ -2895,6 +3279,15 @@ struct CalendarScreen: View {
             ),
             radius: isInactiveCompleted ? 5 : 10,
             y: isInactiveCompleted ? 2 : 4
+        )
+        .accessibilityAddTraits(isHighlighted ? .isSelected : [])
+        .accessibilityHint(
+            isHighlighted
+                ? L10n.t(
+                    "discover_pro_game_schedule_highlight_a11y_hint",
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                )
+                : ""
         )
         .onAppear {
             guard !deferExpensiveSections else { return }
@@ -3079,7 +3472,7 @@ struct CalendarScreen: View {
                 }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(isSaved ? "Unsave pro game" : "Save pro game")
+        .accessibilityLabel(isSaved ? L10n.t("unsave_pro_sports_game_a11y", languageCode: appLanguageRaw) : L10n.t("save_pro_sports_game_a11y", languageCode: appLanguageRaw))
     }
 
     private func calendarFeaturedEvent(for match: LiveMatch) -> FeaturedEvent? {
@@ -3740,11 +4133,11 @@ struct CalendarScreen: View {
     private func calendarSearchModeLabel(_ mode: CalendarTabGameFilter) -> String {
         switch mode {
         case .venueGames:
-            return "Venues"
+            return "Watch"
         case .pickupGames:
-            return "Pickup"
+            return "Play"
         case .proGames:
-            return "Pro"
+            return "ProGames"
         }
     }
 
@@ -4434,13 +4827,14 @@ private struct CalendarSearchSuggestion: Identifiable {
 
 private struct CalendarLeagueCountryFilterSheet: View {
     let countries: [String]
+    let suggestedNearYouCountry: String?
     @Binding var selectedCountries: Set<String>
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
-    private let northAmericaPreset = ["United States", "Canada", "Mexico"]
-    private let topEuropePreset = ["England", "France", "Spain", "Germany", "Italy"]
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     var body: some View {
         NavigationStack {
@@ -4450,45 +4844,70 @@ private struct CalendarLeagueCountryFilterSheet: View {
                         Text("Calendar Countries")
                             .font(FGTypography.sectionTitle)
                             .foregroundStyle(FGColor.primaryText(colorScheme))
-                        Text("Choose which league countries appear in Pro Games.")
+                        Text(L10n.t("pro_sports_country_filter_subtitle", languageCode: languageCode))
                             .font(FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                     }
                     .padding(.vertical, 4)
                 }
 
+                if let nearYou = suggestedNearYouCountry {
+                    Section {
+                        countryRow(
+                            title: nearYou,
+                            subtitle: L10n.t("near_you", languageCode: languageCode),
+                            flag: CountryFlagHelper.flag(for: nearYou),
+                            isSelected: selectedCountries.contains(nearYou),
+                            accessibilityLabel: String(
+                                format: L10n.t("near_you_country_a11y_format", languageCode: languageCode),
+                                locale: Locale(identifier: languageCode),
+                                nearYou
+                            ),
+                            accessibilityHint: countryToggleHint(isSelected: selectedCountries.contains(nearYou))
+                        ) {
+                            applySelection(LiveLeagueCountryFilterPresentation.toggling(nearYou, in: selectedCountries))
+                        }
+                    }
+                }
+
                 Section("Quick Actions") {
-                    quickAction("Select All") {
-                        selectedCountries = Set(countries)
+                    quickAction(
+                        title: L10n.t("country_filter_select_all", languageCode: languageCode),
+                        accessibilityHint: L10n.t("country_filter_select_all_a11y_hint", languageCode: languageCode)
+                    ) {
+                        applySelection(Set(countries))
                     }
-                    quickAction("Clear") {
-                        selectedCountries = []
+                    quickAction(
+                        title: L10n.t("country_filter_clear", languageCode: languageCode),
+                        accessibilityHint: L10n.t("country_filter_clear_a11y_hint", languageCode: languageCode)
+                    ) {
+                        applySelection([])
                     }
-                    quickAction("North America") {
-                        selectedCountries = Set(northAmericaPreset)
-                    }
-                    quickAction("Top European") {
-                        selectedCountries = Set(topEuropePreset)
-                    }
+                    presetRow(
+                        title: L10n.t("live_region_north_america", languageCode: languageCode),
+                        preset: LiveLeagueCountryFilterPresentation.northAmericaPreset,
+                        accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
+                    )
+                    presetRow(
+                        title: L10n.t("country_filter_top_european", languageCode: languageCode),
+                        preset: LiveLeagueCountryFilterPresentation.topEuropePreset,
+                        accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
+                    )
                 }
 
                 Section("Countries") {
                     ForEach(countries, id: \.self) { country in
-                        Button {
-                            toggle(country)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Text(country)
-                                    .font(FGTypography.body)
-                                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                                Spacer()
-                                if selectedCountries.contains(country) {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(FGColor.accentGreen)
-                                }
-                            }
+                        let isSelected = selectedCountries.contains(country)
+                        countryRow(
+                            title: country,
+                            subtitle: nil,
+                            flag: nil,
+                            isSelected: isSelected,
+                            accessibilityLabel: country,
+                            accessibilityHint: countryToggleHint(isSelected: isSelected)
+                        ) {
+                            applySelection(LiveLeagueCountryFilterPresentation.toggling(country, in: selectedCountries))
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -4505,18 +4924,123 @@ private struct CalendarLeagueCountryFilterSheet: View {
         }
     }
 
-    private func quickAction(_ title: String, action: @escaping () -> Void) -> some View {
+    private func applySelection(_ next: Set<String>) {
+        selectedCountries = next
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
+    private func countryToggleHint(isSelected: Bool) -> String {
+        isSelected
+            ? L10n.t("country_filter_deselect_a11y_hint", languageCode: languageCode)
+            : L10n.t("country_filter_select_a11y_hint", languageCode: languageCode)
+    }
+
+    private func quickAction(title: String, accessibilityHint: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
                 .font(FGTypography.body.weight(.semibold))
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityHint(accessibilityHint)
+    }
+
+    private func presetRow(title: String, preset: Set<String>, accessibilityHint: String) -> some View {
+        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(preset, in: selectedCountries)
+        return Button {
+            applySelection(LiveLeagueCountryFilterPresentation.togglingPreset(preset, in: selectedCountries))
+        } label: {
+            HStack(spacing: 12) {
+                Text(title)
+                    .font(FGTypography.body.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                Spacer(minLength: 8)
+                presetTrailingIcon(state)
+            }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(title)
+        .accessibilityValue(presetAccessibilityValue(state))
+        .accessibilityHint(accessibilityHint)
+    }
+
+    private func countryRow(
+        title: String,
+        subtitle: String?,
+        flag: String?,
+        isSelected: Bool,
+        accessibilityLabel: String,
+        accessibilityHint: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    HStack(spacing: 8) {
+                        if let flag, !flag.isEmpty {
+                            Text(flag)
+                                .font(.system(size: 22))
+                                .accessibilityHidden(true)
+                        }
+                        Text(title)
+                            .font(FGTypography.body.weight(subtitle == nil ? .regular : .semibold))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+                Spacer(minLength: 8)
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(FGColor.accentGreen)
+                        .accessibilityHidden(true)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(
+            isSelected
+                ? L10n.t("country_filter_selected_a11y", languageCode: languageCode)
+                : L10n.t("country_filter_not_selected_a11y", languageCode: languageCode)
+        )
+        .accessibilityHint(accessibilityHint)
+    }
+
+    @ViewBuilder
+    private func presetTrailingIcon(_ state: LiveLeagueCountryFilterPresentation.PresetSelectionState) -> some View {
+        switch state {
+        case .full:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(FGColor.accentGreen)
+        case .partial:
+            Image(systemName: "minus.circle.fill")
+                .foregroundStyle(FGColor.accentGreen.opacity(0.85))
+        case .none:
+            EmptyView()
         }
     }
 
-    private func toggle(_ country: String) {
-        if selectedCountries.contains(country) {
-            selectedCountries.remove(country)
-        } else {
-            selectedCountries.insert(country)
+    private func presetAccessibilityValue(_ state: LiveLeagueCountryFilterPresentation.PresetSelectionState) -> String {
+        switch state {
+        case .full:
+            return L10n.t("country_filter_selected_a11y", languageCode: languageCode)
+        case .partial:
+            return L10n.t("country_filter_partially_selected_a11y", languageCode: languageCode)
+        case .none:
+            return L10n.t("country_filter_not_selected_a11y", languageCode: languageCode)
         }
     }
 }

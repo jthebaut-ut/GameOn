@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 import Supabase
 
@@ -15,10 +16,15 @@ extension MapViewModel {
     static let fanPasswordResetRedirectURL = URL(string: "fangeo://reset-password")!
     static let emailVerificationRedirectURL = URL(string: "fangeo://email-confirmed")!
     private static let emailDeliveryGuidanceMessage = "We sent you an email. If you don’t see it, check your Spam or Junk folder and mark FanGeo as safe."
+    static let emailVerifiedSignInContinueMessage = "Email verified. Sign in to continue."
+    static let finishingEmailVerificationMessage = "Finishing email verification…"
+    static let emailConfirmationLinkFailedMessage =
+        "This verification link is invalid or expired. Request a new email or sign in."
 
     private static let storedAccountModeKey = "GameOn.storedAccountMode"
     private static let storedAccountAuthUserIdKey = "GameOn.storedAccountAuthUserId"
     private static let pendingBusinessEmailSignupDraftFilename = "pending-business-email-signup-draft.json"
+    private static let pendingFanEmailSignupDraftFilename = "pending-fan-email-signup-draft.json"
 
     private static var pendingBusinessEmailSignupDraftURL: URL? {
         do {
@@ -32,6 +38,23 @@ extension MapViewModel {
         } catch {
 #if DEBUG
             print("[BusinessSignupDraft] applicationSupportURLFailed error=\(error.localizedDescription)")
+#endif
+            return nil
+        }
+    }
+
+    private static var pendingFanEmailSignupDraftURL: URL? {
+        do {
+            let directory = try FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+            return directory.appendingPathComponent(pendingFanEmailSignupDraftFilename)
+        } catch {
+#if DEBUG
+            print("[FanSignupDraft] applicationSupportURLFailed error=\(error.localizedDescription)")
 #endif
             return nil
         }
@@ -80,13 +103,75 @@ extension MapViewModel {
     }
 
     @MainActor
-    func clearEmailVerificationPending() {
+    func clearEmailVerificationPending(clearFanDraft: Bool = false) {
         pendingEmailVerificationEmail = ""
         pendingEmailVerificationKind = nil
         businessEmailVerificationUIFlowActive = false
         emailVerificationError = ""
         emailVerificationMessage = ""
+        if clearFanDraft {
+            clearPendingFanEmailSignupDraft()
+        }
+    }
+
+    @MainActor
+    func clearPendingFanEmailSignupDraft() {
         pendingFanEmailSignupDraft = nil
+        clearPersistedPendingFanEmailSignupDraft()
+    }
+
+    @MainActor
+    func restorePendingFanEmailSignupDraftIfNeeded() {
+        if pendingFanEmailSignupDraft != nil { return }
+        guard let url = Self.pendingFanEmailSignupDraftURL,
+              FileManager.default.fileExists(atPath: url.path) else {
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let draft = try JSONDecoder().decode(PendingFanEmailSignupDraft.self, from: data)
+            pendingFanEmailSignupDraft = draft
+            let normalized = OwnerBusinessEmail.normalized(draft.email)
+            if OwnerBusinessEmail.isValidStrict(normalized) {
+                pendingEmailVerificationEmail = normalized
+                if pendingEmailVerificationKind == nil {
+                    pendingEmailVerificationKind = .fan
+                }
+            }
+#if DEBUG
+            print("[FanSignupDraft] restoredPendingFanEmailSignupDraft=true")
+#endif
+        } catch {
+#if DEBUG
+            print("[FanSignupDraft] restoreFailed error=\(error.localizedDescription)")
+#endif
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    func persistPendingFanEmailSignupDraft(_ draft: PendingFanEmailSignupDraft) {
+        guard let url = Self.pendingFanEmailSignupDraftURL else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(draft)
+            try data.write(to: url, options: [.atomic])
+#if DEBUG
+            print("[FanSignupDraft] persistedPendingFanEmailSignupDraft=true")
+#endif
+        } catch {
+#if DEBUG
+            print("[FanSignupDraft] persistFailed error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
+    func clearPersistedPendingFanEmailSignupDraft() {
+        guard let url = Self.pendingFanEmailSignupDraftURL else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     @MainActor
@@ -132,6 +217,13 @@ extension MapViewModel {
             pendingBusinessEmailSignupDraft = verifiedDraft
             persistPendingBusinessEmailSignupDraft(verifiedDraft)
         }
+#if DEBUG
+        let venueName = pendingBusinessEmailSignupDraft?.signup.firstLocation.venueName
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        print(
+            "[BusinessSignupFlow] source=emailConfirmReturn markedVerified email=\(normalized) authUserId=\(currentUserAuthId?.uuidString.lowercased() ?? "nil") draftPresent=\(pendingBusinessEmailSignupDraft != nil) venueNameEmpty=\(venueName.isEmpty) needsVenueSetup=\(businessEmailVerifiedNeedsVenueSetup)"
+        )
+#endif
     }
 
     /// Confirmed Supabase session with a matching pending business draft → verified venue-setup state.
@@ -463,6 +555,7 @@ extension MapViewModel {
 
     func shouldPreserveMissingSessionForRestore() -> Bool {
         guard !UserDefaults.standard.bool(forKey: Self.didExplicitlyLogoutKey) else { return false }
+        if resolvingEmailConfirmation { return true }
         if hasStoredAccountModeForRestore() { return true }
         return isAuthenticatedForSocialFeatures
             || isAuthSessionRestoringForProfilePresentation
@@ -1371,6 +1464,10 @@ extension MapViewModel {
         currentUserAuthId = nil
         FanGeoUserEntitlements.reset()
         clearUnseenPokesBadgeState()
+        clearPostSignupPresentation(reason: "clearAuthenticatedSessionCaches")
+        emailVerifiedSignInNotice = ""
+        dismissPublicProfile()
+        ProfilePhase1PersonalizationCache.clear(for: nil)
 
         Task { await GameReminderNotificationService.shared.cancelAllProGameReminders() }
         savedProGames = []
@@ -2447,6 +2544,15 @@ extension MapViewModel {
                 return
             }
 
+            await MainActor.run {
+                restorePendingFanEmailSignupDraftIfNeeded()
+            }
+            if let draft = pendingFanEmailSignupDraft,
+               OwnerBusinessEmail.normalized(draft.email) == fanEmail {
+                _ = await completePendingEmailFanSignupAfterConfirmation(session: session, draft: draft)
+                return
+            }
+
             if await businessAccountExistsForOwnerEmailOrUserId(email: fanEmail, userId: session.user.id) {
 #if DEBUG
                 print("[AuthAccountTypeGate] fan login blocked businessEmail=\(fanEmail)")
@@ -2483,8 +2589,10 @@ extension MapViewModel {
                     venueOwnerMode = false
                     markAuthSignedIn(reason: "loginUser")
                     authErrorMessage = ""
+                    emailVerifiedSignInNotice = ""
                     bumpCurrentUserAvatarDisplayRefresh()
                 }
+                FanGeoStartupGuidePreferences.migrateLegacyGlobalPreferenceIfNeeded(for: session.user.id)
             }
 
             await persistAccountModeForActiveAuthSession(.fanUser)
@@ -2507,12 +2615,15 @@ extension MapViewModel {
 
                 if Self.isUnconfirmedEmailAuthError(error) {
                     authErrorMessage = "Please verify your email before signing in."
+                    emailVerifiedSignInNotice = ""
                     markEmailVerificationPending(email: fanEmail, kind: .fan)
                     print("[EmailVerifyDebug] signInBlockedUnconfirmed=true")
                 } else if message.contains("invalid login credentials") {
                     authErrorMessage = "No account found or incorrect password."
+                    emailVerifiedSignInNotice = ""
                 } else {
                     authErrorMessage = "Unable to login."
+                    emailVerifiedSignInNotice = ""
                 }
             }
 
@@ -2571,18 +2682,111 @@ extension MapViewModel {
 
     func handleEmailVerificationDeepLink(_ url: URL) async {
         guard Self.isEmailVerificationDeepLink(url) else { return }
-        print("[EmailVerifyDebug] confirmationDeepLinkReceived=true")
-        await MainActor.run {
+
+        let shouldStart = await MainActor.run { () -> Bool in
+            if resolvingEmailConfirmation {
+                return false
+            }
+            resolvingEmailConfirmation = true
+            isAuthSessionRestoringForProfilePresentation = true
+            transitionAuthSessionState(.loadingSession, reason: "emailConfirmationCallback")
             restorePendingBusinessEmailSignupDraftIfNeeded()
+            restorePendingFanEmailSignupDraftIfNeeded()
+            authErrorMessage = ""
+            venueAuthErrorMessage = ""
+            emailVerifiedSignInNotice = ""
+            emailVerificationError = ""
+            return true
+        }
+        guard shouldStart else {
+#if DEBUG
+            print("[EmailConfirmationRoute] callbackIgnored=alreadyResolving")
+#endif
+            return
+        }
+#if DEBUG
+        print("[EmailConfirmationRoute] callbackReceived=true")
+#endif
+        let params = Self.passwordResetDeepLinkParams(from: url)
+        let alreadySignedInUserId = await MainActor.run { () -> UUID? in
+            isLoggedIn ? currentUserAuthId : nil
         }
 
-        if let session = try? await supabase.auth.session(from: url) {
+        if params["error"] != nil || params["error_code"] != nil || params["error_description"] != nil {
+#if DEBUG
+            print("[EmailConfirmationRoute] exchangeResult=callbackError")
+#endif
+            await finishEmailConfirmationResolutionAsSignInRequired(
+                notice: Self.emailConfirmationLinkFailedMessage,
+                isSuccessNotice: false,
+                preserveSignedInUserId: alreadySignedInUserId
+            )
+            return
+        }
+
+#if DEBUG
+        print("[EmailConfirmationRoute] exchangeStarted=true")
+#endif
+
+        do {
+            UserDefaults.standard.set(false, forKey: Self.didExplicitlyLogoutKey)
+            let session = try await emailConfirmationSession(from: url, params: params)
             guard await passwordResetRecoverySessionIsAllowed(session: session) else {
+                await MainActor.run {
+                    resolvingEmailConfirmation = false
+                    isAuthSessionRestoringForProfilePresentation = false
+                }
                 return
             }
+
             let confirmedAt = session.user.emailConfirmedAt ?? session.user.confirmedAt
             print("[EmailConfirmDebug] emailConfirmedAt=\(confirmedAt?.description ?? "nil")")
+
+            // Idempotent: already authenticated as this confirmed user (e.g. double-tap / reuse).
+            if await MainActor.run(body: { isLoggedIn && currentUserAuthId == session.user.id }) {
+                await MainActor.run {
+                    if let draft = pendingFanEmailSignupDraft,
+                       OwnerBusinessEmail.normalized(draft.email)
+                        == OwnerBusinessEmail.normalized(session.user.email ?? "") {
+                        clearPendingFanEmailSignupDraft()
+                    }
+                    pendingEmailVerificationKind = nil
+                    businessEmailVerificationUIFlowActive = false
+                    emailVerificationError = ""
+                    emailVerificationMessage = ""
+                    emailVerifiedSignInNotice = ""
+                    authErrorMessage = ""
+                    venueAuthErrorMessage = ""
+                    resolvingEmailConfirmation = false
+                    isAuthSessionRestoringForProfilePresentation = false
+                }
+#if DEBUG
+                print("[EmailConfirmationRoute] exchangeResult=alreadySignedInIdempotent")
+#endif
+                return
+            }
+
             if await completePendingEmailSignupAfterConfirmationIfPossible(session: session) {
+#if DEBUG
+                print("[EmailConfirmationRoute] exchangeResult=sessionEstablished")
+                print("[EmailConfirmationRoute] profileState=complete")
+                print("[EmailConfirmationRoute] destination=discoverWelcomeGuide")
+#endif
+                await MainActor.run {
+                    resolvingEmailConfirmation = false
+                    isAuthSessionRestoringForProfilePresentation = false
+                    emailVerifiedSignInNotice = ""
+                    authErrorMessage = ""
+                    venueAuthErrorMessage = ""
+                }
+                return
+            }
+
+            if await activateConfirmedFanSessionAfterEmailVerification(session: session) {
+#if DEBUG
+                print("[EmailConfirmationRoute] exchangeResult=sessionEstablished")
+                print("[EmailConfirmationRoute] destination=discoverWelcomeGuide")
+#endif
                 return
             }
 
@@ -2595,50 +2799,298 @@ extension MapViewModel {
                     sessionEmail: sessionEmail,
                     source: "handleEmailVerificationDeepLink"
                 ) else {
+                    await MainActor.run {
+                        resolvingEmailConfirmation = false
+                        isAuthSessionRestoringForProfilePresentation = false
+                    }
                     return
                 }
-                await forceLogout(reason: "businessSignupResumeAfterEmailVerification", source: "MapViewModel.handleEmailVerificationDeepLink")
+                await forceLogout(
+                    reason: "businessSignupResumeAfterEmailVerification",
+                    source: "MapViewModel.handleEmailVerificationDeepLink"
+                )
                 await MainActor.run {
                     markBusinessEmailVerifiedAwaitingVenueSetup(email: sessionEmail)
                     authErrorMessage = ""
                     venueAuthErrorMessage = ""
+                    emailVerifiedSignInNotice = ""
                     openVenueOwnerAuthSheetFromClaimFlow = true
+                    resolvingEmailConfirmation = false
+                    isAuthSessionRestoringForProfilePresentation = false
+                    requestPostAccountCreationLanguageSelector(
+                        userId: session.user.id,
+                        source: "emailConfirmationBusinessVerified"
+                    )
                 }
                 return
             }
 
-            await forceLogout(reason: "emailVerificationCompleted", source: "MapViewModel.handleEmailVerificationDeepLink")
-        }
+            // Session established, email confirmed, but no fan/business draft route applied —
+            // safe fallback: ask for sign-in without framing the account as blocked.
+#if DEBUG
+            print("[EmailConfirmationRoute] exchangeResult=verifiedNoSessionRouteFallback")
+#endif
+            await forceLogout(
+                reason: "emailVerificationVerifiedAwaitingSignIn",
+                source: "MapViewModel.handleEmailVerificationDeepLink"
+            )
+            await finishEmailConfirmationResolutionAsSignInRequired(
+                notice: Self.emailVerifiedSignInContinueMessage,
+                isSuccessNotice: true,
+                prefillEmail: sessionEmail
+            )
+        } catch {
+#if DEBUG
+            print("[EmailConfirmationRoute] exchangeResult=verifiedNoSession")
+            print("[EmailConfirmationRoute] exchangeError=\(error.localizedDescription)")
+#endif
+            await MainActor.run {
+                restorePendingBusinessEmailSignupDraftIfNeeded()
+                restorePendingFanEmailSignupDraftIfNeeded()
+            }
 
-        await MainActor.run {
-            clearEmailVerificationPending()
-            if let draft = pendingBusinessEmailSignupDraft {
+            // Preserve an already-authenticated session on invalid/expired/reused links.
+            if let alreadySignedInUserId,
+               await MainActor.run(body: { isLoggedIn && currentUserAuthId == alreadySignedInUserId }) {
+                await MainActor.run {
+                    resolvingEmailConfirmation = false
+                    isAuthSessionRestoringForProfilePresentation = false
+                    emailVerifiedSignInNotice = ""
+                    authErrorMessage = ""
+                }
+#if DEBUG
+                print("[EmailConfirmationRoute] exchangeResult=preservedExistingSession")
+#endif
+                return
+            }
+
+            if let draft = await MainActor.run(body: { pendingBusinessEmailSignupDraft }) {
                 let draftEmail = OwnerBusinessEmail.normalized(draft.email)
                 if OwnerBusinessEmail.isValidStrict(draftEmail) {
-                    markBusinessEmailVerifiedAwaitingVenueSetup(email: draftEmail)
-                    authErrorMessage = ""
-                    venueAuthErrorMessage = ""
-                    emailVerificationMessage = "Email verified. Sign in to add your first venue for FanGeo review."
-                    emailVerificationError = ""
-                    openVenueOwnerAuthSheetFromClaimFlow = true
+                    await MainActor.run {
+                        markBusinessEmailVerifiedAwaitingVenueSetup(email: draftEmail)
+                        authErrorMessage = ""
+                        venueAuthErrorMessage = ""
+                        emailVerificationMessage = "Email verified. Sign in to add your first venue for FanGeo review."
+                        emailVerificationError = ""
+                        emailVerifiedSignInNotice = ""
+                        openVenueOwnerAuthSheetFromClaimFlow = true
+                        resolvingEmailConfirmation = false
+                        isAuthSessionRestoringForProfilePresentation = false
+                        markAuthSignedOut(reason: "emailConfirmationBusinessVerifiedNoSession")
+                    }
                     return
                 }
             }
-            authErrorMessage = "Email verified. You can now sign in."
-            venueAuthErrorMessage = "Email verified. You can now sign in."
-            emailVerificationMessage = "Email verified. You can now sign in."
-            emailVerificationError = ""
+
+            let prefill = await MainActor.run { () -> String in
+                if let draft = pendingFanEmailSignupDraft {
+                    return OwnerBusinessEmail.normalized(draft.email)
+                }
+                return OwnerBusinessEmail.normalized(pendingEmailVerificationEmail)
+            }
+            let hasPendingFanSignup = await MainActor.run {
+                pendingFanEmailSignupDraft != nil
+                    || OwnerBusinessEmail.isValidStrict(OwnerBusinessEmail.normalized(pendingEmailVerificationEmail))
+            }
+            await finishEmailConfirmationResolutionAsSignInRequired(
+                notice: hasPendingFanSignup
+                    ? Self.emailVerifiedSignInContinueMessage
+                    : Self.emailConfirmationLinkFailedMessage,
+                isSuccessNotice: hasPendingFanSignup,
+                prefillEmail: prefill,
+                preserveSignedInUserId: alreadySignedInUserId
+            )
         }
+    }
+
+    private func emailConfirmationSession(from url: URL, params: [String: String]) async throws -> Session {
+        if let accessToken = params["access_token"], let refreshToken = params["refresh_token"] {
+            return try await supabase.auth.setSession(accessToken: accessToken, refreshToken: refreshToken)
+        }
+
+        if let tokenHash = params["token_hash"] ?? params["token_hashes"] {
+            let typeRaw = (params["type"] ?? "signup").lowercased()
+            let otpType = EmailOTPType(rawValue: typeRaw) ?? .signup
+            let response = try await supabase.auth.verifyOTP(tokenHash: tokenHash, type: otpType)
+            if let session = response.session {
+                return session
+            }
+            struct EmailConfirmationVerifiedWithoutSessionError: Error {}
+            throw EmailConfirmationVerifiedWithoutSessionError()
+        }
+
+        return try await supabase.auth.session(from: url)
+    }
+
+    @MainActor
+    private func finishEmailConfirmationResolutionAsSignInRequired(
+        notice: String,
+        isSuccessNotice: Bool,
+        prefillEmail: String = "",
+        preserveSignedInUserId: UUID? = nil
+    ) async {
+        // Invalid/expired/reused confirmation links must not tear down an active session.
+        if let preserveSignedInUserId,
+           isLoggedIn,
+           currentUserAuthId == preserveSignedInUserId {
+            resolvingEmailConfirmation = false
+            isAuthSessionRestoringForProfilePresentation = false
+            emailVerifiedSignInNotice = ""
+            if !isSuccessNotice {
+                // Keep soft diagnostics only; do not surface blocked-account UI.
+                emailVerificationError = ""
+                authErrorMessage = ""
+            }
+#if DEBUG
+            print("[EmailConfirmationRoute] destination=preservedSignedInSession")
+#endif
+            return
+        }
+
+        let normalizedPrefill = OwnerBusinessEmail.normalized(prefillEmail)
+        resolvingEmailConfirmation = false
+        isAuthSessionRestoringForProfilePresentation = false
+        markAuthSignedOut(reason: "emailConfirmationRequiresSignIn")
+
+        // Keep pending fan draft for profile creation after sign-in.
+        pendingEmailVerificationKind = nil
+        businessEmailVerificationUIFlowActive = false
+        emailVerificationError = isSuccessNotice ? "" : notice
+        emailVerificationMessage = ""
+        authErrorMessage = ""
+        venueAuthErrorMessage = ""
+
+        if OwnerBusinessEmail.isValidStrict(normalizedPrefill) {
+            pendingEmailVerificationEmail = normalizedPrefill
+        }
+
+        if isSuccessNotice {
+            emailVerifiedSignInNotice = notice
+#if DEBUG
+            print("[EmailConfirmationRoute] destination=signInVerifiedNotice")
+#endif
+        } else {
+            emailVerifiedSignInNotice = ""
+            authErrorMessage = notice
+#if DEBUG
+            print("[EmailConfirmationRoute] destination=signInRecoverableError")
+#endif
+        }
+
+        fanUserAuthSheetOpenInRegisterMode = false
+        presentFanUserAuthSheetFromDiscover = true
+    }
+
+    private func activateConfirmedFanSessionAfterEmailVerification(session: Session) async -> Bool {
+        guard Self.userEmailConfirmed(session.user) else { return false }
+        let fanEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
+        guard OwnerBusinessEmail.isValidStrict(fanEmail) else { return false }
+
+        if let businessDraft = pendingBusinessEmailSignupDraft,
+           OwnerBusinessEmail.normalized(businessDraft.email) == fanEmail {
+            return false
+        }
+
+        if await businessAccountExistsForOwnerEmailOrUserId(email: fanEmail, userId: session.user.id) {
+            return false
+        }
+
+        if let draft = pendingFanEmailSignupDraft,
+           OwnerBusinessEmail.normalized(draft.email) == fanEmail {
+            return await completePendingEmailFanSignupAfterConfirmation(session: session, draft: draft)
+        }
+
+        if await refreshActiveBanGate(reason: "emailConfirmationFanActivate") {
+            await MainActor.run {
+                resolvingEmailConfirmation = false
+                isAuthSessionRestoringForProfilePresentation = false
+            }
+            return true
+        }
+
+        guard await claimAccountIdentity(.fan, context: "emailConfirmationFanActivate") else {
+            await MainActor.run {
+                resolvingEmailConfirmation = false
+                isAuthSessionRestoringForProfilePresentation = false
+            }
+            return true
+        }
+
+        if await enforceDeletedFanAccountLoginGate(
+            userId: session.user.id,
+            sessionEmail: fanEmail,
+            source: "emailConfirmationFanActivate"
+        ) {
+            await MainActor.run {
+                resolvingEmailConfirmation = false
+                isAuthSessionRestoringForProfilePresentation = false
+            }
+            return true
+        }
+
+        if !(await checkCurrentUserAdminStatus()) {
+            await MainActor.run {
+                resolvingEmailConfirmation = false
+                isAuthSessionRestoringForProfilePresentation = false
+            }
+            return true
+        }
+
+        let shouldRequestWelcomeGuide = await MainActor.run {
+            pendingEmailVerificationKind == .fan || pendingFanEmailSignupDraft != nil
+        }
+
+        await MainActor.run {
+            beginFanLoginSession(
+                userId: session.user.id,
+                reason: "emailConfirmationFanActivate",
+                email: fanEmail
+            ) {
+                isLoggedIn = true
+                isVenueOwnerLoggedIn = false
+                venueOwnerMode = false
+                markAuthSignedIn(reason: "emailConfirmationFanActivate")
+                authErrorMessage = ""
+                venueAuthErrorMessage = ""
+                emailVerifiedSignInNotice = ""
+                emailVerificationError = ""
+                emailVerificationMessage = ""
+                pendingEmailVerificationKind = nil
+                businessEmailVerificationUIFlowActive = false
+                bumpCurrentUserAvatarDisplayRefresh()
+            }
+            resolvingEmailConfirmation = false
+            isAuthSessionRestoringForProfilePresentation = false
+            if shouldRequestWelcomeGuide {
+                markPostSignupDiscoverWelcomeGuideIfPossible(source: "emailConfirmationFanActivate")
+            } else {
+                FanGeoStartupGuidePreferences.migrateLegacyGlobalPreferenceIfNeeded(for: session.user.id)
+            }
+        }
+
+        await persistAccountModeForActiveAuthSession(.fanUser)
+        clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+        await registerFanActiveSessionOnLogin()
+        Task {
+            await loadFavoriteTeamsFromSupabase(forceRefresh: true)
+            await refreshUserPersonalizationInBackground()
+        }
+#if DEBUG
+        print("[EmailConfirmationRoute] profileState=existingOrLoading")
+#endif
+        return true
     }
 
     private func completePendingEmailSignupAfterConfirmationIfPossible(session: Session) async -> Bool {
         await MainActor.run {
             restorePendingBusinessEmailSignupDraftIfNeeded()
+            restorePendingFanEmailSignupDraftIfNeeded()
         }
         guard Self.userEmailConfirmed(session.user) else { return false }
         let sessionEmail = OwnerBusinessEmail.normalized(session.user.email ?? "")
 
-        if pendingEmailVerificationKind == .fan,
+        if (pendingEmailVerificationKind == .fan || pendingFanEmailSignupDraft != nil),
            let draft = pendingFanEmailSignupDraft,
            OwnerBusinessEmail.normalized(draft.email) == sessionEmail {
             print("[EmailConfirmDebug] creatingProfileAfterConfirmation=true")
@@ -2916,6 +3368,7 @@ extension MapViewModel {
             isVenueOwnerLoggedIn = false
             venueOwnerMode = false
             venueOwnerEmail = ""
+            FanGeoStartupGuidePreferences.migrateLegacyGlobalPreferenceIfNeeded(for: session.user.id)
             isAdminLoggedIn = false
             isBusinessOwnerSessionRestorePending = false
             currentUserAuthId = session.user.id
@@ -3072,6 +3525,8 @@ extension MapViewModel {
             authSessionRestoreID = restoreID
             isAuthSessionRestoringForProfilePresentation = true
             transitionAuthSessionState(.loadingSession, reason: "bootstrapStart")
+            restorePendingFanEmailSignupDraftIfNeeded()
+            restorePendingBusinessEmailSignupDraftIfNeeded()
         }
         logBusinessSessionRestoreDebug("bootstrapStart=true")
         defer {
@@ -3466,7 +3921,8 @@ extension MapViewModel {
     func checkUsernameAvailable(_ rawHandle: String) async -> Bool? {
         let stored = FanGeoHandleRules.normalizeForStorage(rawHandle)
         print("[HandleValidationDebug] normalizedHandle=\(stored)")
-        guard FanGeoHandleRules.validate(rawHandle) == nil else {
+        // Format only — reserved-token policy is enforced by edit/signup validators before this RPC.
+        guard FanGeoHandleRules.validateFormat(rawHandle) == nil else {
             print("[HandleValidationDebug] handleRejected reason=invalid")
             return false
         }
@@ -3606,6 +4062,7 @@ extension MapViewModel {
         print("[ProfileSave] profile upsert id = \(authId)")
         print("[ProfileSave] current email = \(emailForRow)")
         print("[ProfilePersistenceDebug] loadingProfileForUserId=\(authId.uuidString.lowercased())")
+        print("[FanProfileSave] requestStarted table=user_profiles")
 #endif
 
         if let cached = currentUserAuthId, cached != authId {
@@ -3663,30 +4120,90 @@ extension MapViewModel {
             finalDisplayName = displayName
         }
 
-        if ReservedNameValidation.containsReservedTerm(finalDisplayName) {
-            return ReservedNameValidation.rejectionMessage
+        if let nameReservedError = ReservedNameValidation.editReservedRejectionMessage(
+            edited: finalDisplayName,
+            original: existingDisplay.isEmpty ? currentUserDisplayName : existingDisplay
+        ) {
+#if DEBUG
+            print("[FanProfileValidation] originalDisplayName=\(existingDisplay.isEmpty ? currentUserDisplayName : existingDisplay)")
+            print("[FanProfileValidation] draftDisplayName=\(finalDisplayName)")
+            print("[FanProfileValidation] reservedDisplayNameResult=true")
+            print("[FanProfileValidation] saveAllowed=false reason=reservedDisplayName")
+#endif
+            return nameReservedError
         }
+#if DEBUG
+        if ReservedNameValidation.containsReservedTerm(finalDisplayName) {
+            print("[FanProfileValidation] reservedDisplayNameResult=grandfatheredBaselineTokens")
+        }
+#endif
 
         if let username {
-            if let issue = FanGeoHandleRules.validate(username) {
-                print("[HandleValidationDebug] handleRejected reason=\(issue)")
-                return FanGeoHandleRules.validationMessage(for: issue)
-            }
             let stored = FanGeoHandleRules.normalizeForStorage(username)
-            print("[HandleValidationDebug] normalizedHandle=\(stored)")
-            guard !stored.isEmpty else {
-                print("[HandleValidationDebug] handleRejected reason=empty")
-                return "Choose a @handle."
-            }
-            if let available = await checkUsernameAvailable(stored) {
-                if !available {
-                    print("[HandleValidationDebug] handleRejected reason=already_taken")
-                    return "That handle is already taken."
+            let existingHandleRaw = Self.trimmedNonEmpty(existingProfile?.username).isEmpty
+                ? currentUserUsername
+                : Self.trimmedNonEmpty(existingProfile?.username)
+            let existingStored = FanGeoHandleRules.normalizeForStorage(existingHandleRaw)
+            let handleChanged = stored != existingStored
+#if DEBUG
+            print("[FanProfileValidation] originalHandle=\(existingHandleRaw)")
+            print("[FanProfileValidation] draftHandle=\(username)")
+            print("[FanProfileValidation] normalizedOriginalHandle=\(existingStored)")
+            print("[FanProfileValidation] normalizedDraftHandle=\(stored)")
+            print("[FanProfileValidation] handleChanged=\(handleChanged)")
+#endif
+            if handleChanged {
+                if let handleError = FanIdentityValidation.validateHandleForEdit(
+                    username,
+                    original: existingHandleRaw
+                ) {
+                    print("[HandleValidationDebug] handleRejected reason=editValidation")
+#if DEBUG
+                    print("[FanProfileValidation] reservedHandleResult=\(handleError == ReservedNameValidation.rejectionMessage)")
+                    print("[FanProfileValidation] handleAvailabilityState=skipped_invalid")
+                    print("[FanProfileValidation] saveAllowed=false reason=handleInvalid")
+#endif
+                    return handleError
+                }
+                print("[HandleValidationDebug] normalizedHandle=\(stored)")
+                guard !stored.isEmpty else {
+                    print("[HandleValidationDebug] handleRejected reason=empty")
+#if DEBUG
+                    print("[FanProfileValidation] handleAvailabilityState=empty")
+                    print("[FanProfileValidation] saveAllowed=false reason=emptyHandle")
+#endif
+                    return "Choose a @handle."
+                }
+                if let available = await checkUsernameAvailable(stored) {
+#if DEBUG
+                    print("[FanProfileValidation] reservedHandleResult=false")
+                    print("[FanProfileValidation] handleAvailabilityState=\(available ? "available" : "taken")")
+#endif
+                    if !available {
+                        print("[HandleValidationDebug] handleRejected reason=already_taken")
+#if DEBUG
+                        print("[FanProfileValidation] saveAllowed=false reason=handleTaken")
+#endif
+                        return "That handle is already taken."
+                    }
+                } else {
+#if DEBUG
+                    print("[FanProfileValidation] handleAvailabilityState=rpc_failed")
+                    print("[FanProfileValidation] saveAllowed=false reason=handleAvailabilityUnknown")
+#endif
+                    return "Could not verify whether this handle is available. Please try again."
                 }
             } else {
-                return "Could not verify whether this handle is available. Please try again."
+#if DEBUG
+                print("[FanProfileValidation] reservedHandleResult=skippedUnchanged")
+                print("[FanProfileValidation] handleAvailabilityState=skippedUnchangedOwnHandle")
+#endif
             }
         }
+
+#if DEBUG
+        print("[FanProfileValidation] saveAllowed=true")
+#endif
 
         let usernameToSave: String? = {
             if let username {
@@ -3865,6 +4382,8 @@ extension MapViewModel {
 #if DEBUG
             print("[ProfileBioDebug] saveBio=\(finalBioToSave ?? "")")
             print("[ProfileBioDebug] savedUserProfilesBio=\(finalBioToSave ?? "")")
+            print("[FanProfileSave] requestSucceeded table=user_profiles username=\(finalUsernameToSave ?? "") bioLen=\(finalBioToSave?.count ?? 0)")
+            print("[FanProfileSave] profileRefreshed=true source=localViewModelCache")
 #endif
             print("[HandleValidationDebug] profileSaved handle=\(finalUsernameToSave.map { FanGeoHandleRules.displayHandle(stored: $0) } ?? "nil")")
             print("USER PROFILE SAVED")
@@ -3872,6 +4391,9 @@ extension MapViewModel {
 
         } catch {
             print("ERROR SAVING USER PROFILE:", error)
+#if DEBUG
+            print("[FanProfileSave] requestFailed=\(error.localizedDescription)")
+#endif
             if Self.isDuplicateUsernameConstraintViolation(error) {
                 return "That handle is already taken."
             }
@@ -3934,6 +4456,29 @@ extension MapViewModel {
 
             await MainActor.run {
                 isUpdatingProfileDiscoverabilitySetting = false
+            }
+
+            // Discoverability alone is not Nearby — write a fresh coarse location when enabling.
+            FansNearbyService.shared.invalidateAmongMembership(reason: "discoverabilityChanged")
+            if discoverable {
+                _ = await refreshCurrentUserLocationIfAuthorized(timeoutSeconds: 5)
+                await MainActor.run {
+                    if let coordinate = currentUserLocation {
+                        PresenceService.shared.updateHeartbeatLocation(
+                            latitude: coordinate.latitude,
+                            longitude: coordinate.longitude
+                        )
+                    }
+                    PresenceService.shared.startIfNeeded(
+                        userID: session.user.id,
+                        isAuthenticated: true,
+                        reason: "discoverabilityEnabled"
+                    )
+                }
+                _ = await PresenceService.shared.sendHeartbeatAwaitingWrite(
+                    reason: "discoverabilityEnabled",
+                    force: true
+                )
             }
         } catch {
 #if DEBUG

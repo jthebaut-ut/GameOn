@@ -191,8 +191,16 @@ extension MapViewModel {
             discoverClusteredBarsCacheKey = nil
             discoverClusteredBarsCache = nil
             discoverSearchDebounceTask = nil
+            if suppressDiscoverSearchFilterClearOnce {
+                suppressDiscoverSearchFilterClearOnce = false
+            } else {
+                clearDiscoverVenueEventSearchFilter()
+            }
             return
         }
+
+        // A new typed query replaces any prior game/sport venue filter.
+        clearDiscoverVenueEventSearchFilter()
 
         discoverSearchDebounceTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -319,6 +327,7 @@ extension MapViewModel {
     func clearDiscoverVenueSearchForSelection() {
         discoverSearchDebounceTask?.cancel()
         discoverSearchDebounceTask = nil
+        suppressDiscoverSearchFilterClearOnce = true
         searchText = ""
         debouncedDiscoverSearchText = ""
         venueSearchResults = []
@@ -351,6 +360,7 @@ extension MapViewModel {
 #endif
         }
         discoverRemotePreviewHoldVenueId = nil
+        clearDiscoverVenueEventSearchFilter()
 
         clearDiscoverVenueSearchForSelection()
 #if DEBUG
@@ -359,5 +369,198 @@ extension MapViewModel {
         print("[VenueSearchSelect] venue=\(canonical.name) date=\(dateLabel) gamesForPreview=\(n)")
 #endif
         centerMap(on: canonical)
+    }
+
+    // MARK: - Venue-event search (selected-date, in-memory)
+
+    func clearDiscoverVenueEventSearchFilter() {
+        discoverSearchVenueIDFilter = nil
+        discoverSearchFilterStatusText = nil
+    }
+
+    func discoverVenueEventSearchIndex() -> DiscoverVenueEventSearch.Index {
+        let key = discoverVenueEventSearchIndexCacheSignature()
+        if let cached = discoverVenueEventSearchIndexCache,
+           discoverVenueEventSearchIndexCacheKey == key {
+            return cached
+        }
+        let built = DiscoverVenueEventSearch.buildIndex(
+            rows: venueEventRows,
+            bars: bars,
+            selectedDate: selectedDate
+        )
+        discoverVenueEventSearchIndexCache = built
+        discoverVenueEventSearchIndexCacheKey = key
+        return built
+    }
+
+    /// Invalidates when day, row count, bar count, or sampled event identity changes (not count-only).
+    private func discoverVenueEventSearchIndexCacheSignature() -> String {
+        let day = DiscoverVenueEventSearch.dayString(for: selectedDate)
+        let rows = venueEventRows
+        let n = rows.count
+        guard n > 0 else { return "\(day)|0|\(bars.count)" }
+        let mid = rows[n / 2]
+        let sample = [
+            rows[0].id?.uuidString ?? "",
+            mid.id?.uuidString ?? "",
+            rows[n - 1].id?.uuidString ?? "",
+            rows[0].home_team ?? "",
+            rows[n - 1].away_team ?? "",
+            rows[0].event_title ?? "",
+            rows[n - 1].event_title ?? ""
+        ].joined(separator: ":")
+        return "\(day)|\(n)|\(bars.count)|\(sample)"
+    }
+
+    func discoverVenueEventSearchSuggestions(
+        for query: String,
+        languageCode: String
+    ) -> [DiscoverVenueEventSearch.Suggestion] {
+        let index = discoverVenueEventSearchIndex()
+        let dateLabel = selectedDate.formatted(date: .abbreviated, time: .omitted)
+        return DiscoverVenueEventSearch.suggestions(
+            query: query,
+            index: index,
+            selectedDateLabel: dateLabel,
+            languageCode: languageCode
+        )
+    }
+
+    /// Applies a selected game/team/league venue filter for the current visible map region without changing the Discover date.
+    func applyDiscoverVenueEventSearchSelection(
+        venueIDs: [UUID],
+        subjectTitle: String,
+        languageCode: String,
+        restrictToVisibleRegion: Bool = true
+    ) {
+        let uniqueIDs = Array(Set(venueIDs))
+        let candidates = uniqueIDs.compactMap { id in bars.first(where: { $0.id == id }) }
+        let region = cameraPosition.region
+        let matchingBars: [BarVenue] = {
+            guard restrictToVisibleRegion else { return candidates }
+            return candidates.filter { isBarCoordinate($0, in: region) }
+        }()
+        clearDiscoverVenueSearchForSelection()
+        dismissKeyboardIfNeededForDiscoverSearch()
+
+        let dateLabel = selectedDate.formatted(date: .abbreviated, time: .omitted)
+        guard !matchingBars.isEmpty else {
+            discoverSearchVenueIDFilter = []
+            discoverSearchFilterStatusText = String(
+                format: L10n.t("discover_search_no_venues_in_area_showing_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                subjectTitle,
+                dateLabel
+            )
+            selectedBar = nil
+            selectedEvent = nil
+            return
+        }
+
+        discoverSearchVenueIDFilter = Set(matchingBars.map(\.id))
+        if matchingBars.count == 1 {
+            discoverSearchFilterStatusText = String(
+                format: L10n.t("discover_search_one_venue_in_area_showing_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                subjectTitle
+            )
+            // Venue is already in the visible region — focus without a large camera jump.
+            selectedBar = matchingBars[0]
+            selectedEvent = nil
+            discoverRemotePreviewHoldVenueId = nil
+        } else {
+            discoverSearchFilterStatusText = String(
+                format: L10n.t("discover_search_venues_in_area_showing_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                matchingBars.count,
+                subjectTitle
+            )
+            selectedBar = nil
+            selectedEvent = nil
+            discoverRemotePreviewHoldVenueId = nil
+            // Keep the current regional camera; do not zoom out to distant matches.
+        }
+    }
+
+    func applyDiscoverSportSearchSelection(_ sportToken: String, languageCode: String) {
+        clearDiscoverVenueEventSearchFilter()
+        clearDiscoverVenueSearchForSelection()
+        let resolved = sportToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolved.isEmpty else { return }
+        sportChanged(to: resolved)
+        let index = discoverVenueEventSearchIndex()
+        let matchIDs = DiscoverVenueEventSearch.venuesShowingSport(sport: resolved, index: index).map(\.venueID)
+        let region = cameraPosition.region
+        let matchingBars = Array(Set(matchIDs))
+            .compactMap { id in bars.first(where: { $0.id == id }) }
+            .filter { isBarCoordinate($0, in: region) }
+        let label = AppSportCatalog.displayLabel(forSportToken: resolved)
+        let dateLabel = selectedDate.formatted(date: .abbreviated, time: .omitted)
+        if matchingBars.isEmpty {
+            discoverSearchVenueIDFilter = []
+            discoverSearchFilterStatusText = String(
+                format: L10n.t("discover_search_no_venues_in_area_sport_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                label,
+                dateLabel
+            )
+            selectedBar = nil
+            selectedEvent = nil
+        } else {
+            discoverSearchVenueIDFilter = Set(matchingBars.map(\.id))
+            discoverSearchFilterStatusText = matchingBars.count == 1
+                ? String(
+                    format: L10n.t("discover_search_one_venue_in_area_showing_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    label
+                )
+                : String(
+                    format: L10n.t("discover_search_venues_in_area_showing_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    matchingBars.count,
+                    label
+                )
+            if matchingBars.count == 1 {
+                selectedBar = matchingBars[0]
+                selectedEvent = nil
+                discoverRemotePreviewHoldVenueId = nil
+            } else {
+                selectedBar = nil
+                selectedEvent = nil
+                discoverRemotePreviewHoldVenueId = nil
+            }
+        }
+    }
+
+    func fitDiscoverMap(to venues: [BarVenue]) {
+        guard !venues.isEmpty else { return }
+        if venues.count == 1 {
+            centerMap(on: venues[0], selectForPreview: false)
+            return
+        }
+        let lats = venues.map(\.coordinate.latitude)
+        let lons = venues.map(\.coordinate.longitude)
+        guard let minLat = lats.min(), let maxLat = lats.max(),
+              let minLon = lons.min(), let maxLon = lons.max() else {
+            return
+        }
+        let center = CLLocationCoordinate2D(
+            latitude: (minLat + maxLat) / 2,
+            longitude: (minLon + maxLon) / 2
+        )
+        let latDelta = max((maxLat - minLat) * 1.45, 0.05)
+        let lonDelta = max((maxLon - minLon) * 1.45, 0.05)
+        cameraPosition = .region(
+            MKCoordinateRegion(
+                center: center,
+                span: MKCoordinateSpan(latitudeDelta: latDelta, longitudeDelta: lonDelta)
+            )
+        )
+        visibleLatitudeDelta = latDelta
+    }
+
+    private func dismissKeyboardIfNeededForDiscoverSearch() {
+        // Selection paths already dismiss keyboard from the view layer; no-op here.
     }
 }

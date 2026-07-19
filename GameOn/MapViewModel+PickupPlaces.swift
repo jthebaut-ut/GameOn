@@ -445,6 +445,12 @@ extension MapViewModel {
         return rows.filter { pickupPlace($0, matchesSearch: q) }
     }
 
+    /// Canonical Discover count for visible pickup places (same filter stage as rendered map pins).
+    /// Use this for dock status and any UI that claims the visible place total — never a parallel tally.
+    var discoverVisiblePickupPlaceCount: Int {
+        pickupPlacesVisibleAsMapPins(for: currentMapRegionBounds()).count
+    }
+
     private func pickupPlace(_ place: PickupPlaceRow, matchesSport selected: String) -> Bool {
         place.sportTags.contains { tag in
             tag.localizedCaseInsensitiveContains(selected)

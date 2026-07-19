@@ -2,16 +2,41 @@ import Foundation
 import Supabase
 
 /// Filters Suggested Fans to match the same eligibility rules as ``PublicUserProfileService/load(userId:)``.
+///
+/// Important: `user_profiles` RLS allows authenticated clients to SELECT only their own row
+/// (`id = auth.uid()`). Direct profile-row lookups therefore cannot verify other candidates.
+/// Missing row data must **not** exclude a candidate; public visibility is decided by
+/// ``PublicUserProfileService/isPublicIdentityVisible(userId:)`` (SECURITY DEFINER RPC).
 enum SuggestedFansEligibility {
     enum ExclusionReason: String {
         case selfUser = "self"
         case blocked = "blocked"
-        case missingProfileRow = "missing_profile_row"
         case deleted = "deleted"
         case notDiscoverable = "not_discoverable"
         case businessAccount = "business_account"
         case inactiveAdmin = "inactive_admin"
         case publicIdentityHidden = "public_identity_hidden"
+        /// Row absent because of RLS or transient fetch — not an exclusion by itself.
+        case profileRowUnavailable = "profile_row_unavailable"
+    }
+
+    struct FilterSummary: Sendable {
+        var backendRows: Int = 0
+        var decodedRows: Int = 0
+        var clientVisibleRows: Int = 0
+        var blocked: Int = 0
+        var selfExcluded: Int = 0
+        var deleted: Int = 0
+        var notDiscoverable: Int = 0
+        var businessAccount: Int = 0
+        var inactiveAdmin: Int = 0
+        var publicIdentityHidden: Int = 0
+        var profileRowUnavailable: Int = 0
+        var alreadyFriends: Int = 0
+        var banned: Int = 0
+        var missingLocation: Int = 0
+        var outsideRadius: Int = 0
+        var belowScore: Int = 0
     }
 
     private static let profileSelect =
@@ -28,12 +53,17 @@ enum SuggestedFansEligibility {
             .execute()
             .value) ?? []
 
-        return Dictionary(uniqueKeysWithValues: rows.compactMap { row in
-            guard let id = row.id else { return nil }
-            return (id, row)
-        })
+        return Dictionary(
+            rows.compactMap { row -> (UUID, UserProfileRow)? in
+                guard let id = row.id else { return nil }
+                return (id, row)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
+    /// Returns an exclusion reason when the optional readable profile row proves ineligibility.
+    /// Returns `nil` when the candidate should proceed to the public-identity visibility check.
     static func clientExclusionReason(
         userId: UUID,
         profileRow: UserProfileRow?,
@@ -47,7 +77,8 @@ enum SuggestedFansEligibility {
             return .blocked
         }
         guard let row = profileRow else {
-            return .missingProfileRow
+            // Own-row RLS prevents reading other fans — defer to public identity RPC.
+            return nil
         }
         if row.isDeletedAccount {
             return .deleted
@@ -71,22 +102,37 @@ enum SuggestedFansEligibility {
         viewerId: UUID?,
         profileRowsById: [UUID: UserProfileRow],
         isBlocked: (UUID) -> Bool
-    ) async -> [FriendSuggestionProfile] {
-#if DEBUG
-        print("[SuggestedFansDebug] rawCount=\(suggestions.count)")
-#endif
-
+    ) async -> (eligible: [FriendSuggestionProfile], summary: FilterSummary) {
+        var summary = FilterSummary(
+            backendRows: suggestions.count,
+            decodedRows: suggestions.count
+        )
         var eligible: [FriendSuggestionProfile] = []
         eligible.reserveCapacity(suggestions.count)
 
         for suggestion in suggestions {
             let userId = suggestion.userID
+            let row = profileRowsById[userId]
+            if row == nil {
+                summary.profileRowUnavailable += 1
+            }
+
             if let reason = clientExclusionReason(
                 userId: userId,
-                profileRow: profileRowsById[userId],
+                profileRow: row,
                 viewerId: viewerId,
                 isBlocked: isBlocked(userId)
             ) {
+                switch reason {
+                case .selfUser: summary.selfExcluded += 1
+                case .blocked: summary.blocked += 1
+                case .deleted: summary.deleted += 1
+                case .notDiscoverable: summary.notDiscoverable += 1
+                case .businessAccount: summary.businessAccount += 1
+                case .inactiveAdmin: summary.inactiveAdmin += 1
+                case .publicIdentityHidden, .profileRowUnavailable:
+                    break
+                }
 #if DEBUG
                 print("[SuggestedFansDebug] excluded reason=\(reason.rawValue) user_id=\(userId.uuidString.lowercased())")
 #endif
@@ -95,6 +141,7 @@ enum SuggestedFansEligibility {
 
             let visible = await PublicUserProfileService.isPublicIdentityVisible(userId: userId)
             guard visible else {
+                summary.publicIdentityHidden += 1
 #if DEBUG
                 print("[SuggestedFansDebug] excluded reason=\(ExclusionReason.publicIdentityHidden.rawValue) user_id=\(userId.uuidString.lowercased())")
 #endif
@@ -104,9 +151,7 @@ enum SuggestedFansEligibility {
             eligible.append(suggestion)
         }
 
-#if DEBUG
-        print("[SuggestedFansDebug] finalCount=\(eligible.count)")
-#endif
-        return eligible
+        summary.clientVisibleRows = eligible.count
+        return (eligible, summary)
     }
 }

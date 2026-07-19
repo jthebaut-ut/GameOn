@@ -8,7 +8,7 @@ enum ChatInboxListItem: Identifiable {
     var id: String {
         switch self {
         case .conversation(let friend):
-            return "chat-conversation-\(friend.id.uuidString)"
+            return "chat-\(friend.inboxKind.rawValue)-\(friend.id.uuidString.lowercased())"
         case .nativeAd(let slot):
             return slot.id
         }
