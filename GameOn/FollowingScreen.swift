@@ -33,6 +33,7 @@ struct FollowingScreen: View {
     @State private var pickupDetailNav: PickupDetailNavigationToken?
     @State private var followingPickupWithdrawConfirm: PickupJoinWithdrawConfirmState?
     @State private var followingPickupWithdrawInFlight = false
+    @State private var followingPickupPlayingClearConfirm: PickupPlayingClearConfirmState?
 
     @State private var followingMyPickupClockTick: Date = Date()
     @State private var followingMyPickupFormMode: PickupGameFormMode?
@@ -104,6 +105,10 @@ struct FollowingScreen: View {
         static let proGamesStatusIndicatorMinVisibleDelayNs: UInt64 = 300_000_000
     }
 
+    /// First-open two-phase: background paints before list/card construction.
+    /// Stays true after the first activation so later visits remain immediate.
+    @State private var goingHeavyContentReady = false
+
     private let followingMyPickupMinuteTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     /// Nil while Going tab is not selected so lazy mount does not trigger global refresh at launch.
@@ -153,6 +158,7 @@ struct FollowingScreen: View {
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "Going")
         followingLifecycleRoot
     }
 
@@ -171,7 +177,11 @@ struct FollowingScreen: View {
     @ViewBuilder
     private var followingRootContent: some View {
         if isFollowingTabSelected {
-            followingActiveContent
+            if goingHeavyContentReady {
+                followingActiveContent
+            } else {
+                goingFirstFrameShell
+            }
         } else {
             followingOffTabPlaceholder
         }
@@ -182,6 +192,17 @@ struct FollowingScreen: View {
         Color.clear
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityHidden(true)
+    }
+
+    /// One-frame background while cached paint / list construction yields past the selection frame.
+    private var goingFirstFrameShell: some View {
+        ZStack {
+            Color.clear
+                .fanGeoScreenBackground()
+                .ignoresSafeArea()
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var followingActiveContent: some View {
@@ -297,6 +318,7 @@ struct FollowingScreen: View {
             _ = paintGoingTabFromCachedStateImmediately(reason: "appear")
         }
         if isFollowingTabSelected {
+            activateGoingHeavyContentIfNeeded(source: "onAppear")
             scheduleGoingProGamesDisplayCacheRebuild(reason: "appear")
         }
         sanitizeBusinessGoingModeIfNeeded()
@@ -306,7 +328,9 @@ struct FollowingScreen: View {
         }
         guard isFollowingTabSelected else { return }
         guard viewModel.isAuthenticatedForSocialFeatures else { return }
-        _ = runGoingTabSelectionActivationIfNeeded(source: "onAppear")
+        if goingHeavyContentReady {
+            _ = runGoingTabSelectionActivationIfNeeded(source: "onAppear")
+        }
     }
 
     private func handleFollowingAuthIdChange(_ newId: UUID?) {
@@ -346,9 +370,12 @@ struct FollowingScreen: View {
 
     private func handleFollowingTabSelectionChange(_ visible: Bool) {
         if visible {
+            let firstOpen = !goingHeavyContentReady
             AppPerfDebug.screenLoadStart(tab: "following", source: "tabVisible")
+            GoingActivationPerf.selected(source: "tabVisible", firstOpen: firstOpen)
+            GoingActivationPerf.shellVisible(cachedContentUsable: goingTabHasCachedContentForImmediatePaint())
             prepareGoingTabSelectionGeneration()
-            _ = runGoingTabSelectionActivationIfNeeded(source: "tabVisible")
+            activateGoingHeavyContentIfNeeded(source: "tabVisible")
             applyPendingDiscoverTodayDashboardNavIfNeeded()
             Task { @MainActor in
                 await Task.yield()
@@ -361,6 +388,29 @@ struct FollowingScreen: View {
             cancelGoingTabDeferredWork(reason: "tabHidden")
             goingTabPerf.tabSelectionActivationActive = false
             goingTabPerf.handledTabSelectionActivationGeneration = 0
+        }
+    }
+
+    /// First selection: paint the screen background, then enable heavy lists after one yield.
+    private func activateGoingHeavyContentIfNeeded(source: String) {
+        guard isFollowingTabSelected else { return }
+        if goingHeavyContentReady {
+            _ = runGoingTabSelectionActivationIfNeeded(source: source)
+            GoingActivationPerf.stableReady(cachedContentUsable: goingTabHasCachedContentForImmediatePaint())
+            return
+        }
+        Task { @MainActor in
+            await Task.yield()
+            guard isFollowingTabSelected, !goingHeavyContentReady else { return }
+            let started = CFAbsoluteTimeGetCurrent()
+            goingHeavyContentReady = true
+            _ = runGoingTabSelectionActivationIfNeeded(source: source)
+            let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+            GoingActivationPerf.publishMs(ms, reason: "heavyContentReady:\(source)")
+            GoingActivationPerf.stableReady(cachedContentUsable: goingTabHasCachedContentForImmediatePaint())
+            if ms >= 50 {
+                TabTapPerf.mainActorBusy(ms: ms, source: "goingHeavyContentReady")
+            }
         }
     }
 
@@ -435,6 +485,12 @@ struct FollowingScreen: View {
             goingTabPerf.deferredWorkReady = false
             goingTabPerf.firstPaintRecorded = false
         }
+        GoingActivationPerf.activation(
+            cachedRows: viewModel.followingTabGoingItems.count
+                + viewModel.myPickupGameJoinRequestCards.count
+                + viewModel.savedProGames.count,
+            source: source
+        )
         logGoingTabPerfSummary(
             cachedPaint: cachedPaint,
             deferredRefresh: !goingTabRecentlyBackgroundRefreshed(within: GoingTabPerfState.backgroundRefreshTTL),
@@ -719,6 +775,7 @@ struct FollowingScreen: View {
             }
         }) { token in
             DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                .environmentObject(chatViewModel)
         }
         .alert(item: $followingPickupWithdrawConfirm) { state in
             Alert(
@@ -728,6 +785,33 @@ struct FollowingScreen: View {
                     Task { await performFollowingPickupWithdraw(state) }
                 },
                 secondaryButton: .cancel()
+            )
+        }
+        .alert(item: $followingPickupPlayingClearConfirm) { state in
+            Alert(
+                title: Text(L10n.t("pickup_playing_clear_confirm_title", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))),
+                message: Text(
+                    L10n.t(
+                        state.warnUnrated
+                            ? "pickup_playing_clear_confirm_unrated_message"
+                            : "pickup_playing_clear_confirm_rated_message",
+                        languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                    )
+                ),
+                primaryButton: .destructive(
+                    Text(
+                        L10n.t(
+                            state.warnUnrated
+                                ? "pickup_playing_clear_anyway"
+                                : "pickup_playing_clear_from_going",
+                            languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                        )
+                    )
+                ) {
+                    viewModel.markPickupFollowingPlayingCompletedUserCleared(pickupGameId: state.pickupGameId)
+                    rebuildFollowingDisplayCaches(reason: "playingManualClear", prefetchAvatars: false)
+                },
+                secondaryButton: .cancel(Text(L10n.t("cancel", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))))
             )
         }
         .sheet(item: $followingMyPickupFormMode) { mode in
@@ -970,8 +1054,15 @@ struct FollowingScreen: View {
     // MARK: - Logged out
 
     private var loggedOutContent: some View {
-        AuthenticationRequiredView.going
-            .padding(.bottom, 92)
+        AuthenticationRequiredView.going(
+            onSignIn: {
+                viewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
+            },
+            onNotNow: {
+                selectedTab = .discover
+            }
+        )
+        .padding(.bottom, 92)
     }
 
     // MARK: - Logged in
@@ -982,37 +1073,54 @@ struct FollowingScreen: View {
             .padding(.horizontal, FGSpacing.md)
             .padding(.bottom, 8)
 
-            ScrollView {
-                goingHubContent
-                    .padding(.horizontal, FGSpacing.md)
-                    .padding(.bottom, 110)
-            }
-            .refreshable {
-                if isBusinessProGamesOnly {
-                    await reloadBusinessProGamesData(reason: "pullToRefresh")
+            ScrollViewReader { proxy in
+                ScrollView {
+                    goingHubContent
+                        .padding(.horizontal, FGSpacing.md)
+                        .padding(.bottom, 110)
+                }
+                .refreshable {
+                    if isBusinessProGamesOnly {
+                        await reloadBusinessProGamesData(reason: "pullToRefresh")
+                        logGoingHubDebug(reason: "pullToRefresh")
+                        return
+                    }
+                    if activeGoingMode == .proGames {
+                        await viewModel.refreshGoingProGames(reason: "pullToRefresh")
+                        await refreshFavoriteTeamProGames(reason: "pullToRefresh", forceRefresh: true)
+                    } else {
+                        await viewModel.fetchSavedProGames(forceRefresh: true, reason: "pullToRefresh")
+                    }
+                    await viewModel.refreshFollowingTabDataGlobally()
+                    await viewModel.loadMyPickupGameJoinRequestsForFollowing(
+                        forceRefresh: true,
+                        reason: "pullToRefresh"
+                    )
+                    logFollowingMyPickupGames(action: "pullToRefresh")
                     logGoingHubDebug(reason: "pullToRefresh")
-                    return
                 }
-                if activeGoingMode == .proGames {
-                    await viewModel.refreshGoingProGames(reason: "pullToRefresh")
-                    await refreshFavoriteTeamProGames(reason: "pullToRefresh", forceRefresh: true)
-                } else {
-                    await viewModel.fetchSavedProGames(forceRefresh: true, reason: "pullToRefresh")
+                .onReceive(followingMyPickupMinuteTicker) { date in
+                    followingMyPickupClockTick = date
+                    scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: date)
+                    guard isFollowingTabSelected else { return }
+                    rebuildFollowingDisplayCaches(reason: "goingCompletedVisibilityTick", prefetchAvatars: false)
+                    scheduleGoingProGamesDisplayCacheRebuild(reason: "goingCompletedVisibilityTick")
                 }
-                await viewModel.refreshFollowingTabDataGlobally()
-                await viewModel.loadMyPickupGameJoinRequestsForFollowing(
-                    forceRefresh: true,
-                    reason: "pullToRefresh"
-                )
-                logFollowingMyPickupGames(action: "pullToRefresh")
-                logGoingHubDebug(reason: "pullToRefresh")
-            }
-            .onReceive(followingMyPickupMinuteTicker) { date in
-                followingMyPickupClockTick = date
-                scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: date)
-                guard isFollowingTabSelected else { return }
-                rebuildFollowingDisplayCaches(reason: "goingCompletedVisibilityTick", prefetchAvatars: false)
-                scheduleGoingProGamesDisplayCacheRebuild(reason: "goingCompletedVisibilityTick")
+                .onChange(of: viewModel.pendingPickupCreatorRatingNotificationDeepLink) { _, request in
+                    guard let request else { return }
+                    fulfillPickupCreatorRatingNotificationDeepLink(
+                        pickupGameId: request.pickupGameId,
+                        scrollProxy: proxy
+                    )
+                }
+                .onAppear {
+                    if let request = viewModel.pendingPickupCreatorRatingNotificationDeepLink {
+                        fulfillPickupCreatorRatingNotificationDeepLink(
+                            pickupGameId: request.pickupGameId,
+                            scrollProxy: proxy
+                        )
+                    }
+                }
             }
         }
         .onAppear {
@@ -1162,15 +1270,21 @@ struct FollowingScreen: View {
         }
     }
 
-    private func isGoingVenueEventOnLocalToday(_ row: VenueEventRow, now: Date = Date()) -> Bool {
-        if let start = FanGeoLiveEnergyTiming.parseScheduledStart(row.scheduled_start_at, eventId: row.id) {
-            return Calendar.current.isDate(start, inSameDayAs: now)
-        }
+    /// Cached: this runs inside Going display-cache rebuild filter loops on every
+    /// tab activation; a per-call `DateFormatter()` here was rebuilt for every row.
+    private static let goingLocalDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone.current
         formatter.dateFormat = "yyyy-MM-dd"
-        let todayYMD = formatter.string(from: now)
+        return formatter
+    }()
+
+    private func isGoingVenueEventOnLocalToday(_ row: VenueEventRow, now: Date = Date()) -> Bool {
+        if let start = FanGeoLiveEnergyTiming.parseScheduledStart(row.scheduled_start_at, eventId: row.id) {
+            return Calendar.current.isDate(start, inSameDayAs: now)
+        }
+        let todayYMD = Self.goingLocalDayFormatter.string(from: now)
         let eventYMD = (row.event_date ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard eventYMD.count >= 10 else { return false }
         return String(eventYMD.prefix(10)) == todayYMD
@@ -1199,7 +1313,10 @@ struct FollowingScreen: View {
             }
         }.filter { card in
             guard let game = viewModel.pickupGamesFollowingTabCache[card.pickupGameId] else { return true }
-            return GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(row: game)
+            return viewModel.isPickupPlayingCardVisibleInGoing(
+                game: game,
+                now: followingMyPickupClockTick
+            )
         }
         let fingerprint = followingDisplayCachesFingerprint(venueItems: sorted, playingCards: playing)
         if fingerprint == goingTabPerf.lastFollowingDisplayCachesFingerprint {
@@ -1211,6 +1328,7 @@ struct FollowingScreen: View {
             }
 #if DEBUG
             let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+            GoingActivationPerf.snapshotBuildMs(ms, reason: "\(reason):skipped")
             DebugLogGate.goingTabPerfVerbose(
                 "[RenderPerf] view=FollowingScreen renderMs=\(String(format: "%.2f", ms)) rebuildReason=\(reason):skipped"
             )
@@ -1226,6 +1344,8 @@ struct FollowingScreen: View {
         }
 #if DEBUG
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        GoingActivationPerf.snapshotBuildMs(ms, reason: reason)
+        GoingActivationPerf.publishMs(ms, reason: reason)
         DebugLogGate.goingTabPerfVerbose(
             "[RenderPerf] view=FollowingScreen renderMs=\(String(format: "%.2f", ms)) rebuildReason=\(reason)"
         )
@@ -1243,7 +1363,13 @@ struct FollowingScreen: View {
             .map { "\($0.id.uuidString):\($0.isServerGoing ? 1 : 0):\($0.isInterestedOnlyLocal ? 1 : 0)" }
             .joined(separator: ",")
         let playing = playingCards
-            .map { "\($0.id.uuidString):\($0.pill.rawValue)" }
+            .map {
+                let rated = viewModel.hasSubmittedPickupCreatorRating(for: $0.pickupGameId)
+                let ratedAt = viewModel.myPickupCreatorRatingCreatedAt(for: $0.pickupGameId)?.timeIntervalSince1970 ?? 0
+                let cleared = viewModel.isPickupFollowingPlayingCompletedUserCleared(pickupGameId: $0.pickupGameId) ? 1 : 0
+                let post = viewModel.pickupCreatorRatingPostSubmitPromptGameIds.contains($0.pickupGameId) ? 1 : 0
+                return "\($0.id.uuidString):\($0.pill.rawValue):r\(rated ? 1 : 0):t\(Int(ratedAt)):c\(cleared):p\(post)"
+            }
             .joined(separator: ",")
         return "going=\(going);playing=\(playing)"
     }
@@ -4184,6 +4310,20 @@ struct FollowingScreen: View {
                         pickupGameJoinCard(card)
                     }
                     .equatable()
+                    .id(card.pickupGameId)
+                    .overlay {
+                        if viewModel.pendingPickupPlayingHighlightGameID == card.pickupGameId {
+                            RoundedRectangle(cornerRadius: FGRadius.card, style: .continuous)
+                                .strokeBorder(FGColor.accentGreen.opacity(0.95), lineWidth: 2.5)
+                                .shadow(color: FGColor.accentGreen.opacity(0.35), radius: 8, y: 0)
+                                .allowsHitTesting(false)
+                                .transition(.opacity)
+                        }
+                    }
+                    .animation(
+                        .easeInOut(duration: 0.25),
+                        value: viewModel.pendingPickupPlayingHighlightGameID == card.pickupGameId
+                    )
                 }
             }
         }
@@ -4247,7 +4387,7 @@ struct FollowingScreen: View {
                 Spacer(minLength: 0)
             }
 
-            if let dateLine = game.pickupDateWithCompactTimeRange {
+            if let dateLine = game.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw) {
                 Label(dateLine, systemImage: "calendar")
                     .font(FGTypography.caption.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(followingColorScheme))
@@ -4370,8 +4510,7 @@ struct FollowingScreen: View {
 
     private func spotsOpenLine(for game: PickupGameRow) -> String {
         let open = game.pickupOpenSlotsRemaining
-        if open == 1 { return "1 spot open" }
-        return "\(open) spots open"
+        return pickupLocalizedSpotsOpen(open, languageCode: appLanguageRaw)
     }
 
     private var hostedGamesListContent: some View {
@@ -4465,8 +4604,40 @@ struct FollowingScreen: View {
             isRefreshSpinning: viewModel.pickupFollowingCardRefreshSpinGameId == card.pickupGameId,
             isWithdrawInFlight: followingPickupWithdrawInFlight,
             lastJoinStatusRefreshAt: viewModel.lastJoinStatusRefreshAt,
+            isHighlightedFromRatingNotification: viewModel.pendingPickupPlayingHighlightGameID == card.pickupGameId,
             colorScheme: followingColorScheme
         )
+    }
+
+    /// Going → Play → Playing for a pickup rating notification tap; scrolls and briefly highlights the card.
+    private func fulfillPickupCreatorRatingNotificationDeepLink(
+        pickupGameId: UUID,
+        scrollProxy: ScrollViewProxy
+    ) {
+        selectedGoingMode = .pickupGames
+        selectedGoingGamesTab = .playing
+        goingDayScope = .all
+        sanitizeBusinessGoingModeIfNeeded()
+        viewModel.pendingPickupPlayingHighlightGameID = pickupGameId
+        viewModel.clearPendingPickupCreatorRatingNotificationDeepLink()
+
+        Task { @MainActor in
+            await viewModel.loadMyPickupGameJoinRequestsForFollowing(
+                forceRefresh: false,
+                reason: "pickupCreatorRatingDeepLink"
+            )
+            await viewModel.refreshMyPickupCreatorRatingsForPickupGames(pickupGameIds: [pickupGameId])
+            // Yield so Playing list / rating prompt can mount before scroll.
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            withAnimation(.easeInOut(duration: 0.35)) {
+                scrollProxy.scrollTo(pickupGameId, anchor: .center)
+            }
+            try? await Task.sleep(nanoseconds: 2_400_000_000)
+            if viewModel.pendingPickupPlayingHighlightGameID == pickupGameId {
+                viewModel.clearPendingPickupPlayingHighlightGameID()
+            }
+        }
     }
 
     private var hostingEmptyStateCard: some View {
@@ -5045,7 +5216,12 @@ struct FollowingScreen: View {
                             .font(FGTypography.caption.weight(.semibold))
                             .foregroundStyle(Color.red.opacity(followingColorScheme == .dark ? 0.9 : 0.78))
                             .fixedSize(horizontal: false, vertical: true)
-                        Text(viewModel.pickupHistoryAutoClearCaption(forPickupGameId: card.pickupGameId))
+                        Text(
+                            viewModel.pickupHistoryAutoClearCaption(
+                                forPickupGameId: card.pickupGameId,
+                                languageCode: appLanguageRaw
+                            )
+                        )
                             .font(FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(followingColorScheme))
                             .fixedSize(horizontal: false, vertical: true)
@@ -5061,8 +5237,11 @@ struct FollowingScreen: View {
             .contentShape(Rectangle())
             .onTapGesture(perform: openMap)
 
-            if !card.dateTimeLine.isEmpty {
-                Label(card.dateTimeLine, systemImage: "calendar")
+            let localizedDateTimeLine = resolvedGame?
+                .pickupDateWithCompactTimeRange(languageCode: appLanguageRaw)
+                ?? card.dateTimeLine
+            if !localizedDateTimeLine.isEmpty {
+                Label(localizedDateTimeLine, systemImage: "calendar")
                     .font(FGTypography.caption.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(followingColorScheme))
                     .labelStyle(.titleAndIcon)
@@ -5108,12 +5287,19 @@ struct FollowingScreen: View {
                 Spacer(minLength: 0)
             }
 
-            // TODO(Organizer Reputation): Re-enable organizer rating/review presentation here
-            // when reputation includes average rating, total reviews, reliability score,
-            // organizer badges, and profile reputation display.
+            if let row = resolvedGame, card.pill == .approved, !isOrganizerCanceled {
+                followingPickupCreatorRatingSection(game: row, card: card)
+            }
 
             if let spots = card.spotsRemainingSummary, !spots.isEmpty, !isOrganizerCanceled {
-                Text(spots)
+                Text(
+                    resolvedGame.map {
+                        pickupLocalizedSpotsOpen(
+                            $0.pickupOpenSlotsRemaining,
+                            languageCode: appLanguageRaw
+                        )
+                    } ?? spots
+                )
                     .font(FGTypography.metadata)
                     .foregroundStyle(FGColor.mutedText(followingColorScheme))
                     .contentShape(Rectangle())
@@ -5144,26 +5330,71 @@ struct FollowingScreen: View {
                         .tint(Color.red.opacity(0.92))
                         .disabled(followingPickupWithdrawInFlight)
                     } else if card.pill == .approved {
-                        Button(role: .destructive) {
-                            let rid = viewModel.pickupJoinRequestLatestByPickupGameIdForFan[card.pickupGameId]?.id ?? card.id
+                        let isCompleted = resolvedGame.map {
+                            GoingTabCompletedGameVisibility.isPickupGameCompleted($0, now: now)
+                        } ?? false
+                        if isCompleted {
+                            let clearWarnUnrated = !(resolvedGame.map {
+                                viewModel.hasSubmittedPickupCreatorRating(for: $0.id)
+                            } ?? false)
+                            let clearLang = L10n.normalizedLanguageCode(appLanguageRaw)
+                            VStack(spacing: FGSpacing.sm) {
+                                Button(action: {}) {
+                                    Text(L10n.t("Completed", languageCode: clearLang))
+                                        .font(FGTypography.metadata.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(Color.gray.opacity(0.75))
+                                .disabled(true)
+                                .accessibilityLabel(L10n.t("Completed", languageCode: clearLang))
+
+                                Button {
+                                    followingPickupPlayingClearConfirm = PickupPlayingClearConfirmState(
+                                        pickupGameId: card.pickupGameId,
+                                        warnUnrated: clearWarnUnrated
+                                    )
+                                } label: {
+                                    Text(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
+                                        .font(FGTypography.caption.weight(.semibold))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 8)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(Color.primary.opacity(followingColorScheme == .dark ? 0.55 : 0.45))
+                                .accessibilityLabel(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
+                                .accessibilityHint(
+                                    L10n.t(
+                                        clearWarnUnrated
+                                            ? "pickup_playing_clear_confirm_unrated_message"
+                                            : "pickup_playing_clear_confirm_rated_message",
+                                        languageCode: clearLang
+                                    )
+                                )
+                            }
+                        } else {
+                            Button(role: .destructive) {
+                                let rid = viewModel.pickupJoinRequestLatestByPickupGameIdForFan[card.pickupGameId]?.id ?? card.id
 #if DEBUG
-                            print("[PickupJoinWithdraw] tapped gameId=\(card.pickupGameId.uuidString.lowercased())")
-                            print("[PickupJoinWithdraw] requestId=\(rid.uuidString.lowercased())")
+                                print("[PickupJoinWithdraw] tapped gameId=\(card.pickupGameId.uuidString.lowercased())")
+                                print("[PickupJoinWithdraw] requestId=\(rid.uuidString.lowercased())")
 #endif
-                            followingPickupWithdrawConfirm = PickupJoinWithdrawConfirmState(
-                                requestId: rid,
-                                pickupGameId: card.pickupGameId,
-                                intent: .approved
-                            )
-                        } label: {
-                            Text("Can’t make it")
-                                .font(FGTypography.metadata.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
+                                followingPickupWithdrawConfirm = PickupJoinWithdrawConfirmState(
+                                    requestId: rid,
+                                    pickupGameId: card.pickupGameId,
+                                    intent: .approved
+                                )
+                            } label: {
+                                Text("Can’t make it")
+                                    .font(FGTypography.metadata.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(Color.red.opacity(0.92))
+                            .disabled(followingPickupWithdrawInFlight)
                         }
-                        .buttonStyle(.bordered)
-                        .tint(Color.red.opacity(0.92))
-                        .disabled(followingPickupWithdrawInFlight)
                     } else {
                         Button {
                             viewModel.markPickupFollowingRejectedRequestCleared(
@@ -5187,14 +5418,35 @@ struct FollowingScreen: View {
                 if !isOrganizerCanceled {
                     if let at = viewModel.lastJoinStatusRefreshAt {
                         Label {
-                            Text("Updated \(at.formatted(date: .abbreviated, time: .shortened))")
+                            Text(
+                                String(
+                                    format: L10n.t(
+                                        "pickup_updated_format",
+                                        languageCode: appLanguageRaw
+                                    ),
+                                    at.formatted(
+                                        Date.FormatStyle.dateTime
+                                            .month(.abbreviated)
+                                            .day()
+                                            .year()
+                                            .hour()
+                                            .minute()
+                                            .locale(
+                                                Locale(
+                                                    identifier: L10n.normalizedLanguageCode(appLanguageRaw)
+                                                        .replacingOccurrences(of: "-", with: "_")
+                                                )
+                                            )
+                                    )
+                                )
+                            )
                         } icon: {
                             Image(systemName: "clock.arrow.circlepath")
                         }
                         .font(FGTypography.caption)
                         .foregroundStyle(FGColor.secondaryText(followingColorScheme))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                     } else {
                         Label("Sync pending", systemImage: "clock")
                             .font(FGTypography.caption)
@@ -5298,6 +5550,17 @@ struct FollowingScreen: View {
         .task(id: card.organizerUserId) {
             await viewModel.loadPickupCreatorDisplayNameIfNeeded(creatorUserId: card.organizerUserId)
         }
+        .task(id: card.pickupGameId) {
+            guard card.pill == .approved else { return }
+            viewModel.ensurePickupCreatorRatingSessionScoped()
+            await viewModel.refreshMyPickupCreatorRatingsForPickupGames(pickupGameIds: [card.pickupGameId])
+            if let row = viewModel.resolvedPickupGameRow(for: card.pickupGameId) {
+                await viewModel.refreshPickupCreatorRatingUIContext(
+                    pickupGameId: row.id,
+                    creatorUserId: row.creator_user_id
+                )
+            }
+        }
         .onAppear {
             if let row = viewModel.resolvedPickupGameRow(for: card.pickupGameId) {
                 PickupGameStartedStateDebug.log(
@@ -5306,6 +5569,134 @@ struct FollowingScreen: View {
                     allowedActions: "following_join_card,view_detail"
                 )
             }
+        }
+    }
+
+    @ViewBuilder
+    private func followingPickupCreatorRatingSection(
+        game: PickupGameRow,
+        card: PickupGameJoinRequestCardDisplay
+    ) -> some View {
+        let joinStatus = viewModel.pickupJoinRequestLatestByPickupGameIdForFan[card.pickupGameId]?.status
+            ?? "approved"
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        if viewModel.pickupCreatorRatingPostSubmitPromptGameIds.contains(game.id) {
+            followingPickupPostRatingClearChoices(game: game, languageCode: lang)
+        } else if viewModel.hasSubmittedPickupCreatorRating(for: game.id) {
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                PickupCreatorRateOrganizerHistoryRow(
+                    viewModel: viewModel,
+                    game: game,
+                    joinStatus: joinStatus
+                )
+                if let deadline = viewModel.pickupPlayingAutoClearDeadline(for: game.id),
+                   GoingTabCompletedGameVisibility.isPickupGameCompleted(game, now: followingMyPickupClockTick) {
+                    Text(
+                        String(
+                            format: L10n.t("pickup_playing_auto_clears_on_format", languageCode: lang),
+                            locale: Locale(identifier: lang),
+                            deadline.formatted(date: .abbreviated, time: .omitted)
+                        )
+                    )
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel(
+                        String(
+                            format: L10n.t("pickup_playing_auto_clears_on_a11y_format", languageCode: lang),
+                            locale: Locale(identifier: lang),
+                            deadline.formatted(date: .abbreviated, time: .omitted)
+                        )
+                    )
+                }
+            }
+        } else if viewModel.shouldPresentPickupCreatorRatingPrompt(game: game, joinStatus: joinStatus) {
+            PickupCreatorRatingPromptCard(viewModel: viewModel, game: game)
+        } else if viewModel.shouldShowPickupCreatorRateOrganizerAction(game: game, joinStatus: joinStatus) {
+            PickupCreatorRateOrganizerHistoryRow(
+                viewModel: viewModel,
+                game: game,
+                joinStatus: joinStatus
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func followingPickupPostRatingClearChoices(game: PickupGameRow, languageCode: String) -> some View {
+        VStack(alignment: .leading, spacing: FGSpacing.sm) {
+            HStack(alignment: .center, spacing: FGSpacing.sm) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(FGColor.accentGreen)
+                    .accessibilityHidden(true)
+                Text(L10n.t("pickup_playing_thanks_for_rating", languageCode: languageCode))
+                    .font(FGTypography.cardTitle.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(L10n.t("pickup_playing_thanks_for_rating", languageCode: languageCode))
+
+            Text(L10n.t("pickup_playing_clear_confirm_rated_message", languageCode: languageCode))
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let deadline = viewModel.pickupPlayingAutoClearDeadline(for: game.id) {
+                Text(
+                    String(
+                        format: L10n.t("pickup_playing_auto_clears_on_format", languageCode: languageCode),
+                        locale: Locale(identifier: languageCode),
+                        deadline.formatted(date: .abbreviated, time: .omitted)
+                    )
+                )
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel(
+                    String(
+                        format: L10n.t("pickup_playing_auto_clears_on_a11y_format", languageCode: languageCode),
+                        locale: Locale(identifier: languageCode),
+                        deadline.formatted(date: .abbreviated, time: .omitted)
+                    )
+                )
+            }
+
+            HStack(spacing: FGSpacing.sm) {
+                Button {
+                    viewModel.markPickupFollowingPlayingCompletedUserCleared(pickupGameId: game.id)
+                    rebuildFollowingDisplayCaches(reason: "playingClearNowAfterRating", prefetchAvatars: false)
+                } label: {
+                    Text(L10n.t("pickup_playing_clear_now", languageCode: languageCode))
+                        .font(FGTypography.metadata.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .tint(Color.red.opacity(0.88))
+                .accessibilityLabel(L10n.t("pickup_playing_clear_now", languageCode: languageCode))
+                .accessibilityHint(L10n.t("pickup_playing_clear_confirm_rated_message", languageCode: languageCode))
+
+                Button {
+                    viewModel.acknowledgePickupCreatorRatingPostSubmitPrompt(pickupGameId: game.id)
+                    rebuildFollowingDisplayCaches(reason: "playingKeepForLater", prefetchAvatars: false)
+                } label: {
+                    Text(L10n.t("pickup_playing_keep_for_later", languageCode: languageCode))
+                        .font(FGTypography.metadata.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(FGColor.accentBlue)
+                .accessibilityLabel(L10n.t("pickup_playing_keep_for_later", languageCode: languageCode))
+            }
+        }
+        .padding(FGSpacing.md)
+        .background(FGColor.cardBackground(followingColorScheme))
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.card, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.card, style: .continuous)
+                .strokeBorder(FGColor.divider(followingColorScheme), lineWidth: 1)
         }
     }
 
@@ -5320,7 +5711,7 @@ struct FollowingScreen: View {
 
     private func pickupJoinStatusPill(_ pill: PickupFollowingJoinRequestPillKind) -> some View {
         let colors = pickupJoinPillColors(pill)
-        return Text(pill.title)
+        return Text(pill.title(languageCode: appLanguageRaw))
             .font(FGTypography.metadata)
             .fontWeight(.semibold)
             .foregroundStyle(colors.foreground)
@@ -5612,7 +6003,7 @@ struct FollowingScreen: View {
                 Button {
                     openFollowingDirectionsToVenue(bar: bar)
                 } label: {
-                    Text(bar.address)
+                    Text(bar.displayAddress(languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
                         .font(FGTypography.caption.weight(.semibold))
                         .foregroundStyle(isCompleted ? secondaryText : FGColor.accentBlue)
                         .multilineTextAlignment(.leading)
@@ -5828,7 +6219,7 @@ struct FollowingScreen: View {
                     Button {
                         openFollowingDirectionsToVenue(bar: bar)
                     } label: {
-                        Text(bar.address)
+                        Text(bar.displayAddress(languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
                             .font(FGTypography.caption.weight(.semibold))
                             .foregroundStyle(FGColor.accentBlue)
                             .multilineTextAlignment(.leading)
@@ -6056,6 +6447,7 @@ private struct PickupGameInviteDetailSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     private var game: PickupGameRow { item.game }
 
@@ -6155,7 +6547,7 @@ private struct PickupGameInviteDetailSheet: View {
 
     private var gameFacts: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let dateLine = game.pickupDateWithCompactTimeRange {
+            if let dateLine = game.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw) {
                 factRow("calendar", dateLine)
             }
             if !locationLine.isEmpty {
@@ -6238,7 +6630,7 @@ private struct PickupGameInviteDetailSheet: View {
 
     private var spotsOpenLine: String {
         let open = game.pickupOpenSlotsRemaining
-        return open == 1 ? "1 spot open" : "\(open) spots open"
+        return pickupLocalizedSpotsOpen(open, languageCode: appLanguageRaw)
     }
 }
 
@@ -6299,6 +6691,7 @@ private struct PickupPlayingCardRenderToken: Equatable {
     let isRefreshSpinning: Bool
     let isWithdrawInFlight: Bool
     let lastJoinStatusRefreshAt: Date?
+    let isHighlightedFromRatingNotification: Bool
     let colorScheme: ColorScheme
 }
 

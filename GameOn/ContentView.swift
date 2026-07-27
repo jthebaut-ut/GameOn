@@ -1,21 +1,36 @@
+import Combine
 import SwiftUI
 import UIKit
+
+/// Owns the Chat view model without forwarding its high-frequency `objectWillChange` stream
+/// into `ContentView`. Chat leaves and the narrow Main-tab projection observe what they need.
+@MainActor
+private final class ChatViewModelOwner: ObservableObject {
+    let value = ChatViewModel()
+}
 
 /// Root view for the single-window app; delegates UI to ``MainTabView``.
 struct ContentView: View {
     @StateObject private var viewModel = MapViewModel()
-    @StateObject private var chatViewModel = ChatViewModel()
+    @StateObject private var chatViewModelOwner = ChatViewModelOwner()
     @StateObject private var bootstrapCoordinator = BootstrapLoadingCoordinator()
+    @ObservedObject private var ageAccessGate = AgeAccessGateService.shared
     @Environment(\.scenePhase) private var scenePhase
     @State private var queuedSupportDeepLinkRequest: SupportReplyNotificationDeepLinkRequest?
     @State private var supportNotificationPresentation: SupportNotificationPresentation?
     @State private var lastPresentedSupportDeepLinkRequestID: UUID?
     @State private var lastPresentedSupportConversationID: UUID?
+    @State private var didRunExistingUserAgeAccessCheck = false
     #if DEBUG
     @State private var debugSplashMinimumElapsed = false
     #endif
 
+    private var chatViewModel: ChatViewModel {
+        chatViewModelOwner.value
+    }
+
     var body: some View {
+        let _ = MainTabObservationPerf.contentBodyEvaluated()
         ZStack {
             Color.white
                 // Decorative root fill — edge-to-edge under status bar / home indicator.
@@ -52,6 +67,49 @@ struct ContentView: View {
                         || viewModel.isBusinessOwnerSessionRestorePending {
                 AccountSuspensionGateView(viewModel: viewModel, ban: ban, kind: .business)
                     .zIndex(2)
+            } else if shouldBlockSocialTabsForAgeAccess {
+                // Authenticated unresolved / under-13 / error: do not mount MainTabView.
+                // Actionable age outcomes use the gate overlay; in-flight resolution reuses
+                // the branded FanGeo splash (never a blank "Checking…" screen).
+                if ageAccessGate.presentation != nil
+                    || (ageAccessGate.blocksSocialSession && !ageAccessGate.isResolvingSocialSession) {
+                    AgeAccessGateOverlay(
+                        gate: ageAccessGate,
+                        onUnder13Close: {
+                            Task {
+                                await viewModel.quarantineSessionAfterAgeAccessBlock(
+                                    reason: "ageAccessBlockedUnder13OverlayClose"
+                                )
+                            }
+                        },
+                        onNeedsConfirmationCancel: {
+                            Task {
+                                _ = await viewModel.logoutUser(reason: "ageAccessUnresolvedCancel")
+                            }
+                        }
+                    )
+                    .zIndex(3)
+                    .onAppear {
+                        if let uid = viewModel.currentUserAuthId {
+                            AgeAccessRuntimeLog.socialShellBlocked(userId: uid, state: ageAccessGate.latestState)
+                        } else {
+                            AgeAccessRuntimeLog.socialSubsystemBlocked(userId: nil, subsystem: "missing_auth_uuid")
+                        }
+                    }
+                } else {
+                    FanGeoSplashView(
+                        statusMessage: BootstrapLoadingCoordinator.ageEligibilitySplashMessage
+                    )
+                    .zIndex(3)
+                    .onAppear {
+#if DEBUG
+                        print("[AgeStartupDebug] brandedSplashWhileResolving=true")
+#endif
+                        if let uid = viewModel.currentUserAuthId {
+                            AgeAccessRuntimeLog.socialShellBlocked(userId: uid, state: ageAccessGate.latestState)
+                        }
+                    }
+                }
             } else {
                 PublicProfilePresentationHost(
                     viewModel: viewModel,
@@ -64,11 +122,23 @@ struct ContentView: View {
                     )
                 }
                 .zIndex(0)
+                .onAppear {
+                    if isAuthenticatedForAgeAccess, let uid = viewModel.currentUserAuthId {
+                        AgeAccessRuntimeLog.socialShellMounted(userId: uid)
+                    }
+                }
+            }
+
+            if ageAccessGate.presentation != nil, !isAuthenticatedForAgeAccess {
+                // Pre-auth / sign-up confirmation only — authenticated blocking uses the branch above.
+                AgeAccessGateOverlay(gate: ageAccessGate)
+                    .zIndex(50)
             }
         }
         .onAppear {
             FanGeoAnalyticsService.recordAppOpen()
             ProGameNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            PickupCreatorRatingNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             SupportReplyNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             FanGeoPlusAwardNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
@@ -77,7 +147,47 @@ struct ContentView: View {
             print("[LaunchPathDebug] ContentViewMounted=true")
             print("[LaunchPathDebug] isBootstrapping=\(bootstrapCoordinator.isBootstrapping)")
             print("[LaunchPathDebug] splashMinDurationActive=\(!debugSplashMinimumElapsed)")
+            AgeAccessGateSelfTests.runAll()
+            FanProfileAvatarRefreshSelfTests.runAll()
+            ChatRealtimeConnectionStatusSelfTests.run()
+            LogoutBoundingSelfTests.runAll()
+            AccountIdentityClassificationSelfTests.runAll()
+            PickupGameDiscoverAvailabilitySelfTests.runAll()
+            LiveMatchHydrationIndexSelfTests.runAll()
+            PickupGameChatAccessSelfTests.runAll()
+            PickupGameRosterSelfTests.runAll()
+            AgeStartupUnificationSelfTests.runAll()
+            SuggestedFansRankingSelfTests.runAll()
+            VenueMapEnergyScoreSelfTests.runAll()
+            DiscoverGameVenueRankingSelfTests.runAll()
+            _ = viewModel.runPickupMonthDotSelectionStabilityBoundaryTest()
             #endif
+        }
+        .task(id: existingUserAgeAccessTaskID) {
+            await runExistingUserAgeAccessCheckIfNeeded()
+        }
+        .onChange(of: viewModel.isLoggedIn) { _, isLoggedIn in
+            handleAuthenticatedSessionChangeForAgeAccess(
+                isAuthenticated: isLoggedIn || viewModel.isVenueOwnerLoggedIn || viewModel.hasAuthenticatedVenueOwnerSession
+            )
+        }
+        .onChange(of: viewModel.isVenueOwnerLoggedIn) { _, isVenueOwnerLoggedIn in
+            handleAuthenticatedSessionChangeForAgeAccess(
+                isAuthenticated: viewModel.isLoggedIn || isVenueOwnerLoggedIn || viewModel.hasAuthenticatedVenueOwnerSession
+            )
+        }
+        .onChange(of: viewModel.currentUserAuthId) { previous, next in
+            guard next != previous else { return }
+            didRunExistingUserAgeAccessCheck = false
+            if let next {
+                // bindAuthenticatedUser already fails closed unless THIS UUID was
+                // server-confirmed eligible in this session.
+                ageAccessGate.bindAuthenticatedUser(next, reason: previous == nil ? .login : .accountSwitch)
+            } else if !isAuthenticatedForAgeAccess {
+                ageAccessGate.handleLogoutOrAccountSwitch()
+            } else {
+                ageAccessGate.failClosedPendingAuthenticatedResolution()
+            }
         }
         .onChange(of: viewModel.pendingSupportReplyNotificationDeepLink) { _, request in
             guard let request else { return }
@@ -116,6 +226,11 @@ struct ContentView: View {
             #endif
         }
         .onChange(of: scenePhase) { _, phase in
+#if DEBUG
+            if MemoryAuditProbe.isEnabled {
+                MemoryAuditProbe.log("scenePhase", details: "phase=\(String(describing: phase))")
+            }
+#endif
             guard phase == .active else { return }
             FanGeoAnalyticsService.touchLastActive()
             Task {
@@ -146,15 +261,33 @@ struct ContentView: View {
                 await viewModel.handlePasswordResetDeepLink(url)
             }
         }
+#if DEBUG
+        .onReceive(NotificationCenter.default.publisher(for: MemoryAuditProbe.tabSelectNotification)) { note in
+            guard MemoryAuditProbe.isEnabled, let tab = note.object as? String, !tab.isEmpty else { return }
+            viewModel.requestedMainTabRaw = tab
+            MemoryAuditProbe.log("remote_tab", details: "tab=\(tab)")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MemoryAuditProbe.logoutNotification)) { _ in
+            guard MemoryAuditProbe.isEnabled else { return }
+            MemoryAuditProbe.log("remote_logout_requested")
+            viewModel.beginSafeUserLogout(source: "MemoryAuditProbe")
+        }
+#endif
         .background(PasswordResetRecoveryOverlayWindowPresenter(viewModel: viewModel))
         .task {
 #if DEBUG
+            MemoryAuditProbe.installIfNeeded()
             print("[ChatViewModelInstanceDebug] ContentView root ChatViewModel id=\(ObjectIdentifier(chatViewModel))")
             print("[MainActorDebug] ContentView bootstrap task actor=MainActor")
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 debugSplashMinimumElapsed = true
                 print("[LaunchPathDebug] splashMinDurationActive=false")
+                StartupPerf.phase(
+                    "debugSplashMinimumSatisfied",
+                    ms: 2000,
+                    details: "artificialDebugHold=true isBootstrapping=\(bootstrapCoordinator.isBootstrapping)"
+                )
             }
 #endif
             await bootstrapCoordinator.beginIfNeeded(
@@ -170,6 +303,89 @@ struct ContentView: View {
         #else
         return bootstrapCoordinator.isBootstrapping
         #endif
+    }
+
+    private var isAuthenticatedForAgeAccess: Bool {
+        viewModel.isLoggedIn
+            || viewModel.isVenueOwnerLoggedIn
+            || viewModel.hasAuthenticatedVenueOwnerSession
+    }
+
+    /// Authenticated sessions must not mount social tabs until the authoritative server
+    /// record confirmed THIS UUID eligible under the current policy in this session.
+    private var shouldBlockSocialTabsForAgeAccess: Bool {
+        guard isAuthenticatedForAgeAccess else { return false }
+        guard let uid = viewModel.currentUserAuthId else { return true }
+        return !ageAccessGate.isSocialShellAllowed(for: uid)
+    }
+
+    private var existingUserAgeAccessTaskID: String {
+        let uid = viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil"
+        return "\(uid)|\(viewModel.isLoggedIn)|\(viewModel.isVenueOwnerLoggedIn)|\(viewModel.hasAuthenticatedVenueOwnerSession)|\(bootstrapCoordinator.isBootstrapping)"
+    }
+
+    @MainActor
+    private func handleAuthenticatedSessionChangeForAgeAccess(isAuthenticated: Bool) {
+        if !isAuthenticated {
+            didRunExistingUserAgeAccessCheck = false
+            ageAccessGate.handleLogoutOrAccountSwitch()
+            return
+        }
+        // Fail closed as soon as an authenticated session appears.
+        if let uid = viewModel.currentUserAuthId {
+            ageAccessGate.bindAuthenticatedUser(uid, reason: .login)
+        } else {
+            ageAccessGate.failClosedPendingAuthenticatedResolution()
+        }
+        didRunExistingUserAgeAccessCheck = false
+    }
+
+    @MainActor
+    private func runExistingUserAgeAccessCheckIfNeeded() async {
+        // Cold launch: BootstrapLoadingCoordinator owns age hydration while splash is visible.
+        if bootstrapCoordinator.isBootstrapping {
+#if DEBUG
+            print("[AgeStartupDebug] contentViewAgeDeferred reason=bootstrap_owns_cold_launch")
+#endif
+            return
+        }
+        guard isAuthenticatedForAgeAccess else { return }
+
+        guard let userId = viewModel.currentUserAuthId else {
+            ageAccessGate.failClosedPendingAuthenticatedResolution()
+            return
+        }
+
+        let previousBound = ageAccessGate.activeUserId
+        let reason: AgeAccessGateService.EvaluationReason = {
+            if previousBound == nil { return didRunExistingUserAgeAccessCheck ? .login : .launch }
+            if previousBound != userId { return .accountSwitch }
+            return .login
+        }()
+
+        // Fail closed immediately so MainTabView cannot mount under an unresolved session.
+        if !ageAccessGate.isSocialShellAllowed(for: userId) {
+            ageAccessGate.bindAuthenticatedUser(userId, reason: reason)
+        }
+
+        // Same UUID already confirmed against the server in this session — no Apple request.
+        if ageAccessGate.isSocialShellAllowed(for: userId) {
+            didRunExistingUserAgeAccessCheck = true
+            return
+        }
+
+        didRunExistingUserAgeAccessCheck = true
+        let ageStart = Date()
+#if DEBUG
+        print("[AgeStartupDebug] contentViewAgeStart reason=\(reason)")
+#endif
+        await viewModel.evaluateAgeAccessForExistingAuthenticatedSessionIfNeeded(reason: reason)
+#if DEBUG
+        let ageMs = Int(Date().timeIntervalSince(ageStart) * 1000)
+        print(
+            "[AgeStartupDebug] contentViewAgeMs=\(ageMs) allowed=\(ageAccessGate.isSocialShellAllowed(for: userId))"
+        )
+#endif
     }
 
     private func queueSupportDeepLinkRequest(_ request: SupportReplyNotificationDeepLinkRequest) {

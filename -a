@@ -1,0 +1,27 @@
+[MemoryAudit] phase=cold_or_attach footprintMB=16.9 hooks=installed
+[MemoryAudit] phase=scenePhase footprintMB=21.0 phase=active
+[MemoryAudit] phase=appReady footprintMB=29.2
+[MemoryAudit] phase=remote_tab footprintMB=79.3 tab=live
+[MemoryAudit] phase=remote_sample footprintMB=63.0
+[MemoryAudit] phase=tab footprintMB=63.0 selected=discover mounted=discover,live
+[MemoryAudit] phase=remote_tab footprintMB=240.8 tab=calendar
+[MemoryAudit] phase=remote_sample footprintMB=71.4
+[MemoryAudit] phase=periodic footprintMB=71.0 tick=1
+[MemoryAudit] phase=remote_tab footprintMB=70.7 tab=following
+[MemoryAudit] phase=remote_sample footprintMB=69.4
+[MemoryAudit] phase=remote_tab footprintMB=69.4 tab=chat
+[MemoryAudit] phase=remote_sample footprintMB=71.5
+[MemoryAudit] phase=remote_tab footprintMB=71.6 tab=account
+[MemoryAudit] phase=remote_sample footprintMB=126.7
+[MemoryAudit] phase=remote_tab footprintMB=126.6 tab=discover
+[MemoryAudit] phase=periodic footprintMB=233.2 tick=2
+[MemoryAudit] phase=remote_sample footprintMB=186.7
+[MemoryAudit] phase=remote_tab footprintMB=183.1 tab=live
+[MemoryAudit] phase=remote_sample footprintMB=79.8
+[MemoryAudit] phase=remote_tab footprintMB=77.6 tab=chat
+[MemoryAudit] phase=remote_sample footprintMB=75.5
+[MemoryAudit] phase=remote_tab footprintMB=75.4 tab=following
+[MemoryAudit] phase=remote_sample footprintMB=76.2
+[MemoryAudit] phase=remote_tab footprintMB=76.2 tab=account
+[MemoryAudit] phase=periodic footprintMB=116.3 tick=3
+[MemoryAudit] phase=remote_sample footprintMB=127.2

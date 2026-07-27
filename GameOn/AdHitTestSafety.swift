@@ -33,6 +33,8 @@ enum AdHitTestSafety {
         guard let view else { return }
         view.isUserInteractionEnabled = enabled
 #if DEBUG
+        // Fires on every layout pass for each placement; opt in with -VerboseAdHitTestDiagnostics.
+        guard DebugLogGate.verboseAdHitTestLogging else { return }
         if enabled, logFrameWhenEnabled {
             let frame = view.convert(view.bounds, to: view.window)
             print("[AdHitTestDebug] visibleFrame placement=\(placement) frame=\(frame.debugDescription)")

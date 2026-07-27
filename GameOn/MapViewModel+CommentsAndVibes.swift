@@ -258,6 +258,38 @@ extension MapViewModel {
         #endif
     }
 
+    /// Unique visible commenters for Discover map energy (not raw comment count).
+    @MainActor
+    func refreshVenueEventUniqueCommenterCount(for venueEventID: UUID, from rows: [VenueEventCommentRow]) {
+        let next = Self.uniqueVisibleCommenterCount(from: rows)
+        if venueEventUniqueCommenterCounts[venueEventID] != next {
+            venueEventUniqueCommenterCounts[venueEventID] = next
+        }
+    }
+
+    @MainActor
+    func refreshVenueEventUniqueCommenterCountFromCaches(for venueEventID: UUID) {
+        if let full = venueEventComments[venueEventID], !full.isEmpty {
+            refreshVenueEventUniqueCommenterCount(for: venueEventID, from: full)
+            return
+        }
+        if let previews = venueEventCommentPreviews[venueEventID], !previews.isEmpty {
+            // Preview-only: under-count is safer than treating raw comment volume as unique fans.
+            refreshVenueEventUniqueCommenterCount(for: venueEventID, from: previews)
+        }
+    }
+
+    nonisolated static func uniqueVisibleCommenterCount(from rows: [VenueEventCommentRow]) -> Int {
+        var emails = Set<String>()
+        for row in rows {
+            guard !row.isHiddenFromThread, !row.isFailedSend else { continue }
+            let email = OwnerBusinessEmail.normalized(row.user_email ?? "")
+            guard OwnerBusinessEmail.isValidStrict(email) else { continue }
+            emails.insert(email)
+        }
+        return emails.count
+    }
+
     @MainActor
     private func applyVenueEventCommentCountDelta(
         for venueEventID: UUID,
@@ -686,6 +718,7 @@ extension MapViewModel {
     }
 
     private func startFanChatAppLevelRealtimeIfNeeded(eventIDs: [UUID]) async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         let ids = Array(Set(eventIDs))
             .sorted { $0.uuidString < $1.uuidString }
             .prefix(FanChatAppLevelRealtimeConfig.maxTrackedEventIDs)
@@ -707,21 +740,25 @@ extension MapViewModel {
         }
     }
 
-    private func stopFanChatAppLevelRealtime() async {
+    func stopFanChatAppLevelRealtime() async {
         fanChatAppLevelRealtimeResubscribeTask?.cancel()
         fanChatAppLevelRealtimeResubscribeTask = nil
 
-        if let task = fanChatAppLevelRealtimeTask {
-            task.cancel()
-            _ = await task.result
-            fanChatAppLevelRealtimeTask = nil
-        }
+        let task = fanChatAppLevelRealtimeTask
+        let channel = fanChatAppLevelRealtimeChannel
+        fanChatAppLevelRealtimeTask = nil
+        fanChatAppLevelRealtimeChannel = nil
+
         fanUpdatesStore.crowdReactionVibeRealtimeRefreshTask?.cancel()
         fanUpdatesStore.crowdReactionVibeRealtimeRefreshTask = nil
 
-        if let channel = fanChatAppLevelRealtimeChannel {
+        // Channel removal unblocks listen loops; never await task.result before removeChannel.
+        task?.cancel()
+        if let channel {
             await supabase.removeChannel(channel)
-            fanChatAppLevelRealtimeChannel = nil
+        }
+        if let task {
+            _ = await task.result
         }
     }
 
@@ -2764,6 +2801,7 @@ extension MapViewModel {
             }
             venueEventCommentPreviews[venueEventID] = previewRows
             fanUpdatesCommentPrefetchedAt[venueEventID] = Date()
+            refreshVenueEventUniqueCommenterCount(for: venueEventID, from: previewRows)
         }
     }
 
@@ -2783,21 +2821,29 @@ extension MapViewModel {
             let rows = rowsRaw.filter { !$0.isHiddenFromThread }
             var counts: [UUID: Int] = [:]
             var previews: [UUID: [VenueEventCommentRow]] = [:]
+            var uniqueCommenters: [UUID: Set<String>] = [:]
             for row in rows {
                 guard let eventID = row.venue_event_id else { continue }
                 counts[eventID, default: 0] += 1
                 if (previews[eventID]?.count ?? 0) < VenueEventCommentsPagination.previewLimit {
                     previews[eventID, default: []].append(row)
                 }
+                let email = OwnerBusinessEmail.normalized(row.user_email ?? "")
+                if OwnerBusinessEmail.isValidStrict(email) {
+                    uniqueCommenters[eventID, default: []].insert(email)
+                }
             }
 
             await MainActor.run {
                 let now = Date()
+                var nextUnique = venueEventUniqueCommenterCounts
                 for eventID in venueEventIDs {
                     updateVenueEventCommentPreviewCount(for: eventID, to: counts[eventID] ?? 0)
                     venueEventCommentPreviews[eventID] = previews[eventID] ?? []
                     fanUpdatesCommentPrefetchedAt[eventID] = now
+                    nextUnique[eventID] = uniqueCommenters[eventID]?.count ?? 0
                 }
+                venueEventUniqueCommenterCounts = nextUnique
             }
         } catch {
             logVenueEventSocialLoadError("ERROR LOADING FAN UPDATES PREVIEW BATCH:", loadCancelledTag: "fan_updates_preview_batch", error: error)
@@ -2874,6 +2920,7 @@ extension MapViewModel {
                     return !serverIDs.contains(matchedServerID)
                 }
                 venueEventComments[venueEventID] = rows + unsentLocalRows
+                refreshVenueEventUniqueCommenterCount(for: venueEventID, from: rows + unsentLocalRows)
                 let cachedCount = venueEventCommentPreviewCounts[venueEventID] ?? 0
                 let visibleUnsentCount = unsentLocalRows.filter { !$0.isFailedSend && !$0.isHiddenFromThread }.count
                 updateVenueEventCommentPreviewCount(

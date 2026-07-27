@@ -9,6 +9,7 @@ private let pickupGameInvitesSelectColumns =
 
 private let pickupFollowingOrganizerCanceledUserClearedKeyPrefix = "gameon.following.pickupOrganizerCanceledClearedIds."
 private let pickupFollowingRejectedUserClearedKeyPrefix = "gameon.following.pickupRejectedClearedRequestIds."
+private let pickupFollowingPlayingCompletedUserClearedKeyPrefix = "gameon.following.pickupPlayingCompletedClearedIds."
 
 private func pickupRequestDebugYMD(_ d: Date) -> String {
     let c = Calendar.current
@@ -318,6 +319,7 @@ extension MapViewModel {
     }
 
     func ensurePickupInviteRealtimeIfNeeded() async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         guard canFanUsePickupGamesUI, let uid = currentUserAuthId else {
             await stopPickupInviteRealtime()
             return
@@ -337,6 +339,7 @@ extension MapViewModel {
     }
 
     func restartPickupInviteRealtimeAfterForeground() async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
 #if DEBUG
         print("[PickupInviteRealtimeDebug] reconnectOnForeground=true")
 #endif
@@ -365,17 +368,19 @@ extension MapViewModel {
         pickupInviteRealtimeDebounceTask?.cancel()
         pickupInviteRealtimeDebounceTask = nil
 
-        if let task = pickupInviteRealtimeTask {
-            task.cancel()
-            _ = await task.result
-            pickupInviteRealtimeTask = nil
-        }
-
-        if let ch = pickupInviteRealtimeChannel {
-            await supabase.removeChannel(ch)
-            pickupInviteRealtimeChannel = nil
-        }
+        let task = pickupInviteRealtimeTask
+        let channel = pickupInviteRealtimeChannel
+        pickupInviteRealtimeTask = nil
+        pickupInviteRealtimeChannel = nil
         pickupInviteRealtimeBoundUserId = nil
+
+        task?.cancel()
+        if let channel {
+            await supabase.removeChannel(channel)
+        }
+        if let task {
+            _ = await task.result
+        }
     }
 
     private func runPickupInviteRealtimeLoop(userId: UUID) async {
@@ -579,6 +584,41 @@ extension MapViewModel {
         }
     }
 
+    /// Persists per-user “Clear from Going” for completed Playing pickup cards (does not alter join/rating rows).
+    func markPickupFollowingPlayingCompletedUserCleared(pickupGameId: UUID) {
+        guard let uid = currentUserAuthId else { return }
+        var s = Self.readPickupFollowingPlayingCompletedUserClearedSet(userId: uid)
+        s.insert(pickupGameId)
+        Self.writePickupFollowingPlayingCompletedUserClearedSet(userId: uid, ids: s)
+        pickupCreatorRatingPostSubmitPromptGameIds.remove(pickupGameId)
+        myPickupGameJoinRequestCards.removeAll {
+            $0.pickupGameId == pickupGameId && $0.pill == .approved
+        }
+        pickupFollowingUnreadActivityGameIds.remove(pickupGameId)
+        pickupActivityCount = pickupFollowingUnreadActivityGameIds.count
+        hasUnreadPickupActivity = pickupActivityCount > 0
+#if DEBUG
+        print("[PickupPlayingClear] gameId=\(pickupGameId.uuidString.lowercased()) userCleared=true")
+#endif
+        showSocialActionToast("Removed from Going", isError: false)
+    }
+
+    func isPickupFollowingPlayingCompletedUserCleared(pickupGameId: UUID) -> Bool {
+        guard let uid = currentUserAuthId else { return false }
+        return Self.readPickupFollowingPlayingCompletedUserClearedSet(userId: uid).contains(pickupGameId)
+    }
+
+    /// Playing-card visibility for completed / rated / manually cleared games (does not change Hosting 48h rules).
+    func isPickupPlayingCardVisibleInGoing(game: PickupGameRow, now: Date = Date()) -> Bool {
+        GoingPickupPlayingCompletedVisibility.isVisible(
+            game: game,
+            manuallyCleared: isPickupFollowingPlayingCompletedUserCleared(pickupGameId: game.id),
+            hasRated: hasSubmittedPickupCreatorRating(for: game.id),
+            ratedAt: myPickupCreatorRatingCreatedAt(for: game.id),
+            now: now
+        )
+    }
+
     /// Persists per-user “Clear now” for Following → Games to Play organizer-canceled pickup cards.
     func markPickupFollowingOrganizerCanceledCardUserCleared(pickupGameId: UUID) {
         guard let uid = currentUserAuthId else { return }
@@ -643,6 +683,21 @@ extension MapViewModel {
         let capped = ids.sorted { $0.uuidString < $1.uuidString }.prefix(240)
         let raw = capped.map { $0.uuidString.lowercased() }.joined(separator: ",")
         UserDefaults.standard.set(raw, forKey: pickupFollowingRejectedUserClearedKeyPrefix + userId.uuidString.lowercased())
+    }
+
+    private static func readPickupFollowingPlayingCompletedUserClearedSet(userId: UUID) -> Set<UUID> {
+        let raw = UserDefaults.standard.string(forKey: pickupFollowingPlayingCompletedUserClearedKeyPrefix + userId.uuidString.lowercased()) ?? ""
+        return Set(
+            raw.split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .compactMap { UUID(uuidString: $0) }
+        )
+    }
+
+    private static func writePickupFollowingPlayingCompletedUserClearedSet(userId: UUID, ids: Set<UUID>) {
+        let capped = ids.sorted { $0.uuidString < $1.uuidString }.prefix(240)
+        let raw = capped.map { $0.uuidString.lowercased() }.joined(separator: ",")
+        UserDefaults.standard.set(raw, forKey: pickupFollowingPlayingCompletedUserClearedKeyPrefix + userId.uuidString.lowercased())
     }
 
     private static let pickupCanceledVisibilityLogISO8601: ISO8601DateFormatter = {
@@ -1087,6 +1142,9 @@ extension MapViewModel {
 #if DEBUG
             print("[PickupRequest] request failed game=\(pickupGameId.uuidString.lowercased()) error=\(error)")
 #endif
+            // Opens the shared age gate when the backend denied for age; rethrow keeps
+            // caller UI state handling unchanged (no retry of the prohibited mutation).
+            AgeAccessBackendDenial.handle(error, requestUserId: uid)
             throw error
         }
     }
@@ -1204,6 +1262,8 @@ extension MapViewModel {
             throw error
         }
 
+        await cancelPickupCreatorRatingReminder(pickupGameId: pickupGameId)
+
         try await refreshPickupGameRowFromServerAndMerge(id: pickupGameId)
         await loadMyLatestJoinRequestForPickupGame(pickupGameId: pickupGameId)
         await loadOrganizerPickupRequestSummaries(gameIds: [pickupGameId])
@@ -1232,6 +1292,7 @@ extension MapViewModel {
             organizerWithdrawnListCount = pickupOrganizerWithdrawnRequestsByGameId[pickupGameId]?.count ?? 0
             refreshedOrganizerGames = true
         }
+        await refreshPickupGameRoster(pickupGameId: pickupGameId)
 
 #if DEBUG
         print("[PickupJoinWithdraw] gameId=\(pickupGameId.uuidString.lowercased())")
@@ -1278,7 +1339,6 @@ extension MapViewModel {
                 .execute()
                 .value
             requesterLookupSucceeded = true
-            let requesterId = requestRows.first?.requester_user_id
             let requesterStatus = requestRows.first?.status ?? "unknown"
 #if DEBUG
             print("[PickupApprovalDebug] decodeFailed=false error=")
@@ -1302,21 +1362,19 @@ extension MapViewModel {
             print("[PickupRequest] approve completed id=\(requestId.uuidString.lowercased())")
             print("[PickupApprovalDebug] refetchSucceeded=true")
 #endif
-            if let requesterId {
-                await awardFanXP(
-                    userId: requesterId,
-                    amount: 10,
-                    source: FanXPSource.pickupJoinApproved,
-                    sourceId: requestId,
-                    showToast: false
-                )
-            }
+            // Server awards the approved joiner after validating creator + approved status.
+            await awardFanXP(
+                source: FanXPSource.pickupJoinApproved,
+                sourceId: requestId,
+                showToast: false
+            )
             refreshPickupJoinCachesAfterMutation()
             await refreshPickupGamesForDiscoverMap(force: true)
             recomputeCalendarDotDates()
             await loadOrganizerPickupRequestSummaries(gameIds: [pickupGameId])
             await loadOrganizerWithdrawnPickupRequestsForSettings(gameIds: [pickupGameId])
             await loadOrganizerApprovedPickupJoinersForSettings(gameIds: [pickupGameId])
+            await refreshPickupGameRoster(pickupGameId: pickupGameId)
             await loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: false)
             pickupOrganizerRequestsSyncGeneration &+= 1
             showSocialActionToast("Request approved.", isError: false)
@@ -1391,6 +1449,7 @@ extension MapViewModel {
         await loadOrganizerPickupRequestSummaries(gameIds: [pickupGameId])
         await loadOrganizerWithdrawnPickupRequestsForSettings(gameIds: [pickupGameId])
         await loadOrganizerApprovedPickupJoinersForSettings(gameIds: [pickupGameId])
+        await refreshPickupGameRoster(pickupGameId: pickupGameId)
         await loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: false)
         pickupOrganizerRequestsSyncGeneration &+= 1
         showSocialActionToast("Request rejected.", isError: false)
@@ -1532,28 +1591,55 @@ extension MapViewModel {
         pickupJoinRequestBadgeDebounceTask?.cancel()
         pickupJoinRequestBadgeDebounceTask = nil
 
-        if let task = pickupJoinRequestBadgeRealtimeTask {
-            task.cancel()
-            _ = await task.result
-            pickupJoinRequestBadgeRealtimeTask = nil
-        }
+        let task = pickupJoinRequestBadgeRealtimeTask
+        let channel = pickupJoinRequestBadgeRealtimeChannel
+        pickupJoinRequestBadgeRealtimeTask = nil
+        pickupJoinRequestBadgeRealtimeChannel = nil
+        pickupJoinRequestBadgeRealtimeOwnerUserId = nil
+        pickupJoinRequestBadgeRealtimeTrackedGameIds = nil
 
-        if let ch = pickupJoinRequestBadgeRealtimeChannel {
-            await supabase.removeChannel(ch)
-            pickupJoinRequestBadgeRealtimeChannel = nil
+        task?.cancel()
+        if let channel {
+            await supabase.removeChannel(channel)
+        }
+        if let task {
+            _ = await task.result
         }
     }
 
     func syncPickupJoinRequestBadgeRealtimeSubscription(trackedGameIds: [UUID]) async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         let uniqueSorted = Array(Set(trackedGameIds)).sorted { $0.uuidString < $1.uuidString }
         let capped = Array(uniqueSorted.prefix(200))
-        guard canFanUsePickupGamesUI, currentUserAuthId != nil, !capped.isEmpty else {
+        guard canFanUsePickupGamesUI, let uid = currentUserAuthId, !capped.isEmpty else {
             await stopPickupJoinRequestBadgeRealtime()
             return
         }
 
+        // Reuse the live channel when the same owner already tracks the same game ids and the
+        // subscription is still alive. Prevents repeated Account visits from churning the socket.
+        if pickupJoinRequestBadgeRealtimeOwnerUserId == uid,
+           pickupJoinRequestBadgeRealtimeTrackedGameIds == capped,
+           pickupJoinRequestBadgeRealtimeTask != nil,
+           pickupJoinRequestBadgeRealtimeChannel != nil {
+            AccountActivationPerf.subscriptionReused(name: "pickupJoinRequestBadge")
+            return
+        }
+
+        let resyncReason: String
+        if pickupJoinRequestBadgeRealtimeOwnerUserId != uid {
+            resyncReason = "ownerChanged"
+        } else if pickupJoinRequestBadgeRealtimeTask == nil || pickupJoinRequestBadgeRealtimeChannel == nil {
+            resyncReason = "channelAbsent"
+        } else {
+            resyncReason = "trackedGamesChanged"
+        }
+        AccountActivationPerf.subscriptionResynced(name: "pickupJoinRequestBadge", reason: resyncReason)
+
         await stopPickupJoinRequestBadgeRealtime()
 
+        pickupJoinRequestBadgeRealtimeOwnerUserId = uid
+        pickupJoinRequestBadgeRealtimeTrackedGameIds = capped
         pickupJoinRequestBadgeRealtimeTask = Task { [weak self] in
             guard let self else { return }
             await self.runPickupJoinRequestBadgeRealtimeLoop(trackedGameIds: capped)
@@ -1633,7 +1719,10 @@ extension MapViewModel {
         reason: String = "ordinary"
     ) async {
         guard canFanUsePickupGamesUI, let uid = currentUserAuthId else {
-            myPickupGameJoinRequestCards = []
+            if !myPickupGameJoinRequestCards.isEmpty {
+                myPickupGameJoinRequestCards = []
+                GoingActivationPerf.publishApplied(name: "myPickupGameJoinRequestCards", rows: 0)
+            }
             pickupGamesFollowingTabCache.removeAll()
             pickupJoinRequestLatestByPickupGameIdForFan = [:]
             lastSuccessfulFollowingJoinRequestsRefreshAt = nil
@@ -1651,6 +1740,7 @@ extension MapViewModel {
            let refreshedAt = freshFollowingJoinRequestsRefreshDate(for: uid) {
             let age = Date().timeIntervalSince(refreshedAt)
             if age < Self.followingJoinRequestsFreshnessInterval {
+                GoingActivationPerf.refreshSkipped(reason: "freshCache", source: "followingJoinRequests")
 #if DEBUG
                 TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSkipped reason=fresh age=\(String(format: "%.1f", age))")
 #endif
@@ -1658,10 +1748,35 @@ extension MapViewModel {
             }
         }
 
+        if let inFlight = followingJoinRequestsLoadTask {
+            GoingActivationPerf.refreshCoalesced(source: "followingJoinRequests")
+            TabPerf.duplicateRefreshCoalesced(name: "followingJoinRequests")
+            await inFlight.value
+            return
+        }
+
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.loadMyPickupGameJoinRequestsForFollowingNow(
+                uid: uid,
+                reason: reason
+            )
+        }
+        followingJoinRequestsLoadTask = task
+        await task.value
+        followingJoinRequestsLoadTask = nil
+    }
+
+    private func loadMyPickupGameJoinRequestsForFollowingNow(
+        uid: UUID,
+        reason: String
+    ) async {
 #if DEBUG
         TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshStarted reason=\(reason)")
         print("[PickupPlayingDebug] loadStarted=true")
 #endif
+        GoingActivationPerf.refreshStarted(source: "followingJoinRequests")
+        let startedAt = Date()
 
         let baseline = pickupFollowingCaptureActivityBaseline()
         let wasPrimed = pickupFollowingActivityPrimed
@@ -1687,7 +1802,12 @@ extension MapViewModel {
                 .value
 
             guard !requests.isEmpty else {
-                myPickupGameJoinRequestCards = []
+                if !myPickupGameJoinRequestCards.isEmpty {
+                    myPickupGameJoinRequestCards = []
+                    GoingActivationPerf.publishApplied(name: "myPickupGameJoinRequestCards", rows: 0)
+                } else {
+                    GoingActivationPerf.publishSkippedIdentical(name: "myPickupGameJoinRequestCards", rows: 0)
+                }
                 pickupGamesFollowingTabCache.removeAll()
                 pickupJoinRequestLatestByPickupGameIdForFan = [:]
                 pickupFollowingApplyActivityAfterJoinListLoad(
@@ -1698,6 +1818,7 @@ extension MapViewModel {
                     statusByGameId: [:]
                 )
                 await stopFollowingPickupRealtime()
+                await cancelAllPickupCreatorRatingReminders()
 #if DEBUG
                 print("[GamesToPlayDebug] approvedRequestsCount=0 activeApprovedGamesCount=0 filteredExpiredGamesCount=0 finalGamesToPlayCount=0 reason=no_requests")
                 print("[PickupPlayingDebug] requestsLoaded=0")
@@ -1711,6 +1832,10 @@ extension MapViewModel {
                 logPickupActivityBadgeDebug()
                 lastSuccessfulFollowingJoinRequestsRefreshAt = Date()
                 lastSuccessfulFollowingJoinRequestsRefreshUserId = uid
+                GoingActivationPerf.refreshCompleted(
+                    source: "followingJoinRequests",
+                    ms: Int(Date().timeIntervalSince(startedAt) * 1000)
+                )
 #if DEBUG
                 TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=0")
 #endif
@@ -1800,7 +1925,7 @@ extension MapViewModel {
                     continue
                 }
 
-                guard GoingTabCompletedGameVisibility.isPickupGameVisibleInGoingTab(row: game) else {
+                guard isPickupPlayingCardVisibleInGoing(game: game) else {
                     if st == "approved" { filteredExpiredGamesCount += 1 }
                     continue
                 }
@@ -1943,7 +2068,13 @@ extension MapViewModel {
 #endif
 
             pickupGamesFollowingTabCache = mergedGameRowById
-            myPickupGameJoinRequestCards = cards
+            if myPickupGameJoinRequestCards != cards {
+                myPickupGameJoinRequestCards = cards
+                GoingActivationPerf.publishApplied(name: "myPickupGameJoinRequestCards", rows: cards.count)
+            } else {
+                Perf.publishedWriteSkipped(name: "myPickupGameJoinRequestCards", reason: "unchanged")
+                GoingActivationPerf.publishSkippedIdentical(name: "myPickupGameJoinRequestCards", rows: cards.count)
+            }
             pickupFollowingApplyActivityAfterJoinListLoad(
                 baseline: baseline,
                 wasPrimed: wasPrimed,
@@ -1965,13 +2096,25 @@ extension MapViewModel {
             logPickupActivityBadgeDebug()
             lastSuccessfulFollowingJoinRequestsRefreshAt = Date()
             lastSuccessfulFollowingJoinRequestsRefreshUserId = uid
+            GoingActivationPerf.refreshCompleted(
+                source: "followingJoinRequests",
+                ms: Int(Date().timeIntervalSince(startedAt) * 1000)
+            )
 #if DEBUG
             TabPerfDebug.log("[TabPerfDebug] followingJoinRequestsRefreshSucceeded count=\(cards.count)")
 #endif
+            await reconcilePickupCreatorRatingRemindersForPlayingCards(
+                cards: cards,
+                gameById: mergedGameRowById
+            )
         } catch {
 #if DEBUG
             print("[FollowingPickup] load join cards failed:", error)
 #endif
+            GoingActivationPerf.refreshCompleted(
+                source: "followingJoinRequests",
+                ms: Int(Date().timeIntervalSince(startedAt) * 1000)
+            )
         }
     }
 
@@ -2005,7 +2148,9 @@ extension MapViewModel {
     }
 
     private func dateTimeLineForFollowingPickupCard(game: PickupGameRow) -> String {
-        if let line = game.pickupDateWithCompactTimeRange {
+        let languageCode = UserDefaults.standard.string(forKey: L10n.appLanguageKey)
+            ?? L10n.defaultLanguageCode
+        if let line = game.pickupDateWithCompactTimeRange(languageCode: languageCode) {
             return line
         }
         guard let d = PickupGameModels.parseSupabaseTimestamptz(game.game_start_at) else { return "" }
@@ -2036,10 +2181,14 @@ extension MapViewModel {
     }
 
     private func spotsSummaryForFollowingPickupCard(game: PickupGameRow) -> String? {
-        if game.isPickupFullForDiscover { return "Full" }
+        let languageCode = UserDefaults.standard.string(forKey: L10n.appLanguageKey)
+            ?? L10n.defaultLanguageCode
+        if game.isPickupFullForDiscover {
+            return L10n.t("pickup_status_full", languageCode: languageCode)
+        }
         let n = game.pickupOpenSlotsRemaining
         guard n > 0 else { return nil }
-        return n == 1 ? "1 spot open" : "\(n) spots open"
+        return pickupLocalizedSpotsOpen(n, languageCode: languageCode)
     }
 
     private static let followingPickupCardDateFormatter: DateFormatter = {

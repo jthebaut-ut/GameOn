@@ -38,6 +38,13 @@ struct WatchZoneApp: App {
                 .onAppear {
                     #if DEBUG
                     print("[LaunchPathDebug] WatchZoneAppMounted=true")
+                    print("[SettingsAppearanceDebug] appRootAppear preference=\(appearancePreference.rawValue)")
+                    #endif
+                }
+                .onChange(of: appearancePreferenceRaw) { _, newRaw in
+                    #if DEBUG
+                    let preference = FanGeoAppearancePreference(rawValue: newRaw) ?? .system
+                    print("[SettingsAppearanceDebug] appRootPreferenceChanged=\(preference.rawValue)")
                     #endif
                 }
         }
@@ -99,6 +106,7 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
     ) async {
         await MainActor.run {
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            PickupCreatorRatingNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             SupportReplyNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanGeoPlusAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)

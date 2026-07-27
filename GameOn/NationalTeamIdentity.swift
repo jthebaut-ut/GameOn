@@ -47,12 +47,13 @@ enum NationalTeamCopy {
 
     private static let fallbacks: [String: String] = [
         "national_team": "National Team",
-        "national_team_subtitle": "Represent your country for World Cup season.",
+        "national_team_subtitle": "Represent your country.",
         "choose_national_team": "Choose National Team",
         "who_are_you_supporting": "Who are you supporting?",
         "choose_national_team_subtitle": "Choose your national team",
         "search_countries": "Search countries",
-        "world_cup_2026": "World Cup 2026",
+        "world_cup_2026": "National Soccer Team",
+        "national_soccer_team": "National Soccer Team",
         "national_team_label_fan": "Fan",
         "national_team_label_supporter": "Supporter",
         "national_team_label_till_i_die": "Till I Die",
@@ -167,7 +168,7 @@ enum NationalTeamCountryCatalog {
 
 struct NationalTeamIdentityCard: View {
     enum PresentationStyle: Equatable {
-        /// Profile / picker title: "[Country] Fan" + World Cup line.
+        /// Profile / picker title: "[Country] Fan" + national-identity subtitle (independent of My Team).
         case standard
         /// Onboarding selected-country identity messaging.
         case joiningTeam
@@ -177,11 +178,24 @@ struct NationalTeamIdentityCard: View {
     var showsEditAffordance = false
     var compact = false
     var presentationStyle: PresentationStyle = .standard
+    /// Optional structured sport from a selected national-team catalog entry.
+    /// Never inferred from My Team. Nil → neutral country subtitle.
+    var nationalTeamSport: FavoriteTeamSport? = nil
     var onTap: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
+    private var identitySubtitle: String {
+        NationalFanIdentityDisplay.stripSubtitle(
+            nationalTeamSport: nationalTeamSport,
+            languageCode: appLanguageRaw
+        )
+    }
+
+    private var identitySportSymbol: String {
+        nationalTeamSport?.catalogSymbol ?? "flag.fill"
+    }
     var body: some View {
         let flagFrame: CGFloat = compact ? 58 : 46
         let flagFont: CGFloat = compact ? 40 : 34
@@ -236,11 +250,12 @@ struct NationalTeamIdentityCard: View {
                         .fixedSize(horizontal: false, vertical: true)
                     } else {
                         HStack(spacing: 6) {
-                            Image(systemName: "soccerball")
+                            Image(systemName: identitySportSymbol)
                                 .font(.system(size: compact ? 11 : 10, weight: .bold))
-                            Text(NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw))
+                            Text(identitySubtitle)
                                 .font(.system(size: compact ? 12 : 11, weight: .bold, design: .rounded))
                                 .lineLimit(1)
+                                .minimumScaleFactor(0.85)
                         }
                         .foregroundStyle(FGColor.accentGreen)
                     }
@@ -323,7 +338,11 @@ struct NationalTeamIdentityCard: View {
     private var accessibilityLabel: String {
         switch presentationStyle {
         case .standard:
-            return identity.displayTitle(languageCode: appLanguageRaw)
+            return NationalFanIdentityDisplay.accessibilityLabel(
+                identity: identity,
+                nationalTeamSport: nationalTeamSport,
+                languageCode: appLanguageRaw
+            )
         case .joiningTeam:
             let supporting = CountryDemonymCopy.connectionMessage(
                 countryCode: identity.countryCode,

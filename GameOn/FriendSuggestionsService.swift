@@ -80,6 +80,60 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         reasonLabel = try container.decodeIfPresent(String.self, forKey: .reasonLabel)
     }
 
+    init(
+        userID: UUID,
+        email: String?,
+        displayName: String?,
+        handle: String?,
+        avatarURL: String?,
+        avatarThumbnailURL: String?,
+        bio: String?,
+        sharedFavoriteTeamsCount: Int,
+        sharedEventInterestCount: Int,
+        sharedPickupGameCount: Int,
+        mutualFriendCount: Int,
+        mutualFriendAvatars: [FriendSuggestionMutualFanAvatar],
+        score: Double,
+        reasonType: String?,
+        reasonLabel: String?
+    ) {
+        self.userID = userID
+        self.email = email
+        self.displayName = displayName
+        self.handle = handle
+        self.avatarURL = avatarURL
+        self.avatarThumbnailURL = avatarThumbnailURL
+        self.bio = bio
+        self.sharedFavoriteTeamsCount = sharedFavoriteTeamsCount
+        self.sharedEventInterestCount = sharedEventInterestCount
+        self.sharedPickupGameCount = sharedPickupGameCount
+        self.mutualFriendCount = mutualFriendCount
+        self.mutualFriendAvatars = mutualFriendAvatars
+        self.score = score
+        self.reasonType = reasonType
+        self.reasonLabel = reasonLabel
+    }
+
+    func replacingAvatars(avatarURL: String?, avatarThumbnailURL: String?) -> FriendSuggestionProfile {
+        FriendSuggestionProfile(
+            userID: userID,
+            email: email,
+            displayName: displayName,
+            handle: handle,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            bio: bio,
+            sharedFavoriteTeamsCount: sharedFavoriteTeamsCount,
+            sharedEventInterestCount: sharedEventInterestCount,
+            sharedPickupGameCount: sharedPickupGameCount,
+            mutualFriendCount: mutualFriendCount,
+            mutualFriendAvatars: mutualFriendAvatars,
+            score: score,
+            reasonType: reasonType,
+            reasonLabel: reasonLabel
+        )
+    }
+
     private static func decodeUUID(
         from container: KeyedDecodingContainer<CodingKeys>,
         preferredKey: CodingKeys,
@@ -157,58 +211,139 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         SuggestedFanWhyExplanation.make(from: self, max: max)
     }
 
-    fileprivate var indicatesSimilarVenueOverlap: Bool {
-        if sharedEventInterestCount > 0 { return true }
-        let normalizedType = (reasonType ?? "")
+    fileprivate var normalizedReasonType: String {
+        (reasonType ?? "")
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
             .replacingOccurrences(of: " ", with: "_")
-        switch normalizedType {
-        case "favorite_venue", "shared_venue", "venue",
-             "venue_event", "watch_party", "shared_event", "event_interest", "event":
+    }
+
+    fileprivate var indicatesFavoriteVenueOverlap: Bool {
+        switch normalizedReasonType {
+        case "favorite_venue", "shared_venue", "venue":
             return true
         default:
             break
         }
         let label = (reasonLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return label == "Same venue" || label == "Same watch party"
+        return label == "Same venue"
+            || label == "Both follow this venue"
+    }
+
+    fileprivate var indicatesSimilarVenueOverlap: Bool {
+        if sharedEventInterestCount > 0 { return true }
+        if indicatesFavoriteVenueOverlap { return true }
+        switch normalizedReasonType {
+        case "venue_event", "watch_party", "shared_event", "event_interest", "event":
+            return true
+        default:
+            return false
+        }
     }
 }
 
-/// Compact public-safe explanation derived from existing Suggested Fans overlap fields.
+/// Compact public-safe explanation derived from server reason + overlap fields.
+/// Precedence follows strongest scoring component (server `reason_type`), not a hard-coded UI order.
 enum SuggestedFanWhyExplanation: Equatable, Hashable, Sendable {
-    case sharedFavoriteTeams(Int)
-    case similarPickupGames
-    case similarVenues
     case mutualFans(Int)
+    case similarPickupGames
+    case sameMyTeam
+    case myTeamAffinity
+    case nearby
+    case similarWatchParty
+    case sharedFavoriteTeams(Int)
+    case similarVenues
 
     static func make(from profile: FriendSuggestionProfile, max: Int = 3) -> [SuggestedFanWhyExplanation] {
         guard max > 0 else { return [] }
-        var ordered: [SuggestedFanWhyExplanation] = []
 
-        // Priority matches product guidance — stop at `max`.
-        if profile.sharedFavoriteTeamsCount > 0 {
-            ordered.append(.sharedFavoriteTeams(profile.sharedFavoriteTeamsCount))
+        let primary = explanation(forServerReasonType: profile.reasonType, profile: profile)
+        var ordered: [SuggestedFanWhyExplanation] = []
+        if let primary {
+            ordered.append(primary)
+        }
+
+        var secondary: [(SuggestedFansRanking.ReasonType, SuggestedFanWhyExplanation)] = []
+        if profile.mutualFriendCount > 0 {
+            secondary.append((.mutualFriends, .mutualFans(profile.mutualFriendCount)))
         }
         if profile.sharedPickupGameCount > 0 {
-            ordered.append(.similarPickupGames)
+            secondary.append((.pickupGame, .similarPickupGames))
         }
-        if profile.indicatesSimilarVenueOverlap {
-            ordered.append(.similarVenues)
+        if profile.normalizedReasonType == "my_team" {
+            secondary.append((.myTeam, .sameMyTeam))
         }
-        if profile.mutualFriendCount > 0 {
-            ordered.append(.mutualFans(profile.mutualFriendCount))
+        if profile.normalizedReasonType == "my_team_affinity" {
+            secondary.append((.myTeamAffinity, .myTeamAffinity))
+        }
+        if profile.normalizedReasonType == "proximity" {
+            secondary.append((.proximity, .nearby))
+        }
+        if profile.sharedEventInterestCount > 0 {
+            secondary.append((.venueEvent, .similarWatchParty))
+        }
+        if profile.sharedFavoriteTeamsCount > 0 {
+            secondary.append((.favoriteTeam, .sharedFavoriteTeams(profile.sharedFavoriteTeamsCount)))
+        }
+        if profile.indicatesFavoriteVenueOverlap {
+            secondary.append((.favoriteVenue, .similarVenues))
+        }
+
+        for (_, explanation) in secondary.sorted(by: { $0.0.tieBreakPriority < $1.0.tieBreakPriority }) {
+            if ordered.contains(explanation) { continue }
+            ordered.append(explanation)
+            if ordered.count >= max { break }
         }
 
         return Array(ordered.prefix(max))
     }
 
+    private static func explanation(
+        forServerReasonType raw: String?,
+        profile: FriendSuggestionProfile
+    ) -> SuggestedFanWhyExplanation? {
+        switch profile.normalizedReasonType {
+        case "mutual_friends":
+            return .mutualFans(max(profile.mutualFriendCount, 1))
+        case "pickup_game":
+            return .similarPickupGames
+        case "my_team":
+            return .sameMyTeam
+        case "my_team_affinity":
+            return .myTeamAffinity
+        case "proximity":
+            return .nearby
+        case "venue_event", "watch_party", "shared_event", "event_interest", "event":
+            return .similarWatchParty
+        case "favorite_team", "shared_team", "team":
+            return .sharedFavoriteTeams(max(profile.sharedFavoriteTeamsCount, 1))
+        case "favorite_venue", "shared_venue", "venue":
+            return .similarVenues
+        case "recent_activity", "reputation", "fallback":
+            // Soft quality / fallback — prefer a concrete overlap signal if present.
+            if profile.mutualFriendCount > 0 { return .mutualFans(profile.mutualFriendCount) }
+            if profile.sharedPickupGameCount > 0 { return .similarPickupGames }
+            if profile.sharedFavoriteTeamsCount > 0 {
+                return .sharedFavoriteTeams(profile.sharedFavoriteTeamsCount)
+            }
+            if profile.sharedEventInterestCount > 0 { return .similarWatchParty }
+            return nil
+        default:
+            if let raw, !raw.isEmpty {
+                return nil
+            }
+            return nil
+        }
+    }
+
     var systemImage: String {
         switch self {
-        case .sharedFavoriteTeams: return "sportscourt.fill"
-        case .similarPickupGames: return "figure.run"
-        case .similarVenues: return "building.2.fill"
         case .mutualFans: return "person.2.fill"
+        case .similarPickupGames: return "figure.run"
+        case .sameMyTeam, .myTeamAffinity, .sharedFavoriteTeams: return "sportscourt.fill"
+        case .nearby: return "location.fill"
+        case .similarWatchParty: return "tv.fill"
+        case .similarVenues: return "building.2.fill"
         }
     }
 
@@ -228,9 +363,11 @@ enum SuggestedFanWhyExplanation: Equatable, Hashable, Sendable {
                 countText
             )
         case .similarPickupGames:
-            return L10n.t("suggested_fan_why_similar_pickup", languageCode: language)
+            return L10n.t("suggested_fan_why_same_pickup", languageCode: language)
+        case .similarWatchParty:
+            return L10n.t("suggested_fan_why_same_watch_party", languageCode: language)
         case .similarVenues:
-            return L10n.t("suggested_fan_why_similar_venues", languageCode: language)
+            return L10n.t("suggested_fan_why_same_venue_follow", languageCode: language)
         case .mutualFans(let count):
             let safe = max(count, 1)
             let countText = safe.formatted(.number.locale(locale))
@@ -242,6 +379,12 @@ enum SuggestedFanWhyExplanation: Equatable, Hashable, Sendable {
                 locale: locale,
                 countText
             )
+        case .sameMyTeam:
+            return L10n.t("suggested_fan_why_same_my_team", languageCode: language)
+        case .myTeamAffinity:
+            return L10n.t("suggested_fan_why_my_team_affinity", languageCode: language)
+        case .nearby:
+            return L10n.t("suggested_fan_why_nearby", languageCode: language)
         }
     }
 }
@@ -281,7 +424,7 @@ final class FriendSuggestionsService {
             let p_center_lng: Double?
         }
 
-        // Always send p_radius_miles explicitly so SQL DEFAULT 20 is never used.
+        // Always send p_radius_miles explicitly; server default is also 45 (20260895).
         let resolvedRadiusMiles = radiusMiles > 0 ? radiusMiles : SuggestedFansProduct.nearbyRadiusMiles
 
         do {
@@ -304,9 +447,11 @@ final class FriendSuggestionsService {
                 print("[FriendSuggestionsDebug] mutualFriendCount=\(row.mutualFriendCount) user_id=\(row.userID.uuidString.lowercased())")
                 print("[FriendSuggestionsDebug] reasonSignals=\(row.reasonSignalsDebugDescription) user_id=\(row.userID.uuidString.lowercased())")
                 print("[FriendSuggestionsDebug] rankingScore=\(row.score) user_id=\(row.userID.uuidString.lowercased())")
+                print("[FriendSuggestionsDebug] reasonType=\(row.reasonType ?? "nil") user_id=\(row.userID.uuidString.lowercased())")
             }
             #endif
 
+            // Preserve authoritative server order (already diversity-shaped for the fetch pool).
             return rows
         } catch {
             #if DEBUG

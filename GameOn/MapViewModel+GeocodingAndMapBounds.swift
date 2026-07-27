@@ -370,47 +370,76 @@ extension MapViewModel {
         )
     }
 
-    /// Per-venue map energy: sum of (going + comments + vibes) across games shown for that day slice.
+    /// Per-venue map energy using ``VenueMapEnergyScore`` (Going + vibes + unique commenters + LIVE).
     func mapPinEnergyScore(bar: BarVenue, gamesOnMapDay: [SportsEvent]) -> Int {
-        gamesOnMapDay.reduce(0) { total, game in
-            guard let id = cachedVenueEventID(for: bar, gameTitle: game.title) else {
-                return total
-            }
-            let going = interestCountForVenueEvent(id)
-            let comments = fanUpdatesDisplayCommentCount(for: id)
-            let vibes = venueEventVibeCounts[id]?.values.reduce(0, +) ?? 0
-            return total + going + comments + vibes
-        }
+        mapPinEnergyBreakdown(bar: bar, gamesOnMapDay: gamesOnMapDay).total
     }
 
-    /// Strongest single-game energy in the cluster and that game’s sport (for marker glyph).
+    func mapPinEnergyBreakdown(bar: BarVenue, gamesOnMapDay: [SportsEvent]) -> VenueMapEnergyScore.Breakdown {
+        if let focused = discoverFocusedProGame?.externalGameId.trimmingCharacters(in: .whitespacesAndNewlines),
+           !focused.isEmpty {
+            let rows = venueEventRows.filter { row in
+                guard row.venue_id == bar.id, row.id != nil else { return false }
+                let rowGameID = row.external_game_id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard rowGameID == focused else { return false }
+                let status = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                if !status.isEmpty, status != "active" { return false }
+                return true
+            }
+            let activities: [VenueMapEnergyScore.EventActivity] = rows.compactMap { row in
+                guard let eventID = row.id else { return nil }
+                return VenueMapEnergyScore.eventActivity(
+                    goingCount: interestCountForVenueEvent(eventID),
+                    vibeCounts: venueEventVibeCounts[eventID] ?? [:],
+                    uniqueCommenterCount: venueEventUniqueCommenterCounts[eventID] ?? 0,
+                    isLiveNow: isVenueEventRowLiveNow(row)
+                )
+            }
+            return VenueMapEnergyScore.score(events: activities)
+        }
+
+        var activities: [VenueMapEnergyScore.EventActivity] = []
+        activities.reserveCapacity(gamesOnMapDay.count)
+        for game in gamesOnMapDay {
+            guard let id = cachedVenueEventID(for: bar, gameTitle: game.title) else { continue }
+            let going = interestCountForVenueEvent(id)
+            let vibes = venueEventVibeCounts[id] ?? [:]
+            let commenters = venueEventUniqueCommenterCounts[id] ?? 0
+            let live = hasLiveVenueEventNow(for: bar, game: game)
+            activities.append(
+                VenueMapEnergyScore.eventActivity(
+                    goingCount: going,
+                    vibeCounts: vibes,
+                    uniqueCommenterCount: commenters,
+                    isLiveNow: live
+                )
+            )
+        }
+        return VenueMapEnergyScore.score(events: activities)
+    }
+
+    private func hasLiveVenueEventNow(for bar: BarVenue, game: SportsEvent) -> Bool {
+        hasLiveVenueEventNow(for: bar, events: [game])
+    }
+
+    /// Strongest venue energy in the cluster and that venue’s dominant sport glyph.
     func clusterVenueAnnotationEnergy(cluster: VenueCluster) -> (maxScore: Int, dominantSport: String?) {
         var maxScore = 0
         var dominantSport: String?
         for bar in cluster.bars {
             let gamesToday = selectedDayEventsForMap(bar)
-            for game in gamesToday {
-                guard let id = cachedVenueEventID(for: bar, gameTitle: game.title) else { continue }
-                let going = interestCountForVenueEvent(id)
-                let comments = fanUpdatesDisplayCommentCount(for: id)
-                let vibes = venueEventVibeCounts[id]?.values.reduce(0, +) ?? 0
-                let score = going + comments + vibes
-                if score > maxScore {
-                    maxScore = score
-                    dominantSport = game.sport
-                }
+            let score = mapPinEnergyScore(bar: bar, gamesOnMapDay: gamesToday)
+            if score > maxScore {
+                maxScore = score
+                dominantSport = gamesToday.first?.sport ?? bar.primarySport
             }
         }
         return (maxScore, dominantSport)
     }
 
-    /// Short label for cluster badge (same bands as game rows).
+    /// Short label for cluster badge (aligned with ``VenueMapEnergyScore`` tiers).
     func mapClusterEnergyCaption(maxScore: Int) -> String? {
-        if maxScore >= 40 { return "👑 Trending" }
-        if maxScore >= 16 { return "🚀 Hot" }
-        if maxScore >= 6 { return "🔥 Active" }
-        if maxScore >= 1 { return "✨ Starting" }
-        return nil
+        VenueMapEnergyScore.tier(for: maxScore).clusterCaption
     }
 
     func centerMap(on bar: BarVenue, selectForPreview: Bool = true) {

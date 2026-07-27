@@ -65,6 +65,32 @@ struct GroupInboxSummaryRow: Decodable, Equatable, Sendable {
     let last_system_payload: GroupSystemEventPayload?
     let unread_count: Int?
     let is_muted: Bool?
+    /// Set when this inbox row is the private chat for a pickup game (migration 20260893+).
+    let pickup_game_id: UUID?
+
+    var isPickupGameChat: Bool { pickup_game_id != nil }
+}
+
+/// Pending group invitation for the current user (consent required before membership).
+struct GroupPendingInvitationRow: Decodable, Equatable, Identifiable, Sendable {
+    let invitation_id: UUID
+    let conversation_id: UUID
+    let group_title: String
+    let inviter_user_id: UUID
+    let created_at: String
+    let member_count: Int?
+
+    var id: UUID { invitation_id }
+}
+
+/// Admin-visible pending invite for Group Info.
+struct GroupConversationPendingInviteRow: Decodable, Equatable, Identifiable, Sendable {
+    let invitation_id: UUID
+    let invitee_user_id: UUID
+    let inviter_user_id: UUID
+    let created_at: String
+
+    var id: UUID { invitation_id }
 }
 
 /// Active membership row used to hydrate Chat Inbox avatar clusters (no RPC change).
@@ -74,7 +100,8 @@ struct GroupActiveMemberRow: Decodable, Equatable, Sendable {
     let joined_at: String
 }
 
-enum GroupInboxAvatarMembership {
+/// Pure ordering helper; callable off the MainActor by Chat inbox snapshot preparation.
+nonisolated enum GroupInboxAvatarMembership {
     /// Stable display order: other members by `joined_at` then UUID; current user only if alone.
     static func orderedAvatarMemberIds(
         members: [(userId: UUID, joinedAt: String)],
@@ -202,6 +229,26 @@ struct GroupConversationDetailRow: Decodable, Equatable, Sendable {
     let member_joined_at: String
     let viewer_is_admin: Bool
     let viewer_is_muted: Bool
+    /// Present when this conversation is linked to a pickup game (migration 20260893+).
+    let pickup_game_id: UUID?
+
+    var isPickupGameChat: Bool { pickup_game_id != nil }
+
+    /// Copies membership rows with an updated viewer mute flag (same value on every peer row).
+    func withViewerMuted(_ muted: Bool) -> GroupConversationDetailRow {
+        GroupConversationDetailRow(
+            conversation_id: conversation_id,
+            title: title,
+            created_by: created_by,
+            created_at: created_at,
+            member_user_id: member_user_id,
+            member_role: member_role,
+            member_joined_at: member_joined_at,
+            viewer_is_admin: viewer_is_admin,
+            viewer_is_muted: muted,
+            pickup_game_id: pickup_game_id
+        )
+    }
 }
 
 struct GroupMessageInsert: Encodable {
@@ -209,4 +256,26 @@ struct GroupMessageInsert: Encodable {
     let sender_id: UUID
     let body: String
     let message_type: String
+}
+
+/// Presentation context when opening a group thread as a pickup-game chat (not a social group).
+struct PickupGameChatContext: Equatable, Sendable {
+    let pickupGameId: UUID
+    let title: String
+    let sportLabel: String
+    let whenLabel: String
+    let locationLabel: String?
+    let approvedParticipantCount: Int
+
+    var headerSubtitle: String {
+        var parts: [String] = []
+        let sport = sportLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sport.isEmpty { parts.append(sport) }
+        let when = whenLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !when.isEmpty { parts.append(when) }
+        if approvedParticipantCount > 0 {
+            parts.append("\(approvedParticipantCount) approved")
+        }
+        return parts.joined(separator: " · ")
+    }
 }

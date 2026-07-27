@@ -228,6 +228,10 @@ struct WowMomentToastHost: View {
                     .padding(.bottom, bottomInset)
                     .transition(toastTransition)
                     .zIndex(9_500)
+                    // Hit-test only the toast card — never the full-screen host (which sat over the
+                    // floating tab bar and ate the first tab tap as a dismiss).
+                    .allowsHitTesting(true)
+                    .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                     .onTapGesture { manager.dismiss() }
                     .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isStaticText)
@@ -240,8 +244,8 @@ struct WowMomentToastHost: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .allowsHitTesting(manager.presentation != nil)
         .animation(reduceMotion ? .easeOut(duration: 0.18) : .spring(response: 0.42, dampingFraction: 0.82), value: manager.presentation?.id)
-        // Only the toast card receives taps; the rest of the screen keeps map/nav gestures.
     }
 
     private var toastTransition: AnyTransition {
@@ -273,7 +277,8 @@ struct WowMomentToastHost: View {
 /// Isolated so ``MainTabView`` can keep a single source of truth for floating-tab inset without circular type access issues.
 enum MainTabViewFloatingTabBarMetrics {
     /// Matches ``MainTabView/floatingTabBarStackHeight`` with a little air above the capsule.
-    static let wowMomentBottomInset: CGFloat = 102
+    /// Keep toast clear of the ~92pt floating tab bar so taps land on tabs, not the toast.
+    static let wowMomentBottomInset: CGFloat = 118
 }
 
 private struct WowMomentToastCard: View {

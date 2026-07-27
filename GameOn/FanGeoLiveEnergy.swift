@@ -112,13 +112,13 @@ struct VenueGamePreviewEnergy {
     private static func label(for score: Int) -> String? {
         switch score {
         case 81...:
-            return "🚀 Trending Now"
+            return "👑 Trending"
         case 51...80:
-            return "🔥 Packed Crowd"
+            return "🚀 Hot"
         case 26...50:
-            return "⚡ Live Energy"
+            return "🔥 Active"
         case 10...25:
-            return "🟢 Active Fan Zone"
+            return "✨ Starting"
         default:
             return nil
         }
@@ -152,10 +152,10 @@ struct VenueGamePreviewEnergy {
 
 enum VenueEnergyTier: String {
     case quiet = "Low Activity"
-    case activeFanZone = "Active Fan Zone"
-    case liveEnergy = "Live Energy"
-    case packedCrowd = "Packed Crowd"
-    case trendingNow = "Trending Now"
+    case activeFanZone = "Starting"
+    case liveEnergy = "Active"
+    case packedCrowd = "Hot"
+    case trendingNow = "Trending"
 
     static func tier(for score: Int) -> VenueEnergyTier {
         switch score {

@@ -1491,16 +1491,16 @@ struct DiscoverAnnouncementBannerPageView: View {
     private func remoteSponsoredAnnouncementImage(url: URL) -> some View {
         let shape = sponsoredAnnouncementImageShape
 
-        AsyncImage(url: url, transaction: Transaction(animation: nil)) { phase in
+        CachedRemoteImagePhaseView(url: url, bucket: .venue) { phase in
             switch phase {
-            case .success(let image):
-                image
+            case .success(let uiImage):
+                Image(uiImage: uiImage)
                     .resizable()
                     .interpolation(.high)
                     .scaledToFill()
             case .failure:
                 sponsoredVenuePlaceholderImage
-            default:
+            case .empty:
                 sponsoredVenuePlaceholderImage
                     .opacity(0.72)
             }
@@ -2110,16 +2110,16 @@ private struct DiscoverSponsoredAnnouncementDetailSheet: View {
 
         Group {
             if let imageURL = announcement.resolvedImageURL {
-                AsyncImage(url: imageURL, transaction: Transaction(animation: nil)) { phase in
+                CachedRemoteImagePhaseView(url: imageURL, bucket: .venue) { phase in
                     switch phase {
-                    case .success(let image):
-                        image
+                    case .success(let uiImage):
+                        Image(uiImage: uiImage)
                             .resizable()
                             .interpolation(.high)
                             .scaledToFill()
                     case .failure:
                         sponsoredDetailPlaceholderImage
-                    default:
+                    case .empty:
                         sponsoredDetailPlaceholderImage
                             .opacity(0.72)
                     }

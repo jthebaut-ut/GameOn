@@ -592,8 +592,12 @@ extension MapViewModel {
         print("[GoingProRefreshDebug] refresh started reason=\(reason)")
 #endif
         var previousSnapshots: [String: SavedProGame] = [:]
+        let previousSnapshotIndex = cachedLiveMatchesHydrationIndex()
         for savedGame in savedProGames {
-            previousSnapshots[savedGame.stableKey] = currentSavedProGameSnapshot(savedGame)
+            previousSnapshots[savedGame.stableKey] = currentSavedProGameSnapshot(
+                savedGame,
+                using: previousSnapshotIndex
+            )
         }
         var refreshedMatches: [LiveMatch] = []
         var liveSyncSucceeded = false
@@ -624,35 +628,154 @@ extension MapViewModel {
         )
 
 #if DEBUG
-        for saved in savedProGames {
-            let previous = previousSnapshots[saved.stableKey]
-            print("[GoingProRefreshDebug] hydrated game=\(saved.stableKey)")
-            print("[GoingProRefreshDebug] old score=\(previous.map { "\($0.scoreAway)-\($0.scoreHome)" } ?? "nil")")
-            print("[GoingProRefreshDebug] new score=\(saved.scoreAway)-\(saved.scoreHome)")
-            print("[GoingProRefreshDebug] status=\(saved.matchStatus.rawValue)")
-            print("[GoingProRefreshDebug] savedAfterStatus=\(saved.matchStatus.rawValue)")
-            print("[GoingProRefreshDebug] finalCardState=\(saved.isFinal)")
+        if DebugLogGate.verboseProGameHydrationLogging {
+            for saved in savedProGames {
+                let previous = previousSnapshots[saved.stableKey]
+                print("[GoingProRefreshDebug] hydrated game=\(saved.stableKey)")
+                print("[GoingProRefreshDebug] old score=\(previous.map { "\($0.scoreAway)-\($0.scoreHome)" } ?? "nil")")
+                print("[GoingProRefreshDebug] new score=\(saved.scoreAway)-\(saved.scoreHome)")
+                print("[GoingProRefreshDebug] status=\(saved.matchStatus.rawValue)")
+                print("[GoingProRefreshDebug] savedAfterStatus=\(saved.matchStatus.rawValue)")
+                print("[GoingProRefreshDebug] finalCardState=\(saved.isFinal)")
+            }
         }
         print("[GoingProRefreshDebug] UI updated=\(uiUpdated)")
 #endif
     }
 
     func isProGameSaved(_ match: LiveMatch) -> Bool {
+        // Signed-out / business sessions must never show a filled heart for this fan action.
+        guard canFavoriteProGames else { return false }
         let key = SavedProGame.stableKey(for: match)
         return savedProGames.contains { $0.stableKey == key }
     }
 
     func toggleSavedProGame(_ match: LiveMatch) {
-        if isProGameSaved(match) {
-            unsaveProGame(id: SavedProGame.stableKey(for: match))
-            showSocialActionToast(L10n.t("removed_from_pro_sports_games"), isError: false)
+        // Favoriting is fan-account specific: never toggle or hit the network while signed out.
+        if canFavoriteProGames {
+            if isProGameSaved(match) {
+                unsaveProGame(id: SavedProGame.stableKey(for: match))
+                showSocialActionToast(L10n.t("removed_from_pro_sports_games"), isError: false)
+            } else {
+                saveProGame(match)
+                showSocialActionToast("Saved to Going.", isError: false)
+            }
+            return
+        }
+
+        if isGuestDiscoverMode || !isAuthenticatedForSocialFeatures {
+            requestSaveProGameSignIn(for: match)
+            return
+        }
+
+        logBusinessUserGateBlocked(action: "favoriteProGame")
+        showSocialActionToast(BusinessFanGateCopy.actionTapBlocked, isError: true)
+    }
+
+    /// Presents the save-games sign-in prompt without mutating heart state or issuing network calls.
+    @MainActor
+    func requestSaveProGameSignIn(for match: LiveMatch) {
+        pendingSaveProGameMatch = match
+        pendingSaveProGameCompletionToken = nil
+        if isLiveTabSelected {
+            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.live.rawValue
+        } else if isCalendarTabSelected {
+            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.calendar.rawValue
         } else {
+            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.following.rawValue
+        }
+        presentSaveProGameSignInPrompt = true
+#if DEBUG
+        print("[SaveProGameAuth] promptPresented stableKey=\(SavedProGame.stableKey(for: match)) returnTab=\(pendingSaveProGameReturnTabRaw ?? "nil")")
+#endif
+    }
+
+    @MainActor
+    func dismissSaveProGameSignInPrompt() {
+        presentSaveProGameSignInPrompt = false
+        // Keep pending match so Sign In → login can still complete the favorite.
+        // Not Now clears the pending action entirely.
+    }
+
+    @MainActor
+    func cancelSaveProGameSignInPrompt() {
+        presentSaveProGameSignInPrompt = false
+        clearPendingSaveProGameIntent()
+#if DEBUG
+        print("[SaveProGameAuth] promptCancelled")
+#endif
+    }
+
+    /// Sign In on the save-games prompt: Account tab + existing fan login sheet.
+    @MainActor
+    func continueSaveProGameSignInFromPrompt() {
+        presentSaveProGameSignInPrompt = false
+        discoverPresentFanUserAuthSheet(openRegisterMode: false)
+#if DEBUG
+        print("[SaveProGameAuth] continueToLogin pending=\(pendingSaveProGameMatch != nil)")
+#endif
+    }
+
+    @MainActor
+    func clearPendingSaveProGameIntent() {
+        pendingSaveProGameMatch = nil
+        pendingSaveProGameReturnTabRaw = nil
+        pendingSaveProGameCompletionToken = nil
+    }
+
+    /// After fan login, optionally favorite the pending game once and restore the prior tab/game context.
+    @MainActor
+    func completePendingSaveProGameAfterLoginIfNeeded() {
+        guard pendingSaveProGameMatch != nil else { return }
+        guard canFavoriteProGames else {
+            // Signed in as a business (or otherwise non-fan) account — do not favorite; drop the intent.
+            if isAuthenticatedForSocialFeatures {
+                clearPendingSaveProGameIntent()
+            }
+            return
+        }
+        guard let match = pendingSaveProGameMatch else { return }
+        // One-shot: ignore duplicate auth observers / sheet dismiss + login success races.
+        if pendingSaveProGameCompletionToken != nil { return }
+        pendingSaveProGameCompletionToken = UUID()
+
+        let returnTab = pendingSaveProGameReturnTabRaw
+        let key = SavedProGame.stableKey(for: match)
+        pendingSaveProGameMatch = nil
+        pendingSaveProGameReturnTabRaw = nil
+        presentSaveProGameSignInPrompt = false
+
+        if !isProGameSaved(match) {
             saveProGame(match)
             showSocialActionToast("Saved to Going.", isError: false)
+#if DEBUG
+            print("[SaveProGameAuth] pendingFavoriteCompleted stableKey=\(key)")
+#endif
+        } else {
+#if DEBUG
+            print("[SaveProGameAuth] pendingFavoriteSkippedAlreadySaved stableKey=\(key)")
+#endif
         }
+
+        if let returnTab, !returnTab.isEmpty {
+            requestedMainTabRaw = returnTab
+        }
+
+        // Calendar: highlight / focus the same game when practical.
+        if returnTab == MainTabView.AppTab.calendar.rawValue {
+            enqueueScheduleProGameNav(match: match)
+        }
+
+        pendingSaveProGameCompletionToken = nil
     }
 
     func saveProGame(_ match: LiveMatch) {
+        guard canFavoriteProGames else {
+#if DEBUG
+            print("[SaveProGameAuth] saveBlocked reason=notAuthenticatedOrNotFan")
+#endif
+            return
+        }
         let snapshot = SavedProGame(match: match)
         savedProGames.removeAll { $0.stableKey == snapshot.stableKey }
         savedProGames.append(snapshot)
@@ -688,6 +811,12 @@ extension MapViewModel {
     }
 
     func unsaveProGame(id: String, onRemoteDeleteFailed: ((Error) -> Void)? = nil) {
+        guard canFavoriteProGames else {
+#if DEBUG
+            print("[SaveProGameAuth] unsaveBlocked reason=notAuthenticatedOrNotFan")
+#endif
+            return
+        }
         let savedGame = savedProGames.first { $0.stableKey == id || $0.id == id }
         let restoreSnapshot = savedGame
         let remoteLiveMatchId = savedGame?.id ?? id
@@ -742,7 +871,15 @@ extension MapViewModel {
     }
 
     func currentSavedProGameSnapshot(_ saved: SavedProGame) -> SavedProGame {
-        guard let hydration = freshestLiveMatch(for: saved) else {
+        currentSavedProGameSnapshot(saved, using: cachedLiveMatchesHydrationIndex())
+    }
+
+    /// Batch callers pass a prebuilt index so one reconciliation pass validates the Live snapshot once.
+    func currentSavedProGameSnapshot(
+        _ saved: SavedProGame,
+        using index: LiveMatchHydrationIndex
+    ) -> SavedProGame {
+        guard let hydration = freshestLiveMatch(for: saved, in: liveMatches, index: index) else {
             let fallback = staleLiveFinalCandidateDisplaySnapshot(for: saved, reason: "currentSnapshot")
 #if DEBUG
             logSavedProGameHydrationDebug(saved: saved, hydration: nil, merged: fallback ?? saved)
@@ -775,91 +912,37 @@ extension MapViewModel {
         return (hydratedSavedProGame(saved, with: hydration.match), hydration.matchedBy)
     }
 
+    /// Lookup tables for the current ``liveMatches`` snapshot, rebuilt only when the snapshot changes.
+    func cachedLiveMatchesHydrationIndex() -> LiveMatchHydrationIndex {
+        if let cached = liveMatchHydrationIndexCache, cached.isValid(for: liveMatches) {
+            return cached
+        }
+        let built = LiveMatchHydrationIndex.build(from: liveMatches)
+        liveMatchHydrationIndexCache = built
+        return built
+    }
+
     private func freshestLiveMatch(for saved: SavedProGame) -> SavedProGameHydrationMatch? {
-        freshestLiveMatch(for: saved, in: liveMatches)
+        freshestLiveMatch(for: saved, in: liveMatches, index: cachedLiveMatchesHydrationIndex())
     }
 
     private func freshestLiveMatch(for saved: SavedProGame, in candidateMatches: [LiveMatch]) -> SavedProGameHydrationMatch? {
-        let savedId = SavedProGame.normalizedHydrationToken(saved.id)
-        let savedStableKey = SavedProGame.normalizedHydrationToken(saved.stableKey)
-        if let direct = candidateMatches.first(where: { match in
-            let matchId = SavedProGame.normalizedHydrationToken(match.id)
-            return !matchId.isEmpty && (matchId == savedId || matchId == savedStableKey)
-        }) {
-            return SavedProGameHydrationMatch(match: direct, matchedBy: "directId")
-        }
-
-        if let source = saved.source?.trimmingCharacters(in: .whitespacesAndNewlines), !source.isEmpty,
-           let externalId = saved.resolvedProviderExternalId,
-           let externalMatch = candidateMatches.first(where: { match in
-               guard match.source?.caseInsensitiveCompare(source) == .orderedSame else { return false }
-               let matchExternal = SavedProGame.normalizedHydrationToken(match.externalId)
-               return matchExternal == SavedProGame.normalizedHydrationToken(externalId)
-           }) {
-            return SavedProGameHydrationMatch(match: externalMatch, matchedBy: "directExternalId")
-        }
-
-        if let providerId = saved.resolvedProviderExternalId,
-           let externalMatch = candidateMatches.first(where: { match in
-               SavedProGame.normalizedHydrationToken(match.externalId) == SavedProGame.normalizedHydrationToken(providerId)
-           }) {
-            return SavedProGameHydrationMatch(match: externalMatch, matchedBy: "directExternalId")
-        }
-
-        if let exact = candidateMatches.first(where: { SavedProGame.stableKey(for: $0) == saved.stableKey }) {
-            return SavedProGameHydrationMatch(match: exact, matchedBy: "stableKey")
-        }
-
-        if let source = saved.source?.trimmingCharacters(in: .whitespacesAndNewlines), !source.isEmpty,
-           let externalId = saved.externalId?.trimmingCharacters(in: .whitespacesAndNewlines), !externalId.isEmpty,
-           let externalMatch = candidateMatches.first(where: { match in
-               match.source?.caseInsensitiveCompare(source) == .orderedSame
-                   && match.externalId?.caseInsensitiveCompare(externalId) == .orderedSame
-           }) {
-            return SavedProGameHydrationMatch(match: externalMatch, matchedBy: "source+externalId")
-        }
-
-        let savedIdentifiers = savedProGameHydrationIdentifiers(
-            id: saved.id,
-            externalId: saved.externalId,
-            source: saved.source
+        freshestLiveMatch(
+            for: saved,
+            in: candidateMatches,
+            index: LiveMatchHydrationIndex.build(from: candidateMatches)
         )
-        if !savedIdentifiers.isEmpty,
-           let providerMatch = candidateMatches.first(where: { match in
-               !savedIdentifiers.isDisjoint(with: savedProGameHydrationIdentifiers(
-                   id: match.id,
-                   externalId: match.externalId,
-                   source: match.source
-               ))
-           }) {
-            return SavedProGameHydrationMatch(match: providerMatch, matchedBy: "providerId")
-        }
+    }
 
-        let savedAway = LiveMatchFilters.normalizedSearchText(saved.awayTeam)
-        let savedHome = LiveMatchFilters.normalizedSearchText(saved.homeTeam)
-        let savedLeague = LiveMatchFilters.normalizedSearchText(saved.league)
-        let savedSport = LiveSportVisualType.normalize(saved.sport)
-        guard !savedAway.isEmpty, !savedHome.isEmpty else { return nil }
-
-        let fallbackMatches = candidateMatches.filter { match in
-            let matchAway = LiveMatchFilters.normalizedSearchText(match.awayTeam)
-            let matchHome = LiveMatchFilters.normalizedSearchText(match.homeTeam)
-            guard matchAway == savedAway, matchHome == savedHome else { return false }
-
-            let startsNearSavedTime = abs(match.startTime.timeIntervalSince(saved.startTime)) <= 6 * 60 * 60
-            let sameDay = Calendar.current.isDate(match.startTime, inSameDayAs: saved.startTime)
-            guard startsNearSavedTime || sameDay else { return false }
-
-            guard savedSport == LiveSportVisualType.normalize(match.sport) else { return false }
-
-            let matchLeague = LiveMatchFilters.normalizedSearchText(match.league)
-            if !savedLeague.isEmpty, !matchLeague.isEmpty, savedLeague != matchLeague {
-                return startsNearSavedTime
-            }
-            return true
-        }
-        guard fallbackMatches.count == 1, let fallback = fallbackMatches.first else { return nil }
-        return SavedProGameHydrationMatch(match: fallback, matchedBy: "teams+date")
+    /// Matching precedence and comparison rules live in ``LiveMatchHydrationIndex``; the index
+    /// reproduces the previous per-tier `first(where:)` scan without re-normalizing every row.
+    private func freshestLiveMatch(
+        for saved: SavedProGame,
+        in candidateMatches: [LiveMatch],
+        index: LiveMatchHydrationIndex
+    ) -> SavedProGameHydrationMatch? {
+        guard let hit = index.firstMatch(for: saved, in: candidateMatches) else { return nil }
+        return SavedProGameHydrationMatch(match: hit.match, matchedBy: hit.matchedBy)
     }
 
     private func hydratedSavedProGame(_ saved: SavedProGame, with match: LiveMatch) -> SavedProGame {
@@ -903,9 +986,11 @@ extension MapViewModel {
 
     private func staleLiveFinalCandidateDisplaySnapshot(for saved: SavedProGame, reason: String) -> SavedProGame? {
         guard isStaleLiveFinalCandidate(saved) else { return nil }
-#if DEBUG
-        print("[GoingProRefreshDebug] staleFinalCandidate=true id=\(saved.stableKey) reason=\(reason) elapsedHours=\(String(format: "%.1f", Date().timeIntervalSince(saved.startTime) / 3600)) score=\(saved.scoreAway)-\(saved.scoreHome) savedStatus=\(saved.matchStatus.rawValue)")
-#endif
+        DebugLogGate.proGameHydrationVerbose(
+            "[GoingProRefreshDebug] staleFinalCandidate=true id=\(saved.stableKey) reason=\(reason) "
+                + "elapsedHours=\(String(format: "%.1f", Date().timeIntervalSince(saved.startTime) / 3600)) "
+                + "score=\(saved.scoreAway)-\(saved.scoreHome) savedStatus=\(saved.matchStatus.rawValue)"
+        )
         return SavedProGame(
             id: saved.id,
             source: saved.source,
@@ -947,34 +1032,6 @@ extension MapViewModel {
         }
     }
 
-    private func savedProGameHydrationIdentifiers(id: String, externalId: String?, source: String?) -> Set<String> {
-        var identifiers = Set<String>()
-        for raw in [id, externalId].compactMap({ $0 }) {
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            insertSavedProGameHydrationIdentifier(trimmed, into: &identifiers)
-            if let last = trimmed.split(separator: ":").last {
-                insertSavedProGameHydrationIdentifier(String(last), into: &identifiers)
-            }
-            if let source {
-                let normalizedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !normalizedSource.isEmpty {
-                    insertSavedProGameHydrationIdentifier("\(normalizedSource):\(trimmed)", into: &identifiers)
-                }
-            }
-        }
-        return identifiers
-    }
-
-    private func insertSavedProGameHydrationIdentifier(_ raw: String, into identifiers: inout Set<String>) {
-        let normalized = raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-            .lowercased()
-        guard !normalized.isEmpty else { return }
-        identifiers.insert(normalized)
-    }
-
 #if DEBUG
     private func logSavedProGameHydrationDebug(
         saved: SavedProGame,
@@ -982,6 +1039,7 @@ extension MapViewModel {
         merged: SavedProGame
     ) {
         guard SavedProGameStatusDiagnostics.enabled else { return }
+        guard DebugLogGate.verboseProGameHydrationLogging else { return }
         let fresh = hydration?.match
         let matchedBy = hydration?.matchedBy ?? "none"
         print("[SavedProGameHydrationDebug] directIdLookupAttempt=\(saved.stableKey)")
@@ -1020,6 +1078,7 @@ extension MapViewModel {
         savedCardHydrated: Bool,
         reason: String
     ) {
+        guard DebugLogGate.verboseProGameHydrationLogging else { return }
         let fetchedMatch = fetched?.match
         print(
             "[ProScoreRefreshDebug] " +
@@ -1067,8 +1126,12 @@ extension MapViewModel {
         guard !matches.isEmpty else {
 #if DEBUG
             for saved in savedProGames {
-                print("[GoingProRefreshDebug] liveMatchFound=false id=\(saved.stableKey)")
-                print("[GoingProRefreshDebug] hydrationSkippedReason=no_live_matches id=\(saved.stableKey)")
+                DebugLogGate.proGameHydrationVerbose(
+                    "[GoingProRefreshDebug] liveMatchFound=false id=\(saved.stableKey)"
+                )
+                DebugLogGate.proGameHydrationVerbose(
+                    "[GoingProRefreshDebug] hydrationSkippedReason=no_live_matches id=\(saved.stableKey)"
+                )
                 _ = staleLiveFinalCandidateDisplaySnapshot(for: saved, reason: "\(reason):noLiveMatches")
             }
 #endif
@@ -1078,13 +1141,31 @@ extension MapViewModel {
         var changedSavedSnapshots = false
         var calendarSyncCandidates: [SavedProGame] = []
 
+        // One index per snapshot instead of a full linear rescan (with per-row Unicode folding)
+        // for every saved game and every matching tier.
+        let batchStartedAt = CFAbsoluteTimeGetCurrent()
+        let incomingIndex = LiveMatchHydrationIndex.build(from: matches)
+        let currentIndex = cachedLiveMatchesHydrationIndex()
+        var batchMetrics = LiveApplyPerf.SavedGameBatchMetrics()
+        batchMetrics.savedGamesConsidered = savedProGames.count
+        batchMetrics.indexBuildMs = incomingIndex.buildMs
+
         for savedIndex in savedProGames.indices {
             let previousSavedSnapshot = savedProGames[savedIndex]
-            let previousDisplaySnapshot = currentSavedProGameSnapshot(previousSavedSnapshot)
-            guard let hydration = freshestLiveMatch(for: previousSavedSnapshot, in: matches) else {
+            let previousDisplaySnapshot = currentSavedProGameSnapshot(previousSavedSnapshot, using: currentIndex)
+            guard let hydration = freshestLiveMatch(
+                for: previousSavedSnapshot,
+                in: matches,
+                index: incomingIndex
+            ) else {
+                batchMetrics.savedGamesUnmatched += 1
 #if DEBUG
-                print("[GoingProRefreshDebug] liveMatchFound=false id=\(previousSavedSnapshot.stableKey)")
-                print("[GoingProRefreshDebug] hydrationSkippedReason=no_matching_live_match id=\(previousSavedSnapshot.stableKey)")
+                DebugLogGate.proGameHydrationVerbose(
+                    "[GoingProRefreshDebug] liveMatchFound=false id=\(previousSavedSnapshot.stableKey)"
+                )
+                DebugLogGate.proGameHydrationVerbose(
+                    "[GoingProRefreshDebug] hydrationSkippedReason=no_matching_live_match id=\(previousSavedSnapshot.stableKey)"
+                )
                 _ = staleLiveFinalCandidateDisplaySnapshot(for: previousSavedSnapshot, reason: "\(reason):noMatchingLiveMatch")
                 logProScoreRefreshDebug(
                     saved: previousSavedSnapshot,
@@ -1099,10 +1180,15 @@ extension MapViewModel {
                 continue
             }
 
+            batchMetrics.savedGamesMatched += 1
             let updatedSnapshot = hydratedSavedProGame(previousSavedSnapshot, with: hydration.match)
 #if DEBUG
-            print("[GoingProRefreshDebug] liveMatchFound=true id=\(previousSavedSnapshot.stableKey) matchedBy=\(hydration.matchedBy)")
-            print("[GoingProRefreshDebug] hydrationSkippedReason=none id=\(previousSavedSnapshot.stableKey)")
+            DebugLogGate.proGameHydrationVerbose(
+                "[GoingProRefreshDebug] liveMatchFound=true id=\(previousSavedSnapshot.stableKey) matchedBy=\(hydration.matchedBy)"
+            )
+            DebugLogGate.proGameHydrationVerbose(
+                "[GoingProRefreshDebug] hydrationSkippedReason=none id=\(previousSavedSnapshot.stableKey)"
+            )
             logProScoreRefreshDebug(
                 saved: previousSavedSnapshot,
                 previous: previousDisplaySnapshot,
@@ -1114,6 +1200,7 @@ extension MapViewModel {
             )
 #endif
             if updatedSnapshot != previousSavedSnapshot {
+                batchMetrics.savedGamesChanged += 1
                 savedProGames[savedIndex] = updatedSnapshot
                 changedSavedSnapshots = true
                 if savedProGameCalendarFieldsChanged(from: previousSavedSnapshot, to: updatedSnapshot) {
@@ -1164,6 +1251,9 @@ extension MapViewModel {
                 await self?.deliverSavedProGamePredictionResultNotificationIfNeeded(updatedSnapshot, reason: reason)
             }
         }
+
+        batchMetrics.reconcileMs = (CFAbsoluteTimeGetCurrent() - batchStartedAt) * 1000
+        LiveApplyPerf.savedGameBatch(batchMetrics, reason: reason)
 
         if changedSavedSnapshots {
             sortSavedProGames()
@@ -1218,19 +1308,19 @@ extension MapViewModel {
         reason: String
     ) {
         guard let userID = currentUserAuthId, isAuthenticatedForSocialFeatures else { return }
-#if DEBUG
-        print("[GoingProRefreshDebug] savedBeforeStatus=\(previous.matchStatus.rawValue)")
-        print("[GoingProRefreshDebug] liveStatus=\(liveStatus.rawValue)")
-        print("[GoingProRefreshDebug] normalizedStatus=\(updated.matchStatus.rawValue)")
-        print("[GoingProRefreshDebug] savedAfterStatus=\(updated.matchStatus.rawValue)")
-#endif
+        DebugLogGate.proGameHydrationVerbose(
+            "[GoingProRefreshDebug] savedBeforeStatus=\(previous.matchStatus.rawValue) "
+                + "liveStatus=\(liveStatus.rawValue) "
+                + "normalizedStatus=\(updated.matchStatus.rawValue) "
+                + "savedAfterStatus=\(updated.matchStatus.rawValue)"
+        )
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await self.upsertSavedProGameToSupabase(updated, userID: userID)
-#if DEBUG
-                print("[GoingProRefreshDebug] savedStatusPersisted=true id=\(updated.stableKey) reason=\(reason)")
-#endif
+                DebugLogGate.proGameHydrationVerbose(
+                    "[GoingProRefreshDebug] savedStatusPersisted=true id=\(updated.stableKey) reason=\(reason)"
+                )
             } catch {
 #if DEBUG
                 print("[GoingProRefreshDebug] savedStatusPersisted=false id=\(updated.stableKey) reason=\(reason) error=\(error.localizedDescription)")

@@ -92,7 +92,9 @@ extension MapViewModel {
     }
 
     func rescheduleGameReminderIfPossible(venueEventID: UUID) async {
-        print("[NotificationDebug] rescheduleReminder eventId=\(venueEventID.uuidString)")
+        DebugLogGate.proGameReminderVerbose(
+            "[NotificationDebug] rescheduleReminder eventId=\(venueEventID.uuidString)"
+        )
         guard notifyBeforeGame else {
             await cancelGameReminder(venueEventID: venueEventID)
             return
@@ -108,9 +110,14 @@ extension MapViewModel {
     func reconcileGameRemindersForLoadedVenueEvents() async {
         guard notifyBeforeGame else { return }
         let visibleGoingIDs = venueEventRows.compactMap(\.id).filter { venueEventInterestIDs.contains($0) }
-        for eventID in visibleGoingIDs {
-            await rescheduleGameReminderIfPossible(venueEventID: eventID)
-        }
+        let events = visibleGoingIDs.compactMap { gameReminderNotificationEvent(for: $0) }
+        guard !events.isEmpty else { return }
+        await gameReminderService.scheduleReminders(
+            for: events,
+            reminderMinutesBefore: reminderMinutesBefore,
+            repeatUntilStart: repeatGameReminder,
+            repeatEveryMinutes: repeatEveryMinutes
+        )
     }
 
     func scheduleProGameNotificationsIfPossible(_ savedGame: SavedProGame) async {
@@ -323,11 +330,34 @@ extension MapViewModel {
     }
 
     private func rescheduleAvailableGameReminders(reason: String) async {
+        guard notifyBeforeGame else { return }
+        let startedAt = Date()
         let eventIDs = availableGoingVenueEventIDs()
+        var events: [GameReminderNotificationEvent] = []
+        events.reserveCapacity(eventIDs.count)
         for eventID in eventIDs {
-            print("[NotificationDebug] rescheduleReminder eventId=\(eventID.uuidString) reason=\(reason)")
-            await scheduleGameReminderIfPossible(venueEventID: eventID)
+            DebugLogGate.proGameReminderVerbose(
+                "[NotificationDebug] rescheduleReminder eventId=\(eventID.uuidString) reason=\(reason)"
+            )
+            guard let event = gameReminderNotificationEvent(for: eventID) else { continue }
+            events.append(event)
         }
+        guard !events.isEmpty else { return }
+
+        // One diffed pass: unchanged reminders stay pending instead of cancel + re-add per event.
+        let diff = await gameReminderService.scheduleReminders(
+            for: events,
+            reminderMinutesBefore: reminderMinutesBefore,
+            repeatUntilStart: repeatGameReminder,
+            repeatEveryMinutes: repeatEveryMinutes
+        )
+        GoingApplyPerf.notificationDiff(
+            desired: diff.desired,
+            scheduled: diff.alreadyScheduled,
+            applied: diff.applied + diff.removed,
+            ms: Date().timeIntervalSince(startedAt) * 1000,
+            reason: reason
+        )
     }
 
     private func rescheduleAvailableProGameKickoffAlerts(reason: String) async {

@@ -9,6 +9,7 @@ struct PickupBulkImportPreviewView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var isFileImporterPresented = false
     @State private var selectedFileName = ""
@@ -20,6 +21,10 @@ struct PickupBulkImportPreviewView: View {
     @State private var templateErrorMessage: String?
     @State private var importResult: PickupBulkImportResult?
     @State private var selectedRowIDs: Set<UUID> = []
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var summary: PickupBulkImportSummary {
         PickupBulkImportValidator.summary(for: previewRows)
@@ -41,6 +46,14 @@ struct PickupBulkImportPreviewView: View {
         hasSuccessfulImport || selectedImportableRows.isEmpty || isLoadingPreview || isImporting
     }
 
+    private var isStep3Enabled: Bool {
+        !isImportButtonDisabled
+    }
+
+    private var isUploadEnabled: Bool {
+        !isLoadingPreview && !isImporting && !hasSuccessfulImport
+    }
+
     private var allowedFileTypes: [UTType] {
         var types: [UTType] = [.commaSeparatedText]
         if let csv = UTType(filenameExtension: "csv") {
@@ -55,52 +68,10 @@ struct PickupBulkImportPreviewView: View {
     var body: some View {
         List {
             Section {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("Upload multiple pickup games at once using the FanGeo template.")
-                        .font(FGTypography.body)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    pickupAgeRangeImportTip
-
-                    if let templateURL {
-                        ShareLink(item: templateURL) {
-                            Label("Download Template", systemImage: "arrow.down.doc")
-                                .font(FGTypography.body.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                    } else {
-                        Button {
-                            prepareTemplateFile()
-                        } label: {
-                            Label("Download Template", systemImage: "arrow.down.doc")
-                                .font(FGTypography.body.weight(.semibold))
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    Button {
-                        isFileImporterPresented = true
-                    } label: {
-                        Label(selectedFileName.isEmpty ? "Upload CSV/XLSX" : selectedFileName, systemImage: "doc.badge.plus")
-                            .font(FGTypography.body.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(FGColor.accentBlue)
-                    .disabled(isLoadingPreview || isImporting || hasSuccessfulImport)
-                    if let templateErrorMessage, !templateErrorMessage.isEmpty {
-                        Text(templateErrorMessage)
-                            .font(FGTypography.caption)
-                            .foregroundStyle(FGColor.dangerRed)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(.vertical, 4)
-            } header: {
-                Text("Import CSV/XLSX")
+                csvImportWorkflowHeader
+                    .listRowInsets(EdgeInsets(top: 8, leading: FGSpacing.lg, bottom: 8, trailing: FGSpacing.lg))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
             }
 
             if let errorMessage, !errorMessage.isEmpty {
@@ -116,7 +87,7 @@ struct PickupBulkImportPreviewView: View {
                 Section {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Validating template...")
+                        Text(L10n.t("pickup_csv_import_validating", languageCode: languageCode))
                             .font(FGTypography.body)
                     }
                     .padding(.vertical, 6)
@@ -127,17 +98,17 @@ struct PickupBulkImportPreviewView: View {
                 Section {
                     summaryGrid
                 } header: {
-                    Text("Preview Summary")
+                    Text(L10n.t("pickup_csv_import_preview_summary", languageCode: languageCode))
                 }
 
                 Section {
                     HStack(spacing: 12) {
-                        Button("Select All") {
+                        Button(L10n.t("pickup_csv_import_select_all", languageCode: languageCode)) {
                             selectAllImportableRows()
                         }
                         .disabled(importableRows.isEmpty || isImporting || hasSuccessfulImport)
 
-                        Button("Deselect All") {
+                        Button(L10n.t("pickup_csv_import_deselect_all", languageCode: languageCode)) {
                             selectedRowIDs.removeAll()
                         }
                         .disabled(selectedRowIDs.isEmpty || isImporting || hasSuccessfulImport)
@@ -145,57 +116,84 @@ struct PickupBulkImportPreviewView: View {
                     .font(FGTypography.caption.weight(.semibold))
                     .buttonStyle(.borderless)
 
-                    Text("\(selectedImportableRows.count) selected for import")
+                    Text(
+                        String(
+                            format: L10n.t("pickup_csv_import_selected_count_format", languageCode: languageCode),
+                            locale: Locale(identifier: languageCode),
+                            Int64(selectedImportableRows.count)
+                        )
+                    )
                         .font(FGTypography.body.weight(.semibold))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                 }
 
-                importableRowsSection(title: "Ready rows", status: .valid)
-                importableRowsSection(title: "Warning rows", status: .warning)
+                importableRowsSection(
+                    title: L10n.t("pickup_csv_import_ready_rows", languageCode: languageCode),
+                    status: .valid
+                )
+                importableRowsSection(
+                    title: L10n.t("pickup_csv_import_warning_rows", languageCode: languageCode),
+                    status: .warning
+                )
                 errorRowsSection
             }
 
             if let importResult {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
-                        Label("Imported \(importResult.insertedCount) pickup games", systemImage: "checkmark.circle.fill")
+                        Label(
+                            String(
+                                format: L10n.t("pickup_csv_import_result_inserted_format", languageCode: languageCode),
+                                locale: Locale(identifier: languageCode),
+                                Int64(importResult.insertedCount)
+                            ),
+                            systemImage: "checkmark.circle.fill"
+                        )
                             .foregroundStyle(FGColor.accentGreen)
                             .font(FGTypography.body.weight(.semibold))
                         if importResult.failedCount > 0 {
-                            Text("\(importResult.failedCount) rows failed during insert and were skipped.")
+                            Text(
+                                String(
+                                    format: L10n.t("pickup_csv_import_result_failed_format", languageCode: languageCode),
+                                    locale: Locale(identifier: languageCode),
+                                    Int64(importResult.failedCount)
+                                )
+                            )
                                 .font(FGTypography.caption)
                                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                         }
                     }
                 } header: {
-                    Text("Import Result")
+                    Text(L10n.t("pickup_csv_import_result_header", languageCode: languageCode))
                 }
             }
 
             if !showsNavigationChrome {
                 Section {
                     completionActionButtons
-                        .font(FGTypography.body.weight(.semibold))
                 }
+                .listRowInsets(EdgeInsets(top: 8, leading: FGSpacing.lg, bottom: 12, trailing: FGSpacing.lg))
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
             }
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
         .fanGeoScreenBackground()
-        .navigationTitle(showsNavigationChrome ? "Import CSV/XLSX" : "")
+        .navigationTitle(showsNavigationChrome ? L10n.t("pickup_csv_import_title", languageCode: languageCode) : "")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if showsNavigationChrome {
                 if !hasSuccessfulImport {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") {
+                        Button(L10n.t("pickup_csv_import_done", languageCode: languageCode)) {
                             dismiss()
                         }
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     if hasSuccessfulImport {
-                        Button("Done") {
+                        Button(L10n.t("pickup_csv_import_done", languageCode: languageCode)) {
                             doneTappedAfterSuccess()
                         }
                     } else {
@@ -203,6 +201,7 @@ struct PickupBulkImportPreviewView: View {
                             Task { await importPreparedRows() }
                         }
                         .disabled(isImportButtonDisabled)
+                        .tint(FGColor.intentPlay)
                     }
                 }
             }
@@ -223,40 +222,220 @@ struct PickupBulkImportPreviewView: View {
     }
 
     private var importButtonTitle: String {
-        if isImporting { return "Importing..." }
-        return "Import Games"
+        if isImporting {
+            return L10n.t("pickup_csv_import_button_importing", languageCode: languageCode)
+        }
+        return L10n.t("pickup_csv_import_button", languageCode: languageCode)
     }
 
-    private var pickupAgeRangeImportTip: some View {
-        Label("Use the official FanGeoPickupGamesTemplate.xlsx file to add and import pickup games.", systemImage: "info.circle.fill")
-            .font(FGTypography.caption.weight(.semibold))
-            .foregroundStyle(FGColor.accentBlue)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.14 : 0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    private var step2Subtitle: String {
+        if isLoadingPreview {
+            return L10n.t("pickup_csv_import_validating", languageCode: languageCode)
+        }
+        if !selectedFileName.isEmpty {
+            return selectedFileName
+        }
+        return L10n.t("pickup_csv_import_step2_subtitle", languageCode: languageCode)
+    }
+
+    private var step3Subtitle: String {
+        if isImporting {
+            return L10n.t("pickup_csv_import_button_importing", languageCode: languageCode)
+        }
+        if !previewRows.isEmpty {
+            return String(
+                format: L10n.t("pickup_csv_import_selected_count_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                Int64(selectedImportableRows.count)
+            )
+        }
+        return L10n.t("pickup_csv_import_step3_subtitle", languageCode: languageCode)
+    }
+
+    private var csvImportWorkflowHeader: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.md) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L10n.t("pickup_csv_import_title", languageCode: languageCode))
+                    .font(.system(size: 28, weight: .bold, design: .default))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(L10n.t("pickup_csv_import_subtitle", languageCode: languageCode))
+                    .font(FGTypography.body)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(spacing: FGSpacing.sm) {
+                downloadTemplateStepRow
+                uploadFileStepRow
+                importGamesStepRow
+            }
+
+            if let templateErrorMessage, !templateErrorMessage.isEmpty {
+                Text(templateErrorMessage)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.dangerRed)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            csvOfficialTemplateInfoCard
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var downloadTemplateStepRow: some View {
+        let title = L10n.t("pickup_csv_import_step1_title", languageCode: languageCode)
+        let subtitle = L10n.t("pickup_csv_import_step1_subtitle", languageCode: languageCode)
+        if let templateURL {
+            ShareLink(item: templateURL) {
+                PickupCSVImportStepRow(
+                    title: title,
+                    subtitle: subtitle,
+                    systemImage: "tablecells",
+                    badgeTint: FGColor.accentGreen,
+                    isEnabled: true,
+                    showsChevron: true
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(L10n.t("pickup_csv_import_step1_a11y_hint", languageCode: languageCode))
+        } else {
+            Button {
+                prepareTemplateFile()
+            } label: {
+                PickupCSVImportStepRow(
+                    title: title,
+                    subtitle: subtitle,
+                    systemImage: "tablecells",
+                    badgeTint: FGColor.accentGreen,
+                    isEnabled: true,
+                    showsChevron: true
+                )
+            }
+            .buttonStyle(FGPremiumPressButtonStyle())
+            .accessibilityHint(L10n.t("pickup_csv_import_step1_a11y_hint", languageCode: languageCode))
+        }
+    }
+
+    private var uploadFileStepRow: some View {
+        Button {
+            isFileImporterPresented = true
+        } label: {
+            PickupCSVImportStepRow(
+                title: L10n.t("pickup_csv_import_step2_title", languageCode: languageCode),
+                subtitle: step2Subtitle,
+                systemImage: "arrow.up.doc.fill",
+                badgeTint: FGColor.accentBlue,
+                isEnabled: isUploadEnabled,
+                showsChevron: true
+            )
+        }
+        .buttonStyle(FGPremiumPressButtonStyle())
+        .disabled(!isUploadEnabled)
+        .accessibilityHint(L10n.t("pickup_csv_import_step2_a11y_hint", languageCode: languageCode))
+    }
+
+    @ViewBuilder
+    private var importGamesStepRow: some View {
+        let title = L10n.t("pickup_csv_import_step3_title", languageCode: languageCode)
+        if isStep3Enabled {
+            Button {
+                Task { await importPreparedRows() }
+            } label: {
+                PickupCSVImportStepRow(
+                    title: title,
+                    subtitle: step3Subtitle,
+                    systemImage: "checkmark.circle.fill",
+                    badgeTint: FGColor.intentPlay,
+                    isEnabled: true,
+                    showsChevron: true
+                )
+            }
+            .buttonStyle(FGPremiumPressButtonStyle())
+            .accessibilityHint(L10n.t("pickup_csv_import_step3_a11y_hint", languageCode: languageCode))
+        } else {
+            PickupCSVImportStepRow(
+                title: title,
+                subtitle: step3Subtitle,
+                systemImage: "checkmark.circle.fill",
+                badgeTint: FGColor.intentPlay,
+                isEnabled: false,
+                showsChevron: true
+            )
+            .accessibilityHint(L10n.t("pickup_csv_import_step3_a11y_hint_disabled", languageCode: languageCode))
+        }
+    }
+
+    private var csvOfficialTemplateInfoCard: some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "info.circle.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(FGColor.accentBlue)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+
+            Text(L10n.t("pickup_csv_import_template_tip", languageCode: languageCode))
+                .font(FGTypography.caption.weight(.semibold))
+                .foregroundStyle(FGColor.accentBlue)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.10),
+            in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
     private var completionActionButtons: some View {
         if hasSuccessfulImport {
-            Button("Done") {
-                doneTappedAfterSuccess()
-            }
-            .frame(maxWidth: .infinity)
+            VStack(spacing: FGSpacing.sm) {
+                Button {
+                    doneTappedAfterSuccess()
+                } label: {
+                    Text(L10n.t("pickup_csv_import_done", languageCode: languageCode))
+                        .font(FGTypography.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 50)
+                        .background(FGColor.intentPlay, in: Capsule())
+                }
+                .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: true))
 
-            Button("Import another file") {
-                resetForAnotherFile()
+                Button(L10n.t("pickup_csv_import_another_file", languageCode: languageCode)) {
+                    resetForAnotherFile()
+                }
+                .font(FGTypography.caption.weight(.semibold))
+                .foregroundStyle(FGColor.intentPlay)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 44)
+                .buttonStyle(.plain)
             }
-            .font(FGTypography.caption.weight(.semibold))
-            .frame(maxWidth: .infinity)
-            .buttonStyle(.borderless)
         } else {
-            Button(importButtonTitle) {
+            Button {
                 Task { await importPreparedRows() }
+            } label: {
+                Text(importButtonTitle)
+                    .font(FGTypography.body.weight(.semibold))
+                    .foregroundStyle(isImportButtonDisabled ? FGColor.mutedText(colorScheme) : .white)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: 50)
+                    .background(
+                        (isImportButtonDisabled
+                            ? FGColor.mutedText(colorScheme).opacity(colorScheme == .dark ? 0.28 : 0.18)
+                            : FGColor.intentPlay),
+                        in: Capsule()
+                    )
             }
-            .frame(maxWidth: .infinity)
+            .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: !isImportButtonDisabled))
             .disabled(isImportButtonDisabled)
+            .accessibilityLabel(importButtonTitle)
         }
     }
 
@@ -267,9 +446,21 @@ struct PickupBulkImportPreviewView: View {
 
     private var summaryGrid: some View {
         HStack(spacing: 10) {
-            summaryPill(title: "Ready", value: summary.validCount, tint: FGColor.accentGreen)
-            summaryPill(title: "Warning", value: summary.warningCount, tint: FGColor.accentYellow)
-            summaryPill(title: "Error", value: summary.failedCount, tint: FGColor.dangerRed)
+            summaryPill(
+                title: L10n.t("pickup_csv_import_summary_ready", languageCode: languageCode),
+                value: summary.validCount,
+                tint: FGColor.accentGreen
+            )
+            summaryPill(
+                title: L10n.t("pickup_csv_import_summary_warning", languageCode: languageCode),
+                value: summary.warningCount,
+                tint: FGColor.accentYellow
+            )
+            summaryPill(
+                title: L10n.t("pickup_csv_import_summary_error", languageCode: languageCode),
+                value: summary.failedCount,
+                tint: FGColor.dangerRed
+            )
         }
         .padding(.vertical, 4)
     }
@@ -321,9 +512,9 @@ struct PickupBulkImportPreviewView: View {
                     )
                 }
             } header: {
-                Text("Error rows")
+                Text(L10n.t("pickup_csv_import_error_rows", languageCode: languageCode))
             } footer: {
-                Text("Error rows will not be imported.")
+                Text(L10n.t("pickup_csv_import_error_rows_footer", languageCode: languageCode))
             }
         }
     }
@@ -411,6 +602,75 @@ struct PickupBulkImportPreviewView: View {
         if result.insertedCount > 0 {
             onImported()
         }
+    }
+}
+
+/// Elevated step row for the Create Game CSV Import workflow.
+struct PickupCSVImportStepRow: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let badgeTint: Color
+    var isEnabled: Bool = true
+    var showsChevron: Bool = true
+
+    var body: some View {
+        HStack(alignment: .center, spacing: FGSpacing.sm) {
+            Image(systemName: systemImage)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(isEnabled ? badgeTint : FGColor.mutedText(colorScheme))
+                .frame(width: 36, height: 36)
+                .background(
+                    (isEnabled ? badgeTint : FGColor.mutedText(colorScheme)).opacity(0.14),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 16, weight: .semibold, design: .default))
+                    .foregroundStyle(isEnabled ? FGColor.primaryText(colorScheme) : FGColor.mutedText(colorScheme))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(subtitle)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(isEnabled ? FGColor.secondaryText(colorScheme) : FGColor.mutedText(colorScheme))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(FGColor.mutedText(colorScheme).opacity(isEnabled ? 1 : 0.55))
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(minHeight: 60, alignment: .center)
+        .contentShape(Rectangle())
+        .background(FGAdaptiveSurface.cardElevated)
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                .strokeBorder(
+                    FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.45 : 0.55),
+                    lineWidth: 0.5
+                )
+        }
+        .softCardShadow()
+        .opacity(isEnabled ? 1 : 0.62)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isEnabled ? .isButton : [])
+        .accessibilityLabel(title)
+        .accessibilityValue(subtitle)
+        .accessibilityRespondsToUserInteraction(isEnabled)
     }
 }
 

@@ -45,6 +45,14 @@ nonisolated struct SportsEvent: Identifiable, Equatable, Codable {
     }
 }
 
+/// Placeholder address used when a venue row has no usable street address.
+/// Stored untranslated so directions/geocoding logic stays deterministic; localize
+/// only at render time via ``BarVenue/displayAddress(languageCode:)``.
+nonisolated enum VenueAddressPlaceholder {
+    static let sentinel = "Address unavailable"
+    static let localizationKey = "venue_address_unavailable"
+}
+
 nonisolated struct BarVenue: Identifiable, Equatable {
     let id: UUID
     let name: String
@@ -235,6 +243,14 @@ nonisolated struct BarVenue: Identifiable, Equatable {
             originType: originType
         )
     }
+
+    /// Address for display: localizes the "unavailable" placeholder so it follows
+    /// the in-app language, while leaving real addresses untouched.
+    func displayAddress(languageCode: String) -> String {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.isEmpty || trimmed == VenueAddressPlaceholder.sentinel else { return address }
+        return L10n.t(VenueAddressPlaceholder.localizationKey, languageCode: languageCode)
+    }
 }
 
 nonisolated struct PickupPlaceRow: Identifiable, Equatable {
@@ -423,7 +439,7 @@ struct VenueClaimRow: Codable {
     let rejection_acknowledged_at: String?
 }
 
-nonisolated struct VenueEventRow: Codable {
+nonisolated struct VenueEventRow: Codable, Equatable {
     let id: UUID?
 
     /// Canonical link to ``venues.id`` when set; legacy matching uses ``owner_email`` / ``venue_name`` when nil.

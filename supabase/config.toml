@@ -407,7 +407,8 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.import-games]
 enabled = true
-verify_jwt = true
+# Fail-closed app auth (service role / cron secret). Gateway JWT check alone is insufficient.
+verify_jwt = false
 import_map = "./functions/import-games/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -438,7 +439,8 @@ entrypoint = "./functions/venue-claim-reject/index.ts"
 
 [functions.sync-live-matches]
 enabled = true
-verify_jwt = true
+# Fail-closed app auth (service role / cron secret). Cron + score worker invoke this.
+verify_jwt = false
 import_map = "./functions/sync-live-matches/deno.json"
 entrypoint = "./functions/sync-live-matches/index.ts"
 

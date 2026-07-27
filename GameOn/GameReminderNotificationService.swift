@@ -73,6 +73,7 @@ final class GameReminderNotificationService {
     private let proGameIdentifierPrefix = "fangeo.proGameReminder."
     private let favoriteTeamProGameReminderPrefix = "fangeo.favoriteTeamProGameReminder."
     private let proGameKickoffAlertPrefix = "fangeo.proGameKickoffAlert."
+    private let pickupCreatorRatingIdentifierPrefix = "fangeo.pickupCreatorRating."
     private let proGameFinalIdentifierPrefix = "fangeo.proGameFinal."
     private let proGameHalftimeIdentifierPrefix = "fangeo.proGameHalftime."
     private let proGamePredictionResultIdentifierPrefix = "fangeo.proGamePredictionResult."
@@ -165,55 +166,149 @@ final class GameReminderNotificationService {
         repeatUntilStart: Bool = false,
         repeatEveryMinutes: Int = 30
     ) async {
-        print("[NotificationDebug] reminderPreference=\(reminderMinutesBefore)")
-        print("[NotificationDebug] schedulingReminder eventId=\(event.eventId.uuidString)")
-
-        guard await requestAuthorizationIfNeeded() else {
-            print("[NotificationDebug] permissionDenied=true")
-            return
-        }
-
-        let fireDate = event.startDate.addingTimeInterval(TimeInterval(-reminderMinutesBefore * 60))
-
-        await cancelReminder(eventId: event.eventId)
-
-        let fireDates = reminderFireDates(
-            firstFireDate: fireDate,
-            eventStartDate: event.startDate,
+        _ = await scheduleReminders(
+            for: [event],
+            reminderMinutesBefore: reminderMinutesBefore,
             repeatUntilStart: repeatUntilStart,
             repeatEveryMinutes: repeatEveryMinutes
         )
+    }
 
-        guard !fireDates.isEmpty else { return }
+    /// Outcome of one diffed reminder reconciliation pass (DEBUG metrics only).
+    struct ReminderScheduleDiffResult {
+        var desired = 0
+        var alreadyScheduled = 0
+        var applied = 0
+        var removed = 0
+    }
 
-        for (index, scheduledDate) in fireDates.enumerated() {
-            let minutesUntilStart = max(1, Int(event.startDate.timeIntervalSince(scheduledDate) / 60))
-            let content = UNMutableNotificationContent()
-            content.title = "Game starting soon"
-            content.body = Self.body(for: event, reminderMinutesBefore: minutesUntilStart)
-            content.sound = .default
+    /// Reconciles venue-game reminders for `events` against what is already pending.
+    ///
+    /// Identifiers, fire dates, titles, bodies, and sounds are computed exactly as before; the only
+    /// change is that an unchanged reminder is left in place instead of being canceled and re-added.
+    /// The pending-request snapshot is also read once per pass rather than once per event.
+    @discardableResult
+    func scheduleReminders(
+        for events: [GameReminderNotificationEvent],
+        reminderMinutesBefore: Int,
+        repeatUntilStart: Bool,
+        repeatEveryMinutes: Int
+    ) async -> ReminderScheduleDiffResult {
+        var result = ReminderScheduleDiffResult()
+        guard !events.isEmpty else { return result }
 
-            let components = Calendar.current.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second],
-                from: scheduledDate
+        DebugLogGate.proGameReminderVerbose("[NotificationDebug] reminderPreference=\(reminderMinutesBefore)")
+
+        guard await requestAuthorizationIfNeeded() else {
+            DebugLogGate.notificationWarning("[NotificationDebug] permissionDenied=true")
+            return result
+        }
+
+        let pending = await center.pendingNotificationRequests()
+        var pendingByIdentifier: [String: UNNotificationRequest] = [:]
+        pendingByIdentifier.reserveCapacity(pending.count)
+        for request in pending {
+            pendingByIdentifier[request.identifier] = request
+        }
+        let pendingIdentifiers = Set(pendingByIdentifier.keys)
+
+        var identifiersToRemove: [String] = []
+        var requestsToAdd: [UNNotificationRequest] = []
+
+        for event in events {
+            DebugLogGate.proGameReminderVerbose(
+                "[NotificationDebug] schedulingReminder eventId=\(event.eventId.uuidString)"
             )
-            let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
-            let request = UNNotificationRequest(
-                identifier: reminderIdentifier(for: event.eventId, repeatIndex: index),
-                content: content,
-                trigger: trigger
+
+            let fireDate = event.startDate.addingTimeInterval(TimeInterval(-reminderMinutesBefore * 60))
+            let fireDates = reminderFireDates(
+                firstFireDate: fireDate,
+                eventStartDate: event.startDate,
+                repeatUntilStart: repeatUntilStart,
+                repeatEveryMinutes: repeatEveryMinutes
             )
 
-            do {
-                try await center.add(request)
-            } catch {
-                print("[NotificationDebug] schedulingFailed eventId=\(event.eventId.uuidString) error=\(error.localizedDescription)")
+            let baseIdentifier = reminderIdentifier(for: event.eventId)
+            var desiredIdentifiers = Set<String>()
+
+            for (index, scheduledDate) in fireDates.enumerated() {
+                let identifier = reminderIdentifier(for: event.eventId, repeatIndex: index)
+                desiredIdentifiers.insert(identifier)
+                result.desired += 1
+
+                let minutesUntilStart = max(1, Int(event.startDate.timeIntervalSince(scheduledDate) / 60))
+                let title = "Game starting soon"
+                let body = Self.body(for: event, reminderMinutesBefore: minutesUntilStart)
+                let components = Calendar.current.dateComponents(
+                    [.year, .month, .day, .hour, .minute, .second],
+                    from: scheduledDate
+                )
+
+                if let existing = pendingByIdentifier[identifier],
+                   Self.reminderRequestMatches(existing, title: title, body: body, components: components) {
+                    result.alreadyScheduled += 1
+                    continue
+                }
+
+                let content = UNMutableNotificationContent()
+                content.title = title
+                content.body = body
+                content.sound = .default
+                requestsToAdd.append(
+                    UNNotificationRequest(
+                        identifier: identifier,
+                        content: content,
+                        trigger: UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+                    )
+                )
+            }
+
+            // Drop reminders that are no longer part of the desired schedule for this event.
+            for identifier in pendingIdentifiers
+            where (identifier == baseIdentifier || identifier.hasPrefix("\(baseIdentifier)."))
+                && !desiredIdentifiers.contains(identifier) {
+                identifiersToRemove.append(identifier)
             }
         }
+
+        if !identifiersToRemove.isEmpty {
+            result.removed = identifiersToRemove.count
+            DebugLogGate.proGameReminderVerbose(
+                "[NotificationDebug] cancelReminder count=\(identifiersToRemove.count)"
+            )
+            center.removePendingNotificationRequests(withIdentifiers: identifiersToRemove)
+        }
+
+        for request in requestsToAdd {
+            do {
+                try await center.add(request)
+                result.applied += 1
+            } catch {
+                DebugLogGate.notificationWarning(
+                    "[NotificationDebug] schedulingFailed identifier=\(request.identifier) error=\(error.localizedDescription)"
+                )
+            }
+        }
+
+        return result
+    }
+
+    private static func reminderRequestMatches(
+        _ request: UNNotificationRequest,
+        title: String,
+        body: String,
+        components: DateComponents
+    ) -> Bool {
+        guard let trigger = request.trigger as? UNCalendarNotificationTrigger,
+              trigger.repeats == false,
+              trigger.dateComponents == components else {
+            return false
+        }
+        return request.content.title == title && request.content.body == body
     }
 
     func cancelReminder(eventId: UUID) async {
-        print("[NotificationDebug] cancelReminder eventId=\(eventId.uuidString)")
+        DebugLogGate.proGameReminderVerbose("[NotificationDebug] cancelReminder eventId=\(eventId.uuidString)")
         let baseIdentifier = reminderIdentifier(for: eventId)
         let identifiers = await center.pendingNotificationRequests()
             .map(\.identifier)
@@ -285,6 +380,78 @@ final class GameReminderNotificationService {
         } catch {
             logProGameSchedulingFailure("[ProGameKickoffAlertDebug] notificationCreated=false error=\(error.localizedDescription)")
         }
+    }
+
+    /// One local notification at pickup end time inviting an eligible joiner to rate the organizer.
+    func schedulePickupCreatorRatingReminder(
+        pickupGameId: UUID,
+        fireDate: Date
+    ) async {
+        guard await authorizationForScheduling() else { return }
+
+        let now = Date()
+        guard fireDate > now else { return }
+
+        await cancelPickupCreatorRatingReminder(pickupGameId: pickupGameId)
+
+        let content = UNMutableNotificationContent()
+        content.title = "How was your pickup game?"
+        content.body = "Don't forget to rate your pickup game experience."
+        content.sound = .default
+        PickupCreatorRatingNotificationDeepLinkPayload.apply(to: content, pickupGameId: pickupGameId)
+
+        let components = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: fireDate
+        )
+        let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
+        let scheduledIdentifier = pickupCreatorRatingIdentifier(for: pickupGameId)
+        let request = UNNotificationRequest(
+            identifier: scheduledIdentifier,
+            content: content,
+            trigger: trigger
+        )
+
+        do {
+            try await center.add(request)
+#if DEBUG
+            print("[PickupCreatorRatingReminder] scheduled=true")
+#endif
+        } catch {
+#if DEBUG
+            print("[PickupCreatorRatingReminder] scheduled=false error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
+    func cancelPickupCreatorRatingReminder(pickupGameId: UUID) async {
+        center.removePendingNotificationRequests(
+            withIdentifiers: [pickupCreatorRatingIdentifier(for: pickupGameId)]
+        )
+        center.removeDeliveredNotifications(
+            withIdentifiers: [pickupCreatorRatingIdentifier(for: pickupGameId)]
+        )
+    }
+
+    func cancelAllPickupCreatorRatingReminders() async {
+        let pending = await center.pendingNotificationRequests()
+        let ids = pending
+            .map(\.identifier)
+            .filter { $0.hasPrefix(pickupCreatorRatingIdentifierPrefix) }
+        if !ids.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: ids)
+        }
+        let delivered = await center.deliveredNotifications()
+        let deliveredIds = delivered
+            .map(\.request.identifier)
+            .filter { $0.hasPrefix(pickupCreatorRatingIdentifierPrefix) }
+        if !deliveredIds.isEmpty {
+            center.removeDeliveredNotifications(withIdentifiers: deliveredIds)
+        }
+    }
+
+    private func pickupCreatorRatingIdentifier(for pickupGameId: UUID) -> String {
+        "\(pickupCreatorRatingIdentifierPrefix)\(pickupGameId.uuidString.lowercased())"
     }
 
     func scheduleProGamePreKickoffReminder(
@@ -779,7 +946,9 @@ final class GameReminderNotificationService {
         guard firstFireDate < eventStartDate else { return [] }
         guard repeatUntilStart else {
             guard firstFireDate > now else { return [] }
-            print("[NotificationDebug] scheduledFireDate=\(Self.debugDateString(firstFireDate))")
+            DebugLogGate.proGameReminderVerbose(
+                "[NotificationDebug] scheduledFireDate=\(Self.debugDateString(firstFireDate))"
+            )
             return [firstFireDate]
         }
 
@@ -788,7 +957,9 @@ final class GameReminderNotificationService {
         var next = firstFireDate
         while next < eventStartDate {
             if next > now {
-                print("[NotificationDebug] scheduledFireDate=\(Self.debugDateString(next))")
+                DebugLogGate.proGameReminderVerbose(
+                    "[NotificationDebug] scheduledFireDate=\(Self.debugDateString(next))"
+                )
                 dates.append(next)
             }
             guard let advanced = Calendar.current.date(byAdding: .minute, value: step, to: next) else {

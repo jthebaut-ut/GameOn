@@ -693,7 +693,7 @@ extension MapViewModel {
         return BarVenue(
             id: row.venue_id ?? UUID(),
             name: name,
-            address: "Address unavailable",
+            address: VenueAddressPlaceholder.sentinel,
             phone: "",
             primarySport: sport,
             distance: "",
@@ -1042,11 +1042,9 @@ extension MapViewModel {
             }
         }
 
-        if isInterested, !snapshot.wasAlreadyInterested, let uid = await MainActor.run(body: { currentUserAuthId }) {
+        if isInterested, !snapshot.wasAlreadyInterested, await MainActor.run(body: { currentUserAuthId }) != nil {
             Task {
                 await self.awardFanXP(
-                    userId: uid,
-                    amount: 5,
                     source: FanXPSource.venueEventInterest,
                     sourceId: venueEventID
                 )
@@ -1538,8 +1536,10 @@ extension MapViewModel {
         let t0 = Date()
         /// Must match ``strictNormalizedSessionEmailForSocialTables`` / inserts to `venue_event_interests` (not `currentUserEmail`, which may diverge after profile load).
         let sessionInterestEmail = await strictNormalizedSessionEmailForSocialTables()
+        #if DEBUG
         let interestEmailRead = sessionInterestEmail ?? "nil"
         print("[GoingButtonDebug] interestEmailRead=\(interestEmailRead)")
+        #endif
 
         let previousInterestCounts = await MainActor.run { venueEventInterestCounts }
 
@@ -1575,19 +1575,23 @@ extension MapViewModel {
                         let normalizedRowEmail = OwnerBusinessEmail.normalized(rowEmail)
                         let normalizedSessionEmail = OwnerBusinessEmail.normalized(sessionInterestEmail)
                         if normalizedRowEmail == normalizedSessionEmail {
+                            #if DEBUG
                             print(
                                 "[GoingButtonDebug] rowEmail=\(rowEmail) eventId=\(normalizedVenueEventWireId(eventID))"
                             )
+                            #endif
                             myInterests.insert(eventID)
                         }
                     }
                 }
             }
 
+            #if DEBUG
             let serverMineSummary = myInterests.map { normalizedVenueEventWireId($0) }.sorted().joined(separator: ",")
             print("[GoingButtonDebug] reconcileStart serverMine=\(serverMineSummary.isEmpty ? "[]" : serverMineSummary)")
+            #endif
 
-            await MainActor.run {
+            let interestValuesChanged = await MainActor.run { () -> Bool in
                 var mergedIDs = myInterests
                 var mergedCounts = counts
 
@@ -1604,6 +1608,7 @@ extension MapViewModel {
 
                     for eventID in preserveInFlight.union(preserveConfirmedGoing) {
                         if preserveConfirmedNotGoing.contains(eventID) { continue }
+                        #if DEBUG
                         if !myInterests.contains(eventID) {
                             print(
                                 "[GoingButtonDebug] flipPrevented eventId=\(normalizedVenueEventWireId(eventID))"
@@ -1619,6 +1624,7 @@ extension MapViewModel {
                                 "[GoingButtonDebug] preserveConfirmed eventId=\(normalizedVenueEventWireId(eventID))"
                             )
                         }
+                        #endif
                         mergedIDs.insert(eventID)
                         let prior = previousInterestCounts[eventID] ?? venueEventInterestCounts[eventID] ?? 0
                         let serverCount = counts[eventID] ?? 0
@@ -1638,19 +1644,39 @@ extension MapViewModel {
                     }
                 }
 
+                #if DEBUG
                 let appliedMineSummary = mergedIDs.map { normalizedVenueEventWireId($0) }.sorted().joined(separator: ",")
                 print(
                     "[GoingButtonDebug] reconcileApplied myInterests=\(appliedMineSummary.isEmpty ? "[]" : appliedMineSummary)"
                 )
+                #endif
 
-                venueEventInterestCounts = mergedCounts
-                venueEventInterestIDs = mergedIDs
+                // Equality-guard both publications: an unchanged counts dictionary would otherwise
+                // schedule a redundant Discover map snapshot rebuild via the `venueEventInterestCounts`
+                // didSet, and an unchanged ID set would emit a needless objectWillChange.
+                let countsChanged = venueEventInterestCounts != mergedCounts
+                let idsChanged = venueEventInterestIDs != mergedIDs
+                if countsChanged {
+                    venueEventInterestCounts = mergedCounts
+                } else {
+                    DiscoverPhase3Perf.snapshotRebuildSkipped(reason: "venueEventInterestCountsUnchanged")
+                }
+                if idsChanged {
+                    venueEventInterestIDs = mergedIDs
+                }
+                return countsChanged || idsChanged
             }
 
             #if DEBUG
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             print("[DiscoverPerf] visible interests loaded events=\(visibleEventIDs.count) rows=\(totalRows) ms=\(ms)")
             #endif
+            DiscoverPhase3Perf.interestsLoaded(
+                events: visibleEventIDs.count,
+                rows: totalRows,
+                changed: interestValuesChanged,
+                ms: Int(Date().timeIntervalSince(t0) * 1000)
+            )
 
         } catch {
             #if DEBUG
@@ -1663,10 +1689,20 @@ extension MapViewModel {
     func refreshSocialEnrichmentInBackground() async {
         let t0 = Date()
         await loadVisibleVenueEventInterests()
-        let urls = Array(bars.compactMap { bar -> URL? in
-            guard let s = bar.coverPhotoURL?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
-            return URL(string: s)
-        }.prefix(14))
+        // Prefetch the SAME canonical URL the Discover pin card renders (thumbnail-preferred via
+        // ``ImageDisplayURL.forList``) rather than the raw full-res cover URL, so the warm actually
+        // populates the cache the UI reads and avoids a second, oversized download per venue.
+        var seen = Set<String>()
+        var requestedCount = 0
+        var urls: [URL] = []
+        for bar in bars {
+            guard let s = ImageDisplayURL.forList(thumbnail: bar.coverPhotoThumbnailURL, full: bar.coverPhotoURL)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { continue }
+            requestedCount += 1
+            guard seen.insert(s).inserted, let u = URL(string: s) else { continue }
+            urls.append(u)
+        }
+        DiscoverPhase3Perf.imagePrefetch(requested: requestedCount, unique: urls.count)
         await DiscoverMapImageCache.shared.prefetch(urls: urls)
         #if DEBUG
         let ms = Int(Date().timeIntervalSince(t0) * 1000)

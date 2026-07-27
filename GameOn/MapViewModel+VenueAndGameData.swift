@@ -765,6 +765,50 @@ extension MapViewModel {
         return "p:b:\(boundsBucket)|m:\(fmt.string(from: monthStart))|r:\(fmt.string(from: dateMin))...\(fmt.string(from: dateMax))|s:\(sport)"
     }
 
+    /// Single chokepoint for publishing Discover pickup orange-dot dates (month availability).
+    private func publishPickupGameCalendarDotDates(
+        _ incoming: Set<Date>,
+        caller: String,
+        requestID: UUID? = nil
+    ) {
+        let oldDates = pickupGameCalendarDotDates
+        let newDates = PickupGameMonthAvailabilityMerge.canonicalizeForCalendarGrid(incoming)
+        // While the date picker is open, never collapse a multi-day month set down to
+        // `{selectedDate}` (or any single day). Selection must not own month availability.
+        if discoverDatePickerGeographicFreezeActive,
+           oldDates.count > 1,
+           newDates.count == 1,
+           let only = newDates.first,
+           Calendar.current.isDate(only, inSameDayAs: selectedDate) {
+#if DEBUG
+            let fmt = DiscoverVenueGameDateFormatting.sqlDate
+            print("===== MONTH STATE WRITE BLOCKED =====")
+            print("caller=\(caller)")
+            print("reason=refuseShrinkToSelectedDateWhilePickerOpen")
+            print("oldDates=[\(oldDates.sorted().map { fmt.string(from: $0) }.joined(separator: ","))]")
+            print("incomingDates=[\(incoming.sorted().map { fmt.string(from: $0) }.joined(separator: ","))]")
+            print("selectedDate=\(fmt.string(from: selectedDate))")
+            print("===== END MONTH STATE WRITE BLOCKED =====")
+#endif
+            return
+        }
+#if DEBUG
+        let fmt = DiscoverVenueGameDateFormatting.sqlDate
+        let oldLabels = oldDates.sorted().map { fmt.string(from: $0) }
+        let incomingLabels = incoming.sorted().map { fmt.string(from: $0) }
+        let newLabels = newDates.sorted().map { fmt.string(from: $0) }
+        print("===== MONTH STATE WRITE =====")
+        print("caller=\(caller)")
+        print("oldDates=[\(oldLabels.joined(separator: ","))]")
+        print("incomingDates=[\(incomingLabels.joined(separator: ","))]")
+        print("newDates=[\(newLabels.joined(separator: ","))]")
+        print("selectedDate=\(fmt.string(from: selectedDate))")
+        print("requestID=\(requestID?.uuidString ?? "nil")")
+        print("===== END MONTH STATE WRITE =====")
+#endif
+        pickupGameCalendarDotDates = newDates
+    }
+
     /// Start-of-day normalized dates inside the Discover calendar-dot fetch window (inclusive).
     private func discoverCalendarDotDatesInFetchWindow(_ dates: Set<Date>, dateMin: Date, dateMax: Date) -> Set<Date> {
         let cal = Calendar.current
@@ -878,11 +922,17 @@ extension MapViewModel {
     }
 
     private func noticeVenueCalendarDotBoundsBucketChangeIfNeeded() {
+        // While the Discover date picker is open, incidental map layout must not clear month dots
+        // or change the frozen geographic presentation session.
+        if discoverDatePickerGeographicFreezeActive {
+            recordStableDiscoverMapBoundsIfAvailable()
+            return
+        }
         let bucket = discoverBoundsBucketString()
         defer { lastVenueCalendarDotBoundsBucket = bucket }
         guard lastVenueCalendarDotBoundsBucket != bucket else { return }
         venueGameCalendarDotDates = []
-        pickupGameCalendarDotDates = []
+        publishPickupGameCalendarDotDates([], caller: "boundsBucketChangeClear")
 #if DEBUG
         print("[CalendarDotsFix] cleared venue+pickup dots for bounds bucket change prev=\(lastVenueCalendarDotBoundsBucket ?? "nil") next=\(bucket)")
 #endif
@@ -890,12 +940,39 @@ extension MapViewModel {
 
     /// Debounced calendar-dot reload after the Discover map viewport changes (Watch venue dots or Play pickup dots).
     func scheduleDiscoverVenueCalendarDotRefreshAfterMapViewportChange() {
+        recordStableDiscoverMapBoundsIfAvailable()
+        if discoverDatePickerGeographicFreezeActive {
+            // Picker presentation uses a frozen viewport; do not cancel/clear month dots from overlay layout.
+            if let pending = pendingPickupMonthDotRetryAfterBounds,
+               lastStableDiscoverMapBounds != nil || currentMapRegionBounds() != nil {
+                pendingPickupMonthDotRetryAfterBounds = nil
+                loadPickupGameCalendarDotsForDiscover(
+                    around: pending.monthStart,
+                    reason: pending.reason + "_boundsRetry",
+                    logIfOpeningBeforeReady: false
+                )
+            }
+#if DEBUG
+            print("[PickupDateAvailability] skippedViewportDotRefresh reason=datePickerGeographicFreeze")
+#endif
+            return
+        }
         noticeVenueCalendarDotBoundsBucketChangeIfNeeded()
         discoverVenueCalendarDotPreloadTask?.cancel()
         discoverVenueCalendarDotPreloadTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard let self, !Task.isCancelled else { return }
             self.discoverVenueCalendarDotPreloadTask = nil
+            if let pending = self.pendingPickupMonthDotRetryAfterBounds,
+               self.lastStableDiscoverMapBounds != nil || self.currentMapRegionBounds() != nil {
+                self.pendingPickupMonthDotRetryAfterBounds = nil
+                self.loadPickupGameCalendarDotsForDiscover(
+                    around: pending.monthStart,
+                    reason: pending.reason + "_boundsRetry",
+                    logIfOpeningBeforeReady: false
+                )
+                return
+            }
             self.preloadDiscoverCalendarDotsForVisibleVenues()
         }
     }
@@ -945,43 +1022,37 @@ extension MapViewModel {
         return out
     }
 
-    /// Selected-day pickup rows already on the map can still imply a dot on that day when the broader Supabase dot query returns nothing (e.g. RLS nuance).
-    /// Only count rows that would show as map pins in the **current viewport** (coords + bounds).
+    /// Selected-day pickup rows already on the map can still **add** a day to month availability
+    /// when the broader Supabase month query lags. They must never replace the month set.
+    /// Only count rows that would show as map pins in the **captured viewport** (same resolver as calendar fetch).
     private func discoverPickupCalendarDotDatesFromLoadedPickupRows(
         dateMin: Date,
         dateMax: Date,
-        sport: String
+        sport: String,
+        mapBounds: PickupGameMapBounds? = nil
     ) -> Set<Date> {
-        let cal = Calendar.current
+        let bounds = mapBounds ?? resolvedDiscoverMapBoundsForCalendarDots()
+        var context = pickupDiscoverAvailabilityContext(
+            requireMapBounds: true,
+            bounds: bounds?.asTuple
+        )
+        let timeZone = context.timeZone
+        let cal = PickupGameDateNormalizer.displayCalendar(timeZone: timeZone)
         let dMin = cal.startOfDay(for: dateMin)
         let dMax = cal.startOfDay(for: dateMax)
-        let sportFilter = sport.trimmingCharacters(in: .whitespacesAndNewlines)
-        let now = Date()
-        let bounds = currentMapRegionBounds()
+        let sportOverride = sport.trimmingCharacters(in: .whitespacesAndNewlines)
+        context.selectedSport = sportOverride
+        // If we have no bounds, selected-day evidence cannot claim viewport membership.
+        guard bounds != nil else { return [] }
+
         var out = Set<Date>()
         for row in pickupGamesForDiscoverMap {
-            if sportFilter != "All", row.sport != sportFilter { continue }
-            guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
-            let day = cal.startOfDay(for: start)
+            let evaluation = PickupGameAvailabilityResolver.evaluate(
+                PickupGameAvailabilityCandidate(row: row),
+                context: context
+            )
+            guard evaluation.discoverEligible, let day = evaluation.normalizedLocalDay else { continue }
             guard day >= dMin && day <= dMax else { continue }
-            if let remStr = row.remove_after_at,
-               let rem = PickupGameModels.parseSupabaseTimestamptz(remStr),
-               rem <= now {
-                continue
-            }
-            guard row.is_visible, row.status.lowercased() == "active" else { continue }
-            guard let lat = row.latitude, let lon = row.longitude,
-                  CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon)) else {
-                continue
-            }
-            if let bounds {
-                guard lat >= bounds.minLat, lat <= bounds.maxLat,
-                      lon >= bounds.minLon, lon <= bounds.maxLon else {
-                    continue
-                }
-            } else {
-                continue
-            }
             out.insert(day)
         }
         return out
@@ -1068,14 +1139,8 @@ extension MapViewModel {
     }
 
     func hasFreshPickupGameCalendarDotCache(for month: Date) -> Bool {
-        let range = discoverCalendarDotRange(around: month)
-        let cacheKey = pickupGameCalendarDotCacheKey(
-            boundsBucket: discoverBoundsBucketString(),
-            monthStart: range.monthStart,
-            dateMin: range.dateMin,
-            dateMax: range.dateMax,
-            sport: selectedSport
-        )
+        let request = makePickupMonthAvailabilityRequestContext(around: month)
+        let cacheKey = request.cacheKey
         guard let cached = pickupGameCalendarDotDatesCache[cacheKey] else { return false }
         if isGuestDiscoverMode, cached.dates.isEmpty { return false }
         return Date().timeIntervalSince(cached.fetchedAt) < DiscoverCalendarDotCacheConfig.ttl
@@ -1134,8 +1199,13 @@ extension MapViewModel {
     }
 
     /// Bottom-tab Calendar: warm **both** venue and pickup dot caches for `month` without mutating ``discoverMapContentMode``.
-    func loadCalendarTabCalendarDotsAroundMonth(_ month: Date, reason: String) {
-        guard isCalendarTabSelected else {
+    /// - Parameter allowWhenNotSelected: when true, populates caches for launch warm without requiring the Calendar tab.
+    func loadCalendarTabCalendarDotsAroundMonth(
+        _ month: Date,
+        reason: String,
+        allowWhenNotSelected: Bool = false
+    ) {
+        guard allowWhenNotSelected || isCalendarTabSelected else {
 #if DEBUG
             print("[PerfPhase1D] deferredCalendarWork reason=loadCalendarTabCalendarDotsAroundMonth:\(reason)")
 #endif
@@ -1235,7 +1305,10 @@ extension MapViewModel {
             return
         }
 
-        let silentBackgroundVenueDotRefresh = reason == "phase1_preload" || reason == "map_viewport_refresh"
+        let silentBackgroundVenueDotRefresh =
+            reason == "phase1_preload"
+            || reason == "map_viewport_refresh"
+            || reason.hasPrefix("warm_preload")
         if !silentBackgroundVenueDotRefresh || !venueGameCalendarDotDates.isEmpty {
             calendarDotStatusText = "Loading game dates..."
         }
@@ -1371,22 +1444,28 @@ extension MapViewModel {
         reason: String,
         logIfOpeningBeforeReady: Bool
     ) {
-        let range = discoverCalendarDotRange(around: month)
-        let monthStart = range.monthStart
-        let sport = selectedSport
-        let boundsBucket = discoverBoundsBucketString()
-        let cacheKey = pickupGameCalendarDotCacheKey(
-            boundsBucket: boundsBucket,
-            monthStart: monthStart,
-            dateMin: range.dateMin,
-            dateMax: range.dateMax,
-            sport: sport
-        )
+        recordStableDiscoverMapBoundsIfAvailable()
+        let requestID = UUID()
+        let request = makePickupMonthAvailabilityRequestContext(around: month, requestID: requestID)
+        let monthStart = request.monthStart
+        let sport = request.sport
+        let cacheKey = request.cacheKey
+        let timeZone = request.timeZone
 
         #if DEBUG
         let fmtLog = DiscoverVenueGameDateFormatting.sqlDate
         let pickupCacheKeyHit = pickupGameCalendarDotDatesCache[cacheKey] != nil
-        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots start reason=\(reason) monthAround=\(fmtLog.string(from: month)) boundsBucket=\(boundsBucket) pickupGamesForDiscoverMap=\(pickupGamesForDiscoverMap.count) cacheKeyHit=\(pickupCacheKeyHit)")
+        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots start reason=\(reason) monthAround=\(fmtLog.string(from: month)) boundsBucket=\(request.boundsBucket) hasBounds=\(request.hasMapBounds) pickupGamesForDiscoverMap=\(pickupGamesForDiscoverMap.count) cacheKeyHit=\(pickupCacheKeyHit) requestID=\(requestID.uuidString)")
+        print("===== PICKUP MONTH DOT REQUEST (load) =====")
+        print("requestID=\(request.requestID.uuidString)")
+        print("month=\(String(PickupGameDateNormalizer.ymdString(for: request.monthStart, timeZone: timeZone).prefix(7)))")
+        print("sport=\(request.sport)")
+        print("boundsBucket=\(request.boundsBucket)")
+        print("bounds=\(request.mapBounds?.bucketString ?? "nil")")
+        print("queryBoundsBucket=\(request.boundsBucket)")
+        print("cacheKey=\(cacheKey)")
+        print("cacheKeyMatchesQuery=true")
+        print("===== END PICKUP MONTH DOT REQUEST (load) =====")
         #endif
 
         if logIfOpeningBeforeReady && (isLoadingPickupCalendarDots || hasFreshPickupGameCalendarDotCache(for: monthStart) == false) {
@@ -1396,6 +1475,8 @@ extension MapViewModel {
         }
 
         let pickupDotsAtVeryStart = pickupGameCalendarDotDates
+        let cachedEntry = pickupGameCalendarDotDatesCache[cacheKey]
+        let hasAuthoritativeCache = cachedEntry.map { !$0.dates.isEmpty } ?? false
 
         if isGuestDiscoverMode,
            discoverGuestCalendarDotEmptyCacheBypassReason(reason),
@@ -1407,41 +1488,57 @@ extension MapViewModel {
             #endif
         }
 
-        if let cached = pickupGameCalendarDotDatesCache[cacheKey] {
-            pickupGameCalendarDotDates = cached.dates
-            #if DEBUG
-            print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots syncCacheApplied=yes pickupGameCalendarDotDates=\(pickupGameCalendarDotDates.count)")
-            print("[CalendarDotsPerf] cached pickup dots applied immediately month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) count=\(cached.dates.count) ageSec=\(String(format: "%.1f", Date().timeIntervalSince(cached.fetchedAt)))")
-            #endif
+        let preservedWindow = discoverCalendarDotDatesInFetchWindow(
+            pickupDotsAtVeryStart,
+            dateMin: request.dateMin,
+            dateMax: request.dateMax
+        )
+        // Authoritative month cache / prior published only. Never seed from selected-day map rows.
+        let seeded = PickupGameMonthAvailabilityMerge.presentationSeed(
+            published: preservedWindow,
+            authoritativeCached: pickupGameCalendarDotDatesCache[cacheKey]?.dates
+        )
+        // Keep showing a valid prior month set while loading — never flash-clear to empty/selected-day.
+        if !(seeded.isEmpty && !pickupDotsAtVeryStart.isEmpty) {
+            publishPickupGameCalendarDotDates(seeded, caller: "loadPickupGameCalendarDots.presentationSeed", requestID: requestID)
         } else {
-            let fromRowsSync = discoverPickupCalendarDotDatesFromLoadedPickupRows(
-                dateMin: range.dateMin,
-                dateMax: range.dateMax,
-                sport: sport
+#if DEBUG
+            print(
+                "[PickupDateAvailability] presentationSeedKeptPrior prior=\(pickupDotsAtVeryStart.count) seededEmpty=true (no selected-day substitute)"
             )
-            let preservedStart = discoverCalendarDotDatesInFetchWindow(pickupDotsAtVeryStart, dateMin: range.dateMin, dateMax: range.dateMax)
-            if !fromRowsSync.isEmpty {
-                pickupGameCalendarDotDates = fromRowsSync
-                #if DEBUG
-                print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots syncCacheApplied=no seededFromPickupRows=\(fromRowsSync.count)")
-                #endif
-            } else if !preservedStart.isEmpty {
-                pickupGameCalendarDotDates = preservedStart
-                #if DEBUG
-                print("[CalendarDotsFix] kept existing pickup dots count=\(preservedStart.count) syncCacheApplied=no (no cache; in-window prior)")
-                print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots syncCacheApplied=no keptInWindowPrior=\(preservedStart.count)")
-                #endif
-            } else {
-                pickupGameCalendarDotDates = []
-                #if DEBUG
-                print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots syncCacheApplied=no pickupGameCalendarDotDates=0")
-                #endif
-            }
+#endif
         }
+        #if DEBUG
+        print(
+            "[PickupDateAvailability] presentationSeed published=\(pickupGameCalendarDotDates.count) hasAuthoritativeCache=\(hasAuthoritativeCache) preserved=\(preservedWindow.count)"
+        )
+        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots syncSeed pickupGameCalendarDotDates=\(pickupGameCalendarDotDates.count)")
+        print("===== MONTH DOT STATE BEFORE SELECTION =====")
+        print("selectedDate=\(fmtLog.string(from: selectedDate))")
+        print("monthDates=\(discoverCalendarDotDatesDebugLabel(pickupGameCalendarDotDates))")
+        print("calendarInputDates=\(discoverCalendarDotDatesDebugLabel(pickupGameCalendarDotDates))")
+        print("===== END MONTH DOT STATE BEFORE SELECTION =====")
+        print("===== PICKUP CALENDAR OPEN =====")
+        print("selectedDate=\(fmtLog.string(from: selectedDate))")
+        print("displayedMonth=\(fmtLog.string(from: monthStart))")
+        print("sport=\(sport)")
+        print("mapBounds=\(request.mapBounds?.bucketString ?? "nil")")
+        print("boundsBucket=\(request.boundsBucket)")
+        print("===== END PICKUP CALENDAR OPEN =====")
+        #endif
 
         let pickupCacheAge = pickupGameCalendarDotDatesCache[cacheKey].map { Date().timeIntervalSince($0.fetchedAt) } ?? .infinity
         let guestCalendarOpenForcesNetwork = discoverGuestCalendarOpenForcesCalendarDotNetwork(reason)
-        if !guestCalendarOpenForcesNetwork && pickupCacheAge < DiscoverCalendarDotCacheConfig.ttl {
+        let cachedDates = pickupGameCalendarDotDatesCache[cacheKey]?.dates
+        // Month cache freshness only — never use selected-day map rows as completeness signal.
+        let cacheFreshEnoughToSkipNetwork =
+            !guestCalendarOpenForcesNetwork
+            && request.hasMapBounds
+            && pickupCacheAge < DiscoverCalendarDotCacheConfig.ttl
+            && cachedDates != nil
+            && !(cachedDates?.isEmpty ?? true)
+
+        if cacheFreshEnoughToSkipNetwork {
             if let task = pickupCalendarDotLoadTask {
                 #if DEBUG
                 print("[CalendarDotsPerf] pickupDotTaskCancelled")
@@ -1452,6 +1549,7 @@ extension MapViewModel {
             pickupCalendarDotLoadRequestID = nil
             isLoadingPickupCalendarDots = false
             calendarDotStatusText = nil
+            pendingPickupMonthDotRetryAfterBounds = nil
             #if DEBUG
             print("[CalendarDotsPerf] pickup dots cache fresh skip network month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
             print("[PickupCalendarPerf] pickup dots cache fresh skip network month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
@@ -1460,7 +1558,12 @@ extension MapViewModel {
             return
         }
 
-        if reason != "phase1_preload" || !pickupGameCalendarDotDates.isEmpty {
+        // No authoritative month yet → loading, not selected-day-as-complete.
+        // Background warm must not flash Calendar status while the tab is unselected.
+        let isBackgroundWarmReason =
+            reason.hasPrefix("warm_preload") || reason.contains("warm_preload_")
+        if !isBackgroundWarmReason,
+           reason != "phase1_preload" || !pickupGameCalendarDotDates.isEmpty || !hasAuthoritativeCache {
             calendarDotStatusText = "Loading game dates..."
         }
 
@@ -1471,13 +1574,15 @@ extension MapViewModel {
             #endif
             task.cancel()
         }
-        let requestID = UUID()
         pickupCalendarDotLoadRequestID = requestID
 
         #if DEBUG
         print("[CalendarDotsPerf] pickup preload started month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) reason=\(reason)")
         print("[CalendarDotsPerf] pickupDotTaskStarted")
         #endif
+
+        // Capture immutable request for the entire async lifetime.
+        let capturedRequest = request
 
         pickupCalendarDotLoadTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -1499,106 +1604,144 @@ extension MapViewModel {
                 }
             }
 
-            if self.discoverMapContentMode == .pickupGames, self.pickupGamesForDiscoverMap.isEmpty {
-                await self.refreshPickupGamesForDiscoverMap(force: false, preservePickupCalendarDotDatesCache: true)
-            }
-
+            // Month availability must not wait on / couple to selected-day map rows.
             do {
-                let fetchedDates = try await self.fetchPickupGameCalendarDotDatesForDiscoverRange(
-                    dateMin: range.dateMin,
-                    dateMax: range.dateMax
+                let outcome = try await self.fetchPickupGameCalendarDotDatesForDiscoverRange(
+                    context: capturedRequest
                 )
                 guard !Task.isCancelled else { return }
                 guard self.pickupCalendarDotsRequestIsCurrent(requestID: requestID) else {
                     #if DEBUG
                     print("[CalendarDotsPerf] stale pickup dot result ignored month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
+                    print("[PickupDateAvailability] staleMonthWriteIgnored requestID=\(requestID) outcome=D")
                     #endif
                     return
                 }
 
-                let fromRows = self.discoverPickupCalendarDotDatesFromLoadedPickupRows(
-                    dateMin: range.dateMin,
-                    dateMax: range.dateMax,
-                    sport: sport
-                )
-                let merged = fetchedDates.union(fromRows)
-
-                if merged.isEmpty {
-                    self.pickupGameCalendarDotDatesCache.removeValue(forKey: cacheKey)
-                    #if DEBUG
-                    print("[CalendarDotsCache] pickup dots skip emptyCache rpcDotCount=\(fetchedDates.count) fallbackFromRows=\(fromRows.count) month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
-                    #endif
+                switch outcome {
+                case .skippedNoBounds:
+                    // C: bounds unavailable — not authoritative; retain prior; one deferred retry.
                     let preserved = self.discoverCalendarDotDatesInFetchWindow(
                         pickupDotsBaselineBeforeNetwork,
-                        dateMin: range.dateMin,
-                        dateMax: range.dateMax
+                        dateMin: capturedRequest.dateMin,
+                        dateMax: capturedRequest.dateMax
                     )
-                    if !preserved.isEmpty {
-                        self.pickupGameCalendarDotDates = preserved
-                        #if DEBUG
-                        print("[CalendarDotsFix] kept existing pickup dots count=\(preserved.count) because refresh returned empty")
-                        #endif
-                    } else {
-                        self.pickupGameCalendarDotDates = merged
-                    }
-                } else {
-                    self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: merged, fetchedAt: Date())
-                    self.prunePickupGameCalendarDotDatesCacheIfNeeded()
-                    self.pickupGameCalendarDotDates = merged
-                }
+                    self.publishPickupGameCalendarDotDates(
+                        PickupGameMonthAvailabilityMerge.resolveSkippedNoBounds(previousPublished: preserved),
+                        caller: "loadPickupGameCalendarDots.skippedNoBounds",
+                        requestID: requestID
+                    )
+                    self.pendingPickupMonthDotRetryAfterBounds = (
+                        monthStart: capturedRequest.monthStart,
+                        reason: reason,
+                        requestID: requestID
+                    )
+#if DEBUG
+                    print("[PickupDateAvailability] outcome=C skippedNoBounds retained=\(self.pickupGameCalendarDotDates.count) scheduledOneBoundsRetry=true")
+                    print("finalPublishedDates=\(self.discoverCalendarDotDatesDebugLabel(self.pickupGameCalendarDotDates))")
+#endif
+                    return
 
-                #if DEBUG
-                print("[CalendarDotsDebug] pickup dot dates count=\(fetchedDates.count) merged=\(merged.count) month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
-                print("[CalendarDotsPerf] pickup fetch completed month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) count=\(merged.count)")
-                print("[PickupCalendarPerf] background refresh completed month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) count=\(merged.count)")
-                print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcOk finalPickupGameCalendarDotDates=\(self.pickupGameCalendarDotDates.count) fetchedDotCount=\(fetchedDates.count) fallbackDotCount=\(fromRows.count)")
-                #endif
+                case .success(let fetchedDates, let rawRowCount, let eligibleRowCount):
+                    let canonicalFetched = PickupGameMonthAvailabilityMerge.canonicalizeForCalendarGrid(fetchedDates)
+#if DEBUG
+                    print("===== MONTH QUERY RESULT =====")
+                    print("rawRowCount=\(rawRowCount)")
+                    print("eligibleRowCount=\(eligibleRowCount)")
+                    print("monthQueryDates=\(self.discoverCalendarDotDatesDebugLabel(canonicalFetched))")
+                    print("normalizedDates=\(self.discoverCalendarDotDatesDebugLabel(canonicalFetched))")
+                    print("===== END MONTH QUERY RESULT =====")
+#endif
+                    if canonicalFetched.isEmpty {
+                        // Authoritative empty — keep prior published dots if any (avoid flash-clear
+                        // while picker open); still cache empty for this viewport key.
+                        let preserved = self.discoverCalendarDotDatesInFetchWindow(
+                            pickupDotsBaselineBeforeNetwork,
+                            dateMin: capturedRequest.dateMin,
+                            dateMax: capturedRequest.dateMax
+                        )
+                        self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: [], fetchedAt: Date())
+                        self.prunePickupGameCalendarDotDatesCacheIfNeeded()
+                        if preserved.isEmpty {
+                            self.publishPickupGameCalendarDotDates(
+                                PickupGameMonthAvailabilityMerge.resolveSuccessfulEmptyMonthFetch(),
+                                caller: "loadPickupGameCalendarDots.successfulEmpty",
+                                requestID: requestID
+                            )
+                        } else {
+                            // Retain prior month UI; empty cache means next open will refetch.
+                            self.publishPickupGameCalendarDotDates(
+                                preserved,
+                                caller: "loadPickupGameCalendarDots.emptyFetchRetainPrior",
+                                requestID: requestID
+                            )
+                        }
+                        self.pendingPickupMonthDotRetryAfterBounds = nil
+#if DEBUG
+                        print("[PickupDateAvailability] outcome=A emptyMonthFetch preservedPrior=\(preserved.count) rawMonthRows=\(rawRowCount)")
+#endif
+                    } else {
+                        let monthOnly = PickupGameMonthAvailabilityMerge.mergeAuthoritative(
+                            fetchedMonth: canonicalFetched,
+                            selectedDayEvidence: []
+                        )
+                        self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: monthOnly, fetchedAt: Date())
+                        self.prunePickupGameCalendarDotDatesCacheIfNeeded()
+                        self.publishPickupGameCalendarDotDates(
+                            monthOnly,
+                            caller: "loadPickupGameCalendarDots.monthFetchSuccess",
+                            requestID: requestID
+                        )
+                        self.pendingPickupMonthDotRetryAfterBounds = nil
+#if DEBUG
+                        print(
+                            "[PickupDateAvailability] outcome=A success rawMonthRows=\(rawRowCount) eligibleMonthRows=\(eligibleRowCount) fetchedMonthDates=\(self.discoverCalendarDotDatesDebugLabel(canonicalFetched)) finalPublishedDates=\(self.discoverCalendarDotDatesDebugLabel(monthOnly))"
+                        )
+#endif
+                    }
+
+                    #if DEBUG
+                    print("[CalendarDotsDebug] pickup dot dates published=\(self.pickupGameCalendarDotDates.count) month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
+                    print("[CalendarDotsPerf] pickup fetch completed month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) count=\(self.pickupGameCalendarDotDates.count)")
+                    print("[PickupCalendarPerf] background refresh completed month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart)) count=\(self.pickupGameCalendarDotDates.count)")
+                    print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcOk finalPickupGameCalendarDotDates=\(self.pickupGameCalendarDotDates.count) fetchedDotCount=\(canonicalFetched.count)")
+                    #endif
+                }
             } catch is CancellationError {
                 return
             } catch {
                 guard self.pickupCalendarDotsRequestIsCurrent(requestID: requestID) else {
                     #if DEBUG
                     print("[CalendarDotsPerf] stale pickup dot result ignored month=\(DiscoverVenueGameDateFormatting.sqlDate.string(from: monthStart))")
+                    print("[PickupDateAvailability] staleMonthWriteIgnored requestID=\(requestID) outcome=D")
                     #endif
                     return
                 }
-                let fb = self.discoverPickupCalendarDotDatesFromLoadedPickupRows(
-                    dateMin: range.dateMin,
-                    dateMax: range.dateMax,
-                    sport: sport
+                // B: fetch failure — retain prior month dots only; never seed from selected-day rows.
+                let preserved = self.discoverCalendarDotDatesInFetchWindow(
+                    pickupDotsBaselineBeforeNetwork,
+                    dateMin: capturedRequest.dateMin,
+                    dateMax: capturedRequest.dateMax
                 )
-                if !fb.isEmpty {
-                    self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: fb, fetchedAt: Date())
-                    self.prunePickupGameCalendarDotDatesCacheIfNeeded()
-                    self.pickupGameCalendarDotDates = fb
-                    #if DEBUG
-                    print("[CalendarDotsPerf] pickup RPC failed; applied map-row fallback count=\(fb.count) error=\(error.localizedDescription)")
-                    print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcFail finalPickupGameCalendarDotDates=\(fb.count) fetchedDotCount=0 fallbackDotCount=\(fb.count)")
-                    #endif
-                } else {
-                    let preserved = self.discoverCalendarDotDatesInFetchWindow(
-                        pickupDotsBaselineBeforeNetwork,
-                        dateMin: range.dateMin,
-                        dateMax: range.dateMax
-                    )
-                    if !preserved.isEmpty {
-                        self.pickupGameCalendarDotDates = preserved
-                        #if DEBUG
-                        print("[CalendarDotsFix] kept existing pickup dots count=\(preserved.count) because refresh returned empty")
-                        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcFail keptInWindow=\(preserved.count)")
-                        #endif
-                    }
-                    if !self.isLoadingVenueCalendarDots {
-                        self.calendarDotStatusText = nil
-                    }
-                    self.isLoadingPickupCalendarDots = false
-                    self.pickupCalendarDotLoadTask = nil
-                    #if DEBUG
-                    if preserved.isEmpty {
-                        print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcFailNoFallback finalPickupGameCalendarDotDates=0 fetchedDotCount=0 fallbackDotCount=0")
-                    }
-                    #endif
+                let recovered = PickupGameMonthAvailabilityMerge.mergeAfterFetchFailure(
+                    previousPublished: preserved,
+                    selectedDayEvidence: []
+                )
+                self.publishPickupGameCalendarDotDates(
+                    recovered,
+                    caller: "loadPickupGameCalendarDots.fetchFailure",
+                    requestID: requestID
+                )
+                #if DEBUG
+                print("[CalendarDotsPerf] pickup RPC failed; retained prior month set recovered=\(recovered.count) error=\(error.localizedDescription)")
+                print("[DiscoverCalendarDotsDebug] loadPickupGameCalendarDots exit rpcFail finalPickupGameCalendarDotDates=\(recovered.count) fetchedDotCount=0")
+                print("[PickupDateAvailability] outcome=B fetchFailure finalPublishedDates=\(self.discoverCalendarDotDatesDebugLabel(recovered))")
+                #endif
+                if !self.isLoadingVenueCalendarDots {
+                    self.calendarDotStatusText = nil
                 }
+                self.isLoadingPickupCalendarDots = false
+                self.pickupCalendarDotLoadTask = nil
             }
         }
     }
@@ -1607,6 +1750,49 @@ extension MapViewModel {
         noticeVenueCalendarDotBoundsBucketChangeIfNeeded()
         loadDiscoverCalendarDots(around: selectedDate, reason: "map_viewport_refresh")
     }
+
+#if DEBUG
+    /// Production-state-owner regression: ``selectedDate`` must not collapse month orange dots.
+    /// Exercises ``pickupGameCalendarDotDates`` + ``beginDiscoverDateChange`` + calendar render predicate.
+    @discardableResult
+    func runPickupMonthDotSelectionStabilityBoundaryTest() -> Bool {
+        let cal = Calendar.current
+        var comps = DateComponents()
+        comps.year = 2026
+        comps.month = 7
+        comps.day = 30
+        guard let july30 = cal.date(from: comps).map({ cal.startOfDay(for: $0) }) else { return false }
+        comps.day = 31
+        guard let july31 = cal.date(from: comps).map({ cal.startOfDay(for: $0) }) else { return false }
+        let monthDots = Set([july30, july31])
+
+        discoverDatePickerGeographicFreezeActive = true
+        publishPickupGameCalendarDotDates(monthDots, caller: "boundaryTest.seedMonth")
+        var ok = pickupGameCalendarDotDates == monthDots
+
+        _ = beginDiscoverDateChange(to: july30)
+        ok = ok && pickupGameCalendarDotDates == monthDots
+        ok = ok && PickupGameMonthAvailabilityMerge.gridDay(july30, isCoveredBy: pickupGameCalendarDotDates)
+        ok = ok && PickupGameMonthAvailabilityMerge.gridDay(july31, isCoveredBy: pickupGameCalendarDotDates)
+
+        _ = beginDiscoverDateChange(to: july31)
+        ok = ok && pickupGameCalendarDotDates == monthDots
+        ok = ok && PickupGameMonthAvailabilityMerge.gridDay(july30, isCoveredBy: pickupGameCalendarDotDates)
+        ok = ok && PickupGameMonthAvailabilityMerge.gridDay(july31, isCoveredBy: pickupGameCalendarDotDates)
+
+        _ = beginDiscoverDateChange(to: july30)
+        ok = ok && pickupGameCalendarDotDates == monthDots
+
+        // Schedule Play picker must also read month availability — not day-scoped map rows.
+        pickupGamesForDiscoverMap = []
+        let scheduleDots = calendarTabListConsistentPickupDotDates()
+        ok = ok && scheduleDots.isSuperset(of: monthDots)
+
+        discoverDatePickerGeographicFreezeActive = false
+        print("[PickupMonthDotBoundaryTest] \(ok ? "PASSED" : "FAILED") month=\(monthDots.count) afterSelection=\(pickupGameCalendarDotDates.count)")
+        return ok
+    }
+#endif
 
     /// Inclusive date envelope for Phase 3a.2 calendar-dot RPC shadow (same windows as ``performLoadGamesFromSupabase``: official 10d/365, venue 30d/180).
     func calendarDotRPCShadowScheduleBounds() -> (min: Date, max: Date) {
@@ -1622,10 +1808,76 @@ extension MapViewModel {
     }
 
     private func discoverBoundsBucketString() -> String {
-        guard let b = currentMapRegionBounds() else { return "nb" }
-        return String(
-            format: "%.3f|%.3f|%.3f|%.3f",
-            b.minLat, b.maxLat, b.minLon, b.maxLon
+        PickupGameMonthAvailabilityRequestContext.boundsBucket(for: resolvedDiscoverMapBoundsForCalendarDots())
+    }
+
+    /// Prefer live camera bounds; fall back to last stable / picker-frozen snapshot.
+    func resolvedDiscoverMapBoundsForCalendarDots() -> PickupGameMapBounds? {
+        if discoverDatePickerGeographicFreezeActive, let frozen = discoverDatePickerFrozenMapBounds {
+            return frozen
+        }
+        if let live = currentMapRegionBounds() {
+            let bounds = PickupGameMapBounds(live)
+            lastStableDiscoverMapBounds = bounds
+            return bounds
+        }
+        return lastStableDiscoverMapBounds
+    }
+
+    @discardableResult
+    func recordStableDiscoverMapBoundsIfAvailable() -> PickupGameMapBounds? {
+        guard let live = currentMapRegionBounds() else { return lastStableDiscoverMapBounds }
+        let bounds = PickupGameMapBounds(live)
+        lastStableDiscoverMapBounds = bounds
+        return bounds
+    }
+
+    /// Freeze the geographic snapshot used for month dots while the Discover date picker is open.
+    func beginDiscoverDatePickerGeographicFreeze() {
+        let bounds = recordStableDiscoverMapBoundsIfAvailable() ?? lastStableDiscoverMapBounds
+        discoverDatePickerFrozenMapBounds = bounds
+        discoverDatePickerGeographicFreezeActive = true
+#if DEBUG
+        print(
+            "[PickupDateAvailability] geographicFreeze began bounds=\(bounds?.bucketString ?? "nil")"
+        )
+#endif
+    }
+
+    func endDiscoverDatePickerGeographicFreeze() {
+        discoverDatePickerGeographicFreezeActive = false
+        discoverDatePickerFrozenMapBounds = nil
+#if DEBUG
+        print("[PickupDateAvailability] geographicFreeze ended")
+#endif
+    }
+
+    /// Capture one immutable month-dot request context (cache key == query inputs).
+    func makePickupMonthAvailabilityRequestContext(
+        around month: Date,
+        requestID: UUID = UUID()
+    ) -> PickupGameMonthAvailabilityRequestContext {
+        let range = discoverCalendarDotRange(around: month)
+        let timeZone = pickupDiscoverDisplayTimeZone()
+        let cal = PickupGameDateNormalizer.displayCalendar(timeZone: timeZone)
+        let now = Date()
+        let guestFloor: Date? = {
+            guard isGuestDiscoverMode else { return nil }
+            let raw = cal.date(byAdding: .day, value: -1, to: now) ?? now
+            return cal.startOfDay(for: raw)
+        }()
+        let bounds = resolvedDiscoverMapBoundsForCalendarDots()
+        return PickupGameMonthAvailabilityRequestContext(
+            requestID: requestID,
+            monthStart: range.monthStart,
+            dateMin: range.dateMin,
+            dateMax: range.dateMax,
+            sport: selectedSport,
+            timeZoneIdentifier: timeZone.identifier,
+            mapBounds: bounds,
+            boundsBucket: PickupGameMonthAvailabilityRequestContext.boundsBucket(for: bounds),
+            guestRecentFloor: guestFloor,
+            capturedAt: now
         )
     }
 
@@ -1860,7 +2112,8 @@ extension MapViewModel {
             }
             guard discoverSelectedDayRefreshRequestID == requestID else { return }
             if discoverPickupSubMode == .games {
-                await refreshPickupGamesForDiscoverMap()
+                // Date selection refreshes selected-day map rows only — never wipe month orange-dot cache.
+                await refreshPickupGamesForDiscoverMap(preservePickupCalendarDotDatesCache: true)
             } else if bars.isEmpty {
                 await loadVenuesFromSupabase()
             }
@@ -2078,8 +2331,21 @@ extension MapViewModel {
         scheduleDiscoverMapRenderSnapshotRebuild(reason: "mergeVenueSliceIntoEvents")
     }
 
+    /// Compact, PII-free revision string identifying the inputs a Phase 3 run is scoped to.
+    private func discoverPhase3Revision() -> String {
+        let dateKey = Int(selectedDate.timeIntervalSince1970 / 86_400)
+        let sportKey = selectedSport
+        let modeKey = discoverMapContentMode == .pickupGames ? "pickup" : "venues"
+        return "d\(dateKey)|s\(sportKey)|m\(modeKey)|b\(discoverBoundsBucketString())"
+    }
+
     private func scheduleDiscoverFullEnrichmentInBackground() {
+        if discoverFullEnrichmentTask != nil {
+            DiscoverPhase3Perf.staleCancelled(revision: discoverPhase3Revision())
+        }
         discoverFullEnrichmentTask?.cancel()
+        let revision = discoverPhase3Revision()
+        DiscoverPhase3Perf.scheduled(revision: revision)
         discoverFullEnrichmentTask = Task { @MainActor [weak self] in
             guard let self else { return }
             let t0 = Date()
@@ -2088,6 +2354,10 @@ extension MapViewModel {
             #if DEBUG
             print("[Perf] Phase 3 enrichment started")
             #endif
+            DiscoverPhase3Perf.started(
+                revision: revision,
+                msSinceFirstUsable: LaunchBootstrapState.msSinceFirstUsableScreen() ?? -1
+            )
             await self.refreshSocialEnrichmentInBackground()
             guard !Task.isCancelled else { return }
 
@@ -2105,6 +2375,10 @@ extension MapViewModel {
             print("[Phase3Perf] full enrichment load ms=\(ms) bars=\(self.bars.count) events=\(self.events.count)")
             print("[Perf] Phase 3 enrichment completed ms=\(ms)")
             #endif
+            DiscoverPhase3Perf.completed(revision: revision, ms: Int(Date().timeIntervalSince(t0) * 1000))
+            if !self.isDiscoverTabSelectedForEnrichment {
+                DiscoverPhase3Perf.leftDiscoverWhileRunning(revision: revision)
+            }
 
             guard !Task.isCancelled else { return }
             if self.isCalendarTabSelected || self.discoverMapContentMode == .pickupGames {
@@ -2131,31 +2405,30 @@ extension MapViewModel {
             guard !Task.isCancelled else { return }
 
             let anchor = self.selectedDate
-            let range = self.discoverCalendarDotRange(around: anchor)
-            let monthStart = range.monthStart
-            let sport = self.selectedSport
-            let cacheKey = self.pickupGameCalendarDotCacheKey(
-                boundsBucket: self.discoverBoundsBucketString(),
-                monthStart: monthStart,
-                dateMin: range.dateMin,
-                dateMax: range.dateMax,
-                sport: sport
-            )
+            let request = self.makePickupMonthAvailabilityRequestContext(around: anchor)
+            let cacheKey = request.cacheKey
             let cacheAge = self.pickupGameCalendarDotDatesCache[cacheKey].map { Date().timeIntervalSince($0.fetchedAt) } ?? .infinity
             if cacheAge >= DiscoverCalendarDotCacheConfig.ttl {
                 do {
-                    let dates = try await self.fetchPickupGameCalendarDotDatesForDiscoverRange(
-                        dateMin: range.dateMin,
-                        dateMax: range.dateMax
+                    let outcome = try await self.fetchPickupGameCalendarDotDatesForDiscoverRange(
+                        context: request
                     )
                     guard !Task.isCancelled else { return }
-                    if !(self.isGuestDiscoverMode && dates.isEmpty) {
-                        self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: dates, fetchedAt: Date())
-                        self.prunePickupGameCalendarDotDatesCacheIfNeeded()
-                    }
-                    if self.discoverMapContentMode == .pickupGames,
-                       (!dates.isEmpty || !self.isGuestDiscoverMode) {
-                        self.pickupGameCalendarDotDates = dates
+                    switch outcome {
+                    case .skippedNoBounds:
+                        break
+                    case .success(let dates, _, _):
+                        if !(self.isGuestDiscoverMode && dates.isEmpty) {
+                            self.pickupGameCalendarDotDatesCache[cacheKey] = (dates: dates, fetchedAt: Date())
+                            self.prunePickupGameCalendarDotDatesCacheIfNeeded()
+                        }
+                        if self.discoverMapContentMode == .pickupGames,
+                           (!dates.isEmpty || !self.isGuestDiscoverMode) {
+                            self.publishPickupGameCalendarDotDates(
+                                dates,
+                                caller: "pickupMetadataPreload.monthFetch"
+                            )
+                        }
                     }
                 } catch {
                     #if DEBUG

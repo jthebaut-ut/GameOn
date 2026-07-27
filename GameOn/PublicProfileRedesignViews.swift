@@ -50,7 +50,7 @@ enum PublicProfileIdentityCopy {
                 let core = "\(country) \(supporterNoun)"
                 identity = flag.isEmpty ? core : "\(flag) \(core)"
             }
-        } else if let team = data.primaryFavoriteTeam {
+        } else if let team = data.explicitPrimaryFavoriteTeam {
             identity = "\(team.name) \(fanNoun)"
         } else if let sport = PublicProfileOpenToSplit.sportItems(from: data.openToItems).first {
             identity = "\(sport.title) \(fanNoun)"
@@ -72,141 +72,11 @@ enum PublicProfileIdentityCopy {
 
 // MARK: - Hero background
 
-enum PublicProfileHeroBackgroundKind: Equatable {
-    case team(FavoriteTeam)
-    case sport(String)
-    case neutral
-}
-
-enum PublicProfileHeroBackgroundResolver {
-    static func resolve(for data: PublicUserProfileData) -> PublicProfileHeroBackgroundKind {
-        if let primary = data.primaryFavoriteTeam {
-            return .team(primary)
-        }
-        if let first = data.orderedFavoriteTeamsForPublicProfile.first {
-            return .team(first)
-        }
-        if let sport = PublicProfileOpenToSplit.sportItems(from: data.openToItems).first {
-            return .sport(sport.id)
-        }
-        return .neutral
-    }
-}
-
 struct PublicProfileHeroBackgroundView: View {
-    let kind: PublicProfileHeroBackgroundKind
-    @Environment(\.colorScheme) private var colorScheme
+    let backgroundKey: ProfileBackgroundKey
 
     var body: some View {
-        ZStack {
-            softBase
-            accentLayer
-            subtleStadiumOverlay
-            bottomFade
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private var softBase: some View {
-        LinearGradient(
-            colors: [
-                FGColor.accentBlue.opacity(colorScheme == .dark ? 0.22 : 0.16),
-                FGColor.accentGreen.opacity(colorScheme == .dark ? 0.12 : 0.08),
-                Color.white.opacity(colorScheme == .dark ? 0.03 : 0.82)
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
-    @ViewBuilder
-    private var accentLayer: some View {
-        switch kind {
-        case .team(let team):
-            if team.kind == .nationalTeam {
-                nationalTreatment(team)
-            } else {
-                clubTreatment(team)
-            }
-        case .sport(let token):
-            sportTreatment(token)
-        case .neutral:
-            EmptyView()
-        }
-    }
-
-    private func clubTreatment(_ team: FavoriteTeam) -> some View {
-        LinearGradient(
-            colors: [
-                team.badgeColor.opacity(colorScheme == .dark ? 0.30 : 0.20),
-                team.badgeColor.opacity(colorScheme == .dark ? 0.08 : 0.05),
-                Color.clear
-            ],
-            startPoint: .topLeading,
-            endPoint: .bottomTrailing
-        )
-    }
-
-    private func nationalTreatment(_ team: FavoriteTeam) -> some View {
-        // Soft flag-inspired wash: primary · light · companion — never a literal flag.
-        LinearGradient(
-            colors: [
-                team.badgeColor.opacity(colorScheme == .dark ? 0.34 : 0.26),
-                Color.white.opacity(colorScheme == .dark ? 0.12 : 0.72),
-                nationalCompanion(for: team).opacity(colorScheme == .dark ? 0.24 : 0.20)
-            ],
-            startPoint: .topLeading,
-            endPoint: .topTrailing
-        )
-        .opacity(0.78)
-    }
-
-    private func nationalCompanion(for team: FavoriteTeam) -> Color {
-        // Prefer a warm companion when the badge is cool (e.g. France blue → soft red).
-        let r = team.badgeRed
-        let b = team.badgeBlue
-        if b > r + 0.12 {
-            return Color(red: 0.82, green: 0.18, blue: 0.22)
-        }
-        if r > b + 0.12 {
-            return Color(red: 0.12, green: 0.28, blue: 0.68)
-        }
-        return team.badgeColor
-    }
-
-    private func sportTreatment(_ token: String) -> some View {
-        let accent = SportFilterCatalog.resolve(token).accent
-        return accent.opacity(colorScheme == .dark ? 0.14 : 0.09)
-    }
-
-    private var subtleStadiumOverlay: some View {
-        // Soft seating arc suggestion — very low contrast.
-        LinearGradient(
-            colors: [
-                Color.clear,
-                Color.black.opacity(colorScheme == .dark ? 0.05 : 0.02)
-            ],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-        .mask {
-            Ellipse()
-                .frame(width: 480, height: 140)
-                .offset(y: 40)
-                .blur(radius: 28)
-        }
-    }
-
-    private var bottomFade: some View {
-        LinearGradient(
-            colors: [
-                Color.clear,
-                (colorScheme == .dark ? Color.black : Color.white).opacity(0.72)
-            ],
-            startPoint: .center,
-            endPoint: .bottom
-        )
+        ProfileBackgroundHeroFill(option: ProfileBackgroundCatalog.option(for: backgroundKey))
     }
 }
 
@@ -221,14 +91,14 @@ private struct PublicProfileCompactSurface: ViewModifier {
         content
             .background {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Color.white.opacity(colorScheme == .dark ? 0.10 : 0.98))
+                    .fill(FGColor.cardBackground(colorScheme))
             }
             .overlay {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.40 : 0.42), lineWidth: 1)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.42), lineWidth: 1)
             }
             .shadow(
-                color: Color.black.opacity(elevated ? (colorScheme == .dark ? 0.14 : 0.03) : 0),
+                color: Color.black.opacity(elevated ? (colorScheme == .dark ? 0.28 : 0.03) : 0),
                 radius: elevated ? 6 : 0,
                 y: elevated ? 2 : 0
             )
@@ -236,7 +106,7 @@ private struct PublicProfileCompactSurface: ViewModifier {
 }
 
 extension View {
-    fileprivate func publicProfileCompactSurface(cornerRadius: CGFloat = 16, elevated: Bool = true) -> some View {
+    func publicProfileCompactSurface(cornerRadius: CGFloat = 16, elevated: Bool = true) -> some View {
         modifier(PublicProfileCompactSurface(cornerRadius: cornerRadius, elevated: elevated))
     }
 }
@@ -269,6 +139,117 @@ struct PublicProfileOwnerPreviewNotice: View {
     }
 }
 
+// MARK: - Shared below-hero section stack
+
+/// Canonical public-profile section order below the hero (own preview + other-user).
+enum PublicProfileBelowHeroSectionOrder: Int, CaseIterable {
+    case mutualFriends
+    case myTeam
+    case pickupGames
+    case teamsIFollow
+    case sportsIPlay
+    case openTo
+    case homeWatchSpot
+}
+
+/// Shared visibility predicates — identical for self-preview and viewer-facing profiles.
+enum PublicProfileSectionVisibility {
+    static func showsMyTeam(data: PublicUserProfileData) -> Bool {
+        data.explicitPrimaryFavoriteTeam != nil && data.myTeamDisplayModel != nil
+    }
+
+    static func showsOpenTo(socialItems: [PublicProfileOpenToItem]) -> Bool {
+        !socialItems.isEmpty
+    }
+
+    static func showsHomeWatchSpot(summary: HomeCrowdVenueSummary?) -> Bool {
+        summary != nil
+    }
+
+    static func showsSportsIPlay(sportItems: [PublicProfileOpenToItem], isSelfPreview: Bool) -> Bool {
+        !sportItems.isEmpty || isSelfPreview
+    }
+
+    static func showsTeamsIFollow(data: PublicUserProfileData, isSelfPreview: Bool) -> Bool {
+        !data.orderedFavoriteTeamsForPublicProfile.isEmpty || isSelfPreview
+    }
+}
+
+/// One shared below-hero renderer for self-preview and another-user public profiles.
+struct PublicProfileBelowHeroStack: View {
+    let data: PublicUserProfileData
+    let isSelfPreview: Bool
+    let onSelectMutualFan: ((UUID) -> Void)?
+    let onChooseTeam: (() -> Void)?
+    let onAddSports: (() -> Void)?
+    let onViewHomeWatchSpot: (() -> Void)?
+    let onChooseHomeWatchSpot: (() -> Void)?
+
+    private var sportItems: [PublicProfileOpenToItem] {
+        PublicProfileOpenToSplit.sportItems(from: data.openToItems)
+    }
+
+    private var socialItems: [PublicProfileOpenToItem] {
+        PublicProfileOpenToSplit.socialItems(from: data.openToItems)
+    }
+
+    var body: some View {
+        VStack(spacing: PublicProfileSheetLayout.sectionSpacing) {
+            PublicProfileMutualFansSection(
+                count: data.mutualFansCount,
+                avatars: data.mutualFanAvatars,
+                isSelfPreview: isSelfPreview,
+                targetUserId: data.userId,
+                onSelectFan: onSelectMutualFan
+            )
+            .frame(maxWidth: .infinity)
+
+            if PublicProfileSectionVisibility.showsMyTeam(data: data),
+               let myTeam = data.explicitPrimaryFavoriteTeam,
+               let model = data.myTeamDisplayModel {
+                PublicProfileMyTeamSection(model: model, team: myTeam)
+                    .frame(maxWidth: .infinity)
+            }
+
+            PublicProfilePickupGamesSection(data: data)
+                .frame(maxWidth: .infinity)
+
+            if PublicProfileSectionVisibility.showsTeamsIFollow(data: data, isSelfPreview: isSelfPreview) {
+                PublicProfileTeamsIFollowSection(
+                    data: data,
+                    isSelfPreview: isSelfPreview,
+                    onChooseTeam: onChooseTeam
+                )
+                .frame(maxWidth: .infinity)
+            }
+
+            if PublicProfileSectionVisibility.showsSportsIPlay(sportItems: sportItems, isSelfPreview: isSelfPreview) {
+                PublicProfileSportsIPlaySection(
+                    items: sportItems,
+                    isSelfPreview: isSelfPreview,
+                    onAddSports: onAddSports
+                )
+                .frame(maxWidth: .infinity)
+            }
+
+            if PublicProfileSectionVisibility.showsOpenTo(socialItems: socialItems) {
+                PublicProfileSocialOpenToSection(items: socialItems)
+                    .frame(maxWidth: .infinity)
+            }
+
+            if PublicProfileSectionVisibility.showsHomeWatchSpot(summary: data.homeCrowd) {
+                PublicProfileHomeWatchSpotSection(
+                    summary: data.homeCrowd,
+                    isSelfPreview: isSelfPreview,
+                    onViewSpot: onViewHomeWatchSpot,
+                    onChooseSpot: onChooseHomeWatchSpot
+                )
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+}
+
 // MARK: - Redesigned hero
 
 struct PublicProfileRedesignHero: View {
@@ -292,23 +273,13 @@ struct PublicProfileRedesignHero: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
-    @State private var containerWidth: CGFloat = 0
-
-    private var backgroundKind: PublicProfileHeroBackgroundKind {
-        PublicProfileHeroBackgroundResolver.resolve(for: data)
-    }
 
     private var avatarDiameter: CGFloat {
-        guard containerWidth > 0 else { return 84 }
-        return min(88, max(76, containerWidth * 0.215))
+        ProfileHeroMetrics.avatarDiameter
     }
 
     private var trimmedBio: String {
         data.bio?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    }
-
-    private var identityLine: String {
-        PublicProfileIdentityCopy.heroIdentityLine(for: data, languageCode: appLanguageRaw)
     }
 
     private var handleOnly: String {
@@ -318,30 +289,31 @@ struct PublicProfileRedesignHero: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
-                PublicProfileHeroBackgroundView(kind: backgroundKind)
-                    .frame(height: 86)
+                PublicProfileHeroBackgroundView(backgroundKey: data.profileBackgroundKey)
+                    .frame(height: ProfileHeroMetrics.artworkHeight)
                     .frame(maxWidth: .infinity)
 
                 Color.clear.frame(height: 1)
             }
             .clipShape(
                 UnevenRoundedRectangle(
-                    topLeadingRadius: 16,
+                    topLeadingRadius: ProfileHeroMetrics.heroCornerRadius,
                     bottomLeadingRadius: 0,
                     bottomTrailingRadius: 0,
-                    topTrailingRadius: 16,
+                    topTrailingRadius: ProfileHeroMetrics.heroCornerRadius,
                     style: .continuous
                 )
             )
 
-            HStack(alignment: .center, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
                 avatar
-                    .offset(y: -avatarDiameter * 0.42)
+                    // Avatar bridges artwork → light identity surface; text stays on the light surface.
+                    .profileHeroAvatarOverlap()
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
                         Text(data.displayName)
-                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                            .font(.system(size: 26, weight: .bold, design: .rounded))
                             .foregroundStyle(FGColor.primaryText(colorScheme))
                             .lineLimit(2)
                             .minimumScaleFactor(0.82)
@@ -356,33 +328,41 @@ struct PublicProfileRedesignHero: View {
 
                     if !handleOnly.isEmpty {
                         Text(handleOnly.hasPrefix("@") ? handleOnly : "@\(handleOnly)")
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
+                            .font(.system(size: 13.5, weight: .semibold, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.88))
+                            .padding(.top, 2)
                     }
 
-                    Text(identityLine)
-                        .font(.system(size: 12, weight: .regular, design: .rounded))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.95))
-                        .lineLimit(2)
+                    FanXpSummaryLine(
+                        totalXP: data.totalXP,
+                        languageCode: appLanguageRaw
+                    )
+                    .padding(.top, 4)
 
                     if !trimmedBio.isEmpty {
                         Text(trimmedBio)
-                            .font(.system(size: 12, weight: .regular, design: .rounded))
-                            .foregroundStyle(FGColor.mutedText(colorScheme))
-                            .lineSpacing(1)
+                            .font(.system(size: 14.5, weight: .medium, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme).opacity(0.88))
+                            .lineSpacing(2)
                             .lineLimit(3)
-                    } else if isSelfPreview {
-                        Text(L10n.t("public_profile_owner_add_bio_prompt", languageCode: appLanguageRaw))
-                            .font(.system(size: 12, weight: .medium, design: .rounded))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .padding(.top, 5)
                     }
                 }
-                // Raise identity to sit beside the avatar center, matching the mock.
-                .offset(y: -avatarDiameter * 0.10)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
+                // Light Mode: soft white wash for readability. Dark Mode: no panel —
+                // text sits directly on the hero surface (same as Light Mode intent).
+                .background {
+                    if colorScheme == .light {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.white.opacity(0.55))
+                    }
+                }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 4)
+            .padding(.horizontal, ProfileHeroMetrics.heroContentHorizontalPadding)
+            .padding(.top, 2)
+            .padding(.bottom, 2)
 
             PublicProfileHeroActionRow(
                 isSelfPreview: isSelfPreview,
@@ -403,8 +383,13 @@ struct PublicProfileRedesignHero: View {
                 onBlock: onBlock,
                 onPoke: onPoke
             )
-            .padding(.horizontal, 14)
-            .padding(.top, 14)
+            .padding(.horizontal, ProfileHeroMetrics.heroContentHorizontalPadding)
+            .padding(.top, ProfileHeroMetrics.identityToCardsSpacing)
+
+            ProfileHeroIdentityCardsRow(
+                cards: ProfileHeroIdentityCardsBuilder.cards(from: data, languageCode: appLanguageRaw)
+            )
+            .padding(.top, ProfileHeroMetrics.identityToCardsSpacing)
 
             // Shared-teams context only (mutual friends live in the dedicated section below).
             if !isSelfPreview, data.sharedTeamsCount > 0 {
@@ -414,18 +399,12 @@ struct PublicProfileRedesignHero: View {
                     sharedTeamsCount: data.sharedTeamsCount,
                     sharedTeamNames: data.sharedTeamNames
                 )
-                .padding(.horizontal, 14)
+                .padding(.horizontal, ProfileHeroMetrics.heroContentHorizontalPadding)
                 .padding(.top, 12)
             }
         }
-        .padding(.bottom, 18)
-        .background {
-            GeometryReader { geo in
-                Color.clear.preference(key: PublicProfileRedesignHeroWidthKey.self, value: geo.size.width)
-            }
-        }
-        .onPreferenceChange(PublicProfileRedesignHeroWidthKey.self) { containerWidth = $0 }
-        .publicProfileCompactSurface(cornerRadius: 16)
+        .padding(.bottom, ProfileHeroMetrics.heroBottomPadding)
+        .publicProfileCompactSurface(cornerRadius: ProfileHeroMetrics.heroCornerRadius)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(heroAccessibilityLabel)
     }
@@ -435,7 +414,13 @@ struct PublicProfileRedesignHero: View {
         if !handleOnly.isEmpty {
             parts.append(handleOnly.hasPrefix("@") ? handleOnly : "@\(handleOnly)")
         }
-        parts.append(identityLine)
+        let xpAmount = max(0, data.totalXP).formatted(.number.grouping(.automatic))
+        parts.append(
+            String(
+                format: L10n.t("fan_xp_line_format", languageCode: appLanguageRaw),
+                xpAmount
+            )
+        )
         if !trimmedBio.isEmpty {
             parts.append(trimmedBio)
         }
@@ -461,14 +446,13 @@ struct PublicProfileRedesignHero: View {
             Circle()
                 .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.40 : 1), lineWidth: 2.5)
         }
+        .overlay(alignment: .bottomTrailing) {
+            if !data.isBusinessAccount {
+                ActivityStatusCompactPill(lastSeenAtRaw: data.lastSeenAtRaw)
+                    .offset(x: 4, y: 2)
+            }
+        }
         .shadow(color: Color.black.opacity(0.10), radius: 6, y: 2)
-    }
-}
-
-private struct PublicProfileRedesignHeroWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 
@@ -496,39 +480,46 @@ struct PublicProfileHeroActionRow: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
+    /// Viewer-facing friendship presentation. Self-preview always shows the stranger Add Friend control.
+    private var presentedFriendState: PublicProfileFriendButtonState {
+        isSelfPreview ? .requestFriendship : friendState
+    }
+
+    /// Stranger-facing Message eligibility (self-preview mirrors non-friend Message appearance).
     private var canMessage: Bool {
-        friendState == .messageFriend
+        !isSelfPreview && friendState == .messageFriend
+    }
+
+    private var presentedCanPoke: Bool {
+        isSelfPreview ? true : canPoke
+    }
+
+    /// Visual poke availability for stranger-facing layout; self-preview stays fully opaque.
+    private var presentedPokeDisabled: Bool {
+        isSelfPreview ? false : isPokeDisabled
+    }
+
+    private var previewOnlyAccessibilitySuffix: String {
+        L10n.t("public_profile_preview_action_a11y", languageCode: appLanguageRaw)
     }
 
     var body: some View {
         HStack(spacing: 10) {
-            if isSelfPreview {
-                primaryButton(
-                    title: L10n.t("edit_profile", languageCode: appLanguageRaw),
-                    icon: "pencil",
-                    filled: true,
-                    action: onEditProfile
-                )
-                secondaryButton(
-                    title: L10n.t("share_profile", languageCode: appLanguageRaw),
-                    icon: "square.and.arrow.up",
-                    action: onShare
-                )
-                moreMenu
-            } else {
-                friendshipAction
-                messageAction
-                if canPoke {
-                    pokeAction
-                }
-                moreMenu
+            friendshipAction
+            messageAction
+            if presentedCanPoke {
+                pokeAction
             }
+            moreMenu
         }
+        // Keep stranger-facing visuals fully opaque in self-preview; block all hits instead of dimming.
+        .allowsHitTesting(!isSelfPreview)
+        .accessibilityElement(children: .contain)
     }
 
     @ViewBuilder
     private var friendshipAction: some View {
-        switch friendState {
+        switch presentedFriendState {
         case .requestFriendship:
             primaryButton(
                 title: L10n.t("add_friend", languageCode: appLanguageRaw),
@@ -537,6 +528,7 @@ struct PublicProfileHeroActionRow: View {
                 disabled: isFriendActionInFlight,
                 action: onAddFriend
             )
+            .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
         case .friendshipRequested:
             secondaryButton(
                 title: L10n.t("request_sent", languageCode: appLanguageRaw),
@@ -544,6 +536,7 @@ struct PublicProfileHeroActionRow: View {
                 disabled: isFriendActionInFlight,
                 action: onCancelRequest
             )
+            .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
         case .messageFriend:
             secondaryButton(
                 title: L10n.t("friends", languageCode: appLanguageRaw),
@@ -566,16 +559,18 @@ struct PublicProfileHeroActionRow: View {
         )
         .opacity(canMessage ? 1 : 0.55)
         .accessibilityHint(
-            canMessage
-                ? ""
-                : L10n.t("public_profile_message_friends_only_a11y", languageCode: appLanguageRaw)
+            isSelfPreview
+                ? previewOnlyAccessibilitySuffix
+                : (canMessage
+                    ? ""
+                    : L10n.t("public_profile_message_friends_only_a11y", languageCode: appLanguageRaw))
         )
     }
 
     private var pokeAction: some View {
         Button(action: onPoke) {
             HStack(spacing: 5) {
-                if isPokeInFlight {
+                if isPokeInFlight && !isSelfPreview {
                     ProgressView()
                         .controlSize(.mini)
                 } else {
@@ -600,53 +595,44 @@ struct PublicProfileHeroActionRow: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(isPokeDisabled || isPokeInFlight)
-        .opacity(isPokeDisabled ? 0.65 : 1)
+        .disabled(presentedPokeDisabled || (isPokeInFlight && !isSelfPreview))
+        .opacity(presentedPokeDisabled ? 0.65 : 1)
         .accessibilityLabel(
             String(
                 format: L10n.t("public_profile_poke_a11y_format", languageCode: appLanguageRaw),
                 displayName
             )
         )
+        .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
     }
 
     private var moreMenu: some View {
         Menu {
-            if isSelfPreview {
-                Button {
-                    onShare()
+            Button {
+                onShare()
+            } label: {
+                Label(L10n.t("share_profile", languageCode: appLanguageRaw), systemImage: "square.and.arrow.up")
+            }
+
+            if friendState == .friendshipRequested {
+                Button(role: .destructive) {
+                    onCancelRequest()
                 } label: {
-                    Label(L10n.t("share_profile", languageCode: appLanguageRaw), systemImage: "square.and.arrow.up")
+                    Label(L10n.t("cancel_friend_request", languageCode: appLanguageRaw), systemImage: "person.badge.minus")
                 }
-            } else {
+            }
+
+            if canShowSafetyActions {
                 Button {
-                    onShare()
+                    onReport()
                 } label: {
-                    Label(L10n.t("share_profile", languageCode: appLanguageRaw), systemImage: "square.and.arrow.up")
+                    Label(L10n.t("report_fan", languageCode: appLanguageRaw), systemImage: "flag.fill")
                 }
 
-                if friendState == .friendshipRequested {
-                    Button(role: .destructive) {
-                        onCancelRequest()
-                    } label: {
-                        Label(L10n.t("cancel_friend_request", languageCode: appLanguageRaw), systemImage: "person.badge.minus")
-                    }
-                }
-
-                // Poke is a dedicated hero button; keep menu free of the duplicate.
-
-                if canShowSafetyActions {
-                    Button {
-                        onReport()
-                    } label: {
-                        Label(L10n.t("report_fan", languageCode: appLanguageRaw), systemImage: "flag.fill")
-                    }
-
-                    Button(role: .destructive) {
-                        onBlock()
-                    } label: {
-                        Label(L10n.t("block_fan", languageCode: appLanguageRaw), systemImage: "nosign")
-                    }
+                Button(role: .destructive) {
+                    onBlock()
+                } label: {
+                    Label(L10n.t("block_fan", languageCode: appLanguageRaw), systemImage: "nosign")
                 }
             }
         } label: {
@@ -671,6 +657,7 @@ struct PublicProfileHeroActionRow: View {
                     displayName
                 )
         )
+        .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
     }
 
     private func primaryButton(
@@ -903,17 +890,7 @@ struct PublicProfileFanSnapshotView: View {
                     icon: flag.isEmpty ? "flag.fill" : flag,
                     iconIsEmoji: !flag.isEmpty,
                     title: identity.resolvedSupporterLabel(languageCode: appLanguageRaw),
-                    subtitle: NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw)
-                )
-            )
-        } else if let team = data.primaryFavoriteTeam {
-            result.append(
-                Column(
-                    id: "team",
-                    icon: "star.fill",
-                    iconIsEmoji: false,
-                    title: "\(team.name) \(L10n.t("public_profile_identity_fan", languageCode: appLanguageRaw))",
-                    subtitle: L10n.t("my_team", languageCode: appLanguageRaw)
+                    subtitle: NationalFanIdentityDisplay.stripSubtitle(languageCode: appLanguageRaw)
                 )
             )
         }
@@ -940,6 +917,14 @@ struct PublicProfileFanSnapshotView: View {
             )
         }
         return result
+    }
+
+    private func fanSnapshotColumnAccessibilityLabel(_ column: Column) -> String {
+        if column.id == "national" {
+            let heading = L10n.t("national_team", languageCode: appLanguageRaw)
+            return "\(heading), \(column.title), \(column.subtitle)"
+        }
+        return "\(column.title), \(column.subtitle)"
     }
 
     var body: some View {
@@ -978,13 +963,111 @@ struct PublicProfileFanSnapshotView: View {
                     .padding(.horizontal, 6)
                     .padding(.vertical, 10)
                     .publicProfileCompactSurface(cornerRadius: 14, elevated: false)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(fanSnapshotColumnAccessibilityLabel(column))
                 }
             }
         }
     }
 }
 
+// MARK: - My Team (authoritative primary favorite)
+
+struct PublicProfileMyTeamSection: View {
+    let model: MyTeamDisplayModel
+    let team: FavoriteTeam
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                Image(systemName: "trophy.fill")
+                    .font(.system(size: 12, weight: .heavy))
+                    .foregroundStyle(FGColor.accentYellow)
+                    .accessibilityHidden(true)
+                Text(L10n.t("my_team", languageCode: appLanguageRaw))
+                    .font(.system(size: 15, weight: .bold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .textCase(.uppercase)
+                    .tracking(0.4)
+            }
+
+            HStack(alignment: .center, spacing: 12) {
+                SportsIdentityArtworkView(favoriteTeam: team, diameter: 48)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(model.teamName)
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.82)
+
+                    HStack(spacing: 5) {
+                        Text(sportIcon(for: team.sport.chipTitle))
+                            .font(.system(size: 12))
+                        Text(model.sportLabel(languageCode: appLanguageRaw))
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.12 : 0.08))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.34 : 0.22), lineWidth: 1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .publicProfileCompactSurface(cornerRadius: 16)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(model.accessibilityLabel(languageCode: appLanguageRaw))
+    }
+}
+
 // MARK: - Teams I Follow
+
+// MARK: - Pickup Games
+
+struct PublicProfilePickupGamesSection: View {
+    let data: PublicUserProfileData
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L10n.t("pickup_games_section_title", languageCode: appLanguageRaw))
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .textCase(.uppercase)
+                .tracking(0.4)
+
+            PublicProfilePickupOrganizerCard(
+                creatorUserId: data.userId,
+                hostedCount: data.pickupHostedCount,
+                stats: data.organizerStats,
+                lastPickupGameCreatedAt: data.lastPickupGameCreatedAt,
+                compact: true,
+                usesExternalChrome: true
+            )
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .publicProfileCompactSurface(cornerRadius: 16)
+    }
+}
 
 struct PublicProfileTeamsIFollowSection: View {
     let data: PublicUserProfileData
@@ -992,17 +1075,12 @@ struct PublicProfileTeamsIFollowSection: View {
     let onChooseTeam: (() -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
-    @State private var containerWidth: CGFloat = 0
 
     private var teams: [FavoriteTeam] {
         data.orderedFavoriteTeamsForPublicProfile
     }
 
-    /// Target ~2.55 cards visible so the carousel peeks clearly.
-    private var cardWidth: CGFloat {
-        let usable = max(containerWidth - 24, 280)
-        return min(168, max(136, usable / 2.55))
-    }
+    private let cardStyle = FavoriteTeamRichCardStyle.publicCompact
 
     var body: some View {
         if teams.isEmpty {
@@ -1017,97 +1095,39 @@ struct PublicProfileTeamsIFollowSection: View {
                 EmptyView()
             }
         } else {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 10) {
                 Text("\(L10n.t("teams_i_follow", languageCode: appLanguageRaw)) · \(teams.count)")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .center, spacing: 8) {
+                    LazyHStack(alignment: .top, spacing: 10) {
                         ForEach(teams) { team in
-                            teamCard(team, isPrimary: team.id == data.primaryFavoriteTeam?.id)
+                            FavoriteTeamRichCard(
+                                team: team,
+                                isPrimary: team.id == data.explicitPrimaryFavoriteTeam?.id,
+                                style: cardStyle,
+                                languageCode: appLanguageRaw
+                            )
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(
+                                team.id == data.explicitPrimaryFavoriteTeam?.id
+                                    ? MyTeamDisplayModel(team: team).accessibilityLabel(languageCode: appLanguageRaw)
+                                    : "\(team.name), \(team.sport.chipTitle)"
+                            )
                         }
                     }
-                    .scrollTargetLayout()
-                    .padding(.trailing, 20)
+                    .padding(.vertical, 2)
+                    .padding(.trailing, 16)
                 }
-                .scrollTargetBehavior(.viewAligned)
+                .frame(height: cardStyle.carouselHeight, alignment: .topLeading)
+                .scrollClipDisabled()
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background {
-                GeometryReader { geo in
-                    Color.clear.preference(key: PublicProfileTeamsWidthKey.self, value: geo.size.width)
-                }
-            }
-            .onPreferenceChange(PublicProfileTeamsWidthKey.self) { containerWidth = $0 }
             .publicProfileCompactSurface(cornerRadius: 16)
         }
-    }
-
-    private func teamCard(_ team: FavoriteTeam, isPrimary: Bool) -> some View {
-        HStack(alignment: .center, spacing: 10) {
-            SportsIdentityArtworkView(favoriteTeam: team, diameter: 44)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(team.name)
-                    .font(.system(size: 13.5, weight: .bold, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.82)
-
-                HStack(spacing: 4) {
-                    Text(sportIcon(for: team.sport.chipTitle))
-                        .font(.system(size: 10))
-                    Text(team.sport.chipTitle)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                }
-
-                if isPrimary {
-                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
-                        .font(.system(size: 9.5, weight: .heavy, design: .rounded))
-                        .foregroundStyle(FGColor.accentBlue)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background {
-                            Capsule().fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.18 : 0.10))
-                        }
-                        .padding(.top, 1)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 10)
-        .frame(width: cardWidth, height: 88, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.96))
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(
-                    isPrimary ? FGColor.accentBlue.opacity(0.55) : FGColor.divider(colorScheme).opacity(0.7),
-                    lineWidth: isPrimary ? 1.4 : 1
-                )
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(
-            isPrimary
-                ? "\(team.name), \(team.sport.chipTitle). \(L10n.t("my_team", languageCode: appLanguageRaw))"
-                : "\(team.name), \(team.sport.chipTitle)"
-        )
-    }
-}
-
-private struct PublicProfileTeamsWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
     }
 }
 
@@ -1172,12 +1192,18 @@ struct PublicProfileSportsIPlaySection: View {
     }
 }
 
-// MARK: - Social Open To (compact)
+// MARK: - Social Open To (compact rich cards)
 
 struct PublicProfileSocialOpenToSection: View {
     let items: [PublicProfileOpenToItem]
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private let columns = [
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8)
+    ]
 
     var body: some View {
         if items.isEmpty {
@@ -1188,26 +1214,15 @@ struct PublicProfileSocialOpenToSection: View {
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(items) { item in
-                            HStack(spacing: 6) {
-                                Image(systemName: item.systemImage)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(item.tint)
-                                Text(item.openToGridLabel)
-                                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                                    .lineLimit(1)
-                            }
-                            .padding(.horizontal, 10)
-                            .frame(height: 34)
-                            .background {
-                                Capsule(style: .continuous)
-                                    .fill(FanOpenToCatalog.compactTileFill(for: item.id, colorScheme: colorScheme))
-                            }
-                            .accessibilityLabel(item.openToGridLabel)
-                        }
+                LazyVGrid(columns: columns, alignment: .leading, spacing: 8) {
+                    ForEach(items) { item in
+                        FanOpenToCompactTile(
+                            itemID: item.id,
+                            title: item.openToGridLabel,
+                            systemImage: item.systemImage,
+                            isSocial: item.isSocial,
+                            style: .publicCompact
+                        )
                     }
                 }
             }
@@ -1235,14 +1250,8 @@ struct PublicProfileHomeWatchSpotSection: View {
     var body: some View {
         if let summary {
             populatedCard(summary)
-        } else if isSelfPreview {
-            PublicProfileOwnerCompletionPrompt(
-                title: L10n.t("public_profile_choose_home_watch_spot", languageCode: appLanguageRaw),
-                subtitle: nil,
-                actionTitle: L10n.t("public_profile_choose_home_watch_spot", languageCode: appLanguageRaw),
-                action: onChooseSpot
-            )
         } else {
+            // Same visibility for self-preview and other-user: omit when unset.
             EmptyView()
         }
     }

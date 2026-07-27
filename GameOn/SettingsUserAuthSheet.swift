@@ -58,11 +58,18 @@ struct SettingsUserAuthSheet: View {
             Color.clear.frame(height: SettingsScrollBottomLayout.sheetScrollComfortInset)
         }
         .background(FGColor.screenGradient(colorScheme).ignoresSafeArea())
+        .overlay {
+            if viewModel.isSafeLoginBlockingUI {
+                SafeLoginProgressOverlay(viewModel: viewModel)
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Close") { dismiss() }
+                    .disabled(viewModel.isSafeLoginInFlight)
             }
         }
+        .interactiveDismissDisabled(viewModel.isSafeLoginInFlight)
         .onChange(of: viewModel.isLoggedIn) { wasLoggedIn, isLoggedIn in
             // Dismiss after successful fan auth while the sheet is open.
             if !wasLoggedIn && isLoggedIn, !viewModel.isAppleFanSignupOnboardingActive {

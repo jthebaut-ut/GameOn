@@ -1,12 +1,12 @@
 import Foundation
 import Supabase
 
-/// Filters Suggested Fans to match the same eligibility rules as ``PublicUserProfileService/load(userId:)``.
+/// Filters Suggested Fans using server-authoritative eligibility plus local block/self checks.
 ///
-/// Important: `user_profiles` RLS allows authenticated clients to SELECT only their own row
-/// (`id = auth.uid()`). Direct profile-row lookups therefore cannot verify other candidates.
-/// Missing row data must **not** exclude a candidate; public visibility is decided by
-/// ``PublicUserProfileService/isPublicIdentityVisible(userId:)`` (SECURITY DEFINER RPC).
+/// `get_profile_friend_suggestions` already excludes undiscoverable, deleted, business,
+/// inactive, blocked, friended/pending/declined, dismissed, and under-13 candidates.
+/// Optional profile-row reads still apply when RLS returns a readable row. Public-identity
+/// N+1 RPCs are intentionally skipped — the suggestion RPC is the eligibility authority.
 enum SuggestedFansEligibility {
     enum ExclusionReason: String {
         case selfUser = "self"
@@ -139,15 +139,8 @@ enum SuggestedFansEligibility {
                 continue
             }
 
-            let visible = await PublicUserProfileService.isPublicIdentityVisible(userId: userId)
-            guard visible else {
-                summary.publicIdentityHidden += 1
-#if DEBUG
-                print("[SuggestedFansDebug] excluded reason=\(ExclusionReason.publicIdentityHidden.rawValue) user_id=\(userId.uuidString.lowercased())")
-#endif
-                continue
-            }
-
+            // Server RPC already enforced discoverable / soft-deleted / business / age / blocks.
+            // Preserve order; do not re-rank or N+1 public-identity lookups.
             eligible.append(suggestion)
         }
 

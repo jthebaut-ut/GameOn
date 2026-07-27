@@ -1,12 +1,67 @@
 import SwiftUI
 
-// MARK: - Compact Open To tile (Profile preview + editor)
+// MARK: - Compact Open To tile (Profile preview + editor + public read-only)
+
+/// Shared visual metrics for Open To cards. Own-profile / editor keep the full size;
+/// public profile uses a slightly more compact read-only variant (~15% smaller).
+enum FanOpenToCompactTileStyle {
+    case ownProfile
+    case publicCompact
+
+    var height: CGFloat {
+        switch self {
+        case .ownProfile: return 84
+        case .publicCompact: return 72
+        }
+    }
+
+    var cornerRadius: CGFloat {
+        switch self {
+        case .ownProfile: return 18
+        case .publicCompact: return 16
+        }
+    }
+
+    var iconPointSize: CGFloat {
+        switch self {
+        case .ownProfile: return 24
+        case .publicCompact: return 21
+        }
+    }
+
+    var sportBadgeSize: CGFloat {
+        switch self {
+        case .ownProfile: return 30
+        case .publicCompact: return 26
+        }
+    }
+
+    var iconFrameHeight: CGFloat {
+        switch self {
+        case .ownProfile: return 28
+        case .publicCompact: return 24
+        }
+    }
+
+    var titleFontSize: CGFloat {
+        switch self {
+        case .ownProfile, .publicCompact: return 9
+        }
+    }
+
+    var horizontalPadding: CGFloat {
+        switch self {
+        case .ownProfile: return 6
+        case .publicCompact: return 5
+        }
+    }
+}
 
 enum FanOpenToCompactTileMetrics {
-    static let height: CGFloat = 84
-    static let cornerRadius: CGFloat = 18
-    static let iconPointSize: CGFloat = 24
-    static let sportBadgeSize: CGFloat = 30
+    static let height: CGFloat = FanOpenToCompactTileStyle.ownProfile.height
+    static let cornerRadius: CGFloat = FanOpenToCompactTileStyle.ownProfile.cornerRadius
+    static let iconPointSize: CGFloat = FanOpenToCompactTileStyle.ownProfile.iconPointSize
+    static let sportBadgeSize: CGFloat = FanOpenToCompactTileStyle.ownProfile.sportBadgeSize
 }
 
 struct FanOpenToCompactTile: View {
@@ -14,6 +69,7 @@ struct FanOpenToCompactTile: View {
     let title: String
     let systemImage: String
     let isSocial: Bool
+    var style: FanOpenToCompactTileStyle = .ownProfile
 
     @Environment(\.colorScheme) private var colorScheme
 
@@ -25,37 +81,40 @@ struct FanOpenToCompactTile: View {
         VStack(spacing: 4) {
             if isSocial {
                 Image(systemName: systemImage)
-                    .font(.system(size: FanOpenToCompactTileMetrics.iconPointSize, weight: .semibold))
+                    .font(.system(size: style.iconPointSize, weight: .semibold))
                     .foregroundStyle(tint)
-                    .frame(height: 28)
+                    .frame(height: style.iconFrameHeight)
             } else {
                 FanGeoSportBadgeView(
                     sport: itemID,
-                    size: FanOpenToCompactTileMetrics.sportBadgeSize,
+                    size: style.sportBadgeSize,
                     style: .profile
                 )
-                .frame(height: 28)
+                .frame(height: style.iconFrameHeight)
             }
 
             Text(title)
-                .font(.system(size: 9, weight: .bold, design: .rounded))
+                .font(.system(size: style.titleFontSize, weight: .bold, design: .rounded))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .minimumScaleFactor(0.72)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity)
-        .frame(height: FanOpenToCompactTileMetrics.height)
-        .padding(.horizontal, 6)
+        .frame(height: style.height)
+        .padding(.horizontal, style.horizontalPadding)
         .background {
-            RoundedRectangle(cornerRadius: FanOpenToCompactTileMetrics.cornerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous)
                 .fill(FanOpenToCatalog.compactTileFill(for: itemID, colorScheme: colorScheme))
         }
         .overlay {
-            RoundedRectangle(cornerRadius: FanOpenToCompactTileMetrics.cornerRadius, style: .continuous)
+            RoundedRectangle(cornerRadius: style.cornerRadius, style: .continuous)
                 .strokeBorder(tint.opacity(colorScheme == .dark ? 0.28 : 0.18), lineWidth: 0.75)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
     }
 }
 

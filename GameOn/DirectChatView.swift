@@ -85,57 +85,6 @@ private enum DirectChatTimeGrouping {
     }
 }
 
-#if DEBUG
-private enum DirectChatRealtimeConnectionStatus: Equatable {
-    case connected
-    case live
-    case fallback
-    case reconnecting
-    case offline
-
-    var title: String {
-        switch self {
-        case .connected:
-            return "Live"
-        case .live:
-            return "Live"
-        case .fallback:
-            return "Syncing messages..."
-        case .reconnecting:
-            return "Connection issue"
-        case .offline:
-            return "Connection issue"
-        }
-    }
-
-    func tint(colorScheme: ColorScheme) -> Color {
-        switch self {
-        case .connected, .live, .fallback:
-            return FGColor.accentGreen
-        case .reconnecting:
-            return FGColor.accentYellow
-        case .offline:
-            return FGColor.secondaryText(colorScheme)
-        }
-    }
-}
-
-private struct RealtimeConnectionStatusView: View {
-    @Environment(\.colorScheme) private var colorScheme
-
-    let status: DirectChatRealtimeConnectionStatus
-
-    var body: some View {
-        Text(status.title)
-            .font(.caption2.weight(.medium))
-            .foregroundStyle(status.tint(colorScheme: colorScheme).opacity(colorScheme == .dark ? 0.82 : 0.72))
-            .multilineTextAlignment(.center)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .accessibilityLabel(status.title)
-    }
-}
-#endif
-
 // MARK: - Toolbar overflow anchor (global frame for iMessage-style menu placement)
 
 private struct ChatOverflowAnchorKey: PreferenceKey {
@@ -186,9 +135,7 @@ private final class DirectChatPresenter: ObservableObject {
     @Published private(set) var isManuallyRefreshingMessages = false
     @Published private(set) var peerIsDeleted: Bool
     @Published private(set) var headerConnectionStatusText: String = "Syncing messages"
-#if DEBUG
-    @Published private(set) var realtimeConnectionStatus: DirectChatRealtimeConnectionStatus = .reconnecting
-#endif
+    @Published private(set) var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .reconnecting
 
     private(set) var currentUserId: UUID?
 
@@ -370,6 +317,13 @@ private final class DirectChatPresenter: ObservableObject {
         return chatViewModel.isEitherDirectionBlocked(with: friend.id)
     }
 
+    /// Friendship-backed threads require an accepted chip; venue threads do not.
+    private func friendshipAllowsSending() -> Bool {
+        if friend.isBusinessVenueConversation { return true }
+        guard let chatViewModel else { return true }
+        return chatViewModel.chipKind(forOtherUserId: friend.id) == .friends
+    }
+
     private func validateDMText(_ trimmed: String) -> String? {
         if ModerationService.containsProfanity(trimmed) {
             return ModerationService.profanityRejectionUserMessage()
@@ -461,9 +415,7 @@ private final class DirectChatPresenter: ObservableObject {
         stopThreadFallbackPolling(reason: "sessionLoss")
         lastThreadFallbackPollSucceeded = nil
         refreshHeaderConnectionStatus()
-#if DEBUG
         realtimeConnectionStatus = .offline
-#endif
         Task { await self.tearDownRealtimeChannelIfNeeded() }
     }
 
@@ -474,9 +426,7 @@ private final class DirectChatPresenter: ObservableObject {
         threadRealtimeChannelName = nil
         isThreadRealtimeSubscribing = false
         isThreadRealtimeSubscribed = false
-#if DEBUG
         realtimeConnectionStatus = .reconnecting
-#endif
         if let pending = establishingRealtimeChannel {
             establishingRealtimeChannel = nil
             let tid = conversationId?.uuidString.lowercased() ?? "?"
@@ -674,20 +624,16 @@ private final class DirectChatPresenter: ObservableObject {
                     self.lastThreadFallbackPollSucceeded = nil
                     self.refreshHeaderConnectionStatus()
                     DMRealtimeDiagnostics.debug("fallbackPollingActive=true reason=\(reason)")
-#if DEBUG
-                    self.realtimeConnectionStatus = .fallback
-#endif
+                    self.realtimeConnectionStatus = .connecting
                 }
 
                 let result = await self.refreshMessagesForCurrentThreadResult(reason: "thread_fallback_poll")
                 self.lastThreadFallbackPollSucceeded = result.didFetch
                 self.refreshHeaderConnectionStatus()
                 DMRealtimeDiagnostics.debug("fallbackPollingMergedCount=\(result.mergedCount)")
-#if DEBUG
                 if result.didFetch {
-                    self.realtimeConnectionStatus = .fallback
+                    self.realtimeConnectionStatus = .connecting
                 }
-#endif
 
                 guard !self.isThreadRealtimeSubscribed else { break }
                 do {
@@ -778,11 +724,9 @@ private final class DirectChatPresenter: ObservableObject {
         DMRealtimeDiagnostics.debug("backfillStarted=true conversationId=\(cid.uuidString.lowercased()) reason=\(reason)")
         let result = await refreshMessagesForCurrentThreadResult(reason: reason)
         DMRealtimeDiagnostics.debug("backfillMergedCount=\(result.mergedCount) conversationId=\(cid.uuidString.lowercased()) reason=\(reason)")
-#if DEBUG
         if result.didFetch {
             realtimeConnectionStatus = .connected
         }
-#endif
     }
 
     func forceRebuildRealtimeAfterForeground() async {
@@ -826,11 +770,9 @@ private final class DirectChatPresenter: ObservableObject {
 
         let result = await refreshMessagesForCurrentThreadResult(reason: "foreground_force_rebuild")
         DMRealtimeDiagnostics.debug("backfillAfterForegroundMergedCount=\(result.mergedCount)")
-#if DEBUG
         if result.didFetch {
-            realtimeConnectionStatus = .connected
+            realtimeConnectionStatus = isThreadRealtimeSubscribed ? .connected : .connecting
         }
-#endif
         DMRealtimeDiagnostics.debug("reconnectBannerHidden=\(result.didFetch)")
     }
 
@@ -933,9 +875,7 @@ private final class DirectChatPresenter: ObservableObject {
 
         let tid = cid.uuidString.lowercased()
         let identity = chatViewModel?.dmRealtimeIdentitySnapshot(fallbackAuthUserId: me)
-#if DEBUG
         realtimeConnectionStatus = .reconnecting
-#endif
 #if DEBUG
         print("[DirectChatRealtime] subscribe start thread=\(tid)")
         print("[DirectChatRealtime] subscribing conversationId=\(tid)")
@@ -1017,8 +957,8 @@ private final class DirectChatPresenter: ObservableObject {
 #if DEBUG
             print("[DirectChatRealtime] subscribe failed thread=\(tid) error=\(errLabel)")
 #endif
-#if DEBUG
             realtimeConnectionStatus = .reconnecting
+#if DEBUG
             DMRealtimeDiagnostics.log("phase=thread_realtime_subscribe_failed conversation=\(tid) error=\(errLabel)")
             RealtimeHealthDiagnostics.log("subscribeError=\(errLabel) channelName=\(channel.topic)")
 #endif
@@ -1047,9 +987,7 @@ private final class DirectChatPresenter: ObservableObject {
         DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(tid)")
         DMRealtimeDiagnostics.debug("channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscribed")
         stopThreadFallbackPolling(reason: "realtimeSubscribed")
-#if DEBUG
         realtimeConnectionStatus = .connected
-#endif
         await backfillAfterRealtimeResubscribe(conversationId: cid, reason: "realtime_resubscribe")
 
         let decoder = JSONDecoder()
@@ -1070,7 +1008,6 @@ private final class DirectChatPresenter: ObservableObject {
             lastThreadRealtimeInsertReceivedAt = Date()
             DMRealtimeDiagnostics.debug("lastInsertReceivedAt=\(Self.optimisticCreatedAtFormatter.string(from: lastThreadRealtimeInsertReceivedAt ?? Date()))")
 #if DEBUG
-            realtimeConnectionStatus = .live
             RealtimeHealthDiagnostics.log("eventReceived table=direct_messages id=\(row.id.uuidString.lowercased()) elapsedSinceInsertMs=\(DMRealtimePerfLog.elapsedMs(since: dmInsertSuccessTimesByServerID[row.id]))")
 #endif
             applyIncomingDirectMessageRow(row, threadConversationId: cid, me: me)
@@ -1091,9 +1028,7 @@ private final class DirectChatPresenter: ObservableObject {
 #endif
             messagesRealtimeChannel = nil
             threadRealtimeChannelStatus = "streamEnded"
-#if DEBUG
             realtimeConnectionStatus = .reconnecting
-#endif
             await service.removeRealtimeChannel(channel)
         }
     }
@@ -1148,8 +1083,8 @@ private final class DirectChatPresenter: ObservableObject {
                 forceThreadRealtimeReconnectRequested = false
             }
 
-#if DEBUG
             realtimeConnectionStatus = .reconnecting
+#if DEBUG
             RealtimeHealthDiagnostics.log("reconnectDetected=direct_thread attempt=\(attempt + 1) channelName=dm-thread-\(cid.uuidString.lowercased())")
 #endif
 
@@ -1173,11 +1108,9 @@ private final class DirectChatPresenter: ObservableObject {
                 await chatViewModel?.forceRestartChatRealtimeAfterGlobalRetryExhausted(reason: "threadSubscribeTimeout")
                 let result = await refreshMessagesForCurrentThreadResult(reason: "thread_subscribe_timeout")
                 DMRealtimeDiagnostics.debug("backfillMergedCount=\(result.mergedCount) conversationId=\(cid.uuidString.lowercased()) reason=threadSubscribeTimeout")
-#if DEBUG
                 if result.didFetch {
-                    realtimeConnectionStatus = .connected
+                    realtimeConnectionStatus = isThreadRealtimeSubscribed ? .connected : .connecting
                 }
-#endif
                 if !Task.isCancelled, conversationId == cid, currentUserId == me {
                     startThreadFallbackPollingIfNeeded(reason: "subscribeTimeoutRetry")
                     startRealtimeSubscriptionLoopIfNeeded(reason: "subscribeTimeoutRetry")
@@ -1193,11 +1126,9 @@ private final class DirectChatPresenter: ObservableObject {
                     await chatViewModel?.forceRestartChatRealtimeAfterGlobalRetryExhausted(reason: "threadGlobalRetryExhausted")
                     let result = await refreshMessagesForCurrentThreadResult(reason: "thread_global_retry_exhausted")
                     DMRealtimeDiagnostics.debug("backfillMergedCount=\(result.mergedCount) conversationId=\(cid.uuidString.lowercased()) reason=threadGlobalRetryExhausted")
-#if DEBUG
                     if result.didFetch {
-                        realtimeConnectionStatus = .connected
+                        realtimeConnectionStatus = isThreadRealtimeSubscribed ? .connected : .connecting
                     }
-#endif
                     if !Task.isCancelled, conversationId == cid, currentUserId == me {
                         startThreadFallbackPollingIfNeeded(reason: "globalRetryExhaustedRetry")
                         startRealtimeSubscriptionLoopIfNeeded(reason: "globalRetryExhaustedRetry")
@@ -1206,9 +1137,7 @@ private final class DirectChatPresenter: ObservableObject {
                 }
                 attempt += 1
                 if attempt >= directMessageReconnectDelaysNs.count {
-#if DEBUG
                     realtimeConnectionStatus = .offline
-#endif
                     break
                 }
             }
@@ -1239,9 +1168,7 @@ private final class DirectChatPresenter: ObservableObject {
                 dmDebugReceivedDatesByServerID[$0.id] = fallbackReceivedAt
                 logDMEndToEnd(row: $0, conversationId: cid, fallbackUsed: true, receivedAt: fallbackReceivedAt)
             }
-#if DEBUG
-            realtimeConnectionStatus = .fallback
-#endif
+            realtimeConnectionStatus = .connecting
 #if DEBUG
             print("[DirectChatRealtime] refresh merged newCount=\(tailNew.count) thread=\(tid) reason=\(reason)")
 #endif
@@ -1585,8 +1512,23 @@ private final class DirectChatPresenter: ObservableObject {
             messages.removeAll { $0.id == localId }
             removeDisplayTimelineMessage(id: localId)
             draft = trimmed
-            sendError = error.localizedDescription
+            // Backend age denial opens the shared age gate; banner copy stays neutral.
+            AgeAccessBackendDenial.handle(error, requestUserId: currentUserId)
+            sendError = Self.userFacingSendFailureMessage(for: error)
         }
+    }
+
+    private static func userFacingSendFailureMessage(for error: Error) -> String {
+        let raw = error.localizedDescription.lowercased()
+        if raw.contains("row-level security")
+            || raw.contains("violates row-level security")
+            || raw.contains("42501")
+            || raw.contains("permission denied")
+            || raw.contains("not allowed") {
+            // Neutral: could be unfriend or block — never disclose which.
+            return "You can’t send messages in this conversation."
+        }
+        return error.localizedDescription
     }
 
     private func scheduleDirectMessageRealtimeFallback(
@@ -1626,6 +1568,10 @@ private final class DirectChatPresenter: ObservableObject {
         }
         if isMessagingBlocked() {
             sendError = "You can’t message this user."
+            return
+        }
+        if !friendshipAllowsSending() {
+            sendError = "You’re no longer friends. Add them again to continue messaging."
             return
         }
         if let blocked = validateDMText(trimmed) {
@@ -1713,6 +1659,10 @@ private final class DirectChatPresenter: ObservableObject {
         }
         if isMessagingBlocked() {
             sendError = "You can’t message this user."
+            return
+        }
+        if !friendshipAllowsSending() {
+            sendError = "You’re no longer friends. Add them again to continue messaging."
             return
         }
         if let blocked = validateDMText(trimmed) {
@@ -1821,22 +1771,15 @@ private final class DirectChatPresenter: ObservableObject {
         }
     }
 
-    /// Ends friendship + DM thread when `remove_friend_and_clear_conversation` (or `remove_friend`) exists on Supabase.
+    /// Ends friendship without clearing DM history (`remove_friend` / Option B).
     func removeFriend() async throws {
         menuBanner = nil
         struct ParamsFriend: Encodable {
             let p_friend_user_id: UUID
         }
-        let params = ParamsFriend(p_friend_user_id: friend.id)
-        do {
-            try await supabase
-                .rpc("remove_friend_and_clear_conversation", params: params)
-                .execute()
-        } catch {
-            try await supabase
-                .rpc("remove_friend", params: params)
-                .execute()
-        }
+        try await supabase
+            .rpc("remove_friend", params: ParamsFriend(p_friend_user_id: friend.id))
+            .execute()
     }
 }
 
@@ -1851,11 +1794,29 @@ struct DirectChatView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @ObservedObject private var activityClock = ActivityStatusMinuteClock.shared
     @StateObject private var presenter: DirectChatPresenter
     @FocusState private var composerFocused: Bool
 
     @State private var overflowAnchorGlobal: CGRect = .zero
     @State private var scrollToBottomCoalesceTask: Task<Void, Never>?
+    /// One-shot initial pin to newest content after the first usable message snapshot exists.
+    @State private var didCompleteInitialScrollToBottom = false
+    @State private var initialScrollTargetId: UUID?
+    /// True when the viewport is near the newest messages (auto-stick incoming).
+    @State private var isNearBottom = true
+    /// Captured before keyboard lift so transient geometry spikes do not cancel stick-to-bottom.
+    @State private var stickToBottomThroughKeyboardLift = true
+    /// Bumped on conversation change so deferred scrolls cannot affect a newly opened thread.
+    @State private var dmScrollSessionToken = UUID()
+    /// True while the system keyboard is visibly lifting/resizing the chat chrome.
+    @State private var isKeyboardLiftActive = false
+    /// Last observed scroll content height — used to re-pin after variable-height rows settle.
+    @State private var lastScrollContentHeight: CGFloat = 0
+    /// Near-bottom enter / leave thresholds (asymmetric) so keyboard inset jitter does not flip stick state.
+    private static let dmNearBottomEnterDistance: CGFloat = 96
+    private static let dmNearBottomLeaveDistance: CGFloat = 180
     /// Custom overlay only (no `confirmationDialog` / `Menu` / `contextMenu`).
     @State private var chatOverflowPhase: ChatOverflowPhase = .hidden
     /// Quick emoji strip above composer; off by default, toggled by smiley (does not use the system emoji keyboard).
@@ -1923,12 +1884,30 @@ struct DirectChatView: View {
         resolvedFriendPreview.isBusinessVenueConversation
     }
 
+    /// Venue-scoped DM for either participant (fan↔business venue thread).
+    private var isVenueScopedThread: Bool {
+        resolvedFriendPreview.isVenueScopedDirectMessage
+    }
+
     private var isDeletedPeer: Bool {
         !isBusinessVenueThread && (resolvedFriendPreview.isDeleted || presenter.peerIsDeleted)
     }
 
+    /// Friendship-backed DMs only: venue threads do not require friendship.
+    private var requiresAcceptedFriendshipToSend: Bool {
+        !isVenueScopedThread
+    }
+
+    private var friendshipChip: ChatViewModel.FriendshipChipKind {
+        chatViewModel.chipKind(forOtherUserId: presenter.friend.id)
+    }
+
+    private var friendshipAllowsSending: Bool {
+        !requiresAcceptedFriendshipToSend || friendshipChip == .friends
+    }
+
     private var sendingDisabled: Bool {
-        messagingBlocked || isDeletedPeer
+        messagingBlocked || isDeletedPeer || !friendshipAllowsSending
     }
 
     private var resolvedFriendPreview: UserPreview {
@@ -1941,14 +1920,21 @@ struct DirectChatView: View {
     }
 
     private var directChatPresenceText: String {
+        guard !presenter.friend.isBusinessVenueConversation,
+              !resolvedFriendPreview.isBusinessAccount,
+              resolvedFriendPreview.activityStatusVisible else {
+            return ""
+        }
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        _ = activityClock.tickMinute
+        let kind = ActivityStatus.resolve(lastSeenAtRaw: resolvedFriendPreview.lastSeenAtRaw)
         if directChatPresenceLoaded {
-            return resolvedFriendPreview.isOnlineNow ? "Online" : "Offline"
+            return ActivityStatus.chatHeaderSubtitle(kind: kind, languageCode: lang) ?? ""
         }
-        guard let lastSeen = PresenceOnlineStatus.parse(resolvedFriendPreview.lastSeenAtRaw),
-              Date().timeIntervalSince(lastSeen) <= PresenceOnlineStatus.onlineWindowSeconds else {
-            return "Checking"
+        if case .online = kind {
+            return L10n.t("activity_status_online", languageCode: lang)
         }
-        return "Online"
+        return L10n.t("activity_status_checking", languageCode: lang)
     }
 
     init(friend: UserPreview) {
@@ -2283,7 +2269,7 @@ struct DirectChatView: View {
     }
 
     private var showVenueChatIntroBanner: Bool {
-        guard isBusinessVenueThread,
+        guard isVenueScopedThread,
               let conversationId = resolvedVenueChatConversationId else {
             return false
         }
@@ -2297,6 +2283,9 @@ struct DirectChatView: View {
         if messagingBlocked {
             return "Messaging unavailable"
         }
+        if requiresAcceptedFriendshipToSend, !friendshipAllowsSending {
+            return L10n.t("dm_not_friends_header", languageCode: appLanguageRaw)
+        }
         if let businessName = resolvedFriendPreview.businessVenueBusinessName,
            !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return businessName
@@ -2304,8 +2293,13 @@ struct DirectChatView: View {
         if isBusinessVenueThread {
             return "Business"
         }
+        let handle = resolvedFriendPreview.publicHandleLine
+        let presence = directChatPresenceText
+        if !handle.isEmpty {
+            return presence.isEmpty ? handle : "\(handle) · \(presence)"
+        }
         let chatType = resolvedFriendPreview.isBusinessAccount ? "Business chat" : "Direct chat"
-        return "\(chatType) · \(directChatPresenceText)"
+        return presence.isEmpty ? chatType : "\(chatType) · \(presence)"
     }
 
     private func refreshDirectChatPresence(source: String) async {
@@ -2431,8 +2425,10 @@ struct DirectChatView: View {
     private func runRemoveFriendConfirmed() async {
         do {
             try await presenter.removeFriend()
+            // Stay on the thread so history remains visible; composer becomes read-only.
             await chatViewModel.refresh()
-            dismiss()
+            await chatViewModel.refreshInboxSummaries()
+            dismissChatOverflow()
         } catch {
             presenter.menuBanner = error.localizedDescription
         }
@@ -2920,7 +2916,7 @@ struct DirectChatView: View {
                 case .confirmRemoveFriend:
                     chatOverflowConfirmCard(
                         title: "Remove friend?",
-                        message: "You will unfriend \(resolvedFriendPreview.displayName) and leave this chat.",
+                        message: L10n.t("dm_unfriend_confirm_body", languageCode: appLanguageRaw),
                         confirmTitle: "Remove friend",
                         onConfirm: {
                             Task {
@@ -3046,10 +3042,22 @@ struct DirectChatView: View {
         .buttonStyle(.plain)
     }
 
+    /// Stable sentinel for pinning the viewport to newest content (not a message UUID).
+    private static let dmScrollBottomAnchorId = "dm-scroll-bottom-anchor"
+
+    private var dmInitialScrollReadyKey: String {
+        let cid = presenter.conversationId?.uuidString.lowercased() ?? "nil"
+        let last = presenter.lastMessageId?.uuidString.lowercased() ?? "nil"
+        return "\(cid)|\(last)|\(presenter.isLoadingInitial)|\(presenter.messages.count)"
+    }
+
     private var messagesScroll: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: FGSpacing.md) {
+                // Eager VStack: DM pages are capped (~50). LazyVStack estimated heights for
+                // off-screen text rows from tall shared-profile cards, so defaultScrollAnchor /
+                // scrollTo landed past real content (blank viewport until the user scrolled up).
+                VStack(spacing: FGSpacing.md) {
                     if presenter.messages.isEmpty {
                         FGEmptyState(
                             title: "No messages yet",
@@ -3059,6 +3067,10 @@ struct DirectChatView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 48)
                         .padding(.bottom, FGSpacing.sm)
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.dmScrollBottomAnchorId)
+                            .accessibilityHidden(true)
                     } else {
                         if presenter.hasOlderMessages || presenter.isLoadingOlderMessages {
                             HStack(spacing: FGSpacing.sm) {
@@ -3099,7 +3111,8 @@ struct DirectChatView: View {
                             }
                         }
                         Color.clear
-                            .frame(height: 2)
+                            .frame(height: 1)
+                            .id(Self.dmScrollBottomAnchorId)
                             .accessibilityHidden(true)
                     }
                 }
@@ -3107,38 +3120,205 @@ struct DirectChatView: View {
                 .padding(.top, FGSpacing.md)
                 .padding(.bottom, 28)
             }
-            .defaultScrollAnchor(.bottom)
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .alignment)
+            // Only pin on size changes while the user is already at the newest end so
+            // load-older pagination (content grows above) does not jump to the bottom.
+            .defaultScrollAnchor(shouldStickToNewestMessages ? .bottom : nil, for: .sizeChanges)
+            // Hide until the first bottom pin completes so users never see a jump from top → bottom.
+            .opacity(didCompleteInitialScrollToBottom ? 1 : 0)
+            .accessibilityHidden(!didCompleteInitialScrollToBottom)
             .scrollDismissesKeyboard(.interactively)
             .refreshable {
                 await presenter.pullRefreshCurrentThread()
             }
-            .onAppear {
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                let maxY = max(geometry.contentSize.height - geometry.containerSize.height, 0)
+                return maxY - geometry.contentOffset.y
+            } action: { _, distanceFromBottom in
+                updateNearBottomFromScrollDistance(distanceFromBottom)
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentSize.height
+            } action: { oldHeight, newHeight in
+                guard didCompleteInitialScrollToBottom else {
+                    lastScrollContentHeight = newHeight
+                    return
+                }
+                guard shouldStickToNewestMessages, newHeight > oldHeight + 1 else {
+                    lastScrollContentHeight = newHeight
+                    return
+                }
+                // Shared-profile cards / images can expand after first layout; keep newest pinned.
+                lastScrollContentHeight = newHeight
+                scrollChatToBottom(proxy: proxy, animated: false)
 #if DEBUG
-                print("[DMChatPullRefreshDebug] nativeRefreshableAttached=true")
+                print("[DMScrollDebug] contentSizeGrewWhileNearBottom old=\(Int(oldHeight)) new=\(Int(newHeight))")
 #endif
-                scrollChatToBottomAfterLayout(proxy: proxy, nanoseconds: 100_000_000)
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.containerSize.height
+            } action: { oldHeight, newHeight in
+                guard didCompleteInitialScrollToBottom else { return }
+                guard shouldStickToNewestMessages else { return }
+                // Composer / keyboard / tray changes shrink or grow the viewport.
+                guard abs(newHeight - oldHeight) > 1 else { return }
+                scrollChatToBottomAfterLayout(proxy: proxy, force: true)
+#if DEBUG
+                print("[DMScrollDebug] containerHeightChanged old=\(Int(oldHeight)) new=\(Int(newHeight))")
+#endif
+            }
+            .task(id: dmInitialScrollReadyKey) {
+                await performInitialScrollToNewestIfNeeded(proxy: proxy)
+            }
+            .onChange(of: presenter.conversationId) { _, _ in
+                resetDirectChatScrollSession(reason: "conversationIdChanged")
             }
             .onChange(of: presenter.lastMessageId) { oldId, newId in
-                guard newId != nil, newId != oldId else { return }
+                guard let newId, newId != oldId else { return }
+                let isMine = presenter.messages.last?.sender_id == presenter.currentUserId
+                if isMine {
+                    isNearBottom = true
+                    stickToBottomThroughKeyboardLift = true
+                } else {
+                    guard shouldStickToNewestMessages else { return }
+                }
                 var txn = Transaction()
                 txn.disablesAnimations = true
                 withTransaction(txn) {
                     scrollChatToBottom(proxy: proxy, animated: false)
                 }
             }
-            .onChange(of: presenter.isLoadingInitial) { _, loading in
-                guard !loading else { return }
-                scrollChatToBottomAfterLayout(proxy: proxy, nanoseconds: 140_000_000)
-            }
-            .directChatOnKeyboardDidShow {
-                scrollChatToBottomAfterLayout(proxy: proxy, nanoseconds: 90_000_000)
+            .directChatOnKeyboardLift { phase in
+                handleKeyboardLift(phase: phase, proxy: proxy)
             }
             .onChange(of: composerFocused) { _, focused in
-                if focused {
-                    scrollChatToBottomAfterLayout(proxy: proxy, nanoseconds: 100_000_000)
+                if focused, shouldStickToNewestMessages {
+                    stickToBottomThroughKeyboardLift = true
+                    scrollChatToBottomAfterLayout(proxy: proxy, force: true)
                 }
             }
+            .onChange(of: showEmojiQuickTray) { _, _ in
+                guard shouldStickToNewestMessages else { return }
+                scrollChatToBottomAfterLayout(proxy: proxy, force: true)
+            }
         }
+    }
+
+    private var shouldStickToNewestMessages: Bool {
+        isNearBottom || (isKeyboardLiftActive && stickToBottomThroughKeyboardLift)
+    }
+
+    private func resetDirectChatScrollSession(reason: String) {
+        scrollToBottomCoalesceTask?.cancel()
+        scrollToBottomCoalesceTask = nil
+        dmScrollSessionToken = UUID()
+        didCompleteInitialScrollToBottom = false
+        initialScrollTargetId = nil
+        isNearBottom = true
+        stickToBottomThroughKeyboardLift = true
+        isKeyboardLiftActive = false
+        lastScrollContentHeight = 0
+#if DEBUG
+        print("[DMScrollDebug] scrollSessionReset reason=\(reason) token=\(dmScrollSessionToken.uuidString.lowercased())")
+#endif
+    }
+
+    private func updateNearBottomFromScrollDistance(_ distanceFromBottom: CGFloat) {
+        if distanceFromBottom <= Self.dmNearBottomEnterDistance {
+            isNearBottom = true
+            stickToBottomThroughKeyboardLift = true
+            return
+        }
+        if distanceFromBottom > Self.dmNearBottomLeaveDistance {
+            isNearBottom = false
+            // During keyboard lift, inset thrash can briefly report a large distance even
+            // when the user is still at the newest end. Keep the pre-lift stick preference
+            // unless they clearly scrolled far upward.
+            if !isKeyboardLiftActive || distanceFromBottom > Self.dmNearBottomLeaveDistance * 2 {
+                stickToBottomThroughKeyboardLift = false
+            }
+        }
+    }
+
+    private func handleKeyboardLift(phase: DirectChatKeyboardLiftPhase, proxy: ScrollViewProxy) {
+        switch phase {
+        case .willChange:
+            if !isKeyboardLiftActive {
+                // Capture pre-lift stick preference only — do not promote "reading history"
+                // into stick-to-bottom just because the composer gained focus.
+                stickToBottomThroughKeyboardLift = isNearBottom
+            }
+            isKeyboardLiftActive = true
+            guard stickToBottomThroughKeyboardLift else { return }
+            scrollChatToBottomAfterLayout(proxy: proxy, force: true)
+        case .didShow:
+            isKeyboardLiftActive = true
+            guard stickToBottomThroughKeyboardLift || isNearBottom else { return }
+            isNearBottom = true
+            stickToBottomThroughKeyboardLift = true
+            scrollChatToBottomAfterLayout(proxy: proxy, force: true)
+        case .didHide:
+            isKeyboardLiftActive = false
+            // Re-evaluate from the next geometry callback; keep sticky if we were pinned.
+            if stickToBottomThroughKeyboardLift {
+                isNearBottom = true
+            }
+        }
+    }
+
+    @MainActor
+    private func performInitialScrollToNewestIfNeeded(proxy: ScrollViewProxy) async {
+        guard !didCompleteInitialScrollToBottom else { return }
+        guard !presenter.isLoadingInitial else { return }
+
+        let sessionToken = dmScrollSessionToken
+        let expectedConversationId = presenter.conversationId
+
+        if presenter.messages.isEmpty {
+            guard !Task.isCancelled else { return }
+            guard sessionToken == dmScrollSessionToken else { return }
+            guard presenter.conversationId == expectedConversationId else { return }
+            didCompleteInitialScrollToBottom = true
+            isNearBottom = true
+            stickToBottomThroughKeyboardLift = true
+#if DEBUG
+            print("[DMScrollDebug] initialScrollCompletedEmpty conversationId=\(expectedConversationId?.uuidString.lowercased() ?? "nil")")
+#endif
+            return
+        }
+
+        guard let lastId = presenter.lastMessageId else { return }
+        let targetExisted = presenter.messages.contains(where: { $0.id == lastId })
+        initialScrollTargetId = lastId
+
+#if DEBUG
+        print(
+            "[DMScrollDebug] initialScrollReady conversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") messageCount=\(presenter.messages.count) newestMessageId=\(lastId.uuidString.lowercased()) targetExisted=\(targetExisted) visibleBottom=\(isNearBottom) session=\(sessionToken.uuidString.lowercased())"
+        )
+#endif
+
+        // Smallest reliable deferral: yield for the current turn, then wait one main-queue
+        // turn so the eager VStack commits real row heights before the first pin.
+        await Task.yield()
+        guard !Task.isCancelled else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+        guard !Task.isCancelled else { return }
+        guard sessionToken == dmScrollSessionToken else { return }
+        guard presenter.conversationId == expectedConversationId else { return }
+
+        scrollChatToBottom(proxy: proxy, animated: false)
+        didCompleteInitialScrollToBottom = true
+        isNearBottom = true
+        stickToBottomThroughKeyboardLift = true
+
+#if DEBUG
+        print("[DMScrollDebug] initialScrollCompleted targetId=\(lastId.uuidString.lowercased())")
+#endif
     }
 
     private func daySeparatorPill(_ title: String) -> some View {
@@ -3200,28 +3380,41 @@ struct DirectChatView: View {
     }
 
     private func scrollChatToBottom(proxy: ScrollViewProxy, animated: Bool = true) {
-        guard let id = presenter.lastMessageId else { return }
+        // Prefer the stable bottom sentinel so variable-height newest rows (profile cards)
+        // stay fully visible even when their measured height changes after first paint.
+        let target = AnyHashable(Self.dmScrollBottomAnchorId)
         if animated {
             withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                proxy.scrollTo(id, anchor: .bottom)
+                proxy.scrollTo(target, anchor: .bottom)
             }
         } else {
             var txn = Transaction()
             txn.disablesAnimations = true
             withTransaction(txn) {
-                proxy.scrollTo(id, anchor: .bottom)
+                proxy.scrollTo(target, anchor: .bottom)
             }
         }
     }
 
-    /// Coalesces open / keyboard / focus-driven scroll requests so overlapping layout passes produce one smooth scroll.
-    private func scrollChatToBottomAfterLayout(proxy: ScrollViewProxy, nanoseconds: UInt64 = 120_000_000) {
-        guard presenter.lastMessageId != nil else { return }
+    /// Coalesces keyboard / focus / viewport scroll requests after the next layout turn.
+    private func scrollChatToBottomAfterLayout(proxy: ScrollViewProxy, force: Bool = false) {
+        guard force || shouldStickToNewestMessages else { return }
+        let sessionToken = dmScrollSessionToken
+        let expectedConversationId = presenter.conversationId
         scrollToBottomCoalesceTask?.cancel()
         scrollToBottomCoalesceTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: nanoseconds)
+            await Task.yield()
             guard !Task.isCancelled else { return }
-            scrollChatToBottom(proxy: proxy)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async {
+                    continuation.resume()
+                }
+            }
+            guard !Task.isCancelled else { return }
+            guard sessionToken == dmScrollSessionToken else { return }
+            guard presenter.conversationId == expectedConversationId else { return }
+            guard force || shouldStickToNewestMessages else { return }
+            scrollChatToBottom(proxy: proxy, animated: false)
         }
     }
 
@@ -3230,7 +3423,7 @@ struct DirectChatView: View {
         VStack(spacing: showEmojiQuickTray ? FGSpacing.sm : 0) {
             if messagingBlocked {
                 threadStatusBanner(
-                    text: "You can’t send messages in this conversation.",
+                    text: L10n.t("dm_messaging_unavailable", languageCode: appLanguageRaw),
                     systemImage: "lock.fill",
                     tint: FGColor.accentYellow
                 )
@@ -3240,39 +3433,62 @@ struct DirectChatView: View {
                     systemImage: "person.crop.circle.badge.xmark",
                     tint: FGColor.secondaryText(colorScheme)
                 )
+            } else if requiresAcceptedFriendshipToSend, !friendshipAllowsSending {
+                threadStatusBanner(
+                    text: L10n.t("dm_no_longer_friends_notice", languageCode: appLanguageRaw),
+                    systemImage: "person.2.slash",
+                    tint: FGColor.secondaryText(colorScheme)
+                )
+                dmFriendshipActionRow
             }
-#if DEBUG
             if presenter.loadError == nil, presenter.conversationId != nil {
-                RealtimeConnectionStatusView(status: presenter.realtimeConnectionStatus)
+                ChatRealtimeConnectionStatusView(status: presenter.realtimeConnectionStatus)
                     .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
                     .padding(.bottom, FGSpacing.xs)
                     .transition(.opacity)
             }
-#endif
-            ChatMessageComposer(
-                draft: $presenter.draft,
-                showEmojiQuickTray: $showEmojiQuickTray,
-                composerFocused: $composerFocused,
-                canSend: presenter.canSend,
-                sendingDisabled: sendingDisabled,
-                isRefreshing: presenter.isManuallyRefreshingMessages,
-                showsRefreshButton: true,
-                refreshEnabled: presenter.conversationId != nil,
-                placeholder: "Message",
-                maxBodyLength: 1000,
-                colorScheme: colorScheme,
-                emojis: DirectChatQuickReactions.emojis,
-                refreshAccessibilityLabel: "Refresh private chat",
-                emojiToggleAccessibilityLabel: "Toggle emoji reactions",
-                sendAccessibilityLabel: "Send",
-                emojiReactionAccessibilityFormat: "Send %@ reaction",
-                onSend: { sendDraftIfBusinessAllowed() },
-                onQuickEmoji: { sendQuickReactionIfBusinessAllowed($0) },
-                onRefresh: {
-                    Task { await presenter.manualRefreshCurrentThread() }
-                },
-                onTrimDraft: { presenter.trimDraftIfNeeded() }
-            )
+            if !sendingDisabled {
+                ChatMessageComposer(
+                    draft: $presenter.draft,
+                    showEmojiQuickTray: $showEmojiQuickTray,
+                    composerFocused: $composerFocused,
+                    canSend: presenter.canSend,
+                    sendingDisabled: sendingDisabled,
+                    isRefreshing: presenter.isManuallyRefreshingMessages,
+                    showsRefreshButton: true,
+                    refreshEnabled: presenter.conversationId != nil,
+                    placeholder: "Message",
+                    maxBodyLength: 1000,
+                    colorScheme: colorScheme,
+                    emojis: DirectChatQuickReactions.emojis,
+                    refreshAccessibilityLabel: "Refresh private chat",
+                    emojiToggleAccessibilityLabel: "Toggle emoji reactions",
+                    sendAccessibilityLabel: "Send",
+                    emojiReactionAccessibilityFormat: "Send %@ reaction",
+                    onSend: { sendDraftIfBusinessAllowed() },
+                    onQuickEmoji: { sendQuickReactionIfBusinessAllowed($0) },
+                    onRefresh: {
+                        Task { await presenter.manualRefreshCurrentThread() }
+                    },
+                    onTrimDraft: { presenter.trimDraftIfNeeded() }
+                )
+            } else if messagingBlocked || isDeletedPeer || (requiresAcceptedFriendshipToSend && !friendshipAllowsSending) {
+                // Refresh-only strip so history can still be reloaded while send is disabled.
+                HStack {
+                    Spacer(minLength: 0)
+                    Button {
+                        Task { await presenter.manualRefreshCurrentThread() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .padding(10)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(presenter.isManuallyRefreshingMessages || presenter.conversationId == nil)
+                    .accessibilityLabel("Refresh private chat")
+                }
+            }
         }
         .padding(.horizontal, FGSpacing.lg)
         .padding(.top, FGSpacing.sm)
@@ -3282,20 +3498,71 @@ struct DirectChatView: View {
         .animation(.easeInOut(duration: 0.18), value: presenter.realtimeConnectionStatus)
 #endif
     }
+
+    @ViewBuilder
+    private var dmFriendshipActionRow: some View {
+        HStack(spacing: 10) {
+            switch friendshipChip {
+            case .friends:
+                EmptyView()
+            case .pendingOutgoing:
+                Text(L10n.t("dm_friend_request_pending", languageCode: appLanguageRaw))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+            case .declinedOutgoing, .addFriend:
+                Button(L10n.t("dm_friend_request_add", languageCode: appLanguageRaw)) {
+                    Task {
+                        await chatViewModel.sendFriendRequest(to: presenter.friend.id)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            case .pendingIncoming:
+                Button(L10n.t("dm_friend_request_accept", languageCode: appLanguageRaw)) {
+                    Task { await acceptIncomingFriendRequestFromThread() }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 2)
+    }
+
+    private func acceptIncomingFriendRequestFromThread() async {
+        guard let incoming = chatViewModel.incomingRequests.first(where: {
+            $0.requester.id == presenter.friend.id && $0.friendship.isPendingStatus
+        }) else {
+            await chatViewModel.refresh()
+            return
+        }
+        await chatViewModel.accept(incoming)
+    }
+}
+
+private enum DirectChatKeyboardLiftPhase: Equatable {
+    case willChange
+    case didShow
+    case didHide
 }
 
 #if canImport(UIKit)
 private extension View {
-    /// Fires after the keyboard animation has finished (`didShow`), avoiding `willChangeFrame` thrash.
-    func directChatOnKeyboardDidShow(_ action: @escaping () -> Void) -> some View {
-        onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-            action()
-        }
+    /// Keyboard lift lifecycle for DM stick-to-bottom (frame changes + didShow/didHide).
+    func directChatOnKeyboardLift(_ action: @escaping (DirectChatKeyboardLiftPhase) -> Void) -> some View {
+        self
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { _ in
+                action(.willChange)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
+                action(.didShow)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+                action(.didHide)
+            }
     }
 }
 #else
 private extension View {
-    func directChatOnKeyboardDidShow(_ action: @escaping () -> Void) -> some View {
+    func directChatOnKeyboardLift(_ action: @escaping (DirectChatKeyboardLiftPhase) -> Void) -> some View {
         self
     }
 }

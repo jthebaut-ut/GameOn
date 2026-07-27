@@ -389,6 +389,7 @@ struct EventCalendarView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var displayedMonth: Date = SampleData.makeDate(year: 2026, month: 6, day: 1)
+    @State private var lastNotifiedDisplayedMonthStart: Date?
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 7)
     private let calendar = Calendar.current
@@ -611,18 +612,42 @@ struct EventCalendarView: View {
             } else {
                 displayedMonth = monthFromSelection
             }
-            onDisplayedMonthChange?(displayedMonth)
+            // Notify once for the initial month. Do not re-fire on every selection tap —
+            // selection must not reload month availability.
+            notifyDisplayedMonthIfNeeded(displayedMonth)
         }
         .onChange(of: displayedMonth) { _, month in
-            onDisplayedMonthChange?(month)
+            notifyDisplayedMonthIfNeeded(month)
         }
-        .onChange(of: selectedDate) { _, newDate in
+        .onChange(of: selectedDate) { oldDate, newDate in
+            #if DEBUG
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd"
+            fmt.timeZone = TimeZone.current
+            print("===== PICKUP DATE SELECT =====")
+            print("oldSelectedDate=\(fmt.string(from: oldDate))")
+            print("newSelectedDate=\(fmt.string(from: newDate))")
+            print("availabilityBefore=\(eventDotDates.count)")
+            print("availabilitySet=\(eventDotDates.sorted().prefix(12).map { fmt.string(from: $0) }.joined(separator: ","))")
+            print("caller=EventCalendarView.selectedDate.onChange")
+            print("===== END PICKUP DATE SELECT =====")
+            #endif
             guard minimumSelectableDay != nil else { return }
             let minMonth = startOfMonth(selectionFloorStart)
             if startOfMonth(newDate) < minMonth {
                 displayedMonth = minMonth
             }
         }
+    }
+
+    private func notifyDisplayedMonthIfNeeded(_ month: Date) {
+        let monthStart = startOfMonth(month)
+        if let last = lastNotifiedDisplayedMonthStart,
+           calendar.isDate(last, equalTo: monthStart, toGranularity: .month) {
+            return
+        }
+        lastNotifiedDisplayedMonthStart = monthStart
+        onDisplayedMonthChange?(monthStart)
     }
 
     private func jumpToTodayAndApply() {
@@ -656,9 +681,15 @@ struct EventCalendarView: View {
 
     private func hasEventDot(on date: Date) -> Bool {
         let sod = calendar.startOfDay(for: date)
+        let hasAvailability = PickupGameMonthAvailabilityMerge.gridDay(
+            sod,
+            isCoveredBy: eventDotDates,
+            calendar: calendar
+        )
         #if DEBUG
-        if DiscoverCalendarDotsHasEventDotDebugGate.remainingChecks > 0 {
-            DiscoverCalendarDotsHasEventDotDebugGate.remainingChecks -= 1
+        if DiscoverCalendarDotsHasEventDotDebugGate.remainingChecks > 0
+            || calendar.component(.day, from: sod) == 30
+            || calendar.component(.day, from: sod) == 31 {
             let paletteDesc: String = {
                 guard let p = calendarDotPalette else { return "nil" }
                 switch p {
@@ -667,19 +698,30 @@ struct EventCalendarView: View {
                 case .proGames: return "proGames"
                 }
             }()
-            let venueDotCount = calendarDotPalette == .some(.venueGames) ? eventDotDates.count : 0
-            let pickupDotCount = calendarDotPalette == .some(.pickupGames) ? eventDotDates.count : 0
-            print("[DiscoverCalendarDotsDebug] hasEventDot palette=\(paletteDesc) dateSod=\(sod) venueDotCount=\(venueDotCount) pickupDotCount=\(pickupDotCount) eventDotDatesSetCount=\(eventDotDates.count)")
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd"
+            fmt.timeZone = TimeZone.current
+            print("===== CALENDAR RENDER =====")
+            print("day=\(fmt.string(from: sod))")
+            print("isSelected=\(calendar.isDate(sod, inSameDayAs: selectedDate))")
+            print("hasAvailability=\(hasAvailability)")
+            print("availabilitySetCount=\(eventDotDates.count)")
+            print("availabilitySet=\(eventDotDates.sorted().prefix(16).map { fmt.string(from: $0) }.joined(separator: ","))")
+            print("palette=\(paletteDesc)")
+            print("===== END CALENDAR RENDER =====")
+            if DiscoverCalendarDotsHasEventDotDebugGate.remainingChecks > 0 {
+                DiscoverCalendarDotsHasEventDotDebugGate.remainingChecks -= 1
+            }
         }
         #endif
         if calendarDotPalette != nil {
-            return eventDotDates.contains(sod)
+            return hasAvailability
         }
         if useVisibleMapRegionOnly {
-            return eventDotDates.contains(sod)
+            return hasAvailability
         }
         if !eventDotDates.isEmpty {
-            return eventDotDates.contains(sod)
+            return hasAvailability
         }
         return events.contains {
             calendar.isDate($0.date, inSameDayAs: date)

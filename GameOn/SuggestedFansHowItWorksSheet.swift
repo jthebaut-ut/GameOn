@@ -4,7 +4,7 @@ import SwiftUI
 /// Product constants and copy helpers for Suggested Fans.
 enum SuggestedFansProduct {
     /// Authoritative nearby radius for location-backed Suggested Fans ranking.
-    /// Always pass this explicitly to `get_profile_friend_suggestions` so the RPC’s 20‑mile SQL default is never used.
+    /// Always pass this explicitly to `get_profile_friend_suggestions` (server default is also 45).
     nonisolated static let nearbyRadiusMiles: Double = 45
 
     /// Locale-aware display for ``nearbyRadiusMiles`` (miles or kilometers).
@@ -55,10 +55,11 @@ struct SuggestedFansHowItWorksSheet: View {
                     section(
                         title: L10n.t("suggested_fans_info_section_matches", languageCode: languageCode),
                         rows: [
+                            ("person.2.fill", L10n.t("suggested_fans_info_signal_mutual", languageCode: languageCode)),
                             ("figure.run", L10n.t("suggested_fans_info_signal_activity", languageCode: languageCode)),
+                            ("location.fill", L10n.t("suggested_fans_info_signal_nearby", languageCode: languageCode)),
                             ("sportscourt.fill", L10n.t("suggested_fans_info_signal_teams", languageCode: languageCode)),
                             ("building.2.fill", L10n.t("suggested_fans_info_signal_venues", languageCode: languageCode)),
-                            ("person.2.fill", L10n.t("suggested_fans_info_signal_mutual", languageCode: languageCode)),
                             ("bolt.fill", L10n.t("suggested_fans_info_signal_recent", languageCode: languageCode)),
                             ("star.fill", L10n.t("suggested_fans_info_signal_reputation", languageCode: languageCode))
                         ]

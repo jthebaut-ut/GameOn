@@ -1610,6 +1610,7 @@ struct VenueOwnerDashboardView: View {
     @State private var analyticsGameHistoryLoading = false
     @State private var analyticsGameHistoryError = ""
     @State private var showBusinessAnalyticsGuide = false
+    @State private var showVenueEnergyEducation = false
     @State private var businessAnalyticsHelpMetric: BusinessAnalyticsHelpMetric?
 
     private enum VenueAnalyticsDatePreset: String, CaseIterable {
@@ -5137,6 +5138,9 @@ struct VenueOwnerDashboardView: View {
                 .presentationDragIndicator(.visible)
                 .presentationBackground(FGAdaptiveSurface.sheetRoot)
         }
+        .sheet(isPresented: $showVenueEnergyEducation) {
+            VenueEnergyHowItWorksSheet(audience: .business)
+        }
         .sheet(item: $businessAnalyticsHelpMetric) { metric in
             businessAnalyticsMetricHelpSheet(metric)
                 .presentationDetents([.medium])
@@ -5280,6 +5284,58 @@ struct VenueOwnerDashboardView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    Button {
+                        showVenueEnergyEducation = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "flame.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(Color.orange)
+                                .frame(width: 36, height: 36)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(Color.orange.opacity(colorScheme == .dark ? 0.22 : 0.14))
+                                )
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(VenueEnergyEducation.sheetTitle)
+                                    .font(FGTypography.body.weight(.bold))
+                                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                                Text("How Starting, Active, Hot, and Trending work on Discover.")
+                                    .font(FGTypography.caption)
+                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            Spacer(minLength: 0)
+
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(FGColor.mutedText(colorScheme))
+                        }
+                        .padding(14)
+                        .background(
+                            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                                .fill(FGColor.cardBackground(colorScheme))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(VenueEnergyEducation.sheetTitle)
+                    .accessibilityHint(VenueEnergyEducation.aboutAccessibilityHint)
+
+                    businessAnalyticsGuideSection(
+                        title: VenueEnergyEducation.sheetTitle,
+                        body: VenueEnergyEducation.intro,
+                        bullets: VenueEnergyEducation.levels.map { "\($0.emoji) \($0.title)" },
+                        footer: [
+                            VenueEnergyEducation.levelsFooter,
+                            VenueEnergyEducation.trustBody,
+                            VenueEnergyEducation.currencyBody,
+                            VenueEnergyEducation.businessExtraBody,
+                            VenueEnergyEducation.businessIntegrity
+                        ].joined(separator: "\n\n")
+                    )
+
                     businessAnalyticsGuideSection(
                         title: "Engagement Score",
                         body: "Engagement measures fan activity across your venue.",

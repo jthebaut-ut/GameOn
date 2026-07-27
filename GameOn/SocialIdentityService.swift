@@ -5,7 +5,7 @@ import Supabase
 struct SocialIdentityService {
     private let client: SupabaseClient
     private static let userProfileSelectColumns =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,last_seen_at"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,last_seen_at,activity_status_visible"
 
     init(client: SupabaseClient = supabase) {
         self.client = client
@@ -291,7 +291,8 @@ struct SocialIdentityService {
                 liveVisibilityEnabled: false,
                 liveVisibilityMode: .allFriends,
                 selectedLiveVisibilityFriendIDs: [],
-                lastSeenAtRaw: nil
+                lastSeenAtRaw: nil,
+                activityStatusVisible: false
             )
         }
 
@@ -311,7 +312,9 @@ struct SocialIdentityService {
                 liveVisibilityEnabled: true,
                 liveVisibilityMode: .allFriends,
                 selectedLiveVisibilityFriendIDs: [],
-                lastSeenAtRaw: profile?.last_seen_at
+                // Never expose a business owner's personal activity as venue presence.
+                lastSeenAtRaw: nil,
+                activityStatusVisible: false
             )
         }
 
@@ -345,8 +348,21 @@ struct SocialIdentityService {
             liveVisibilityEnabled: profile?.isVisibleForLiveFriendPresence ?? true,
             liveVisibilityMode: profile?.liveVisibilityMode ?? .allFriends,
             selectedLiveVisibilityFriendIDs: Array(profile?.selectedLiveVisibilityFriendIDs ?? []),
-            lastSeenAtRaw: profile?.last_seen_at
+            lastSeenAtRaw: Self.privacyGatedLastSeen(
+                raw: profile?.last_seen_at,
+                activityVisible: profile?.activity_status_visible
+            ),
+            activityStatusVisible: profile?.activity_status_visible != false
         )
+    }
+
+    /// Strips `last_seen_at` when the peer has disabled activity status (default visible).
+    private static func privacyGatedLastSeen(raw: String?, activityVisible: Bool?) -> String? {
+        if activityVisible == false {
+            ActivityStatusDebug.lifecycle("activity visibility disabled")
+            return nil
+        }
+        return raw
     }
 
     private func trimmedNonEmpty(_ raw: String?) -> String {
@@ -366,6 +382,7 @@ struct SocialIdentityService {
         let liveVisibilityMode: LiveVisibilityMode
         let selectedLiveVisibilityFriendIDs: [UUID]
         let lastSeenAtRaw: String?
+        let activityStatusVisible: Bool
 
         var preview: UserPreview {
             UserPreview(
@@ -377,7 +394,8 @@ struct SocialIdentityService {
                 avatarThumbnailURL: avatarThumbnailURL,
                 isBusinessAccount: isBusinessAccount,
                 isDeleted: isDeleted,
-                lastSeenAtRaw: lastSeenAtRaw
+                lastSeenAtRaw: lastSeenAtRaw,
+                activityStatusVisible: activityStatusVisible
             )
         }
 

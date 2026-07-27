@@ -1193,12 +1193,23 @@ enum FavoriteTeamsStore {
         UserDefaults.standard.set(encodeIDs(ids), forKey: appStorageKey)
     }
 
-    static func normalizedPrimaryTeamID(_ raw: String?, within ids: [String]) -> String? {
+    /// Display-only: returns the stored primary only when it is still among favorites.
+    /// Does **not** invent a My Team from favorite ordering.
+    static func explicitPrimaryTeamID(_ raw: String?, within ids: [String]) -> String? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty, ids.contains(trimmed), FavoriteTeamCatalog.team(id: trimmed) != nil else {
-            return ids.first { FavoriteTeamCatalog.team(id: $0) != nil }
+            return nil
         }
         return trimmed
+    }
+
+    /// Persistence helper after remove / sync: keeps an explicit primary when valid,
+    /// otherwise falls back to the first catalog-valid favorite (existing product rule).
+    static func normalizedPrimaryTeamID(_ raw: String?, within ids: [String]) -> String? {
+        if let explicit = explicitPrimaryTeamID(raw, within: ids) {
+            return explicit
+        }
+        return ids.first { FavoriteTeamCatalog.team(id: $0) != nil }
     }
 
     static func writePrimaryTeamIDToAppStorage(_ teamID: String?) {

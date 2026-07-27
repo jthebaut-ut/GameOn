@@ -111,9 +111,9 @@ struct SettingsScreen: View {
     @State private var showLiveSharingModeDialog = false
     @State private var showProfileDiscoveryHelpSheet = false
     @State private var showFanActivityHelpSheet = false
-    @State private var isProfileLogoutInProgress = false
     @State private var profileSettingsLogoutError: String?
     @State private var showProfileOverflowLogoutConfirmation = false
+    @State private var showProfileSettingsLogoutConfirmation = false
     @State private var showProfileOverflowLogoutErrorAlert = false
     @State private var showDeleteAccountSheet = false
     @State private var showDeleteVenueOwnerSheet = false
@@ -190,6 +190,15 @@ struct SettingsScreen: View {
             get: { viewModel.currentUserDiscoverableByFans },
             set: { newValue in
                 Task { await viewModel.setProfileDiscoverableByFans(newValue) }
+            }
+        )
+    }
+
+    private var activityStatusVisibilityBinding: Binding<Bool> {
+        Binding(
+            get: { viewModel.currentUserActivityStatusVisible },
+            set: { newValue in
+                Task { await viewModel.setActivityStatusVisible(newValue) }
             }
         )
     }
@@ -299,44 +308,25 @@ struct SettingsScreen: View {
         viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn || viewModel.hasAuthenticatedVenueOwnerSession
     }
 
-    /// Full Supabase sign-out for fan and business sessions. Keeps Settings open until the remote sign-out and local cleanup agree when logout started from Settings.
+    /// Full Supabase sign-out for fan and business sessions via the shared safe-logout coordinator.
     private func performProfileSettingsLogout(openedFromOverflowMenu: Bool = false) {
-        guard !isProfileLogoutInProgress else { return }
-        isProfileLogoutInProgress = true
+        guard !viewModel.isSafeLogoutBlockingUI else { return }
         profileSettingsLogoutError = nil
         showProfileOverflowLogoutConfirmation = false
+        showProfileSettingsLogoutConfirmation = false
         if openedFromOverflowMenu {
             // Overflow Log Out must never present Settings (avoids sheet flash).
             showProfileSettingsSheet = false
+        } else {
+            // Keep Settings sheet up under the global overlay until sign-out settles.
+            showProfileSettingsSheet = false
         }
-        Task { @MainActor in
-            let didLogout = await viewModel.logoutUser()
-            if didLogout {
-                chatViewModel.clearForSignOut()
-                venueOwnerDashboardSheet = nil
-                showVenueOwnerPasswordResetSheet = false
-                showReportedCommentsSheet = false
-                showDeleteVenueOwnerSheet = false
-                showDeleteAccountSheet = false
-                showProfileSettingsSheet = false
-                showProfileOverflowLogoutConfirmation = false
-                showProfileOverflowLogoutErrorAlert = false
-            } else {
-                let message = viewModel.authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? viewModel.venueAuthErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-                    : viewModel.authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-                profileSettingsLogoutError = message.isEmpty
-                    ? L10n.t(
-                        "Could not log out. Please check your connection and try again.",
-                        languageCode: appLanguageRaw
-                    )
-                    : message
-                if openedFromOverflowMenu || !showProfileSettingsSheet {
-                    showProfileOverflowLogoutErrorAlert = true
-                }
-            }
-            isProfileLogoutInProgress = false
-        }
+        chatViewModel.clearForSignOut()
+        viewModel.beginSafeUserLogout(
+            source: openedFromOverflowMenu
+                ? "SettingsScreen.overflowMenu"
+                : "SettingsScreen.settingsSheet"
+        )
     }
 
     private var canShowProfileOverflowMenu: Bool {
@@ -344,19 +334,19 @@ struct SettingsScreen: View {
     }
 
     private func presentProfileSettingsFromOverflowMenu() {
-        guard !isProfileLogoutInProgress else { return }
+        guard !viewModel.isSafeLogoutBlockingUI else { return }
         showProfileOverflowLogoutConfirmation = false
         showProfileOverflowLogoutErrorAlert = false
         showProfileSettingsSheet = true
     }
 
     private func presentProfileLogoutConfirmationFromOverflowMenu() {
-        guard !isProfileLogoutInProgress else { return }
+        guard !viewModel.isSafeLogoutBlockingUI else { return }
         // Mutually exclusive with Settings — never open the sheet for Log Out.
         showProfileSettingsSheet = false
         // Present after the Menu finishes dismissing so confirmation is not tied to a disappearing hierarchy.
         Task { @MainActor in
-            guard !isProfileLogoutInProgress else { return }
+            guard !viewModel.isSafeLogoutBlockingUI else { return }
             showProfileOverflowLogoutConfirmation = true
         }
     }
@@ -397,7 +387,7 @@ struct SettingsScreen: View {
                     systemImage: "rectangle.portrait.and.arrow.right"
                 )
             }
-            .disabled(isProfileLogoutInProgress)
+            .disabled(viewModel.isSafeLogoutBlockingUI)
         } label: {
             Image(systemName: "ellipsis.circle.fill")
                 .font(.system(size: 17, weight: .semibold))
@@ -416,7 +406,7 @@ struct SettingsScreen: View {
                 }
                 .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 10, y: 4)
         }
-        .disabled(isProfileLogoutInProgress)
+        .disabled(viewModel.isSafeLogoutBlockingUI)
         .accessibilityLabel(L10n.t("profile_overflow_menu_a11y", languageCode: appLanguageRaw))
     }
 
@@ -431,7 +421,7 @@ struct SettingsScreen: View {
                 Button(L10n.t("log_out", languageCode: appLanguageRaw), role: .destructive) {
                     performProfileSettingsLogout(openedFromOverflowMenu: true)
                 }
-                .disabled(isProfileLogoutInProgress)
+                .disabled(viewModel.isSafeLogoutBlockingUI)
                 Button(L10n.t("Cancel", languageCode: appLanguageRaw), role: .cancel) {
                     showProfileOverflowLogoutConfirmation = false
                 }
@@ -447,9 +437,42 @@ struct SettingsScreen: View {
             } message: {
                 Text(profileSettingsLogoutError ?? "")
             }
+            .confirmationDialog(
+                L10n.t("log_out", languageCode: appLanguageRaw),
+                isPresented: $showProfileSettingsLogoutConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button(L10n.t("log_out", languageCode: appLanguageRaw), role: .destructive) {
+                    performProfileSettingsLogout(openedFromOverflowMenu: false)
+                }
+                .disabled(viewModel.isSafeLogoutBlockingUI)
+                Button(L10n.t("Cancel", languageCode: appLanguageRaw), role: .cancel) {
+                    showProfileSettingsLogoutConfirmation = false
+                }
+            }
             .onChange(of: showProfileOverflowLogoutConfirmation) { _, isPresented in
                 if isPresented {
                     showProfileSettingsSheet = false
+                }
+            }
+            .onChange(of: viewModel.safeLogoutPhase) { _, phase in
+                if phase == .failed {
+                    let message = viewModel.safeLogoutFailureMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                    profileSettingsLogoutError = message.isEmpty
+                        ? L10n.t(
+                            "Could not log out. Please check your connection and try again.",
+                            languageCode: appLanguageRaw
+                        )
+                        : message
+                } else if phase == .idle {
+                    venueOwnerDashboardSheet = nil
+                    showVenueOwnerPasswordResetSheet = false
+                    showReportedCommentsSheet = false
+                    showDeleteVenueOwnerSheet = false
+                    showDeleteAccountSheet = false
+                    showProfileSettingsSheet = false
+                    showProfileOverflowLogoutConfirmation = false
+                    showProfileSettingsLogoutConfirmation = false
                 }
             }
     }
@@ -487,13 +510,45 @@ struct SettingsScreen: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    FanGeoPagePurposeHeader(
-                        title: L10n.t("profile_tab_title", languageCode: appLanguageRaw),
-                        subtitle: L10n.t("profile_tab_subtitle", languageCode: appLanguageRaw)
-                    )
+                    HStack(alignment: .center, spacing: 12) {
+                        FanGeoPagePurposeHeader(
+                            title: L10n.t("profile_tab_title", languageCode: appLanguageRaw),
+                            subtitle: ""
+                        )
+
+                        Spacer(minLength: 8)
+
+                        if canShowProfileOverflowMenu {
+                            profileOverflowMenuButton
+                        } else {
+                            Button {
+                                showProfileSettingsSheet = true
+                            } label: {
+                                Image(systemName: "gearshape.fill")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .symbolRenderingMode(.hierarchical)
+                                    .foregroundStyle(FGColor.accentGreen)
+                                    .frame(width: 34, height: 34)
+                                    .background {
+                                        Circle()
+                                            .fill(.ultraThinMaterial)
+                                        Circle()
+                                            .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.82))
+                                    }
+                                    .overlay {
+                                        Circle()
+                                            .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.70), lineWidth: 0.75)
+                                    }
+                                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 10, y: 4)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L10n.t("Open settings", languageCode: appLanguageRaw))
+                        }
+                    }
                     .padding(.horizontal, 16)
+                    // Title sits just below the safe-area content boundary (no duplicate nav-bar row).
                     .padding(.top, 14)
-                    .padding(.bottom, 4)
+                    .padding(.bottom, 0)
 
                     Group {
                         if isBusinessAccountProfileContext {
@@ -531,9 +586,13 @@ struct SettingsScreen: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, FGSpacing.xl)
                         } else if viewModel.isLoggedIn {
-                            ProfileIdentityCard(
-                                viewModel: viewModel,
-                                isAccountTabActive: isAccountTabSelected
+                            // Erase at the SettingsScreen boundary so Account's type graph
+                            // does not embed ProfileIdentityCard's nested SwiftUI generics.
+                            AnyView(
+                                ProfileIdentityCard(
+                                    viewModel: viewModel,
+                                    isAccountTabActive: isAccountTabSelected
+                                )
                             )
                         } else {
                             SettingsUnifiedAccountEntryCard(
@@ -554,8 +613,15 @@ struct SettingsScreen: View {
                             )
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+                    // Fan profile: adaptive outer inset (SE keeps 16; standard/Pro Max use 6).
+                    .padding(
+                        .horizontal,
+                        isBusinessAccountProfileContext || !viewModel.isLoggedIn
+                            ? 16
+                            : ProfileHeroMetrics.outerInset(screenWidth: nil)
+                    )
+                    .padding(.top, isBusinessAccountProfileContext || !viewModel.isLoggedIn ? 16 : 0)
+                    .padding(.bottom, 10)
 
                     if isBusinessAccountProfileContext && !viewModel.isVenueOwnerLoggedIn {
                         settingsBusinessProRow
@@ -816,60 +882,20 @@ struct SettingsScreen: View {
             .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    if canShowProfileOverflowMenu {
-                        profileOverflowMenuButton
-                    } else {
-                        Button {
-                            showProfileSettingsSheet = true
-                        } label: {
-                            Image(systemName: "gearshape.fill")
-                                .font(.system(size: 16, weight: .semibold))
-                                .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(FGColor.accentGreen)
-                                .frame(width: 34, height: 34)
-                                .background {
-                                    Circle()
-                                        .fill(.ultraThinMaterial)
-                                    Circle()
-                                        .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.82))
-                                }
-                                .overlay {
-                                    Circle()
-                                        .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.16 : 0.70), lineWidth: 0.75)
-                                }
-                                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 10, y: 4)
-                                .onAppear {
-#if DEBUG
-                                    print("[ProfileMenuDebug] settingsGearIconApplied=true")
-#endif
-                                }
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(L10n.t("Open settings", languageCode: appLanguageRaw))
-                    }
-                }
-            }
+            .toolbar(.hidden, for: .navigationBar)
             .onAppear {
 #if DEBUG
                 SettingsNavigationDebug.log(
                     "settingsScreenAppear settingsScreenId=\(settingsScreenInstanceId.uuidString) isAccountTabSelected=\(isAccountTabSelected)"
                 )
                 SettingsPerf.log("appear isAccountTabSelected=\(isAccountTabSelected) isLoggedIn=\(viewModel.isLoggedIn) businessContext=\(isBusinessAccountProfileContext)")
-                if ProcessInfo.processInfo.arguments.contains("-SettingsNavSequentialValidation") {
+                // Validation mode: auto-open the Settings sheet so the host-owned
+                // validator can run. The host schedules the single validation run;
+                // no detached "path-only" navigator run (that duplicated the run).
+                if ProfileSettingsSequentialNavValidation.isExplicitlyEnabled {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                         SettingsNavigationDebug.log("sequentialValidationOpeningSettingsSheet=true")
                         showProfileSettingsSheet = true
-                    }
-                    if !ProfileSettingsSequentialNavValidation.didStartPathOnlyRun {
-                        ProfileSettingsSequentialNavValidation.didStartPathOnlyRun = true
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 1_800_000_000)
-                            let nav = ProfileSettingsNavigator()
-                            SettingsNavigationDebug.log("sequentialValidationPathOnlyNavigator=\(nav.instanceId.uuidString)")
-                            await ProfileSettingsSequentialNavValidation.run(navigator: nav)
-                        }
                     }
                 }
 #endif
@@ -885,9 +911,12 @@ struct SettingsScreen: View {
                         await refreshSettingsBusinessProfile(trigger: "accountTabAppears", refreshBusinessData: true, debounce: true)
                     }
                 }
+#if DEBUG
                 print("[FaceIDSettingsDebug] defaultPrivateChatFaceID=false")
+#endif
                 logSettingsBusinessVenueSectionVisibilityForFanAccount()
                 guard isAccountTabSelected else { return }
+                AccountActivationPerf.log("activationStarted cachedContentShown=\(viewModel.currentUserAuthId != nil)")
                 Task {
                     await Task.yield()
                     await viewModel.loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: true)
@@ -1193,7 +1222,7 @@ struct SettingsScreen: View {
             notificationSettingsStore: notificationSettingsStore,
             isPresented: $showProfileSettingsSheet,
             loginEmail: $email,
-            isCloseDisabled: isProfileLogoutInProgress,
+            isCloseDisabled: viewModel.isSafeLogoutBlockingUI,
             navigationTitle: L10n.t("settings", languageCode: appLanguageRaw),
             closeTitle: L10n.t("close", languageCode: appLanguageRaw),
             onRequestFanSignIn: {
@@ -1210,8 +1239,8 @@ struct SettingsScreen: View {
         )
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
-        .presentationBackground(FGAdaptiveSurface.sheetRoot)
-        .interactiveDismissDisabled(isProfileLogoutInProgress)
+        .presentationBackground(SettingsPremiumChrome.presentationBackground(colorScheme))
+        .interactiveDismissDisabled(viewModel.isSafeLogoutBlockingUI)
     }
 
     private var profileSettingsSheetRoot: some View {
@@ -1747,27 +1776,27 @@ struct SettingsScreen: View {
 
                     if viewModel.isLoggedIn {
                         Button {
-                            performProfileSettingsLogout()
+                            showProfileSettingsLogoutConfirmation = true
                         } label: {
                             settingsRow(
-                                title: isProfileLogoutInProgress
+                                title: viewModel.isSafeLogoutBlockingUI
                                     ? L10n.t("settings_logging_out", languageCode: appLanguageRaw)
                                     : L10n.t("log_out", languageCode: appLanguageRaw),
-                                subtitle: isProfileLogoutInProgress
+                                subtitle: viewModel.isSafeLogoutBlockingUI
                                     ? L10n.t("settings_signing_out_securely", languageCode: appLanguageRaw)
                                     : nil,
                                 systemImage: "rectangle.portrait.and.arrow.right",
                                 tint: FGColor.dangerRed.opacity(0.82),
                                 showsChevron: false
                             ) {
-                                if isProfileLogoutInProgress {
+                                if viewModel.isSafeLogoutBlockingUI {
                                     ProgressView()
                                         .controlSize(.small)
                                 }
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(isProfileLogoutInProgress)
+                        .disabled(viewModel.isSafeLogoutBlockingUI)
 
                         settingsRowDivider()
 
@@ -1782,7 +1811,7 @@ struct SettingsScreen: View {
                             )
                         }
                         .buttonStyle(.plain)
-                        .disabled(isProfileLogoutInProgress)
+                        .disabled(viewModel.isSafeLogoutBlockingUI)
 
                         if viewModel.isVenueOwnerLoggedIn {
                             settingsRowDivider()
@@ -1798,27 +1827,27 @@ struct SettingsScreen: View {
                                 )
                             }
                             .buttonStyle(.plain)
-                            .disabled(isProfileLogoutInProgress)
+                            .disabled(viewModel.isSafeLogoutBlockingUI)
                         }
                     } else if viewModel.isVenueOwnerLoggedIn {
                         Button {
-                            performProfileSettingsLogout()
+                            showProfileSettingsLogoutConfirmation = true
                         } label: {
                             settingsRow(
-                                title: isProfileLogoutInProgress ? "Logging out..." : "Logout",
-                                subtitle: isProfileLogoutInProgress ? "Signing out securely." : "Sign out of this business account.",
+                                title: viewModel.isSafeLogoutBlockingUI ? "Logging out..." : "Logout",
+                                subtitle: viewModel.isSafeLogoutBlockingUI ? "Signing out securely." : "Sign out of this business account.",
                                 systemImage: "rectangle.portrait.and.arrow.right",
                                 tint: FGColor.dangerRed.opacity(0.82),
                                 showsChevron: false
                             ) {
-                                if isProfileLogoutInProgress {
+                                if viewModel.isSafeLogoutBlockingUI {
                                     ProgressView()
                                         .controlSize(.small)
                                 }
                             }
                         }
                         .buttonStyle(.plain)
-                        .disabled(isProfileLogoutInProgress)
+                        .disabled(viewModel.isSafeLogoutBlockingUI)
 
                         settingsRowDivider()
 
@@ -1833,7 +1862,7 @@ struct SettingsScreen: View {
                             )
                         }
                         .buttonStyle(.plain)
-                        .disabled(isProfileLogoutInProgress)
+                        .disabled(viewModel.isSafeLogoutBlockingUI)
                     }
                 }
                 .listRowInsets(
@@ -1875,6 +1904,17 @@ struct SettingsScreen: View {
                             infoAccessibilityLabel: L10n.t("profile_discovery_info_a11y", languageCode: appLanguageRaw),
                             infoAccessibilityHint: L10n.t("privacy_setting_info_hint", languageCode: appLanguageRaw),
                             onInfo: { showProfileDiscoveryHelpSheet = true }
+                        )
+
+                        settingsRowDivider()
+
+                        settingsToggleRow(
+                            title: L10n.t("activity_status_privacy_title", languageCode: appLanguageRaw),
+                            subtitle: L10n.t("activity_status_privacy_subtitle", languageCode: appLanguageRaw),
+                            systemImage: "circle.fill",
+                            isOn: activityStatusVisibilityBinding,
+                            isUpdating: viewModel.isUpdatingActivityStatusVisibilitySetting,
+                            tint: FGColor.accentGreen
                         )
 
                         settingsRowDivider()
@@ -4222,10 +4262,10 @@ struct SettingsScreen: View {
             RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
                 .fill(Color.orange.opacity(colorScheme == .dark ? 0.18 : 0.10))
             if !trimmed.isEmpty, let url = URL(string: trimmed) {
-                AsyncImage(url: url) { phase in
+                CachedRemoteImagePhaseView(url: url, bucket: .venue) { phase in
                     switch phase {
-                    case let .success(image):
-                        image
+                    case .success(let uiImage):
+                        Image(uiImage: uiImage)
                             .resizable()
                             .scaledToFill()
                     case .failure:
@@ -4235,10 +4275,6 @@ struct SettingsScreen: View {
                     case .empty:
                         ProgressView()
                             .tint(.orange)
-                    @unknown default:
-                        Image(systemName: "building.2.fill")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.orange)
                     }
                 }
             } else {

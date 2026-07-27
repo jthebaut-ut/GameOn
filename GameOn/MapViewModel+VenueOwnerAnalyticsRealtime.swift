@@ -15,21 +15,26 @@ extension MapViewModel {
         venueOwnerAnalyticsDebounceTask?.cancel()
         venueOwnerAnalyticsDebounceTask = nil
 
-        if let task = venueOwnerAnalyticsRealtimeTask {
-            task.cancel()
-            _ = await task.result
-            venueOwnerAnalyticsRealtimeTask = nil
-        }
+        let task = venueOwnerAnalyticsRealtimeTask
+        let channel = venueOwnerAnalyticsRealtimeChannel
+        venueOwnerAnalyticsRealtimeTask = nil
+        venueOwnerAnalyticsRealtimeChannel = nil
 
-        if let ch = venueOwnerAnalyticsRealtimeChannel {
-            await supabase.removeChannel(ch)
-            venueOwnerAnalyticsRealtimeChannel = nil
+        // Cancel first, then removeChannel so AsyncStreams terminate. Awaiting task.result
+        // *before* removeChannel deadlocks forever (streams only end after channel removal).
+        task?.cancel()
+        if let channel {
+            await supabase.removeChannel(channel)
+        }
+        if let task {
+            _ = await task.result
         }
     }
 
     /// Subscribes to `venue_event_interests`, `venue_event_comments`, and `venue_event_vibes` for the given IDs.
     /// Call ``stopVenueOwnerAnalyticsRealtime()`` when leaving the analytics UI.
     func startVenueOwnerAnalyticsRealtime(trackedEventIDs: [UUID]) async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         await stopVenueOwnerAnalyticsRealtime()
 
         let ids = Array(Set(trackedEventIDs)).sorted { $0.uuidString < $1.uuidString }

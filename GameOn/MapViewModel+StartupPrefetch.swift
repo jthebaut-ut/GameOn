@@ -41,6 +41,17 @@ extension MapViewModel {
 #if DEBUG
         print("[StartupPrefetchDebug] started=true")
 #endif
+        if shouldSuppressAuthenticatedRefreshForSafeLogout {
+            logStartupPrefetchCompletion(
+                startedAt: startedAt,
+                profileLoaded: false,
+                avatarPrefetched: false,
+                goingLoaded: false,
+                favoriteTeamsLoaded: false,
+                skippedReason: "logoutInProgress"
+            )
+            return
+        }
         var profileLoaded = false
         var goingLoaded = false
         var favoriteTeamsLoaded = false
@@ -136,15 +147,30 @@ extension MapViewModel {
         }
         await loadFavoriteTeamsFromSupabase(forceRefresh: shouldForceFavoriteTeams)
         favoriteTeamsLoaded = true
-        await refreshFollowingTodayVenueEventPlansLightweight()
-        goingLoaded = true
 
-        await loadFanIdentityPreferencesFromProfile()
-        await loadHomeCrowdFromProfile()
-        await enforceFanSingleSessionOnForeground()
-        await startFanSingleSessionRealtimeIfNeeded()
-        await loadPendingPickupGameJoinRequestCountForCreator()
-        await ensurePickupInviteRealtimeIfNeeded()
+        let ageAllowsSocial = await MainActor.run {
+            AgeAccessGateService.shared.allowsSocialSubsystemsForActiveUser()
+        }
+        if ageAllowsSocial {
+            await refreshFollowingTodayVenueEventPlansLightweight()
+            goingLoaded = true
+            await loadFanIdentityPreferencesFromProfile()
+            await loadHomeCrowdFromProfile()
+            await enforceFanSingleSessionOnForeground()
+            await startFanSingleSessionRealtimeIfNeeded()
+            await loadPendingPickupGameJoinRequestCountForCreator()
+            await ensurePickupInviteRealtimeIfNeeded()
+        } else {
+#if DEBUG
+            print("[StartupPrefetchDebug] socialHalfSkipped reason=ageAccessUnresolved")
+#endif
+            AgeAccessRuntimeLog.socialSubsystemBlocked(
+                userId: AgeAccessGateService.shared.activeUserId,
+                subsystem: "lightweight_startup_prefetch_social"
+            )
+            await loadFanIdentityPreferencesFromProfile()
+            await loadHomeCrowdFromProfile()
+        }
 
         await refreshDiscoverBannerAnnouncement()
 
@@ -157,7 +183,7 @@ extension MapViewModel {
             avatarPrefetched: avatarPrefetched,
             goingLoaded: goingLoaded,
             favoriteTeamsLoaded: favoriteTeamsLoaded,
-            skippedReason: nil
+            skippedReason: ageAllowsSocial ? nil : "ageAccessUnresolved"
         )
     }
 
@@ -217,6 +243,14 @@ extension MapViewModel {
                 guard let self, let chatViewModel else { return }
                 guard self.isAuthenticatedForSocialFeatures else {
                     print("[StartupWarmCache] task=notificationBadges skipped reason=notAuthenticated")
+                    return
+                }
+                guard AgeAccessGateService.shared.allowsSocialSubsystemsForActiveUser() else {
+                    print("[StartupWarmCache] task=notificationBadges skipped reason=ageAccessUnresolved")
+                    AgeAccessRuntimeLog.socialSubsystemBlocked(
+                        userId: AgeAccessGateService.shared.activeUserId,
+                        subsystem: "startup_social_badges"
+                    )
                     return
                 }
                 let chatResult = await chatViewModel.prefetchLightweightStartupChatData()
@@ -325,7 +359,7 @@ extension MapViewModel {
         return BarVenue(
             id: row.venue_id ?? UUID(),
             name: venueName.isEmpty ? "Venue" : venueName,
-            address: "Address unavailable",
+            address: VenueAddressPlaceholder.sentinel,
             phone: "",
             primarySport: sport,
             distance: "",

@@ -171,14 +171,18 @@ extension MapViewModel {
     func stopFollowingPickupRealtime() async {
         pickupFollowingRealtimeDebounceTask?.cancel()
         pickupFollowingRealtimeDebounceTask = nil
-        if let t = pickupFollowingRealtimeTask {
-            t.cancel()
-            _ = await t.result
-            pickupFollowingRealtimeTask = nil
+
+        let task = pickupFollowingRealtimeTask
+        let channel = pickupFollowingRealtimeChannel
+        pickupFollowingRealtimeTask = nil
+        pickupFollowingRealtimeChannel = nil
+
+        task?.cancel()
+        if let channel {
+            await supabase.removeChannel(channel)
         }
-        if let ch = pickupFollowingRealtimeChannel {
-            await supabase.removeChannel(ch)
-            pickupFollowingRealtimeChannel = nil
+        if let task {
+            _ = await task.result
         }
     }
 
@@ -199,6 +203,7 @@ extension MapViewModel {
     }
 
     func syncFollowingPickupRealtimeSubscriptionIfNeeded(gameIds: [UUID]) async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         let unique = Array(Set(gameIds))
         guard canFanUsePickupGamesUI, let uid = currentUserAuthId, !unique.isEmpty else {
             await stopFollowingPickupRealtime()

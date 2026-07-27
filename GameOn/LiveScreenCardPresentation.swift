@@ -221,7 +221,7 @@ enum LiveVenueActivityResolver {
             isLiveNow: false,
             startsSoon: energyStartsSoon
         )
-        if preview.label == "🟢 Active Fan Zone" {
+        if preview.label == "✨ Starting" {
             return .activeFanZone
         }
         if energyStartsSoon, preview.score >= 10, hasActivitySignal {
@@ -258,11 +258,17 @@ struct LivePickupCardModel: Equatable {
     let id: UUID
     let title: String
     let sport: String
+    /// Fuller address line (Going-style `address · city, state`) for display / copy.
     let locationLine: String?
+    let dateTimeLine: String?
     let statusLabelKey: String
     let statusDetail: String?
     let joinLine: String?
     let isInProgress: Bool
+    let creatorUserId: UUID
+    let latitude: Double?
+    let longitude: Double?
+    let canOpenDirections: Bool
 }
 
 enum LiveVenueEventCardModelBuilder {
@@ -363,34 +369,55 @@ enum LiveVenueEventCardModelBuilder {
 }
 
 enum LivePickupCardModelBuilder {
-    static func build(row: PickupGameRow, now: Date = Date()) -> LivePickupCardModel {
-        let location = [row.city, row.address]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .prefix(2)
-            .joined(separator: " · ")
-
+    static func build(row: PickupGameRow, now: Date = Date(), languageCode: String = L10n.defaultLanguageCode) -> LivePickupCardModel {
+        let addressLine = goingStyleAddressLine(row)
         let status = pickupStatus(row: row, now: now)
         let joinLine: String? = {
+            if row.isPickupFullForDiscover {
+                return L10n.t("Full", languageCode: languageCode)
+            }
             let approved = row.approved_join_count
             guard approved != nil else { return nil }
             let open = row.pickupOpenSlotsRemaining
             if open > 0 {
-                return open == 1 ? "1 spot open" : "\(open) spots open"
+                return pickupLocalizedSpotsOpen(open, languageCode: languageCode)
             }
             return row.lookingForPlayersLine
         }()
+
+        let canDirections = FanGeoDirectionsActions.hasUsableCoordinate(
+            latitude: row.latitude,
+            longitude: row.longitude
+        )
 
         return LivePickupCardModel(
             id: row.id,
             title: row.title,
             sport: row.sport,
-            locationLine: location.isEmpty ? nil : location,
+            locationLine: addressLine,
+            dateTimeLine: row.pickupDateWithCompactTimeRange(languageCode: languageCode),
             statusLabelKey: status.key,
             statusDetail: status.detail,
             joinLine: joinLine,
-            isInProgress: status.key == "pickup_status_in_progress"
+            isInProgress: status.key == "pickup_status_in_progress",
+            creatorUserId: row.creator_user_id,
+            latitude: row.latitude,
+            longitude: row.longitude,
+            canOpenDirections: canDirections
         )
+    }
+
+    /// Matches Going Playing address formatting (`address · city, state`).
+    private static func goingStyleAddressLine(_ row: PickupGameRow) -> String? {
+        let addr = row.address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let loc = [row.city, row.state]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+        if !addr.isEmpty, !loc.isEmpty { return "\(addr) · \(loc)" }
+        if !addr.isEmpty { return addr }
+        if !loc.isEmpty { return loc }
+        return nil
     }
 
     private static func pickupStatus(row: PickupGameRow, now: Date) -> (key: String, detail: String?) {

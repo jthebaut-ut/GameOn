@@ -272,67 +272,261 @@ struct LiveVenueEventRichCard: View {
 // MARK: - Pickup rich card
 
 struct LivePickupRichCard: View {
+    @ObservedObject var viewModel: MapViewModel
     let model: LivePickupCardModel
     var compact: Bool = false
     var relevanceLabel: String? = nil
+    let onOpenDetails: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @State private var showDirectionsDialog = false
 
     private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
+    private var cornerRadius: CGFloat { compact ? 18 : 20 }
+
+    private var organizerDisplayName: String {
+        let raw = viewModel.pickupCreatorDisplayLabel(for: model.creatorUserId)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw
+    }
+
+    private var canPresentDirectionsSheet: Bool {
+        model.canOpenDirections || !(model.locationLine?.isEmpty ?? true)
+    }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            SportArtworkIconView(sport: model.sport, diameter: compact ? 36 : 42)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    pickupStatusPill
-                    if let relevanceLabel {
-                        Text(relevanceLabel)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(FGColor.accentBlue)
+        VStack(alignment: .leading, spacing: compact ? 7 : 8) {
+            Button(action: onOpenDetails) {
+                HStack(alignment: .top, spacing: compact ? 10 : 12) {
+                    SportArtworkIconView(sport: model.sport, diameter: compact ? 34 : 40)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: compact ? 6 : 7) {
+                        headerBlock
+                        if let dateTimeLine = model.dateTimeLine, !dateTimeLine.isEmpty {
+                            dateTimeRow(dateTimeLine)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
-                Text(model.title)
-                    .font(compact ? .system(size: 15, weight: .bold, design: .rounded) : FGTypography.cardTitle)
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(2)
-                if let locationLine = model.locationLine {
-                    Text(locationLine)
-                        .font(FGTypography.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                }
-                Text("\(AppSportCatalog.displayLabel(forSportToken: model.sport)) · \(statusDisplayText)")
-                    .font(FGTypography.caption)
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .lineLimit(1)
-                if let joinLine = model.joinLine {
-                    Text(joinLine)
-                        .font(FGTypography.metadata.weight(.semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            Spacer(minLength: 0)
+            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+            .accessibilityLabel(cardAccessibilitySummary)
+            .accessibilityHint(L10n.t("live_open_pickup_hint", languageCode: languageCode))
+
+            if let locationLine = model.locationLine, !locationLine.isEmpty {
+                addressBlock(locationLine)
+            }
+
+            organizerBlock
+
+            Button(action: onOpenDetails) {
+                VStack(alignment: .leading, spacing: compact ? 6 : 7) {
+                    if let joinLine = model.joinLine, !joinLine.isEmpty {
+                        availabilityRow(joinLine)
+                    }
+                    detailsAffordance
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
+            .accessibilityLabel(L10n.t("View pickup details", languageCode: languageCode))
+            .accessibilityHint(L10n.t("live_open_pickup_hint", languageCode: languageCode))
         }
         .padding(compact ? 12 : 14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: compact ? 18 : 20, style: .continuous)
-                .fill(colorScheme == .dark ? Color.white.opacity(0.075) : Color.white.opacity(0.78))
-                .overlay {
-                    RoundedRectangle(cornerRadius: compact ? 18 : 20, style: .continuous)
-                        .strokeBorder(
-                            model.isInProgress
-                                ? FGColor.dangerRed.opacity(colorScheme == .dark ? 0.34 : 0.22)
-                                : FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 1 : 0.75),
-                            lineWidth: 1
-                        )
+        .background(cardChrome)
+        .confirmationDialog(
+            L10n.t("Get directions", languageCode: languageCode),
+            isPresented: $showDirectionsDialog,
+            titleVisibility: .visible
+        ) {
+            if model.canOpenDirections,
+               let latitude = model.latitude,
+               let longitude = model.longitude {
+                Button(L10n.t("Open in Apple Maps", languageCode: languageCode)) {
+                    FanGeoDirectionsActions.openAppleMapsDirections(
+                        latitude: latitude,
+                        longitude: longitude,
+                        name: model.title
+                    )
                 }
+                Button(L10n.t("Open in Google Maps", languageCode: languageCode)) {
+                    FanGeoDirectionsActions.openGoogleMapsDirections(
+                        latitude: latitude,
+                        longitude: longitude,
+                        name: model.title
+                    )
+                }
+            }
+            if let locationLine = model.locationLine, !locationLine.isEmpty {
+                Button(L10n.t("Copy Address", languageCode: languageCode)) {
+                    FanGeoDirectionsActions.copyAddress(locationLine)
+                }
+            }
+            Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
+        } message: {
+            if let locationLine = model.locationLine, !locationLine.isEmpty {
+                Text(locationLine)
+            }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var cardChrome: some View {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            .fill(colorScheme == .dark ? Color.white.opacity(0.075) : Color.white.opacity(0.78))
+            .overlay {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(
+                        model.isInProgress
+                            ? FGColor.dangerRed.opacity(colorScheme == .dark ? 0.34 : 0.22)
+                            : FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 1 : 0.75),
+                        lineWidth: 1
+                    )
+            }
+    }
+
+    private var headerBlock: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                pickupStatusPill
+                if let relevanceLabel {
+                    Text(relevanceLabel)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(FGColor.accentBlue)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            Text(model.title)
+                .font(compact ? .system(size: 15, weight: .bold, design: .rounded) : FGTypography.cardTitle)
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+        }
+    }
+
+    private func dateTimeRow(_ line: String) -> some View {
+        Label {
+            Text(line)
+                .font(FGTypography.caption.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .lineLimit(2)
+                .minimumScaleFactor(0.85)
+        } icon: {
+            Image(systemName: "calendar")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+        }
+        .labelStyle(.titleAndIcon)
+        .accessibilityLabel(line)
+    }
+
+    private func addressBlock(_ locationLine: String) -> some View {
+        Button {
+            guard canPresentDirectionsSheet else { return }
+            showDirectionsDialog = true
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(locationLine)
+                    .font(FGTypography.caption.weight(.semibold))
+                    .foregroundStyle(FGColor.accentBlue)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                if canPresentDirectionsSheet {
+                    Text(L10n.t("Get directions", languageCode: languageCode))
+                        .font(FGTypography.metadata.weight(.medium))
+                        .foregroundStyle(FGColor.accentBlue.opacity(0.85))
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!canPresentDirectionsSheet)
+        .accessibilityLabel(locationLine)
+        .accessibilityHint(L10n.t("live_pickup_directions_a11y_hint", languageCode: languageCode))
+    }
+
+    private var organizerBlock: some View {
+        let name = organizerDisplayName
+        let fallback = L10n.t("Organizer", languageCode: languageCode)
+        let shownName = name.isEmpty ? fallback : name
+        return PublicProfileAvatarTap(userId: model.creatorUserId, context: "live_pickup_organizer") {
+            HStack(spacing: 8) {
+                UserAvatarView(
+                    avatarThumbnailURL: viewModel.pickupOrganizerAvatarThumbnailForDetail(userId: model.creatorUserId),
+                    avatarURL: viewModel.pickupOrganizerAvatarFullForDetail(userId: model.creatorUserId),
+                    avatarDisplayRefreshToken: viewModel.pickupOrganizerAvatarRefreshTokenForDetail(userId: model.creatorUserId),
+                    displayName: shownName,
+                    email: "",
+                    size: compact ? 30 : 32,
+                    fallbackStyle: colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome,
+                    imagePlaceholderTint: colorScheme == .dark ? .white.opacity(0.72) : nil
+                )
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(L10n.t("Organizer", languageCode: languageCode))
+                        .font(FGTypography.metadata)
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                    Text(shownName)
+                        .font(FGTypography.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel(
+            String(
+                format: L10n.t("live_pickup_organizer_a11y_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                shownName
+            )
         )
-        .accessibilityElement(children: .combine)
+        .accessibilityHint(L10n.t("live_pickup_organizer_a11y_hint", languageCode: languageCode))
+    }
+
+    private func availabilityRow(_ joinLine: String) -> some View {
+        Text(joinLine)
+            .font(FGTypography.metadata.weight(.semibold))
+            .foregroundStyle(FGColor.secondaryText(colorScheme))
+            .lineLimit(1)
+            .accessibilityLabel(joinLine)
+    }
+
+    private var detailsAffordance: some View {
+        HStack(spacing: 4) {
+            Text(L10n.t("View pickup details", languageCode: languageCode))
+                .font(FGTypography.caption.weight(.semibold))
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.bold))
+                .accessibilityHidden(true)
+        }
+        .foregroundStyle(FGColor.accentBlue)
+        .padding(.top, 1)
+    }
+
+    private var cardAccessibilitySummary: String {
+        var parts = [model.title, statusDisplayText]
+        if let dateTimeLine = model.dateTimeLine, !dateTimeLine.isEmpty {
+            parts.append(dateTimeLine)
+        }
+        if let joinLine = model.joinLine, !joinLine.isEmpty {
+            parts.append(joinLine)
+        }
+        return parts.joined(separator: ", ")
     }
 
     private var statusDisplayText: String {
@@ -381,7 +575,7 @@ struct LivePickupRichCard: View {
                 Capsule(style: .continuous)
                     .strokeBorder(tint.opacity(0.26), lineWidth: 1)
             }
-            .accessibilityLabel(label)
+            .accessibilityHidden(true)
         }
     }
 }

@@ -1831,13 +1831,13 @@ private struct VenuePredictionAvatarView: View {
             Circle()
                 .fill(FGColor.cardBackground(colorScheme))
             if let imageURL {
-                AsyncImage(url: imageURL) { phase in
+                CachedRemoteImagePhaseView(url: imageURL, bucket: .avatar) { phase in
                     switch phase {
-                    case .success(let image):
-                        image
+                    case .success(let uiImage):
+                        Image(uiImage: uiImage)
                             .resizable()
                             .scaledToFill()
-                    default:
+                    case .empty, .failure:
                         fallback
                     }
                 }

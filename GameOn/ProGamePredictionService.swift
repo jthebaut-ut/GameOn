@@ -190,6 +190,10 @@ final class ProGamePredictionService {
         summaryCache.removeValue(forKey: proGameID)
     }
 
+    func clearAllCachedSummaries() {
+        summaryCache.removeAll(keepingCapacity: false)
+    }
+
     private func currentUserId() async throws -> UUID {
         do {
             return try await client.auth.session.user.id

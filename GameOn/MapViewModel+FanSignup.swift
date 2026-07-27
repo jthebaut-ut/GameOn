@@ -180,6 +180,19 @@ extension MapViewModel {
             )
         }
 
+        guard await requireAgeAccessForSignUp(email: fanEmail) else {
+            let blocked = AgeAccessGateService.shared.latestState.isBlockingUnder13
+            let message = blocked
+                ? L10n.t("age_gate_under13_body")
+                : L10n.t("age_gate_confirmation_body")
+            return FanSignupSubmitOutcome(
+                succeeded: false,
+                failureStep: .validation,
+                errorMessage: message,
+                authSucceeded: false
+            )
+        }
+
         let trimmedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedPassword.isEmpty else {
             let message = "Password is required."
@@ -378,6 +391,10 @@ extension MapViewModel {
 
         await ensureUserProfileExists()
 
+        // Profile row exists: hand this sign-up's single-use age grant to the server so
+        // the authoritative record — not a local cache — is what grants social access.
+        await claimAgeAccessSignUpOwnership(userId: session.user.id, email: fanEmail)
+
         let profileSaveError = await finishFanSignupProfile(profile: profile)
         if let profileSaveError {
             print("[SignupUX] submitFailed step=profile error=\(profileSaveError)")
@@ -434,6 +451,22 @@ extension MapViewModel {
         profile: FanSignupProfileInput,
         recordFanGuidelinesAcceptance: Bool
     ) async -> FanSignupSubmitOutcome {
+        guard await requireAgeAccessForSignUp() else {
+            if AgeAccessGateService.shared.latestState.isBlockingUnder13 {
+                await quarantineSessionAfterAgeAccessBlock(reason: "ageAccessBlockedUnder13AppleFanProfile")
+            }
+            let blocked = AgeAccessGateService.shared.latestState.isBlockingUnder13
+            let message = blocked
+                ? L10n.t("age_gate_under13_body")
+                : L10n.t("age_gate_confirmation_body")
+            return FanSignupSubmitOutcome(
+                succeeded: false,
+                failureStep: .validation,
+                errorMessage: message,
+                authSucceeded: false
+            )
+        }
+
         let session: Session
         do {
             session = try await supabase.auth.session
@@ -522,6 +555,10 @@ extension MapViewModel {
             )
         }
 
+        // Profile row exists: record this sign-up's age result server-side before the
+        // social shell is allowed to resolve.
+        await claimAgeAccessSignUpOwnership(userId: session.user.id, email: fanEmail)
+
         await MainActor.run {
             isLoggedIn = true
             isVenueOwnerLoggedIn = false
@@ -564,6 +601,15 @@ extension MapViewModel {
         draft: PendingFanEmailSignupDraft
     ) async -> Bool {
         let fanEmail = OwnerBusinessEmail.normalized(session.user.email ?? draft.email)
+        guard await requireAgeAccessForSignUp(email: fanEmail) else {
+            if AgeAccessGateService.shared.latestState.isBlockingUnder13 {
+                await quarantineSessionAfterAgeAccessBlock(reason: "ageAccessBlockedUnder13PendingEmailFan")
+            } else {
+                await forceLogout(reason: "ageAccessUnresolvedPendingEmailFan", source: "MapViewModel.completePendingEmailFanSignupAfterConfirmation")
+            }
+            return false
+        }
+
         guard OwnerBusinessEmail.isValidStrict(fanEmail),
               Self.userEmailConfirmed(session.user) else {
             return false
@@ -600,6 +646,7 @@ extension MapViewModel {
                 // Do not re-request Welcome Guide for an already completed profile.
             }
             await persistAccountModeForActiveAuthSession(.fanUser)
+            await claimAgeAccessSignUpOwnership(userId: session.user.id, email: fanEmail)
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
             await registerFanActiveSessionOnLogin()
             Task { await refreshUserPersonalizationInBackground() }
@@ -664,6 +711,7 @@ extension MapViewModel {
             markPostSignupDiscoverWelcomeGuideIfPossible(source: "completePendingEmailFanSignupAfterConfirmation")
         }
         await persistAccountModeForActiveAuthSession(.fanUser)
+        await claimAgeAccessSignUpOwnership(userId: session.user.id, email: fanEmail)
         clearExplicitLogoutMarkerAfterManualAuthSucceeded()
         await registerFanActiveSessionOnLogin()
 
@@ -713,11 +761,15 @@ extension MapViewModel {
 
         var avatarURL = ""
         var avatarThumbnailURL: String?
+        var replacedAvatarFull: String?
+        var replacedAvatarThumb: String?
         if let data = profile.avatarData {
-            let fileName = "avatar-\(Int(Date().timeIntervalSince1970)).jpg"
+            let fileName = MapViewModel.makeVersionedAvatarFileName()
             if let urls = await uploadUserAvatar(data: data, fileName: fileName) {
                 avatarURL = urls.fullURL
                 avatarThumbnailURL = urls.thumbnailURL
+                replacedAvatarFull = urls.replacedFullURL
+                replacedAvatarThumb = urls.replacedThumbnailURL
             }
         }
 
@@ -728,7 +780,50 @@ extension MapViewModel {
             username: profile.handle,
             bio: bioToSave
         ) {
+            if !avatarURL.isEmpty {
+                Task {
+                    await deleteReplacedStorageObjectIfNeeded(
+                        oldPublicURL: avatarURL,
+                        newPublicURL: "",
+                        bucket: "user-avatars"
+                    )
+                    if let avatarThumbnailURL, !avatarThumbnailURL.isEmpty {
+                        await deleteReplacedStorageObjectIfNeeded(
+                            oldPublicURL: avatarThumbnailURL,
+                            newPublicURL: "",
+                            bucket: "user-avatars"
+                        )
+                    }
+                }
+            }
             return err
+        }
+
+        if !avatarURL.isEmpty {
+            let sessionUserId = (try? await supabase.auth.session)?.user.id
+            if let sessionUserId {
+                let change = FanProfileAvatarChange(
+                    userId: sessionUserId,
+                    avatarURL: avatarURL,
+                    avatarThumbnailURL: avatarThumbnailURL
+                )
+                await MainActor.run {
+                    applyFanProfileAvatarChangeToLocalCaches(change)
+                }
+                FanProfileChangeCenter.postAvatarChange(change)
+            }
+            Task {
+                await deleteReplacedStorageObjectIfNeeded(
+                    oldPublicURL: replacedAvatarFull,
+                    newPublicURL: avatarURL,
+                    bucket: "user-avatars"
+                )
+                await deleteReplacedStorageObjectIfNeeded(
+                    oldPublicURL: replacedAvatarThumb,
+                    newPublicURL: avatarThumbnailURL ?? avatarURL,
+                    bucket: "user-avatars"
+                )
+            }
         }
 
         if !profile.favoriteTeamIDs.isEmpty {

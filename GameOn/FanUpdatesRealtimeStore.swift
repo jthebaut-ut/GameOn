@@ -9,6 +9,8 @@ final class FanUpdatesRealtimeStore: ObservableObject {
     @Published var venueEventVibeCounts: [UUID: [String: Int]] = [:]
     @Published var myVenueEventVibes: [UUID: Set<String>] = [:]
     @Published var venueEventCommentPreviewCounts: [UUID: Int] = [:]
+    /// Unique visible commenters per venue event (normalized email). Used by Discover map energy.
+    @Published var venueEventUniqueCommenterCounts: [UUID: Int] = [:]
     @Published var venueEventCommentPreviews: [UUID: [VenueEventCommentRow]] = [:]
     @Published var venueEventCommentLikeCountsByID: [UUID: Int] = [:]
     @Published var venueEventCommentDownReactionCountsByID: [UUID: Int] = [:]
@@ -59,5 +61,75 @@ final class FanUpdatesRealtimeStore: ObservableObject {
 
     init() {
         DebugLogGate.debug("[FanUpdatesRealtimeStoreDebug] initialized")
+    }
+
+    /// Drops session-scoped Fan Updates maps and cancels in-flight store Tasks (logout / account switch).
+    /// Does not touch Discover public map inventory.
+    func clearSessionScopedStateForLogout() {
+        for task in venueEventCommentsRealtimeTasks.values { task.cancel() }
+        venueEventCommentsRealtimeTasks.removeAll(keepingCapacity: false)
+        venueEventCommentsRealtimeChannels.removeAll(keepingCapacity: false)
+        venueEventCommentsRealtimeListenerTokens.removeAll(keepingCapacity: false)
+        venueEventCommentsRealtimeReadyIDs.removeAll(keepingCapacity: false)
+        venueEventCommentsRealtimeSubscribeStartedAt.removeAll(keepingCapacity: false)
+        venueEventCommentsRealtimeLastEventAt.removeAll(keepingCapacity: false)
+        venueEventCommentRealtimeReceivedServerIDs.removeAll(keepingCapacity: false)
+        for task in venueEventCommentRealtimeFallbackTasks.values { task.cancel() }
+        venueEventCommentRealtimeFallbackTasks.removeAll(keepingCapacity: false)
+        for task in fanChatReceiverRefreshBurstTasks.values { task.cancel() }
+        fanChatReceiverRefreshBurstTasks.removeAll(keepingCapacity: false)
+        fanChatAutoRefreshInFlightIDs.removeAll(keepingCapacity: false)
+        for task in venueEventCommentReactionRealtimeTasks.values { task.cancel() }
+        venueEventCommentReactionRealtimeTasks.removeAll(keepingCapacity: false)
+        venueEventCommentReactionRealtimeChannels.removeAll(keepingCapacity: false)
+        venueEventCommentReactionRealtimeReadyIDs.removeAll(keepingCapacity: false)
+        venueEventCommentReactionRealtimeTrackedCommentIDs.removeAll(keepingCapacity: false)
+        for task in venueEventCommentReactionDebounceTasks.values { task.cancel() }
+        venueEventCommentReactionDebounceTasks.removeAll(keepingCapacity: false)
+        for task in venueEventCommentReactionFallbackPollTasks.values { task.cancel() }
+        venueEventCommentReactionFallbackPollTasks.removeAll(keepingCapacity: false)
+        fanChatAppLevelRealtimeTask?.cancel()
+        fanChatAppLevelRealtimeTask = nil
+        fanChatAppLevelRealtimeChannel = nil
+        fanChatAppLevelRealtimeTrackedEventIDs.removeAll(keepingCapacity: false)
+        fanChatAppLevelLastScheduleRequestedEventIDs.removeAll(keepingCapacity: false)
+        fanChatAppLevelRealtimeResubscribeTask?.cancel()
+        fanChatAppLevelRealtimeResubscribeTask = nil
+        fanChatAppLevelSeenCommentIDs.removeAll(keepingCapacity: false)
+        crowdReactionVibeRealtimeRefreshTask?.cancel()
+        crowdReactionVibeRealtimeRefreshTask = nil
+        for task in fanChatCommentCountReconcileTasks.values { task.cancel() }
+        fanChatCommentCountReconcileTasks.removeAll(keepingCapacity: false)
+        for task in fanUpdatesCommentPrefetchTasks.values { task.cancel() }
+        fanUpdatesCommentPrefetchTasks.removeAll(keepingCapacity: false)
+        for task in fanUpdatesVibePrefetchTasks.values { task.cancel() }
+        fanUpdatesVibePrefetchTasks.removeAll(keepingCapacity: false)
+        fanUpdatesCommentPrefetchedAt.removeAll(keepingCapacity: false)
+        fanUpdatesVibePrefetchedAt.removeAll(keepingCapacity: false)
+        venueEventCommentReactionLastRefreshAt.removeAll(keepingCapacity: false)
+        venueEventVibeWriteInFlightKeys.removeAll(keepingCapacity: false)
+        venueEventCommentLikeWriteInFlightIDs.removeAll(keepingCapacity: false)
+
+        venueEventComments.removeAll(keepingCapacity: false)
+        commentIDsReportedByCurrentUser.removeAll(keepingCapacity: false)
+        venueEventVibeCounts.removeAll(keepingCapacity: false)
+        myVenueEventVibes.removeAll(keepingCapacity: false)
+        venueEventCommentPreviewCounts.removeAll(keepingCapacity: false)
+        venueEventUniqueCommenterCounts.removeAll(keepingCapacity: false)
+        venueEventCommentPreviews.removeAll(keepingCapacity: false)
+        venueEventCommentLikeCountsByID.removeAll(keepingCapacity: false)
+        venueEventCommentDownReactionCountsByID.removeAll(keepingCapacity: false)
+        venueEventCommentIDsLikedByCurrentUser.removeAll(keepingCapacity: false)
+        venueEventCommentViewerReactionsByID.removeAll(keepingCapacity: false)
+
+        venueEventCommentInsertSuccessTimesByServerID.removeAll(keepingCapacity: false)
+        venueEventCommentDebugSendTapDatesByLocalID.removeAll(keepingCapacity: false)
+        venueEventCommentDebugSendTapTimesByServerID.removeAll(keepingCapacity: false)
+        venueEventCommentDebugReceivedDatesByServerID.removeAll(keepingCapacity: false)
+        venueEventCommentDebugFallbackCommentIDs.removeAll(keepingCapacity: false)
+        venueEventCommentLatencySendTimesByLocalID.removeAll(keepingCapacity: false)
+        venueEventCommentLatencySendTimesByServerID.removeAll(keepingCapacity: false)
+        venueEventCommentLatencyLastSendTimeByEventID.removeAll(keepingCapacity: false)
+        venueEventCommentLatencyInsertStartTimesByLocalID.removeAll(keepingCapacity: false)
     }
 }

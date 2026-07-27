@@ -520,7 +520,14 @@ struct ProGamePredictionSheet: View {
             .padding(.vertical, 6)
             .background(
                 Capsule(style: .continuous)
-                    .fill(matchStatusColor.opacity(colorScheme == .dark ? 0.14 : 0.10))
+                    .fill(matchStatusColor.opacity(colorScheme == .dark ? 0.16 : 0.10))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(
+                        matchStatusColor.opacity(colorScheme == .dark ? 0.34 : 0.16),
+                        lineWidth: 0.75
+                    )
             )
     }
 
@@ -801,7 +808,11 @@ struct ProGamePredictionSheet: View {
         case .live, .halfTime:
             return FGColor.dangerRed
         case .fullTime:
-            return FGColor.mutedText(colorScheme)
+            // Dark needs a brighter tone than mutedText (56% white) to stay
+            // legible inside the tinted capsule on the dark header surface.
+            return colorScheme == .dark
+                ? Color.white.opacity(0.85)
+                : FGColor.mutedText(colorScheme)
         case .scheduled:
             return FGColor.secondaryText(colorScheme)
         }
@@ -819,18 +830,43 @@ struct ProGamePredictionSheet: View {
         hydratedLiveMatch?.badgeURL(forTeamName: team)
     }
 
-    private var predictionHeaderBackground: Color {
-        colorScheme == .dark
-            ? Color(red: 0.98, green: 0.98, blue: 0.99)
-            : Color.white
+    /// Header band surface. Light: soft white→cool-tint gradient (premium result card,
+    /// not a flat white block). Dark: elevated dark surface so header content and the
+    /// status pill keep contrast (was a hard-coded near-white fill in Dark Mode).
+    private var predictionHeaderBackground: AnyShapeStyle {
+        if colorScheme == .dark {
+            AnyShapeStyle(
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.13, green: 0.15, blue: 0.20),
+                        Color(red: 0.09, green: 0.11, blue: 0.15)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        } else {
+            AnyShapeStyle(
+                LinearGradient(
+                    colors: [
+                        Color.white,
+                        Color(red: 0.955, green: 0.966, blue: 0.988)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+        }
     }
 
     private var headerPrimaryText: Color {
-        Color(red: 0.08, green: 0.09, blue: 0.11)
+        colorScheme == .dark ? .white : Color(red: 0.08, green: 0.09, blue: 0.11)
     }
 
     private var headerSecondaryText: Color {
-        Color(red: 0.36, green: 0.39, blue: 0.44)
+        colorScheme == .dark
+            ? Color.white.opacity(0.72)
+            : Color(red: 0.36, green: 0.39, blue: 0.44)
     }
 
     private var lockBanner: some View {

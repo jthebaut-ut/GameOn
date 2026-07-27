@@ -36,7 +36,8 @@ extension MapViewModel {
             national_team_country_code: currentUserNationalTeam?.countryCode,
             national_team_country_name: currentUserNationalTeam?.countryName,
             national_team_flag: currentUserNationalTeam?.flag,
-            national_team_supporter_label: currentUserNationalTeam?.supporterLabel
+            national_team_supporter_label: currentUserNationalTeam?.supporterLabel,
+            profile_background_key: currentUserProfileBackgroundKey.rawValue
         )
     }
 

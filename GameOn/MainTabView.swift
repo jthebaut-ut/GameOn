@@ -9,7 +9,11 @@ struct MainTabView: View {
     private static var didResetImageCacheDiagnosticsThisProcess = false
 
     @ObservedObject var viewModel: MapViewModel
-    @ObservedObject var chatViewModel: ChatViewModel
+    /// Owned by `ContentView`; kept as a plain reference so Chat-only publications do not
+    /// invalidate the complete root shell. Chat leaves observe this object directly.
+    let chatViewModel: ChatViewModel
+    @ObservedObject private var chatMainTabState: ChatMainTabState
+    private let chatTabBadgeState: ChatTabBadgeState
     let performsInitialBootstrap: Bool
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -25,9 +29,16 @@ struct MainTabView: View {
     @State private var discoverCalendarOverlayPresented = false
     /// Sticky lazy mount: Discover at launch; other tabs insert on first selection and stay mounted.
     @State private var mountedTabs: Set<AppTab> = [.discover]
+    /// Two-phase first mount: tabs whose heavy subtree has been constructed. A newly mounted
+    /// tab renders a one-frame lightweight shell first so the selection change can commit
+    /// before the expensive first construction runs (see `scheduleFirstMountContentActivation`).
+    @State private var activatedTabContent: Set<AppTab> = [.discover]
     @State private var didStartChatSocialRealtime = false
     @State private var chatSocialRealtimeDeferTask: Task<Void, Never>?
     @State private var foregroundDeferredBatchTask: Task<Void, Never>?
+    /// Last tab the user picked from the floating bar. Used only to report late startup routing
+    /// that lands on a different tab (see ``TabTapPerf/selectionOverwritten(from:to:reason:)``).
+    @State private var lastManualTabSelection: AppTab?
     @State private var tabSwitchStartAt: Date?
     @State private var tabSwitchCachedData: Bool?
     @State private var tabSwitchFromTab: AppTab?
@@ -48,17 +59,56 @@ struct MainTabView: View {
     private static let postAuthBadgeRefreshThrottleInterval: TimeInterval = 4
     private static let postAuthBadgeRefreshCoalesceDelayNs: UInt64 = 140_000_000
 
-    private var selectedTab: AppTab {
-        AppTab(rawValue: selectedTabStorage) ?? .discover
+    init(
+        viewModel: MapViewModel,
+        chatViewModel: ChatViewModel,
+        performsInitialBootstrap: Bool
+    ) {
+        _viewModel = ObservedObject(wrappedValue: viewModel)
+        self.chatViewModel = chatViewModel
+        _chatMainTabState = ObservedObject(wrappedValue: chatViewModel.mainTabState)
+        self.chatTabBadgeState = chatViewModel.tabBadgeState
+        self.performsInitialBootstrap = performsInitialBootstrap
     }
+
+    private var selectedTab: AppTab {
+        let restored = AppTab(rawValue: selectedTabStorage) ?? .discover
+        // SceneStorage can restore `.account` at process start. Honoring it during the
+        // FIRST body evaluation constructs SettingsScreen/ProfileIdentityCard before
+        // `.onAppear` forces Discover, overflowing the main-thread stack in SwiftUI
+        // generic-metadata instantiation (device crashes 2026-07-20, bug_type 309,
+        // "stack guard region" SIGSEGV in ProfileIdentityCard.body). Treat Account as
+        // Discover until the startup Discover force has run this process.
+        if restored == .account, !Self.hasForcedDiscoverTabThisProcess {
+#if DEBUG
+            Self.logSuppressedSceneRestoredAccountOnce()
+#endif
+            return .discover
+        }
+        return restored
+    }
+
+#if DEBUG
+    private static var didLogSuppressedSceneRestoredAccount = false
+    private static func logSuppressedSceneRestoredAccountOnce() {
+        guard !didLogSuppressedSceneRestoredAccount else { return }
+        didLogSuppressedSceneRestoredAccount = true
+        print("[StartupDiscover] suppressedSceneRestoredAccount=true reason=firstBodyPassBeforeDiscoverForce")
+    }
+#endif
 
     private var selectedTabBinding: Binding<AppTab> {
         Binding(
-            get: { AppTab(rawValue: selectedTabStorage) ?? .discover },
+            get: { selectedTab },
             set: { newTab in
                 beginTabSwitch(to: newTab, reason: "selectedTabBinding")
                 mountTab(newTab, reason: "selectedTabBinding")
                 selectedTabStorage = newTab.rawValue
+#if DEBUG
+                if MemoryAuditProbe.isEnabled {
+                    MemoryAuditProbe.log("tab", details: "selected=\(newTab.rawValue) mounted=\(mountedTabs.map(\.rawValue).sorted().joined(separator: ","))")
+                }
+#endif
             }
         )
     }
@@ -80,19 +130,39 @@ struct MainTabView: View {
     private static let floatingTabBarStackHeight: CGFloat = 92
 
     var body: some View {
+        let _ = MainTabObservationPerf.mainBodyEvaluated(selectedTab: selectedTab.rawValue)
         tabShellWithLifecycleModifiers
             .environmentObject(viewModel)
             .environmentObject(chatViewModel)
             .overlay {
-                FanXPRewardOverlayHost(manager: viewModel.fanXPRewardOverlay)
-                    .id(ObjectIdentifier(viewModel.fanXPRewardOverlay))
-                WowMomentToastHost(manager: viewModel.wowMomentOverlay)
-                    .id(ObjectIdentifier(viewModel.wowMomentOverlay))
+                MainTabTransientOverlayLayer(viewModel: viewModel)
+            }
+            .overlay {
+                MainTabSessionOverlayLayer(viewModel: viewModel)
+            }
+            .onChange(of: viewModel.safeLogoutNeedsDiscoverReset) { _, needsReset in
+                guard needsReset else { return }
+                SafeLogoutDebug.step("main_tab_reset_observed", detail: "onChange")
+                settleSafeLogoutToDiscoverRoot()
+            }
+            .onChange(of: viewModel.safeLoginNeedsDiscoverReset) { _, needsReset in
+                guard needsReset else { return }
+                settleSafeLoginToDiscoverRoot()
+            }
+            .onChange(of: viewModel.safeLogoutPhase) { _, phase in
+                if phase == .loggingOut {
+                    chatViewModel.clearForSignOut()
+                }
+            }
+            .onChange(of: viewModel.safeLoginPhase) { _, phase in
+                if phase == .authenticating || phase == .preparingSession {
+                    chatViewModel.clearForSignOut()
+                }
             }
             .background {
                 FanGeoAnnouncementMainTabRouter(viewModel: viewModel) { tabRaw in
                     guard let tab = AppTab(rawValue: tabRaw) else { return }
-                    selectTab(tab, reason: "announcementCTA")
+                    selectTab(tab, animated: false, reason: "announcementCTA")
                 }
             }
             .fullScreenCover(isPresented: $showBlockingFanIdentitySetup) {
@@ -115,6 +185,13 @@ struct MainTabView: View {
                 Text(chatGateAlertMessage ?? "")
             }
             .onAppear {
+                // Observation-race reconciliation: if the reset flag is already true when this
+                // MainTabView appears (root remounted between false→true, so `onChange` never
+                // fired), settle to the signed-out Discover root now. Settlement is idempotent.
+                if viewModel.safeLogoutNeedsDiscoverReset {
+                    SafeLogoutDebug.step("main_tab_reset_observed", detail: "onAppearReconcile")
+                    settleSafeLogoutToDiscoverRoot()
+                }
                 guard !didRunInitialPrivateChatTabGate else { return }
                 didRunInitialPrivateChatTabGate = true
                 print("[FaceIDSettingsDebug] defaultPrivateChatFaceID=false")
@@ -123,13 +200,27 @@ struct MainTabView: View {
             }
     }
 
-    private var tabShellWithLifecycleModifiers: some View {
+    /// Type-erased boundary — do not remove. The full tab shell (root ZStack of
+    /// tab roots + the ~30-modifier lifecycle chain) produced a concrete generic
+    /// type deep enough that Swift runtime metadata instantiation
+    /// (__swift_instantiateConcreteTypeFromMangledNameV2) recursed past the
+    /// main-thread stack guard at launch (EXC_BAD_ACCESS / KERN_PROTECTION_FAILURE).
+    /// Erasing here and at `tabShellBase` interrupts that recursive metadata path.
+    private var tabShellWithLifecycleModifiers: AnyView {
+        AnyView(tabShellLifecycleChain)
+    }
+
+    /// Root ZStack erased before the lifecycle modifier chain so the chain
+    /// composes over AnyView instead of the nested tab-root tuple type.
+    private var tabShellBase: AnyView {
+        let _ = MainTabObservationPerf.rootShellEvaluated(selectedTab: selectedTab.rawValue)
+        return AnyView(
         ZStack {
             if selectedTab == .chat {
                 // Keep this ZStack child mounted so toggling DM open does not reshuffle tab roots.
                 chatTabRootBackground
                     .ignoresSafeArea()
-                    .opacity(chatViewModel.hidesFloatingTabBarForDirectChat ? 0 : 1)
+                    .opacity(chatMainTabState.hidesFloatingTabBarForDirectChat ? 0 : 1)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }
@@ -172,15 +263,29 @@ struct MainTabView: View {
                 chatTabRoot
             }
 
-            lazyPreservedRoot(tab: .account) {
-                SettingsScreen(
-                    viewModel: viewModel,
-                    selectedTab: selectedTabBinding,
-                    isAccountTabSelected: selectedTab == .account
+            // Account must NOT use sticky mount. SceneStorage can restore `.account` at
+            // process start; constructing SettingsScreen/ProfileIdentityCard then triggers
+            // SwiftUI generic-metadata stack overflow before Discover is forced.
+            // Mount Account only while it is the selected tab (true conditional, not opacity).
+            // During safe logout, never construct Account/Profile — keep Discover underneath the overlay.
+            if selectedTab == .account, !viewModel.isSafeLogoutBlockingUI {
+                // AnyView keeps SettingsScreen's deep concrete type out of the
+                // root ZStack tuple (same metadata-recursion protection as above).
+                AnyView(
+                    SettingsScreen(
+                        viewModel: viewModel,
+                        selectedTab: selectedTabBinding,
+                        isAccountTabSelected: true
+                    )
+#if DEBUG
+                    .onAppear {
+                        MainTabTypeSafetyDebug.log("accountLeafMounted=true")
+                    }
+#endif
                 )
             }
 
-            if !chatViewModel.hidesFloatingTabBarForDirectChat {
+            if !chatMainTabState.hidesFloatingTabBarForDirectChat {
                 floatingTabBarChrome
                     .opacity(discoverCalendarOverlayPresented && selectedTab == .discover ? 0.32 : 1)
                     .blur(radius: discoverCalendarOverlayPresented && selectedTab == .discover ? 1.25 : 0)
@@ -189,39 +294,57 @@ struct MainTabView: View {
 
             }
         }
+        )
+    }
+
+    private var tabShellLifecycleChain: some View {
+        tabShellBase
         .overlay(alignment: .top) {
             dmInAppNotificationBannerLayer
         }
         .onAppear {
+#if DEBUG
+            MainTabTypeSafetyDebug.log("rootShellAppeared selectedTab=\(selectedTab.rawValue)")
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                MainTabTypeSafetyDebug.log("rootShellAliveSeconds=10")
+                try? await Task.sleep(nanoseconds: 50_000_000_000)
+                MainTabTypeSafetyDebug.log("rootShellAliveSeconds=60")
+            }
+#endif
             if !Self.didResetImageCacheDiagnosticsThisProcess {
                 Self.didResetImageCacheDiagnosticsThisProcess = true
                 ImageCacheDebug.resetSessionStats(reason: "coldLaunch")
             }
             AdDebugContext.setVisibleTab(selectedTabStorage)
+            // Discover only at process start. Never mount a SceneStorage-restored Account
+            // root before forcing Discover — Account embeds ProfileIdentityCard and can
+            // blow the main-thread stack guard during SwiftUI metadata instantiation.
             mountedTabs.insert(.discover)
-            let restoredTab = selectedTab
-            mountTab(restoredTab, reason: "mainTabOnAppear")
-#if DEBUG
-            print("[PerfLazyTab] restoredSelected tab=\(restoredTab.rawValue)")
-            TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(restoredTab.rawValue)")
-            TabPerfDebug.log("[TabPerfDebug] cacheAge=\(tabCacheAgeDescription(restoredTab)) tab=\(restoredTab.rawValue)")
-            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(tabHasCachedData(restoredTab))")
-            for tab in AppTab.allCases where !mountedTabs.contains(tab) {
-                print("[PerfLazyTab] deferred tab=\(tab.rawValue)")
-            }
-#endif
-            viewModel.isCalendarTabSelected = selectedTab == .calendar
+            viewModel.isCalendarTabSelected = false
             viewModel.startAutomaticTimeZoneChangeMonitoringIfNeeded()
-            viewModel.isLiveTabSelected = selectedTab == .live
+            viewModel.isLiveTabSelected = false
+            viewModel.isDiscoverTabSelectedForEnrichment = true
             if !Self.hasForcedDiscoverTabThisProcess {
                 Self.hasForcedDiscoverTabThisProcess = true
                 selectTab(.discover, animated: false, reason: "startupForceDiscover")
 #if DEBUG
                 print("[StartupDiscover] selectedTab=\(AppTab.discover.rawValue)")
+                print("[PerfLazyTab] deferredAccountUntilSelected=true")
+                TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(AppTab.discover.rawValue)")
+#endif
+            } else {
+                mountTab(selectedTab, reason: "mainTabOnAppear")
+                viewModel.isCalendarTabSelected = selectedTab == .calendar
+                viewModel.isLiveTabSelected = selectedTab == .live
+                viewModel.isDiscoverTabSelectedForEnrichment = selectedTab == .discover
+#if DEBUG
+                print("[PerfLazyTab] restoredSelected tab=\(selectedTab.rawValue)")
+                TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(selectedTab.rawValue)")
 #endif
             }
 #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("-SettingsNavSequentialValidation") {
+            if ProfileSettingsSequentialNavValidation.isExplicitlyEnabled {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                     selectTab(.account, animated: false, reason: "settingsNavSequentialValidation")
                     print("[SettingsNavigationDebug] sequentialValidationForcedAccountTab=true")
@@ -229,6 +352,12 @@ struct MainTabView: View {
             }
 #endif
             logBottomTabStructure()
+            TabTapPerf.startLaunchStallWatchdog()
+            // After the first shell frame, so the Taptic handoff never lands on the first tab tap.
+            Task { @MainActor in
+                await Task.yield()
+                FGInteractionHaptics.prewarm()
+            }
             updateDirectChatReadStateVisibility()
             evaluateBlockingFanIdentitySetupPresentation(reason: "mainTabOnAppear")
             scheduleDeferredChatSocialRealtimeStartupIfNeeded()
@@ -241,11 +370,14 @@ struct MainTabView: View {
                 isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
                 reason: "mainTabOnAppear"
             )
+            if viewModel.isAuthenticatedForSocialFeatures {
+                ActivityStatusMinuteClock.shared.start(reason: "mainTabOnAppear")
+            }
 
             schedulePostAuthBadgeRefresh(reason: "mainTabOnAppear")
             routePostSignupDiscoverWelcomeGuideIfReady(reason: "mainTabOnAppear")
         }
-        .animation(.spring(response: 0.38, dampingFraction: 0.88), value: chatViewModel.hidesFloatingTabBarForDirectChat)
+        .animation(.spring(response: 0.38, dampingFraction: 0.88), value: chatMainTabState.hidesFloatingTabBarForDirectChat)
         .onChange(of: viewModel.switchToAccountForVenueClaim) { _, shouldSwitch in
             guard shouldSwitch else { return }
             viewModel.switchToAccountForVenueClaim = false
@@ -260,14 +392,13 @@ struct MainTabView: View {
         // Splash timeout fallback: finish critical path only; warm preload handles the rest.
         .task {
             guard performsInitialBootstrap else { return }
-            if LaunchBootstrapState.didCompleteCriticalBootstrap {
-                print("[LaunchPerf] duplicateSkipped reason=fallbackCriticalAlreadyCompleted")
-            } else {
-                await BootstrapLoadingCoordinator.performCriticalBootstrap(
-                    viewModel: viewModel,
-                    chatViewModel: chatViewModel
-                )
-            }
+            // Joins the launch-owned bootstrap. Starting a second one here previously ran auth
+            // restore under this `.task`, which the view tree could cancel mid-flight.
+            await BootstrapLoadingCoordinator.joinCriticalBootstrap(
+                viewModel: viewModel,
+                chatViewModel: chatViewModel,
+                owner: "mainTabFallback"
+            )
             if performsInitialBootstrap,
                !LaunchBootstrapState.didBootstrapScheduleWarmPreload {
                 LaunchWarmPreloadCoordinator.shared.beginIfNeeded(
@@ -294,8 +425,11 @@ struct MainTabView: View {
                 LaunchWarmPreloadCoordinator.shared.cancel()
                 UserPreferencesWarmCacheCoordinator.shared.cancel()
                 PresenceService.shared.stop(reason: "authUnavailable")
+                ActivityStatusMinuteClock.shared.stop(reason: "authUnavailable")
                 FansNearbyService.shared.clear(reason: "signedOut")
                 chatViewModel.clearForSignOut()
+                viewModel.clearPendingSaveProGameIntent()
+                viewModel.presentSaveProGameSignInPrompt = false
             } else {
                 scheduleDeferredChatSocialRealtimeStartupIfNeeded()
                 LaunchWarmPreloadCoordinator.shared.beginIfNeeded(
@@ -316,11 +450,13 @@ struct MainTabView: View {
                     isAuthenticated: true,
                     reason: "authBecameAvailable"
                 )
+                ActivityStatusMinuteClock.shared.start(reason: "authBecameAvailable")
                 schedulePostAuthBadgeRefresh(reason: "authBecameAvailable", force: true)
                 // Private Chat was cleared on sign-out; start B's inbox without waiting for the Chat tab.
                 Task { @MainActor in
                     await chatViewModel.beginInitialInboxLoadIfNeeded(source: "login")
                 }
+                viewModel.completePendingSaveProGameAfterLoginIfNeeded()
             }
         }
         .onChange(of: viewModel.currentUserAuthId) { oldValue, newValue in
@@ -352,8 +488,10 @@ struct MainTabView: View {
                 reason: "currentUserChanged"
             )
             if newValue == nil {
+                ActivityStatusMinuteClock.shared.stop(reason: "currentUserCleared")
                 cancelPostAuthBadgeRefresh(reason: "currentUserCleared")
             } else {
+                ActivityStatusMinuteClock.shared.start(reason: "currentUserChanged")
                 schedulePostAuthBadgeRefresh(reason: "currentUserChanged", force: true)
                 routePostAccountCreationLanguageSelectorIfReady(reason: "currentUserAuthIdChanged")
                 routePostSignupDiscoverWelcomeGuideIfReady(reason: "currentUserAuthIdChanged")
@@ -365,29 +503,16 @@ struct MainTabView: View {
             cancelTabPreloadTasks()
             LaunchWarmPreloadCoordinator.shared.cancel()
             PresenceService.shared.stop(reason: "privateSessionCleared")
-        }
-        .onChange(of: chatViewModel.unreadDirectMessageCount) { _, newValue in
-#if DEBUG
-            let visible = chatTabUnreadBadgeVisible(unreadCount: newValue)
-            print("[BadgeArchitectureDebug] MainTabView observed ChatViewModel id=\(ObjectIdentifier(chatViewModel))")
-            print("[ChatTabBadge] unreadCount=\(newValue)")
-            print("[ChatTabBadge] visible=\(visible)")
-            print("[MainActorDebug] MainTabView unread observer actor=MainActor")
-#endif
+            ActivityStatusMinuteClock.shared.stop(reason: "privateSessionCleared")
         }
         .onChange(of: viewModel.profileEditPresentationEvaluationKey) { _, _ in
             evaluateBlockingFanIdentitySetupPresentation(reason: "profilePresentationStateChanged")
         }
-        .onChange(of: chatViewModel.requiresSignIn) { _, _ in
-#if DEBUG
-            let n = chatViewModel.unreadDirectMessageCount
-            let visible = chatTabUnreadBadgeVisible(unreadCount: n)
-            print("[ChatTabBadge] unreadCount=\(n)")
-            print("[ChatTabBadge] visible=\(visible)")
-#endif
-        }
-        .onChange(of: chatViewModel.pendingDmOpenPreview) { _, preview in
+        .onChange(of: chatMainTabState.pendingDmOpenPreview) { _, preview in
             handlePendingDmOpenPreviewChange(preview)
+        }
+        .onChange(of: chatMainTabState.pendingGroupOpenConversationId) { _, groupId in
+            handlePendingGroupOpenConversationChange(groupId)
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -398,6 +523,21 @@ struct MainTabView: View {
             privateChatUnlockedForCurrentSelection = false
             updateDirectChatReadStateVisibility()
             viewModel.discoverNavigateToAccountForUserAuth = false
+        }
+        .sheet(isPresented: Binding(
+            get: { viewModel.presentSaveProGameSignInPrompt },
+            set: { presented in
+                if !presented {
+                    // Swipe-dismiss / system dismiss without choosing Sign In — cancel pending.
+                    if viewModel.presentSaveProGameSignInPrompt {
+                        viewModel.cancelSaveProGameSignInPrompt()
+                    }
+                } else {
+                    viewModel.presentSaveProGameSignInPrompt = true
+                }
+            }
+        )) {
+            SaveProGameSignInPromptSheet(viewModel: viewModel)
         }
         .onChange(of: viewModel.discoverFocusVenueId) { _, venueId in
             guard venueId != nil else { return }
@@ -416,6 +556,7 @@ struct MainTabView: View {
             }
 #endif
             guard let tab = AppTab(rawValue: newRaw) else { return }
+            TabTapPerf.shellVisible(tab: newRaw)
             mountTab(tab, reason: "selectedTabStorage")
             let switchStartedAt = tabSwitchStartAt ?? Date()
             let usedCachedData = tabSwitchCachedData ?? tabHasCachedData(tab)
@@ -429,18 +570,23 @@ struct MainTabView: View {
             DispatchQueue.main.async {
                 logTabFirstContentVisible(tab: tab, startedAt: switchStartedAt, usedCachedData: usedCachedData)
             }
-            AdDebugDiagnostics.logEvent(
-                event: "lazyTabMountState",
-                format: "context",
-                placement: "mainTabs",
-                fields: [
-                    "selectedTab": newRaw,
-                    "mountedTabs": mountedTabs.map(\.rawValue).sorted().joined(separator: ","),
-                    "discoverPreservedOffscreen": "\(newRaw != AppTab.discover.rawValue && mountedTabs.contains(.discover))"
-                ]
-            )
+            // Only build the diagnostics dictionary when ad diagnostics are actually
+            // enabled; otherwise this allocated + sorted + joined on every tab switch.
+            if AdDiagnostics.enabled {
+                AdDebugDiagnostics.logEvent(
+                    event: "lazyTabMountState",
+                    format: "context",
+                    placement: "mainTabs",
+                    fields: [
+                        "selectedTab": newRaw,
+                        "mountedTabs": mountedTabs.map(\.rawValue).sorted().joined(separator: ","),
+                        "discoverPreservedOffscreen": "\(newRaw != AppTab.discover.rawValue && mountedTabs.contains(.discover))"
+                    ]
+                )
+            }
             viewModel.isCalendarTabSelected = tab == .calendar
             viewModel.isLiveTabSelected = tab == .live
+            viewModel.isDiscoverTabSelectedForEnrichment = tab == .discover
             switch tab {
             case .discover:
                 privateChatUnlockedForCurrentSelection = false
@@ -542,27 +688,123 @@ struct MainTabView: View {
     private func mountTab(_ tab: AppTab, reason: String) {
         if mountedTabs.contains(tab) { return }
         mountedTabs.insert(tab)
+        scheduleFirstMountContentActivation(tab, reason: reason)
 #if DEBUG
         print("[PerfLazyTab] mounted tab=\(tab.rawValue) reason=\(reason)")
+        MainTabTypeSafetyDebug.log("tabLeafMounted=\(tab.rawValue) reason=\(reason)")
 #endif
     }
 
-    private func selectTab(_ tab: AppTab, animated: Bool = true, reason: String = "userSelection") {
-        beginTabSwitch(to: tab, reason: reason)
+    /// Two-phase first mount: lets SwiftUI commit the frame that flips the tab (chrome +
+    /// lightweight shell) before the heavy destination subtree is constructed. First
+    /// construction of a tab root (NavigationStack, lists, generic-metadata instantiation)
+    /// previously ran inside the same transaction as the selection write, so the visible
+    /// switch could not paint until it finished — the first-visit stall. The heavy content
+    /// mounts one runloop turn later; lifecycle is otherwise unchanged: the subtree still
+    /// constructs only after first selection and stays sticky afterwards.
+    private func scheduleFirstMountContentActivation(_ tab: AppTab, reason: String) {
+        guard !activatedTabContent.contains(tab) else { return }
+        let mountedAt = Date()
+        TabTapPerf.firstMountShellShown(tab: tab.rawValue, reason: reason)
+        Task { @MainActor in
+            // One hop lands after the runloop turn that commits the shell frame.
+            await Task.yield()
+            guard !activatedTabContent.contains(tab) else { return }
+            activatedTabContent.insert(tab)
+            TabTapPerf.firstMountContentActivated(
+                tab: tab.rawValue,
+                msFromMount: Int(Date().timeIntervalSince(mountedAt) * 1000),
+                reason: reason
+            )
+        }
+    }
+
+    /// After successful safe logout: land on Discover without remounting Account/Profile.
+    private func settleSafeLogoutToDiscoverRoot() {
+        SafeLogoutDebug.log("settle to Discover begin selected=\(selectedTab.rawValue)")
+        selectTab(.discover, animated: false, reason: "safeLogoutDiscoverReset")
+        // Drop sticky Account restoration for the next authenticated session.
+        // Account is conditional-only; forcing Discover prevents SceneStorage reopening Profile.
+        viewModel.acknowledgeSafeLogoutUISettled(reason: "mainTabDiscoverActive")
+        SafeLogoutDebug.log("settle to Discover complete")
+    }
+
+    /// After successful safe login / account switch: mount Discover first, never previous Account tab.
+    private func settleSafeLoginToDiscoverRoot() {
+        SafeLoginDebug.log("settle to Discover begin selected=\(selectedTab.rawValue)")
+        selectTab(.discover, animated: false, reason: "safeLoginDiscoverReset")
+        viewModel.acknowledgeSafeLoginUISettled(reason: "mainTabDiscoverActive")
+        SafeLoginDebug.log("settle to Discover complete")
+    }
+
+    private func selectTab(
+        _ tab: AppTab,
+        animated: Bool = true,
+        reason: String = "userSelection",
+        isUserInitiated: Bool = false
+    ) {
+        let touchAt = Date()
+        let previousTab = selectedTab
+        if !isUserInitiated, previousTab != tab, lastManualTabSelection == previousTab {
+            TabTapPerf.selectionOverwritten(from: previousTab.rawValue, to: tab.rawValue, reason: reason)
+        }
+        // Everything up to the storage write must stay cheap: this is the only work standing
+        // between the touch and the frame that shows the new tab. Diagnostics and preload
+        // scheduling run afterwards, before SwiftUI applies the transaction.
+        noteTabSwitchStart(from: previousTab, to: tab)
         mountTab(tab, reason: reason)
+        // Tab chrome must flip selection synchronously without spring-wrapping the whole shell.
+        // Animation here delayed perceived selection and competed with opacity crossfades.
         if animated {
-            withAnimation(.spring()) {
+            withAnimation(.easeInOut(duration: 0.12)) {
                 selectedTabStorage = tab.rawValue
             }
         } else {
             selectedTabStorage = tab.rawValue
         }
+        let selectMs = Int(Date().timeIntervalSince(touchAt) * 1000)
+        TabTapPerf.selectedTabChanged(tab: tab.rawValue)
+
+        finishTabSwitchBookkeeping(from: previousTab, to: tab, reason: reason)
+        TabPerformanceDebug.log("tab touch received requested=\(tab.rawValue) reason=\(reason)")
+        TabPerformanceDebug.log("selected-tab state changed to=\(tab.rawValue) touchToSelectionMs=\(selectMs)")
+        if selectMs >= 50 {
+            TabPerformanceDebug.log("synchronous main-thread intervalMs=\(selectMs) source=selectTab")
+            TabTapPerf.mainActorBusy(ms: Double(selectMs), source: "selectTab")
+        }
+    }
+
+    /// Floating-bar tap entry point for every tab.
+    ///
+    /// Selection is written first; haptics run afterwards so the Taptic Engine handoff never sits
+    /// between the touch and the frame that shows the new tab.
+    private func handleTabBarTap(_ tab: AppTab, reason: String) {
+        TabTapPerf.tapReceived(
+            tab: tab.rawValue,
+            reason: reason,
+            alreadySelected: selectedTab == tab,
+            overlayHitTestable: tabBarOverlayHitTestable
+        )
+        lastManualTabSelection = tab
+        UserInteractionPriorityGate.noteUserTabInteraction(tab.rawValue)
+        selectTab(tab, animated: false, reason: reason, isUserInitiated: true)
+        FGInteractionHaptics.selection()
+    }
+
+    /// True when a full-screen layer above the floating tab bar is currently accepting touches.
+    /// Used only for diagnostics — it mirrors the `allowsHitTesting` conditions already in the shell.
+    private var tabBarOverlayHitTestable: Bool {
+        if viewModel.isSafeLogoutBlockingUI { return true }
+        if viewModel.isSafeLoginBlockingUI { return true }
+        if viewModel.wowMomentOverlay.presentation != nil { return true }
+        if discoverCalendarOverlayPresented, selectedTab == .discover { return true }
+        return false
     }
 
     /// Selects Discover for a newly completed fan signup unless a higher-priority pending route exists.
     private func routePostSignupDiscoverWelcomeGuideIfReady(reason: String) {
         guard viewModel.hasPostSignupDiscoverWelcomeGuide else { return }
-        if chatViewModel.pendingDmOpenPreview != nil {
+        if chatMainTabState.pendingDmOpenPreview != nil {
 #if DEBUG
             print("[PostSignupRoute] deferDiscover reason=pendingDm source=\(reason)")
 #endif
@@ -580,7 +822,7 @@ struct MainTabView: View {
     /// Selects Discover so the post-account-creation language selector can present (fans and businesses).
     private func routePostAccountCreationLanguageSelectorIfReady(reason: String) {
         guard viewModel.hasPendingPostAccountCreationLanguageSelector else { return }
-        if chatViewModel.pendingDmOpenPreview != nil {
+        if chatMainTabState.pendingDmOpenPreview != nil {
 #if DEBUG
             print("[FirstLaunchLanguage] deferDiscover reason=pendingDm source=\(reason)")
 #endif
@@ -595,39 +837,51 @@ struct MainTabView: View {
         selectTab(.discover, animated: true, reason: "postAccountCreationLanguage:\(reason)")
     }
 
-    private func beginTabSwitch(to tab: AppTab, reason: String) {
-        tabSwitchFromTab = selectedTab
+    /// Cheap state the `selectedTabStorage` observer needs; must run before the selection write.
+    private func noteTabSwitchStart(from previousTab: AppTab, to tab: AppTab) {
+        tabSwitchFromTab = previousTab
         tabSwitchStartAt = Date()
         tabSwitchCachedData = tabHasCachedData(tab)
+    }
+
+    /// Diagnostics + preload scheduling. Runs after the selection write so neither can delay it.
+    private func finishTabSwitchBookkeeping(from previousTab: AppTab, to tab: AppTab, reason: String) {
         let cacheHit = tabSwitchCachedData ?? false
         TabPerf.selectedTab(tab.rawValue)
-        TabPerf.tabSwitchStarted(from: tabSwitchFromTab?.rawValue, to: tab.rawValue)
+        TabPerf.tabSwitchStarted(from: previousTab.rawValue, to: tab.rawValue)
         AppPerfDebug.tabSwitchStart(
             tab: tab.rawValue,
-            from: tabSwitchFromTab?.rawValue,
+            from: previousTab.rawValue,
             cacheHit: cacheHit,
             source: reason
         )
         startTabIntentPreload(tab, reason: reason)
         UIPerformanceDiagnostics.signpost(
             "tab switch",
-            "from=\(tabSwitchFromTab?.rawValue ?? "unknown") to=\(tab.rawValue) reason=\(reason)"
+            "from=\(previousTab.rawValue) to=\(tab.rawValue) reason=\(reason)"
         )
         DebugLogGate.tabSwitchPerfVerbose(
-            "[TabSwitchPerf] begin from=\(tabSwitchFromTab?.rawValue ?? "unknown") to=\(tab.rawValue) cached=\(tabSwitchCachedData ?? false) reason=\(reason)"
+            "[TabSwitchPerf] begin from=\(previousTab.rawValue) to=\(tab.rawValue) cached=\(cacheHit) reason=\(reason)"
         )
 #if DEBUG
         if DebugLogGate.verboseTabSwitchPerfLogging {
-            print("[UISmoothnessDebug] tabTransition=\(tabSwitchFromTab?.rawValue ?? "unknown")->\(tab.rawValue)")
+            print("[UISmoothnessDebug] tabTransition=\(previousTab.rawValue)->\(tab.rawValue)")
             TabPerfDebug.log("[TabPerfDebug] selectedTab=\(tab.rawValue)")
             TabPerfDebug.log("[TabPerfDebug] tabSwitchStart=\(tabSwitchStartAt?.timeIntervalSince1970 ?? 0)")
-            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(tabSwitchCachedData ?? false)")
+            TabPerfDebug.log("[TabPerfDebug] usedCachedData=\(cacheHit)")
             TabPerfDebug.log("[TabPerfDebug] reason=\(reason)")
         }
 #endif
     }
 
+    private func beginTabSwitch(to tab: AppTab, reason: String) {
+        let previousTab = selectedTab
+        noteTabSwitchStart(from: previousTab, to: tab)
+        finishTabSwitchBookkeeping(from: previousTab, to: tab, reason: reason)
+    }
+
     private func logTabFirstContentVisible(tab: AppTab, startedAt: Date, usedCachedData: Bool) {
+        TabTapPerf.firstFrame(tab: tab.rawValue, cachedContentUsable: usedCachedData)
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
         let from = tabSwitchFromTab?.rawValue ?? "unknown"
         TabPerf.tabSwitchRendered(tab: tab.rawValue, durationMs: ms)
@@ -643,12 +897,20 @@ struct MainTabView: View {
         case .account:
             UIPerformanceDiagnostics.signpost("Profile tab open", "ms=\(ms)")
             DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=account readyMs=\(ms)")
+#if DEBUG
+            // Lock + reduce/sort over cache stats: DEBUG-only so it never runs on the
+            // Release tab-selection path.
             ImageCacheDebug.printSessionSummary(reason: "tabVisible:account")
+            ImagePerf.summary(context: "tabVisible:account")
+#endif
         case .following:
             DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=following readyMs=\(ms)")
         case .discover:
             DebugLogGate.tabSwitchPerfVerbose("[TabPreloadDebug] tab=discover readyMs=\(ms)")
+#if DEBUG
             ImageCacheDebug.printSessionSummary(reason: "tabVisible:discover")
+            ImagePerf.summary(context: "tabVisible:discover")
+#endif
         default:
             break
         }
@@ -666,6 +928,14 @@ struct MainTabView: View {
     }
 
     private func startTabIntentPreload(_ tab: AppTab, reason: String) {
+        // Launch already ran discover core + painted from cache; skip deferred Task.sleep + empty work.
+        if tab == .discover,
+           !viewModel.bars.isEmpty,
+           reason.contains("startup") || reason == "startupForceDiscover" {
+            StartupPerf.duplicateSkipped(reason: "discoverTabIntentStartupWarm")
+            TabPerf.refreshSkipped(name: "tabIntentPreload:discover", reason: "startupAlreadyWarmed")
+            return
+        }
         let warmAtStart = tabHasCachedData(tab)
         if let last = lastTabPreloadAt[tab],
            Date().timeIntervalSince(last) < Self.tabPreloadFreshnessInterval,
@@ -804,6 +1074,11 @@ struct MainTabView: View {
         case .calendar:
             if viewModel.canFanUsePickupGamesUI {
                 await viewModel.refreshCalendarTabPickupSources(reason: "tabPreload")
+                // Prefer joining launch warm when it already seeded Schedule caches.
+                if viewModel.lastCalendarTabPickupSourcesRefreshAt != nil {
+                    CalendarActivationPerf.warmJoined(source: "tabPreload")
+                }
+                SchedulePerf.preload(action: "completed", source: "tabPreload")
             }
         case .live:
             if viewModel.liveMatchesAreFreshForTabPreload(
@@ -908,10 +1183,22 @@ struct MainTabView: View {
         }
     }
 
+    private func handlePendingGroupOpenConversationChange(_ groupId: UUID?) {
+        guard groupId != nil else { return }
+        if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
+            Task { await selectChatTabAfterDeviceAuth() }
+        } else {
+            privateChatUnlockedForCurrentSelection = true
+            selectTab(.chat, reason: "pendingGroupOpenConversationId")
+            updateDirectChatReadStateVisibility()
+        }
+    }
+
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         guard phase == .active else {
             viewModel.noteAnnouncementsAppBackgrounded()
             PresenceService.shared.stop(reason: "scenePhase.\(String(describing: phase))")
+            ActivityStatusMinuteClock.shared.stop(reason: "scenePhase.\(String(describing: phase))")
             if requireDeviceAuthForPrivateChat {
                 privateChatUnlockedForCurrentSelection = false
                 updateDirectChatReadStateVisibility()
@@ -968,7 +1255,8 @@ struct MainTabView: View {
         if !viewModel.isAuthenticatedForSocialFeatures {
             await MainActor.run {
                 privateChatUnlockedForCurrentSelection = true
-                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth")
+                lastManualTabSelection = .chat
+                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth", isUserInitiated: true)
                 updateDirectChatReadStateVisibility()
             }
             return
@@ -978,7 +1266,8 @@ struct MainTabView: View {
             print("[PrivateChatSecurityDebug] biometricPromptSkippedReason=settingDisabled")
             await MainActor.run {
                 privateChatUnlockedForCurrentSelection = true
-                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth")
+                lastManualTabSelection = .chat
+                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth", isUserInitiated: true)
                 updateDirectChatReadStateVisibility()
             }
             return
@@ -990,7 +1279,8 @@ struct MainTabView: View {
             switch outcome {
             case .granted:
                 privateChatUnlockedForCurrentSelection = true
-                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth")
+                lastManualTabSelection = .chat
+                selectTab(.chat, reason: "selectChatTabAfterDeviceAuth", isUserInitiated: true)
                 updateDirectChatReadStateVisibility()
             case .authenticationFailed:
                 privateChatUnlockedForCurrentSelection = false
@@ -1087,9 +1377,18 @@ struct MainTabView: View {
         DebugLogGate.debug("[NotificationPerf] badgeRefreshStarted trigger=\(reason)")
 
         await chatViewModel.refreshFriendRequestListsOnly()
-        DebugLogGate.debug("[BadgeLoginRefreshDebug] pending friend requests count=\(chatViewModel.pendingBadgeCount)")
+        DebugLogGate.debug("[BadgeLoginRefreshDebug] pending friend requests count=\(chatTabBadgeState.pendingBadgeCount)")
 
-        await chatViewModel.refreshUnreadDirectMessageCount()
+        // Launch coalesces unread (critical → warm); force on auth change / foreground so badges stay live.
+        let forceUnread =
+            reason.contains("auth")
+            || reason.contains("currentUser")
+            || reason == "foreground"
+            || reason.contains("BecameAvailable")
+        await chatViewModel.refreshUnreadDirectMessageCount(force: forceUnread)
+        if !forceUnread {
+            StartupPerf.phase("postAuthBadgeUnreadCoalesceAllowed", details: "reason=\(reason)")
+        }
         await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
 
         if viewModel.canFanUsePickupGamesUI {
@@ -1106,10 +1405,10 @@ struct MainTabView: View {
         }
 
         DebugLogGate.debug(
-            "[BadgeLoginRefreshDebug] tab badge updated friendRequests=\(chatViewModel.pendingBadgeCount) dmUnread=\(chatViewModel.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count) hostedPickupRequests=\(viewModel.pendingPickupGameJoinRequestCount) playingPickupCards=\(viewModel.myPickupGameJoinRequestCards.count)"
+            "[BadgeLoginRefreshDebug] tab badge updated friendRequests=\(chatTabBadgeState.pendingBadgeCount) dmUnread=\(chatTabBadgeState.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count) hostedPickupRequests=\(viewModel.pendingPickupGameJoinRequestCount) playingPickupCards=\(viewModel.myPickupGameJoinRequestCards.count)"
         )
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        DebugLogGate.debug("[NotificationPerf] badgeRefreshFinished trigger=\(reason) durationMs=\(ms) friendRequests=\(chatViewModel.pendingBadgeCount) dmUnread=\(chatViewModel.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count)")
+        DebugLogGate.debug("[NotificationPerf] badgeRefreshFinished trigger=\(reason) durationMs=\(ms) friendRequests=\(chatTabBadgeState.pendingBadgeCount) dmUnread=\(chatTabBadgeState.unreadDirectMessageCount) pickupInvites=\(viewModel.incomingPickupGameInvites.count)")
     }
 
     private func logBottomTabStructure() {
@@ -1121,8 +1420,8 @@ struct MainTabView: View {
     /// In-app toast when a DM arrives while the thread isn’t open (see ``ChatViewModel/dmInAppNotification``).
     private var dmInAppNotificationBannerLayer: some View {
         VStack {
-            if let banner = chatViewModel.dmInAppNotification,
-               !chatViewModel.hidesFloatingTabBarForDirectChat {
+            if let banner = chatMainTabState.dmInAppNotification,
+               !chatMainTabState.hidesFloatingTabBarForDirectChat {
                 dmInAppNotificationCard(banner)
                     .padding(.horizontal, 14)
                     .padding(.top, 12)
@@ -1130,7 +1429,7 @@ struct MainTabView: View {
                     .task(id: banner.id) {
                         try? await Task.sleep(nanoseconds: 8_500_000_000)
                         await MainActor.run {
-                            if chatViewModel.dmInAppNotification?.id == banner.id {
+                            if chatMainTabState.dmInAppNotification?.id == banner.id {
                                 chatViewModel.dismissDmInAppNotification()
                             }
                         }
@@ -1139,8 +1438,8 @@ struct MainTabView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .allowsHitTesting(chatViewModel.dmInAppNotification != nil && !chatViewModel.hidesFloatingTabBarForDirectChat)
-        .animation(.spring(response: 0.38, dampingFraction: 0.86), value: chatViewModel.dmInAppNotification?.id)
+        .allowsHitTesting(chatMainTabState.dmInAppNotification != nil && !chatMainTabState.hidesFloatingTabBarForDirectChat)
+        .animation(.spring(response: 0.38, dampingFraction: 0.86), value: chatMainTabState.dmInAppNotification?.id)
         .zIndex(90)
     }
 
@@ -1193,7 +1492,8 @@ struct MainTabView: View {
 
     /// Independent overlay: does not participate in `DirectChatView` layout; hidden during DM threads via ``ChatViewModel/hidesFloatingTabBarForDirectChat``.
     private var floatingTabBarChrome: some View {
-        VStack {
+        let _ = MainTabObservationPerf.floatingBarEvaluated(selectedTab: selectedTab.rawValue)
+        return VStack {
             Spacer()
 
             HStack(spacing: 6) {
@@ -1208,12 +1508,12 @@ struct MainTabView: View {
                 chatTabButton()
 
                 Button {
-                    FGInteractionHaptics.selection()
-                    selectTab(.account, reason: "accountTabButton")
+                    handleTabBarTap(.account, reason: "accountTabButton")
                 } label: {
                     accountTabAvatar
                 }
                 .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+                .disabled(viewModel.isSafeLogoutBlockingUI)
             }
             .padding(8)
             .background {
@@ -1234,23 +1534,46 @@ struct MainTabView: View {
             .padding(.horizontal)
             .padding(.bottom, 6)
         }
-        .allowsHitTesting(true)
+        .allowsHitTesting(!viewModel.isSafeLogoutBlockingUI)
         .zIndex(2)
+        .opacity(viewModel.isSafeLogoutBlockingUI ? 0.45 : 1)
     }
 
     /// Lazy sticky mount: unmounted tabs render nothing; mounted tabs use off-screen preservation when inactive.
-    @ViewBuilder
+    /// Returns AnyView so each tab root's deep concrete type stays out of the
+    /// root ZStack tuple (generic-metadata stack-overflow protection).
+    /// Content is still constructed lazily — only after the tab is mounted.
     private func lazyPreservedRoot<Content: View>(
         tab: AppTab,
         @ViewBuilder content: () -> Content
-    ) -> some View {
-        if mountedTabs.contains(tab) {
-            preservedRoot(tab: tab, content: content)
-        } else {
-            Color.clear
-                .frame(width: 0, height: 0)
-                .accessibilityHidden(true)
+    ) -> AnyView {
+        guard mountedTabs.contains(tab) else {
+            return AnyView(
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            )
         }
+        guard activatedTabContent.contains(tab) else {
+            // One-frame lightweight shell while the heavy subtree's first construction is
+            // deferred to the next runloop turn (see scheduleFirstMountContentActivation).
+            return AnyView(preservedRoot(tab: tab) { firstMountShellPlaceholder(for: tab) })
+        }
+        return AnyView(preservedRoot(tab: tab, content: content))
+    }
+
+    /// Matches each destination's base background so the shell → content swap is imperceptible.
+    private func firstMountShellPlaceholder(for tab: AppTab) -> some View {
+        Group {
+            if tab == .chat {
+                chatTabRootBackground
+            } else {
+                FGColor.screenGradient(colorScheme)
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     // Renders a tab’s root off-screen when inactive so SwiftUI state is preserved without receiving touches.
@@ -1264,14 +1587,14 @@ struct MainTabView: View {
         // does not expand under the keyboard. Never branch the active Chat root — that recreates
         // FriendsTabView/NavigationStack and pops Direct Chat.
         let collapseInactiveForDirectChat =
-            chatViewModel.hidesFloatingTabBarForDirectChat && !isSelected
+            chatMainTabState.hidesFloatingTabBarForDirectChat && !isSelected
         content()
             .environment(\.hostTabAdInteractionEnabled, isSelected)
             .opacity(isSelected ? 1 : 0)
             .allowsHitTesting(isSelected)
             .accessibilityHidden(!isSelected)
             .zIndex(isSelected ? 1 : 0)
-            .animation(collapseInactiveForDirectChat ? nil : .easeInOut(duration: 0.18), value: isSelected)
+            .animation(nil, value: isSelected)
             .modifier(DirectChatInactiveTabCollapseModifier(collapse: collapseInactiveForDirectChat))
             .id(tab)
     }
@@ -1286,7 +1609,7 @@ struct MainTabView: View {
         )
         .padding(
             .bottom,
-            chatViewModel.hidesFloatingTabBarForDirectChat ? 0 : Self.floatingTabBarStackHeight
+            chatMainTabState.hidesFloatingTabBarForDirectChat ? 0 : Self.floatingTabBarStackHeight
         )
         .background(chatTabRootBackground.ignoresSafeArea())
     }
@@ -1371,45 +1694,75 @@ struct MainTabView: View {
     
     private func chatTabButton() -> some View {
         Button {
-            FGInteractionHaptics.selection()
-            startTabIntentPreload(.chat, reason: "chatTabButtonIntent")
-            Task { await selectChatTabAfterDeviceAuth() }
+            // Face ID off / signed-out: select synchronously on first tap (no Task hop).
+            if !viewModel.isAuthenticatedForSocialFeatures || !requireDeviceAuthForPrivateChat {
+                privateChatUnlockedForCurrentSelection = true
+                handleTabBarTap(.chat, reason: "chatTabButton")
+                updateDirectChatReadStateVisibility()
+            } else {
+                TabTapPerf.tapReceived(
+                    tab: "chat",
+                    reason: "chatTabButtonDeviceAuth",
+                    alreadySelected: selectedTab == .chat,
+                    overlayHitTestable: tabBarOverlayHitTestable
+                )
+                UserInteractionPriorityGate.noteUserTabInteraction("chat")
+                FGInteractionHaptics.selection()
+                TabPerformanceDebug.log("tab touch received requested=chat reason=chatTabButton")
+                // Warm the inbox while the biometric prompt is up; `selectTab` is not reached
+                // on this branch until the gate resolves, so it cannot schedule the preload.
+                startTabIntentPreload(.chat, reason: "chatTabButtonIntent")
+                Task { await selectChatTabAfterDeviceAuth() }
+            }
         } label: {
-            ZStack(alignment: .topTrailing) {
-                HStack(spacing: 5) {
-                    chatTabMessageIconWithUnreadBadge
-                    if selectedTab == .chat {
-                        Text(localized("chat"))
+            MainTabChatBadgeObserver(state: chatTabBadgeState) { unreadCount, pendingCount, requiresSignIn in
+                ZStack(alignment: .topTrailing) {
+                    HStack(spacing: 5) {
+                        chatTabMessageIconWithUnreadBadge(
+                            unreadCount: unreadCount,
+                            requiresSignIn: requiresSignIn
+                        )
+                        if selectedTab == .chat {
+                            Text(localized("chat"))
+                        }
                     }
-                }
-                .font(.caption)
-                .fontWeight(.bold)
-                .padding(.horizontal, selectedTab == .chat ? 12 : 10)
-                .padding(.vertical, 10)
-                .foregroundStyle(selectedTab == .chat ? Color.white : unselectedTabForegroundColor)
-                .background(selectedTab == .chat ? selectedTabBackgroundColor : Color.clear)
-                .clipShape(Capsule())
-                .softActiveGlow(selectedTab == .chat, color: FGColor.accentBlue)
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .padding(.horizontal, selectedTab == .chat ? 12 : 10)
+                    .padding(.vertical, 10)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(selectedTab == .chat ? Color.white : unselectedTabForegroundColor)
+                    .background(selectedTab == .chat ? selectedTabBackgroundColor : Color.clear)
+                    .clipShape(Capsule())
+                    .softActiveGlow(selectedTab == .chat, color: FGColor.accentBlue)
 
-                if chatViewModel.pendingBadgeCount > 0 {
-                    chatTabPillBadge(count: chatViewModel.pendingBadgeCount)
-                        .offset(x: 6, y: -6)
+                    if pendingCount > 0 {
+                        chatTabPillBadge(count: pendingCount)
+                            .offset(x: 6, y: -6)
+                    }
                 }
             }
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
     /// Same gate as ``FriendsTabView`` inbox (not ``MapViewModel/canUsePrivateChat``, which can lag session used by ``ChatViewModel``).
-    private func chatTabUnreadBadgeVisible(unreadCount: Int) -> Bool {
-        !chatViewModel.requiresSignIn && unreadCount > 0
+    private func chatTabUnreadBadgeVisible(unreadCount: Int, requiresSignIn: Bool) -> Bool {
+        !requiresSignIn && unreadCount > 0
     }
 
     /// Manual unread pill: SwiftUI `.badge` on custom floating-tab labels is unreliable; match inbox ``unreadDirectMessageCount``.
     /// Fixed layout size + padded overlay keeps the pill inside the tab row ``Capsule`` / floating bar clips (offsets do not expand layout).
-    private var chatTabMessageIconWithUnreadBadge: some View {
-        let n = chatViewModel.unreadDirectMessageCount
-        let show = chatTabUnreadBadgeVisible(unreadCount: n)
+    private func chatTabMessageIconWithUnreadBadge(
+        unreadCount n: Int,
+        requiresSignIn: Bool
+    ) -> some View {
+        let show = chatTabUnreadBadgeVisible(
+            unreadCount: n,
+            requiresSignIn: requiresSignIn
+        )
         let label = n > 99 ? "99+" : "\(n)"
 
         return ZStack {
@@ -1460,8 +1813,7 @@ struct MainTabView: View {
 
     private func calendarTabButton() -> some View {
         return Button {
-            FGInteractionHaptics.selection()
-            selectTab(.calendar, reason: "calendarTabButton")
+            handleTabBarTap(.calendar, reason: "calendarTabButton")
         } label: {
             ZStack(alignment: .topTrailing) {
                 HStack(spacing: 5) {
@@ -1475,6 +1827,8 @@ struct MainTabView: View {
                 .fontWeight(.bold)
                 .padding(.horizontal, selectedTab == .calendar ? 12 : 10)
                 .padding(.vertical, 10)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
                 .foregroundStyle(selectedTab == .calendar ? Color.white : unselectedTabForegroundColor)
                 .background(selectedTab == .calendar ? selectedTabBackgroundColor : Color.clear)
                 .clipShape(Capsule())
@@ -1483,12 +1837,12 @@ struct MainTabView: View {
             }
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
     private func followingTabButton() -> some View {
         Button {
-            FGInteractionHaptics.selection()
-            selectTab(.following, reason: "followingTabButton")
+            handleTabBarTap(.following, reason: "followingTabButton")
         } label: {
             ZStack(alignment: .topTrailing) {
                 HStack(spacing: 5) {
@@ -1502,6 +1856,8 @@ struct MainTabView: View {
                 .fontWeight(.bold)
                 .padding(.horizontal, selectedTab == .following ? 12 : 10)
                 .padding(.vertical, 10)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
                 .foregroundStyle(selectedTab == .following ? Color.white : unselectedTabForegroundColor)
                 .background(selectedTab == .following ? selectedTabBackgroundColor : Color.clear)
                 .clipShape(Capsule())
@@ -1518,6 +1874,7 @@ struct MainTabView: View {
             }
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
     private var goingTabHasActivity: Bool {
@@ -1529,8 +1886,7 @@ struct MainTabView: View {
 
     private func tabButton(_ tab: AppTab, title: String, icon: String, glow: Color = FGColor.accentBlue) -> some View {
         Button {
-            FGInteractionHaptics.selection()
-            selectTab(tab, reason: "tabButton")
+            handleTabBarTap(tab, reason: "tabButton")
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: icon)
@@ -1543,12 +1899,15 @@ struct MainTabView: View {
             .fontWeight(.bold)
             .padding(.horizontal, selectedTab == tab ? 12 : 10)
             .padding(.vertical, 10)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
             .foregroundStyle(selectedTab == tab ? Color.white : unselectedTabForegroundColor)
             .background(selectedTab == tab ? selectedTabBackgroundColor : Color.clear)
             .clipShape(Capsule())
             .softActiveGlow(selectedTab == tab, color: glow)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .disabled(viewModel.isSafeLogoutBlockingUI)
     }
     
     private var accountTabIcon: String {
@@ -1640,6 +1999,7 @@ struct MainTabView: View {
     }
 
     private func startChatSocialRealtimeIfNeeded(reason: String) async {
+        guard !viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         guard viewModel.isAuthenticatedForSocialFeatures else { return }
         guard !didStartChatSocialRealtime else {
             AppPerfDebug.realtimeRestarted(false, source: "chatSocialAlreadyStarted:\(reason)")
@@ -1661,6 +2021,14 @@ struct MainTabView: View {
             let ms = UIPerformanceDiagnostics.elapsedMs(since: foregroundRefreshStart)
             let currentTab = AppTab(rawValue: selectedTabStorage)?.rawValue ?? "unknown"
             UIPerformanceDiagnostics.log("visibleTabForegroundRefresh ms=\(UIPerformanceDiagnostics.formattedMs(ms)) tab=\(currentTab)")
+        }
+
+        // User-initiated logout owns teardown — never restart presence/session/chat mid-pipeline.
+        if viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout {
+#if DEBUG
+            print("[Auth] foregroundAuthenticatedWorkSkipped reason=logoutInProgress")
+#endif
+            return
         }
 
         await viewModel.refreshDiscoverBannerAnnouncementOnAppForeground()
@@ -1721,6 +2089,7 @@ struct MainTabView: View {
             isAuthenticated: true,
             reason: "appBecameActive"
         )
+        ActivityStatusMinuteClock.shared.start(reason: "appBecameActive")
         schedulePostAuthBadgeRefresh(reason: "foreground")
         await viewModel.checkCurrentUserAdminStatus()
 
@@ -1887,6 +2256,35 @@ struct MainTabView: View {
     }
 }
 
+/// Shallow badge leaf: only this subtree observes unread/request/auth-gate changes.
+private struct MainTabChatBadgeObserver<Content: View>: View {
+    @ObservedObject var state: ChatTabBadgeState
+    @ViewBuilder let content: (_ unreadCount: Int, _ pendingCount: Int, _ requiresSignIn: Bool) -> Content
+
+    var body: some View {
+        let _ = MainTabObservationPerf.chatBadgeLeafEvaluated()
+        content(
+            state.unreadDirectMessageCount,
+            state.pendingBadgeCount,
+            state.requiresSignIn
+        )
+        .onChange(of: state.unreadDirectMessageCount) { _, count in
+#if DEBUG
+            print("[ChatTabBadge] unreadCount=\(count)")
+            print("[ChatTabBadge] visible=\(!state.requiresSignIn && count > 0)")
+            print("[MainActorDebug] MainTabChatBadgeObserver actor=MainActor")
+#endif
+        }
+        .onChange(of: state.requiresSignIn) { _, requiresSignIn in
+#if DEBUG
+            let count = state.unreadDirectMessageCount
+            print("[ChatTabBadge] unreadCount=\(count)")
+            print("[ChatTabBadge] visible=\(!requiresSignIn && count > 0)")
+#endif
+        }
+    }
+}
+
 /// Collapses inactive tab roots only while Direct Chat is open.
 /// Active Chat tab always uses `collapse == false`, so its NavigationStack identity stays stable.
 private struct DirectChatInactiveTabCollapseModifier: ViewModifier {
@@ -1904,3 +2302,61 @@ private struct DirectChatInactiveTabCollapseModifier: ViewModifier {
         }
     }
 }
+
+/// Root-owned transient overlays (FanXP reward + Wow Moment toasts) as a named
+/// leaf so their concrete types stay out of MainTabView.body's modifier chain.
+struct MainTabTransientOverlayLayer: View {
+    @ObservedObject var viewModel: MapViewModel
+
+    var body: some View {
+        ZStack {
+            FanXPRewardOverlayHost(manager: viewModel.fanXPRewardOverlay)
+                .id(ObjectIdentifier(viewModel.fanXPRewardOverlay))
+            WowMomentToastHost(manager: viewModel.wowMomentOverlay)
+                .id(ObjectIdentifier(viewModel.wowMomentOverlay))
+        }
+#if DEBUG
+        .onAppear {
+            MainTabTypeSafetyDebug.log("transientOverlayMounted=true")
+        }
+#endif
+    }
+}
+
+/// Blocking session-transition overlays (safe logout / safe login) as a named
+/// leaf. Mounted conditionally, exactly as the previous inline overlay was.
+struct MainTabSessionOverlayLayer: View {
+    @ObservedObject var viewModel: MapViewModel
+
+    var body: some View {
+        if viewModel.isSafeLogoutBlockingUI {
+            SafeLogoutProgressOverlay(viewModel: viewModel)
+                .zIndex(10_000)
+                .transition(.opacity)
+#if DEBUG
+                .onAppear {
+                    MainTabTypeSafetyDebug.log("sessionOverlayMounted=safeLogout")
+                }
+#endif
+        } else if viewModel.isSafeLoginBlockingUI {
+            SafeLoginProgressOverlay(viewModel: viewModel)
+                .zIndex(10_000)
+                .transition(.opacity)
+#if DEBUG
+                .onAppear {
+                    MainTabTypeSafetyDebug.log("sessionOverlayMounted=safeLogin")
+                }
+#endif
+        }
+    }
+}
+
+#if DEBUG
+enum MainTabTypeSafetyDebug {
+    private nonisolated static let banner = "===== MAIN TAB TYPE SAFETY ====="
+
+    nonisolated static func log(_ message: String) {
+        print("\(banner) \(message)")
+    }
+}
+#endif

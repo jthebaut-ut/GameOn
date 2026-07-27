@@ -19,8 +19,8 @@ enum PublicProfileSheetLayout {
 
     @MainActor
     static func horizontalPadding(screenWidth: CGFloat? = nil) -> CGFloat {
-        let resolvedWidth = screenWidth ?? currentWindowSceneScreenWidth()
-        return resolvedWidth <= 375 ? 20 : 22
+        // Shared with own-profile outer inset (adaptive: SE 16 / standard 6). Avoid stacking a second chrome inset.
+        ProfileHeroMetrics.outerInset(screenWidth: screenWidth)
     }
 
     static func openToGridColumns(tileWidth: CGFloat = openToTileWidth, spacing: CGFloat = openToTileSpacing) -> [GridItem] {
@@ -34,20 +34,6 @@ enum PublicProfileSheetLayout {
     static func openToGridMaxWidth(itemCount: Int, tileWidth: CGFloat = openToTileWidth, spacing: CGFloat = openToTileSpacing) -> CGFloat {
         let count = max(itemCount, 1)
         return CGFloat(count) * tileWidth + CGFloat(max(0, count - 1)) * spacing
-    }
-
-    @MainActor
-    private static func currentWindowSceneScreenWidth() -> CGFloat {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .first(where: { $0.activationState == .foregroundActive })?
-            .screen
-            .bounds
-            .width
-            ?? UIApplication.shared.connectedScenes
-                .compactMap { ($0 as? UIWindowScene)?.screen.bounds.width }
-                .first
-            ?? 393
     }
 }
 
@@ -88,21 +74,20 @@ private struct PublicProfileEditorialCardModifier: ViewModifier {
         content
             .background {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .background {
-                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .fill(
-                                Color.white.opacity(colorScheme == .dark ? 0.12 : 0.98)
-                            )
-                    }
+                    .fill(FGColor.cardBackground(colorScheme))
                     .overlay {
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                             .strokeBorder(
                                 LinearGradient(
-                                    colors: [
-                                        Color.white.opacity(0.95),
-                                        Color.white.opacity(0.35)
-                                    ],
+                                    colors: colorScheme == .dark
+                                        ? [
+                                            Color.white.opacity(0.18),
+                                            Color.white.opacity(0.06)
+                                        ]
+                                        : [
+                                            Color.white.opacity(0.95),
+                                            Color.white.opacity(0.35)
+                                        ],
                                     startPoint: .topLeading,
                                     endPoint: .bottomTrailing
                                 ),
@@ -110,7 +95,7 @@ private struct PublicProfileEditorialCardModifier: ViewModifier {
                             )
                     }
                     .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.06), radius: 14, y: 8)
-                    .shadow(color: FGColor.accentBlue.opacity(0.04), radius: 18, y: 4)
+                    .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.08 : 0.04), radius: 18, y: 4)
             }
     }
 }
@@ -200,8 +185,9 @@ extension PublicUserProfileData {
         Array(openToItems.prefix(PublicProfileContentBuilder.maxPublicOpenToItems))
     }
 
+    /// Authoritative My Team only — never inferred from favorite ordering.
     var primaryFavoriteTeam: FavoriteTeam? {
-        explicitPrimaryFavoriteTeam ?? favoriteTeams.first
+        explicitPrimaryFavoriteTeam
     }
 
     var explicitPrimaryFavoriteTeam: FavoriteTeam? {
@@ -212,12 +198,16 @@ extension PublicUserProfileData {
         return nil
     }
 
+    var myTeamDisplayModel: MyTeamDisplayModel? {
+        explicitPrimaryFavoriteTeam.map(MyTeamDisplayModel.init(team:))
+    }
+
     var trophyTeamFallbackUsed: Bool {
-        explicitPrimaryFavoriteTeam == nil && !favoriteTeams.isEmpty
+        false
     }
 
     var orderedFavoriteTeamsForPublicProfile: [FavoriteTeam] {
-        guard let primary = primaryFavoriteTeam else { return favoriteTeams }
+        guard let primary = explicitPrimaryFavoriteTeam else { return favoriteTeams }
         return [primary] + favoriteTeams.filter { $0.id != primary.id }
     }
 
@@ -473,7 +463,7 @@ struct PublicProfileFanIdentityCard: View {
                     id: .nationalTeam,
                     icon: .flag(identity.flag),
                     title: identity.resolvedSupporterLabel(languageCode: appLanguageRaw),
-                    subtitle: NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw)
+                    subtitle: NationalFanIdentityDisplay.stripSubtitle(languageCode: appLanguageRaw)
                 )
             )
         }
@@ -570,6 +560,18 @@ struct PublicProfileFanIdentityCard: View {
                 .minimumScaleFactor(0.78)
         }
         .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(fanIdentityColumnAccessibilityLabel(column))
+    }
+
+    private func fanIdentityColumnAccessibilityLabel(_ column: PublicProfileFanIdentityColumn) -> String {
+        switch column.id {
+        case .nationalTeam:
+            let heading = L10n.t("national_team", languageCode: appLanguageRaw)
+            return "\(heading), \(column.title), \(column.subtitle)"
+        case .homeCrowd, .homeCity, .memberSince:
+            return "\(column.title), \(column.subtitle)"
+        }
     }
 
     @ViewBuilder
@@ -681,7 +683,7 @@ struct PublicProfileEditorialHero: View {
             HStack(alignment: .top, spacing: 16) {
                 avatar(diameter: avatarDiameter)
 
-                VStack(alignment: .leading, spacing: 7) {
+                VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 5) {
                         Text(data.displayName)
                             .font(.system(size: 24, weight: .black, design: .rounded))
@@ -699,8 +701,16 @@ struct PublicProfileEditorialHero: View {
                     Text(data.publicHandleDisplayLine)
                         .font(.system(size: 13.5, weight: .semibold, design: .rounded))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .padding(.top, 4)
 
                     heroIdentityMetaLine
+                        .padding(.top, 5)
+
+                    FanXpSummaryLine(
+                        totalXP: data.totalXP,
+                        languageCode: appLanguageRaw
+                    )
+                    .padding(.top, 5)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 3)
@@ -722,7 +732,7 @@ struct PublicProfileEditorialHero: View {
                 .lineSpacing(4)
                 .lineLimit(3)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 2)
+                .padding(.top, 7)
                 .onAppear {
 #if DEBUG
                     print("[ProfileBioDebug] identityCardDisplayedBio=\(trimmedBio)")
@@ -805,26 +815,18 @@ struct PublicProfileEditorialHero: View {
 
     private func heroMyTeamCard(_ team: FavoriteTeam) -> some View {
         HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.18 : 0.14))
-                    .frame(width: 44, height: 44)
-                    .overlay {
-                        Circle()
-                            .strokeBorder(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.34 : 0.24), lineWidth: 1)
-                    }
-                Image(systemName: "trophy.fill")
-                    .font(.system(size: 21, weight: .heavy))
-                    .foregroundStyle(FGColor.accentYellow)
-            }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(L10n.t("my_team", languageCode: appLanguageRaw))
-                    .font(.system(size: 10, weight: .heavy, design: .rounded))
-                    .foregroundStyle(FGColor.accentYellow.opacity(0.96))
-                    .textCase(.uppercase)
-                    .tracking(0.9)
-                    .lineLimit(1)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 5) {
+                    Image(systemName: "trophy.fill")
+                        .font(.system(size: 10, weight: .heavy))
+                        .accessibilityHidden(true)
+                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
+                        .font(.system(size: 10, weight: .heavy, design: .rounded))
+                        .textCase(.uppercase)
+                        .tracking(0.9)
+                        .lineLimit(1)
+                }
+                .foregroundStyle(FGColor.accentYellow.opacity(0.96))
 
                 Text(team.name)
                     .font(.system(size: 17, weight: .black, design: .rounded))
@@ -850,6 +852,8 @@ struct PublicProfileEditorialHero: View {
                         .strokeBorder(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.34 : 0.22), lineWidth: 1)
                 }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(MyTeamDisplayModel(team: team).accessibilityLabel(languageCode: appLanguageRaw))
         .onAppear {
 #if DEBUG
             print("[FavoriteTeamsDebug] userFacingPrimaryLabel=MyTeam")
@@ -1004,7 +1008,7 @@ struct PublicProfileFavoriteTeamsCard: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 10) {
                         ForEach(shownTeams) { team in
-                            favoriteTeamCard(team, isPrimary: team.id == data.primaryFavoriteTeam?.id)
+                            favoriteTeamCard(team, isPrimary: team.id == data.explicitPrimaryFavoriteTeam?.id)
                         }
                     }
                     .padding(.vertical, 2)
@@ -1031,49 +1035,50 @@ struct PublicProfileFavoriteTeamsCard: View {
             : team.badgeColor.opacity(colorScheme == .dark ? 0.16 : 0.09)
         let sportAccent = sportAccentColor(for: team.sport.chipTitle)
 
-        return VStack(alignment: .leading, spacing: 9) {
+        return VStack(alignment: .leading, spacing: 11) {
             HStack(alignment: .top, spacing: 10) {
                 SportsIdentityArtworkView(favoriteTeam: team, diameter: 42)
                 Spacer(minLength: 0)
-                Image(systemName: isPrimary ? "trophy.fill" : "trophy")
-                    .font(.system(size: 16, weight: .heavy))
-                    .foregroundStyle(isPrimary ? FGColor.accentYellow : FGColor.secondaryText(colorScheme).opacity(0.72))
-                    .padding(.top, 2)
+                // Non-primary keeps an outline trophy affordance; primary uses the MY TEAM label only.
+                if !isPrimary {
+                    Image(systemName: "trophy")
+                        .font(.system(size: 16, weight: .heavy))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.72))
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+                }
             }
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 5) {
+                    Image(systemName: "trophy.fill")
+                        .font(.system(size: 10, weight: .heavy))
+                        .accessibilityHidden(true)
+                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
+                        .font(.system(size: 10, weight: .heavy, design: .rounded))
+                }
+                .foregroundStyle(FGColor.accentYellow.opacity(0.96))
+                .opacity(isPrimary ? 1 : 0)
+                .accessibilityHidden(!isPrimary)
+
                 Text(team.name)
                     .font(.system(size: 16, weight: .black, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                     .lineLimit(2)
+                    .multilineTextAlignment(.leading)
                     .minimumScaleFactor(0.78)
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, minHeight: 42, alignment: .topLeading)
 
                 publicFavoriteTeamSportBadge(team)
             }
 
             Spacer(minLength: 0)
-
-            if isPrimary {
-                HStack(spacing: 5) {
-                    Image(systemName: "trophy.fill")
-                        .font(.system(size: 10, weight: .heavy))
-                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
-                        .font(.system(size: 10, weight: .heavy, design: .rounded))
-                }
-                .foregroundStyle(FGColor.accentYellow.opacity(0.96))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background {
-                    Capsule(style: .continuous)
-                        .fill(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.16 : 0.11))
-                }
-            }
         }
         .padding(.top, 12)
         .padding(.horizontal, 12)
         .padding(.bottom, 14)
-        .frame(width: 214, height: 180, alignment: .topLeading)
+        .frame(width: 214, height: 205, alignment: .topLeading)
         .background {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(
@@ -1096,6 +1101,12 @@ struct PublicProfileFavoriteTeamsCard: View {
                         )
                 }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            isPrimary
+                ? MyTeamDisplayModel(team: team).accessibilityLabel(languageCode: appLanguageRaw)
+                : "\(team.name), \(team.sport.chipTitle)"
+        )
         .overlay(alignment: .topLeading) {
             publicFavoriteTeamSportAccent(color: sportAccent)
         }

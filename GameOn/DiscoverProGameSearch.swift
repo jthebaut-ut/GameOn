@@ -27,10 +27,44 @@ struct DiscoverProGameCatalogAliasLookup: Sendable {
     nonisolated func isStrongSportsQuery(_ normalizedQuery: String) -> Bool {
         guard !normalizedQuery.isEmpty else { return false }
         if strongTokens.contains(normalizedQuery) { return true }
-        guard normalizedQuery.count >= 4 else { return false }
+        guard normalizedQuery.count >= 3 else { return false }
+
+        // Prefix of a catalog token: "los angeles" → "los angeles dodgers"
         for token in prefixableTokens where token.hasPrefix(normalizedQuery) {
             return true
         }
+
+        // Whole-word nickname: "dodgers" → "los angeles dodgers"
+        if normalizedQuery.count >= 4 {
+            for token in strongTokens where Self.tokenContainsWholeWord(token, normalizedQuery) {
+                return true
+            }
+        }
+
+        // Multi-word queries such as "la dodgers": every query word must appear as a
+        // whole word in the same catalog token (or as a derived alias token).
+        let words = normalizedQuery.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        if words.count >= 2 {
+            for token in strongTokens {
+                if words.allSatisfy({ Self.tokenContainsWholeWord(token, $0) || token.contains($0) }) {
+                    // Require at least one substantial word (≥4) to avoid weak matches like "la fc".
+                    if words.contains(where: { $0.count >= 4 }) {
+                        return true
+                    }
+                }
+            }
+        }
+
+        return false
+    }
+
+    /// Whole-word containment: query equals token, or is a space-bounded segment of token.
+    nonisolated static func tokenContainsWholeWord(_ token: String, _ word: String) -> Bool {
+        guard !token.isEmpty, !word.isEmpty else { return false }
+        if token == word { return true }
+        if token.hasPrefix(word + " ") { return true }
+        if token.hasSuffix(" " + word) { return true }
+        if token.contains(" " + word + " ") { return true }
         return false
     }
 
@@ -50,6 +84,7 @@ struct DiscoverProGameCatalogAliasLookup: Sendable {
                 let aliasNorm = LiveMatchFilters.normalizedSearchText(alias)
                 if !aliasNorm.isEmpty { aliases.insert(aliasNorm) }
             }
+            aliases.formUnion(derivedNicknameAliases(from: name))
             if entry.isCompetitionLike {
                 let league = LiveMatchFilters.normalizedSearchText(entry.league)
                 if !league.isEmpty {
@@ -61,19 +96,61 @@ struct DiscoverProGameCatalogAliasLookup: Sendable {
             strongTokens.formUnion(aliases)
         }
 
-        for extra in ["epl", "ucl", "uel", "uecl", "mls", "afcon", "wwc", "wsl", "nwsl", "f1", "ipl", "wbc"] {
+        for extra in ["epl", "ucl", "uel", "uecl", "mls", "afcon", "wwc", "wsl", "nwsl", "f1", "ipl", "wbc", "mlb", "nba", "nfl", "nhl"] {
             strongTokens.insert(extra)
         }
 
         let prefixable = strongTokens.filter { $0.count >= 4 }.sorted()
 #if DEBUG
-        print("[DiscoverProGameSearch] aliasLookup tokens=\(strongTokens.count) prefixable=\(prefixable.count)")
+        ProGameSearchDebug.log("aliasLookup tokens=\(strongTokens.count) prefixable=\(prefixable.count)")
 #endif
         return DiscoverProGameCatalogAliasLookup(
             strongTokens: strongTokens,
             prefixableTokens: prefixable,
             aliasesByName: aliasesByName
         )
+    }
+
+    /// Derive searchable nicknames from multi-word catalog names (e.g. "dodgers", "la dodgers").
+    nonisolated static func derivedNicknameAliases(from normalizedName: String) -> Set<String> {
+        let parts = normalizedName.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        guard parts.count >= 2 else { return [] }
+
+        var derived = Set<String>()
+        let last = parts[parts.count - 1]
+        if last.count >= 4, !genericNicknameTokens.contains(last) {
+            derived.insert(last)
+        }
+
+        // City initials + nickname: "los angeles dodgers" → "la dodgers"
+        if parts.count >= 3, last.count >= 4, !genericNicknameTokens.contains(last) {
+            let initials = parts.dropLast().compactMap { $0.first.map(String.init) }.joined()
+            if initials.count >= 2 {
+                derived.insert("\(initials) \(last)")
+            }
+        }
+
+        return derived
+    }
+
+    /// Immutable Sendable constant; explicitly nonisolated so background index
+    /// building (`build(from:)` / `derivedNicknameAliases`) can read it without
+    /// inheriting the project-wide MainActor default isolation.
+    private nonisolated static let genericNicknameTokens: Set<String> = [
+        "club", "city", "football", "basketball", "hockey", "racing", "sport", "sports",
+        "college", "united", "real", "inter", "atletico", "athletic", "sporting",
+        "national", "team", "fc", "cf", "sc", "ac"
+    ]
+}
+
+/// DEBUG-only searchable pro-game search tracing (`===== PRO GAME SEARCH =====`).
+/// Stateless print-only helper; nonisolated so off-main search/index work can log
+/// without hopping to the main actor.
+enum ProGameSearchDebug {
+    nonisolated static func log(_ message: String) {
+#if DEBUG
+        print("===== PRO GAME SEARCH ===== \(message)")
+#endif
     }
 }
 
@@ -157,7 +234,7 @@ enum DiscoverProGameIndexBuilder {
 @MainActor
 final class DiscoverProGameSearchController: ObservableObject {
     @Published private(set) var results: [LiveMatch] = []
-    /// Kept for API compatibility; never drives UI spinners (always false).
+    /// Kept for API compatibility; drives Pro Games empty-state gating while a search is in flight.
     @Published private(set) var isLoading = false
     @Published private(set) var activeNormalizedQuery: String = ""
 
@@ -189,20 +266,21 @@ final class DiscoverProGameSearchController: ObservableObject {
         isFocused: Bool,
         favoriteTeamIDs: [String] = []
     ) {
-#if DEBUG
-        let t0 = CFAbsoluteTimeGetCurrent()
-#endif
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        ProGameSearchDebug.log("query submitted length=\(trimmed.count) focused=\(isFocused)")
         if trimmed.hasPrefix("@") {
+            ProGameSearchDebug.log("empty state published reason=atPrefix")
             cancelInFlight(clearResults: true)
             return
         }
 
         let lookup = resolvedAliasLookup()
         let normalized = Self.normalizeQuery(trimmed)
+        ProGameSearchDebug.log("normalized query generated length=\(normalized.count)")
         activeNormalizedQuery = normalized
         updateFavoriteAliasesIfNeeded(favoriteTeamIDs, lookup: lookup)
         scheduleIndexRebuildIfNeeded(inventory, lookup: lookup)
+        ProGameSearchDebug.log("cached inventory count=\(inventory.count) docs=\(docs.count) freshness=\(inventoryRevision.isEmpty ? "cold" : "indexed")")
 
         guard isFocused else {
             cancelInFlight(clearResults: true)
@@ -214,11 +292,13 @@ final class DiscoverProGameSearchController: ObservableObject {
             favoriteTokens: favoriteAliasTokens,
             lookup: lookup
         ) else {
+            ProGameSearchDebug.log("empty state published reason=ineligibleQuery")
             cancelInFlight(clearResults: true)
             return
         }
 
         guard !docs.isEmpty || !inventory.isEmpty else {
+            ProGameSearchDebug.log("empty state published reason=emptyInventory")
             cancelInFlight(clearResults: true)
             return
         }
@@ -226,9 +306,7 @@ final class DiscoverProGameSearchController: ObservableObject {
         let cacheKey = "\(inventoryRevision)|\(favoriteRevision)|\(normalized)"
         if let cached = resultCache[cacheKey] {
             publish(cached, for: normalized)
-#if DEBUG
-            print("[DiscoverProGameSearch] cacheHit query=\(normalized) ms=\(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))")
-#endif
+            ProGameSearchDebug.log("matched-game count=\(cached.count) source=cache")
             return
         }
 
@@ -237,20 +315,30 @@ final class DiscoverProGameSearchController: ObservableObject {
         let token = generation
         let docsSnapshot = docs
         let favorites = favoriteAliasTokens
+        isLoading = true
 #if DEBUG
         lastQueryStartedAt = CFAbsoluteTimeGetCurrent()
 #endif
+        ProGameSearchDebug.log("refresh started")
         searchTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: debounceMilliseconds * 1_000_000)
-            guard !Task.isCancelled, token == generation else { return }
+            guard !Task.isCancelled, token == generation else {
+                ProGameSearchDebug.log("stale search result ignored phase=debounce")
+                return
+            }
 
             if docsSnapshot.isEmpty, !inventory.isEmpty {
                 await waitForIndex(timeoutMs: 80)
             }
-            guard !Task.isCancelled, token == generation else { return }
+            guard !Task.isCancelled, token == generation else {
+                ProGameSearchDebug.log("stale search result ignored phase=indexWait")
+                return
+            }
             let latestDocs = self.docs
+            ProGameSearchDebug.log("candidate games before text filtering=\(latestDocs.count)")
             guard !latestDocs.isEmpty else {
                 self.publish([], for: normalized)
+                ProGameSearchDebug.log("empty state published reason=docsEmpty")
                 return
             }
 
@@ -261,9 +349,17 @@ final class DiscoverProGameSearchController: ObservableObject {
                 limit: self.resultLimit
             )
             let matches = rankedKeys.compactMap { self.matchesByKey[$0] }
-            guard !Task.isCancelled, token == self.generation, self.activeNormalizedQuery == normalized else { return }
+            guard !Task.isCancelled, token == self.generation, self.activeNormalizedQuery == normalized else {
+                ProGameSearchDebug.log("stale search result ignored phase=rank")
+                return
+            }
             self.storeCache(key: cacheKey, rows: matches)
             self.publish(matches, for: normalized)
+            ProGameSearchDebug.log("matched-game count=\(matches.count)")
+            if matches.isEmpty {
+                ProGameSearchDebug.log("empty state published reason=zeroMatches")
+            }
+            ProGameSearchDebug.log("refresh completed")
 #if DEBUG
             let ms = Int((CFAbsoluteTimeGetCurrent() - self.lastQueryStartedAt) * 1000)
             print("[DiscoverProGameSearch] query=\(normalized) inventory=\(latestDocs.count) hits=\(matches.count) matchMs=\(ms)")
@@ -412,6 +508,9 @@ final class DiscoverProGameSearchController: ObservableObject {
         if token == query { return true }
         if query.count >= 3, token.hasPrefix(query) { return true }
         if query.count >= 4, query.hasPrefix(token), token.count >= 3 { return true }
+        if query.count >= 4, DiscoverProGameCatalogAliasLookup.tokenContainsWholeWord(token, query) {
+            return true
+        }
         return false
     }
 
@@ -554,6 +653,13 @@ final class DiscoverProGameSearchController: ObservableObject {
                 || doc.homeAliases.contains(where: { $0.contains(query) })
                 || doc.awayAliases.contains(where: { $0.contains(query) }) {
                 best = min(best, isLive ? 6 : (isUpcoming ? 60 : 130))
+            }
+            // Whole-word nickname inside full team name (e.g. dodgers ⊂ los angeles dodgers)
+            if DiscoverProGameCatalogAliasLookup.tokenContainsWholeWord(doc.home, query)
+                || DiscoverProGameCatalogAliasLookup.tokenContainsWholeWord(doc.away, query)
+                || doc.homeAliases.contains(where: { DiscoverProGameCatalogAliasLookup.tokenContainsWholeWord($0, query) })
+                || doc.awayAliases.contains(where: { DiscoverProGameCatalogAliasLookup.tokenContainsWholeWord($0, query) }) {
+                best = min(best, isLive ? 5 : (isUpcoming ? 45 : 115))
             }
         }
 

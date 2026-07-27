@@ -420,6 +420,7 @@ private struct DiscoverSearchSuggestion: Identifiable, Hashable, Codable, Sendab
     static func fromProGame(_ match: LiveMatch, languageCode: String) -> DiscoverSearchSuggestion {
         let locale = Locale(identifier: languageCode)
         let isLive = match.matchStatus.isHappeningNow
+        let isFinal = match.matchStatus == .fullTime
         let title: String
         if isLive, match.scoresAreAvailable {
             title = "\(match.homeTeam) \(match.scoreHome)–\(match.scoreAway) \(match.awayTeam)"
@@ -435,14 +436,16 @@ private struct DiscoverSearchSuggestion: Identifiable, Hashable, Codable, Sendab
             } else if let minute = match.minute {
                 subtitleParts.append("\(minute)′")
             }
-        }
-        let league = match.league.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !league.isEmpty {
-            subtitleParts.append(league)
-        }
-        if !isLive {
-            subtitleParts.append(Self.proGameDateFormatter(locale: locale).string(from: match.startTime))
+        } else if isFinal {
+            subtitleParts.append(L10n.t("Final", languageCode: languageCode))
+        } else {
+            subtitleParts.append(Self.proGameRelativeDayLabel(for: match.startTime, languageCode: languageCode))
             subtitleParts.append(Self.proGameTimeFormatter(locale: locale).string(from: match.startTime))
+        }
+
+        let league = match.league.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !league.isEmpty, isLive || isFinal {
+            subtitleParts.append(league)
         }
 
         let a11yStatus: String
@@ -450,6 +453,8 @@ private struct DiscoverSearchSuggestion: Identifiable, Hashable, Codable, Sendab
             a11yStatus = "\(match.scoreHome) to \(match.scoreAway), \(L10n.t("LIVE", languageCode: languageCode))"
         } else if isLive {
             a11yStatus = L10n.t("LIVE", languageCode: languageCode)
+        } else if isFinal {
+            a11yStatus = L10n.t("Final", languageCode: languageCode)
         } else {
             a11yStatus = Self.proGameAccessibilityDateFormatter(locale: locale).string(from: match.startTime)
         }
@@ -469,6 +474,18 @@ private struct DiscoverSearchSuggestion: Identifiable, Hashable, Codable, Sendab
             ].filter { !$0.isEmpty }.joined(separator: ", "),
             proGameStableKey: SavedProGame.stableKey(for: match)
         )
+    }
+
+    /// Concise local-day label for scheduled pro games (`Today` / `Tomorrow` / short date).
+    private static func proGameRelativeDayLabel(for date: Date, languageCode: String) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            return L10n.t("Today", languageCode: languageCode)
+        }
+        if calendar.isDateInTomorrow(date) {
+            return L10n.t("Tomorrow", languageCode: languageCode)
+        }
+        return Self.proGameDateFormatter(locale: Locale(identifier: languageCode)).string(from: date)
     }
 
     private static var proGameDateFormatters: [String: DateFormatter] = [:]
@@ -1231,11 +1248,14 @@ struct DiscoverScreen: View {
 
     @ObservedObject var viewModel: MapViewModel
     @ObservedObject private var fanUpdatesStore: FanUpdatesRealtimeStore
-    @ObservedObject var chatViewModel: ChatViewModel
+    /// Intentionally not `@ObservedObject`: Chat publishes (unread/loading/inbox) must not rebuild Discover.
+    /// Friendship chips for live-energy use equality-gated `@State` via `onReceive`.
+    let chatViewModel: ChatViewModel
     @StateObject private var searchSuggestionController = DiscoverSearchSuggestionController()
     @StateObject private var discoverFanSearchController = DiscoverFanSearchController()
     @StateObject private var discoverProGameSearchController = DiscoverProGameSearchController()
     @State private var discoverProGameDetailMatch: LiveMatch?
+    @State private var acceptedFriendUserIDs: Set<UUID> = []
     @Binding var isCalendarOverlayPresented: Bool
     let isDiscoverTabSelected: Bool
     @Environment(\.colorScheme) private var colorScheme
@@ -1319,7 +1339,7 @@ struct DiscoverScreen: View {
     @State private var venuePreviewDetailEvent: SportsEvent?
     @State private var venueDetailOpenStartedAt: CFAbsoluteTime?
     @Namespace private var discoverModeToggleNamespace
-    private let livePulseThreshold = 16
+    private let livePulseThreshold = VenueMapEnergyScore.hotPulseThreshold
     @State private var discoverAnnotationCache = DiscoverAnnotationCache.empty
     @State private var lastDiscoverTabConsistencyAt: Date?
 
@@ -1409,12 +1429,6 @@ struct DiscoverScreen: View {
         let reusedSportChipIcon: Bool
     }
 
-    private var acceptedFriendUserIDs: Set<UUID> {
-        guard viewModel.canUseFanSocialFeatures else { return [] }
-        return Set(chatViewModel.friendshipChipByOtherUserId.compactMap { userID, kind in
-            kind == .friends ? userID : nil
-        })
-    }
     private let primaryMapUtilityButtonSize: CGFloat = 44
     private let secondaryMapUtilityButtonSize: CGFloat = 44
     private let discoverLightGlassCornerRadius: CGFloat = 28
@@ -2409,7 +2423,10 @@ struct DiscoverScreen: View {
         @Environment(\.colorScheme) private var colorScheme
         @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
         @State private var showCommunityVerifiedInfo = false
+        @State private var showVenueEnergyInfo = false
 
+        /// Human-readable Venue Energy caption for the selected day (never the raw algorithm score).
+        let venueEnergyCaption: String?
         let fireCount: Int
         let seatingCount: Int
         let tvCount: Int
@@ -2481,6 +2498,8 @@ struct DiscoverScreen: View {
 
         var body: some View {
             VStack(alignment: .center, spacing: 8) {
+                venueEnergyHeader
+
                 communityVerifiedHeader
 
                 HStack(spacing: 0) {
@@ -2536,6 +2555,37 @@ struct DiscoverScreen: View {
             } message: {
                 Text(communityVerifiedInfoMessage)
             }
+            .sheet(isPresented: $showVenueEnergyInfo) {
+                VenueEnergyHowItWorksSheet(audience: .fan)
+            }
+        }
+
+        private var venueEnergyHeader: some View {
+            HStack(spacing: 2) {
+                Text("Venue Energy")
+                    .font(FGTypography.metadata.weight(.bold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+                    .accessibilityAddTraits(.isHeader)
+
+                if let venueEnergyCaption, !venueEnergyCaption.isEmpty {
+                    Text(venueEnergyCaption)
+                        .font(FGTypography.metadata.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                }
+
+                VenueEnergyInfoButton(action: {
+                    showVenueEnergyInfo = true
+                }, tint: FGColor.accentBlue)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .accessibilityElement(children: .contain)
         }
 
         private var communityVerifiedInfoMessage: String {
@@ -2744,13 +2794,45 @@ struct DiscoverScreen: View {
     ) {
         _viewModel = ObservedObject(wrappedValue: viewModel)
         _fanUpdatesStore = ObservedObject(wrappedValue: viewModel.fanUpdatesStore)
-        _chatViewModel = ObservedObject(wrappedValue: chatViewModel)
+        self.chatViewModel = chatViewModel
         _isCalendarOverlayPresented = isCalendarOverlayPresented
         self.isDiscoverTabSelected = isDiscoverTabSelected
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "Discover")
         discoverScreenWithToolbar
+            .onAppear {
+                refreshAcceptedFriendUserIDs(reason: "appear")
+            }
+            .onChange(of: viewModel.canUseFanSocialFeatures) { _, _ in
+                refreshAcceptedFriendUserIDs(reason: "socialGate")
+            }
+            .onReceive(chatViewModel.$friendshipChipByOtherUserId) { chips in
+                refreshAcceptedFriendUserIDs(from: chips, reason: "friendshipChips")
+            }
+    }
+
+    private func refreshAcceptedFriendUserIDs(
+        from chips: [UUID: ChatViewModel.FriendshipChipKind]? = nil,
+        reason: String
+    ) {
+        let source = chips ?? chatViewModel.friendshipChipByOtherUserId
+        let next: Set<UUID>
+        if viewModel.canUseFanSocialFeatures {
+            next = Set(source.compactMap { userID, kind in
+                kind == .friends ? userID : nil
+            })
+        } else {
+            next = []
+        }
+        guard next != acceptedFriendUserIDs else {
+            SwiftUIRecompPerf.identicalSnapshotSkipped(source: "discover.acceptedFriends.\(reason)", rows: next.count)
+            return
+        }
+        acceptedFriendUserIDs = next
+        SwiftUIRecompPerf.immutableSnapshotPublished(source: "discover.acceptedFriends.\(reason)", rows: next.count)
+        SwiftUIRecompPerf.rootInvalidated(screen: "Discover", source: "acceptedFriends.\(reason)")
     }
 
     private var discoverScreenWithToolbar: some View {
@@ -2817,6 +2899,7 @@ struct DiscoverScreen: View {
         discoverScreenWithClusterSheet
             .sheet(item: $pickupGameDetailNav) { token in
                 DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                    .environmentObject(chatViewModel)
             }
             .sheet(isPresented: $showDiscoverSportMoreSheet) {
                 DiscoverSportFilterMoreSheet(selectedSport: viewModel.selectedSport) { sport in
@@ -3043,6 +3126,9 @@ struct DiscoverScreen: View {
         }
         .onChange(of: showDatePicker) { _, isOpen in
             isCalendarOverlayPresented = isOpen
+            if !isOpen {
+                viewModel.endDiscoverDatePickerGeographicFreeze()
+            }
             guard isOpen else { return }
             #if DEBUG
             print(
@@ -3060,7 +3146,10 @@ struct DiscoverScreen: View {
                 scheduleDiscoverWeatherRefresh(force: false)
                 if viewModel.discoverMapContentMode == .pickupGames, viewModel.discoverPickupSubMode == .games {
                     Task {
-                        await viewModel.refreshPickupGamesForDiscoverMap(force: true)
+                        await viewModel.refreshPickupGamesForDiscoverMap(
+                            force: true,
+                            preservePickupCalendarDotDatesCache: true
+                        )
                     }
                 } else if isPickupPlacesMode {
                     Task {
@@ -3452,9 +3541,20 @@ struct DiscoverScreen: View {
                         applyDiscoverDatePickerSelection()
                     },
                     onDisplayedMonthChange: { month in
-                        discoverCalendarDisplayedMonth = month
+                        let cal = Calendar.current
+                        let monthStart = cal.date(from: cal.dateComponents([.year, .month], from: month)) ?? month
+                        // Skip duplicate load when openDiscoverDatePicker already started the same month.
+                        if cal.isDate(monthStart, equalTo: discoverCalendarDisplayedMonth, toGranularity: .month),
+                           viewModel.isLoadingPickupCalendarDots
+                            || viewModel.isLoadingVenueCalendarDots
+                            || !viewModel.pickupGameCalendarDotDates.isEmpty
+                            || !viewModel.venueGameCalendarDotDates.isEmpty {
+                            discoverCalendarDisplayedMonth = monthStart
+                            return
+                        }
+                        discoverCalendarDisplayedMonth = monthStart
                         Task { @MainActor in
-                            viewModel.loadDiscoverCalendarDots(around: month, reason: "month_change")
+                            viewModel.loadDiscoverCalendarDots(around: monthStart, reason: "month_change")
                         }
                     }
                 )
@@ -4029,7 +4129,12 @@ struct DiscoverScreen: View {
                 )
             } else {
                 let visibleGames = viewModel.pickupGamesVisibleAsMapPins(for: viewModel.currentMapRegionBounds()).count
-                let shouldReload = forceCurrentModeReload || (visibleGames == 0 && !viewModel.isLoadingPickupGamesForMap)
+                // Meaningful map pans always attempt a viewport-keyed refresh (force=false → TTL/cache).
+                // Do not require visibleGames==0; prior viewport rows may still pin-filter as non-empty.
+                let isMapViewportConsistency = trigger == "mapRegionChanged"
+                let shouldReload = forceCurrentModeReload
+                    || isMapViewportConsistency
+                    || (visibleGames == 0 && !viewModel.isLoadingPickupGamesForMap)
                 guard shouldReload else {
                     logVenueReloadConsistency(
                         trigger: trigger,
@@ -4054,7 +4159,7 @@ struct DiscoverScreen: View {
                     skippedReason: nil
                 )
                 await viewModel.refreshPickupGamesForDiscoverMap(
-                    force: forceCurrentModeReload || viewModel.pickupGamesForDiscoverMap.isEmpty,
+                    force: forceCurrentModeReload,
                     preservePickupCalendarDotDatesCache: true
                 )
                 viewModel.scheduleDiscoverVenueCalendarDotRefreshAfterMapViewportChange()
@@ -4220,17 +4325,12 @@ struct DiscoverScreen: View {
     }
 
     private func venueIsProForPinDisplay(_ bar: BarVenue) -> Bool {
-        let ownerCandidates = [
-            bar.ownerEmail,
-            bar.venueOwnerEmailRaw,
-            bar.businessOwnerEmailRaw,
-            bar.contactEmailRaw
-        ]
-        if ownerCandidates.contains(where: { OwnerBusinessEmail.normalized($0 ?? "") == "venue30@venue30.com" }) {
-            return true
-        }
-        return bar.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            .caseInsensitiveCompare("Venue30") == .orderedSame
+        // Venue30 email/name hardcode removed. Organic energy never uses Pro.
+        // Real Business Pro chrome requires a public entitlement signal on venue/business
+        // inventory (not available on Discover map rows today without N RPCs / migration).
+        // Do not treat all claimed/business venues as Pro.
+        _ = bar
+        return false
     }
 
     private func venuePinTint(for displayClass: VenuePinDisplayClass, hasLiveNow: Bool, energy: Int) -> Color {
@@ -4642,10 +4742,12 @@ struct DiscoverScreen: View {
 
     private func buildDiscoverPickupClustersForMap() -> [PickupGameCluster] {
         guard viewModel.discoverPickupSubMode == .games else { return [] }
-        let rows = viewModel.pickupGamesForDiscoverMap.filter { row in
-            guard let lat = row.latitude, let lon = row.longitude else { return false }
-            return CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon))
-        }
+        // Same geographic meaning as calendar orange dots: only viewport-eligible pins.
+        let rows = viewModel.pickupGamesVisibleAsMapPins(for: viewModel.currentMapRegionBounds())
+            .filter { row in
+                guard let lat = row.latitude, let lon = row.longitude else { return false }
+                return CLLocationCoordinate2DIsValid(CLLocationCoordinate2D(latitude: lat, longitude: lon))
+            }
         return viewModel.clusteredPickupGamesForDiscoverMap(rows: rows)
     }
 
@@ -5034,6 +5136,9 @@ struct DiscoverScreen: View {
                 isMajorRegionJump: isMajorRegionJump,
                 movementIsMeaningful: precomputedDelta?.isMeaningful ?? true
             )
+            if viewModel.discoverFocusedProGame != nil {
+                viewModel.scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "mapCameraEnd")
+            }
             mapVenueReloadTask = Task { @MainActor in
                 if !isMajorRegionJump {
                     do {
@@ -5069,9 +5174,11 @@ struct DiscoverScreen: View {
 #if DEBUG
                 print("[ManualMapReloadDebug] reloadScheduled=true")
 #endif
+                // Ordinary meaningful pans must not force-bypass pickup cache freshness.
+                // Pickup/venues refresh for the new viewport with force=false so TTL / coalescing apply.
                 await ensureDiscoverDatasetConsistency(
                     trigger: "mapRegionChanged",
-                    forceCurrentModeReload: viewModel.discoverMapContentMode == .pickupGames,
+                    forceCurrentModeReload: false,
                     fastRegionJump: isMajorRegionJump,
                     regionOverride: region
                 )
@@ -5479,6 +5586,16 @@ struct DiscoverScreen: View {
                 if viewModel.selectedBar != nil || viewModel.selectedPickupGameForMap != nil || viewModel.selectedPickupPlaceForMap != nil {
                     discoverBottomLeadingCard
                         .padding(.bottom, 2)
+                }
+
+                if viewModel.discoverFocusedProGame != nil {
+                    DiscoverTopVenuesForGamePanel(viewModel: viewModel) { bar in
+                        withAnimation(.spring()) {
+                            viewModel.selectVenueFromDiscoverSearchResult(bar)
+                        }
+                    }
+                    .padding(.bottom, 4)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
                 if !viewModel.isVenueOwnerLoggedIn,
@@ -7051,8 +7168,11 @@ struct DiscoverScreen: View {
             return fanLoading
         case .watchSpots:
             return placeLoading || venueLoading
-        case .pickup, .proGames, .teams:
+        case .pickup, .teams:
             return false
+        case .proGames:
+            return discoverProGameSearchController.isLoading
+                && discoverProGameSearchController.results.isEmpty
         }
     }
 
@@ -7075,8 +7195,11 @@ struct DiscoverScreen: View {
             return !searchSuggestionController.isLoading
                 && !viewModel.isDiscoverVenueSearchLoading
                 && discoverSearchAssistSections.isEmpty
-        case .pickup, .proGames, .teams:
+        case .pickup, .teams:
             return discoverSearchAssistSections.isEmpty
+        case .proGames:
+            return !discoverProGameSearchController.isLoading
+                && discoverSearchAssistSections.isEmpty
         }
     }
 
@@ -7193,43 +7316,87 @@ struct DiscoverScreen: View {
         }
     }
 
+    /// Crest priority: both displayable crests → pair; one → that crest alone;
+    /// none → ONE league/sport icon. Never renders two generic placeholder shields.
+    /// (Club logos resolve to `.none` unless verified licensed, so the sport icon
+    /// is the common displayable fallback for pro clubs.)
     private func discoverProGameCrestPair(for match: LiveMatch) -> some View {
-        HStack(spacing: -6) {
-            discoverProGameCrest(
-                identity: ProGameTeamScoreIdentity.resolve(
-                    teamName: match.homeTeam,
-                    badgeURL: match.homeTeamBadgeURL,
-                    source: "DiscoverSearch"
-                )
-            )
-            discoverProGameCrest(
-                identity: ProGameTeamScoreIdentity.resolve(
-                    teamName: match.awayTeam,
-                    badgeURL: match.awayTeamBadgeURL,
-                    source: "DiscoverSearch"
-                )
-            )
+        let homeIdentity = ProGameTeamScoreIdentity.resolve(
+            teamName: match.homeTeam,
+            badgeURL: match.homeTeamBadgeURL,
+            source: "DiscoverSearch"
+        )
+        let awayIdentity = ProGameTeamScoreIdentity.resolve(
+            teamName: match.awayTeam,
+            badgeURL: match.awayTeamBadgeURL,
+            source: "DiscoverSearch"
+        )
+        let sportVisual = discoverProGameSportVisual(for: match)
+        return HStack(spacing: -6) {
+            if homeIdentity.leading == .none, awayIdentity.leading == .none {
+                discoverProGameSportFallbackCircle(sportVisual)
+            } else {
+                if homeIdentity.leading != .none {
+                    discoverProGameCrest(identity: homeIdentity, sportVisual: sportVisual)
+                }
+                if awayIdentity.leading != .none {
+                    discoverProGameCrest(identity: awayIdentity, sportVisual: sportVisual)
+                }
+            }
         }
         .frame(width: 44, height: 30, alignment: .leading)
     }
 
+    /// Sport icon for a pro game (MLB → baseball, NBA → basketball, …), preferring
+    /// the sport string and falling back to the league name for canonical mapping.
+    private func discoverProGameSportVisual(for match: LiveMatch) -> SportFilterCatalog.ChipVisual {
+        let sportRaw = match.sport.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sportRaw.isEmpty, !SportFilterCatalog.isFallbackSport(sportRaw) {
+            return SportFilterCatalog.resolve(sportRaw)
+        }
+        let leagueRaw = match.league.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !leagueRaw.isEmpty, !SportFilterCatalog.isFallbackSport(leagueRaw) {
+            return SportFilterCatalog.resolve(leagueRaw)
+        }
+        return SportFilterCatalog.fallback
+    }
+
+    private func discoverProGameSportFallbackCircle(_ visual: SportFilterCatalog.ChipVisual) -> some View {
+        Image(systemName: visual.systemImage)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(visual.accent)
+            .frame(width: 26, height: 26)
+            .background {
+                Circle()
+                    .fill(visual.accent.opacity(colorScheme == .dark ? 0.22 : 0.13))
+            }
+            .overlay {
+                Circle()
+                    .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+            }
+    }
+
     @ViewBuilder
-    private func discoverProGameCrest(identity: ProGameTeamScoreIdentity) -> some View {
+    private func discoverProGameCrest(
+        identity: ProGameTeamScoreIdentity,
+        sportVisual: SportFilterCatalog.ChipVisual
+    ) -> some View {
         Group {
             switch identity.leading {
             case .logoURL(let url):
                 DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
-                    Image(systemName: "shield.fill")
+                    // Loading/failure placeholder: sport icon, not a generic shield.
+                    Image(systemName: sportVisual.systemImage)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .foregroundStyle(sportVisual.accent)
                 }
             case .flag(let flag):
                 Text(flag)
                     .font(.system(size: 14))
             case .none:
-                Image(systemName: "shield.fill")
+                Image(systemName: sportVisual.systemImage)
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .foregroundStyle(sportVisual.accent)
             }
         }
         .frame(width: 26, height: 26)
@@ -8005,6 +8172,7 @@ struct DiscoverScreen: View {
             discoverFanSearchController.clear()
             discoverProGameSearchController.clear()
             dismissDiscoverSearchKeyboard()
+            viewModel.setDiscoverFocusedProGame(from: match, alignSelectedDate: true)
             discoverProGameDetailMatch = match
             return
         }
@@ -8224,25 +8392,25 @@ struct DiscoverScreen: View {
         let selection = max(rawSelection, minDay)
         discoverDatePickerSelection = selection
         discoverCalendarDisplayedMonth = cal.date(from: cal.dateComponents([.year, .month], from: selection)) ?? selection
+        // Freeze the map viewport the user was viewing before overlay layout can disturb the camera.
+        viewModel.beginDiscoverDatePickerGeographicFreeze()
         #if DEBUG
         let openedLogFormatter = DateFormatter()
         openedLogFormatter.dateFormat = "yyyy-MM-dd"
         openedLogFormatter.timeZone = TimeZone.current
         print("[DiscoverCalendar] opened at today date=\(openedLogFormatter.string(from: selection))")
+        print("===== PICKUP CALENDAR OPEN =====")
+        print("selectedDate=\(openedLogFormatter.string(from: selection))")
+        print("displayedMonth=\(openedLogFormatter.string(from: discoverCalendarDisplayedMonth))")
+        print("sport=\(viewModel.selectedSport)")
         #endif
-        Task { @MainActor in
-            if viewModel.discoverMapContentMode == .pickupGames, viewModel.discoverPickupSubMode == .games {
-                await viewModel.refreshPickupGamesForDiscoverMap(force: false, preservePickupCalendarDotDatesCache: true)
-                #if DEBUG
-                print("[PickupCalendarFix] pickup preload ensured count=\(viewModel.pickupGamesForDiscoverMap.count)")
-                #endif
-            }
-            viewModel.loadDiscoverCalendarDots(
-                around: discoverCalendarDisplayedMonth,
-                reason: "calendar_open",
-                logIfOpeningBeforeReady: true
-            )
-        }
+        // Month availability is independent of selected-day map rows — start the month load
+        // immediately (do not wait on day-scoped pickup refresh).
+        viewModel.loadDiscoverCalendarDots(
+            around: discoverCalendarDisplayedMonth,
+            reason: "calendar_open",
+            logIfOpeningBeforeReady: true
+        )
         withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) {
             showDatePicker = true
             isCalendarOverlayPresented = true
@@ -8251,6 +8419,7 @@ struct DiscoverScreen: View {
 
     private func dismissDiscoverDatePicker() {
         discoverDatePickerSelection = nil
+        viewModel.endDiscoverDatePickerGeographicFreeze()
         withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) {
             showDatePicker = false
             isCalendarOverlayPresented = false
@@ -8278,6 +8447,7 @@ struct DiscoverScreen: View {
 
         // Dismiss overlay first so Done stays responsive; defer map/date refresh.
         discoverDatePickerSelection = nil
+        viewModel.endDiscoverDatePickerGeographicFreeze()
         withAnimation(.spring(response: 0.32, dampingFraction: 0.88)) {
             showDatePicker = false
             isCalendarOverlayPresented = false
@@ -8835,7 +9005,23 @@ struct DiscoverScreen: View {
                                 Image(systemName: "clock.fill")
                                     .font(.system(size: 13, weight: .semibold))
                                     .foregroundStyle(subInk)
-                                Text(row.pickupDateWithCompactTimeRange ?? start.formatted(date: .abbreviated, time: .shortened))
+                                Text(
+                                    row.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw)
+                                        ?? start.formatted(
+                                            Date.FormatStyle.dateTime
+                                                .month(.abbreviated)
+                                                .day()
+                                                .year()
+                                                .hour()
+                                                .minute()
+                                                .locale(
+                                                    Locale(
+                                                        identifier: L10n.normalizedLanguageCode(appLanguageRaw)
+                                                            .replacingOccurrences(of: "-", with: "_")
+                                                    )
+                                                )
+                                        )
+                                )
                                     .font(FGTypography.metadata.weight(.semibold))
                                     .foregroundStyle(mainInk)
                             }
@@ -8874,18 +9060,16 @@ struct DiscoverScreen: View {
                         if !guestMapsActionsToLogin {
                             HStack(spacing: FGSpacing.sm) {
                                 let playersNeeded = pickupPlayersNeededDisplay(row)
-                                pickupPreviewMetricCapsule("\(playersNeeded) spots left", mainInk: mainInk)
+                                pickupPreviewMetricCapsule(
+                                    pickupLocalizedSpotsLeft(
+                                        playersNeeded,
+                                        languageCode: appLanguageRaw
+                                    ),
+                                    mainInk: mainInk
+                                )
                                 pickupPreviewMetricCapsule(row.pickupCompactDurationLabel ?? "\(playersNeeded) players needed", mainInk: mainInk)
                             }
                             .padding(.top, 2)
-
-                            PickupOrganizerPreviewIdentityRow(
-                                viewModel: viewModel,
-                                organizerUserId: row.creator_user_id,
-                                stats: viewModel.pickupCreatorTrustStats(for: row.creator_user_id),
-                                colorScheme: colorScheme
-                            )
-                                .padding(.top, 2)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -8902,6 +9086,14 @@ struct DiscoverScreen: View {
                         .foregroundStyle(dismissIcon)
                 }
                 .buttonStyle(.plain)
+            }
+
+            if !guestMapsActionsToLogin {
+                PickupOrganizerPreviewIdentityRow(
+                    viewModel: viewModel,
+                    organizerUserId: row.creator_user_id,
+                    colorScheme: colorScheme
+                )
             }
 
             HStack(spacing: FGSpacing.sm) {
@@ -8962,8 +9154,14 @@ struct DiscoverScreen: View {
         .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.1 : 0.05), radius: 14, x: 0, y: 3)
         .task(id: row.id) {
             guard !guestMapsActionsToLogin else { return }
+            PickupOrganizerTrustDebug.lifecycle("selected pickup card opened")
             await viewModel.loadPickupCreatorProfilesIfNeeded(creatorUserIds: [row.creator_user_id])
-            await viewModel.refreshPickupCreatorPublicRatingStats(creatorUserIds: [row.creator_user_id])
+            if viewModel.pickupOrganizerSummary(for: row.creator_user_id) != nil {
+                PickupOrganizerTrustDebug.lifecycle("organizer statistics served from cache")
+            } else {
+                PickupOrganizerTrustDebug.lifecycle("organizer statistics found in existing payload", details: "none")
+            }
+            await viewModel.refreshPickupOrganizerSummaries(userIds: [row.creator_user_id])
         }
         .onAppear {
             guard !guestMapsActionsToLogin else { return }
@@ -9701,7 +9899,12 @@ struct DiscoverScreen: View {
                         }
                     }
 
-                    venuePreviewFanZoneBlock(fanZoneData, isUnclaimedBusiness: resolved.isUnclaimedCommunityVenue)
+                    venuePreviewFanZoneBlock(
+                        fanZoneData,
+                        bar: resolved,
+                        gamesToday: gamesToday,
+                        isUnclaimedBusiness: resolved.isUnclaimedCommunityVenue
+                    )
                         .zIndex(5)
 
                     gamesListSection(bar: resolved, gamesToday: gamesToday)
@@ -9978,8 +10181,16 @@ struct DiscoverScreen: View {
         )
     }
 
-    private func venuePreviewFanZoneBlock(_ data: VenuePreviewFanZoneData, isUnclaimedBusiness: Bool = false) -> some View {
-        VenuePreviewFanZoneBlockView(
+    private func venuePreviewFanZoneBlock(
+        _ data: VenuePreviewFanZoneData,
+        bar: BarVenue,
+        gamesToday: [SportsEvent],
+        isUnclaimedBusiness: Bool = false
+    ) -> some View {
+        let mapEnergyScore = viewModel.mapPinEnergyScore(bar: bar, gamesOnMapDay: gamesToday)
+        let venueEnergyCaption = VenueEnergyEducation.displayLabel(forMapEnergyScore: mapEnergyScore)
+        return VenuePreviewFanZoneBlockView(
+            venueEnergyCaption: venueEnergyCaption.isEmpty ? nil : venueEnergyCaption,
             fireCount: data.fireCount,
             seatingCount: data.seatingCount,
             tvCount: data.tvCount,
@@ -10952,13 +11163,13 @@ struct DiscoverScreen: View {
 
         return ZStack {
             if let url = avatar.url {
-                AsyncImage(url: url, transaction: Transaction(animation: nil)) { phase in
+                CachedRemoteImagePhaseView(url: url, bucket: .avatar) { phase in
                     switch phase {
-                    case .success(let image):
-                        image
+                    case .success(let uiImage):
+                        Image(uiImage: uiImage)
                             .resizable()
                             .scaledToFill()
-                    default:
+                    case .empty, .failure:
                         venuePreviewMiniGoingAvatarInitials(avatar.initials)
                             .onAppear {
 #if DEBUG
@@ -10966,14 +11177,6 @@ struct DiscoverScreen: View {
 #endif
                             }
                     }
-                }
-                .onAppear {
-                    ImageCacheDebug.logBypass(
-                        loader: "AsyncImage",
-                        url: url,
-                        bucket: .avatar,
-                        reason: "venuePreviewMiniGoingAvatar"
-                    )
                 }
             } else {
                 venuePreviewMiniGoingAvatarInitials(avatar.initials)
@@ -13182,7 +13385,8 @@ struct DiscoverScreen: View {
     private func venueGameCardSocialActionRow(
         venueEventID: UUID,
         previewEnergy: VenueGamePreviewEnergy?,
-        fanChatCount: Int? = nil
+        fanChatCount: Int? = nil,
+        onVenueEnergyInfo: (() -> Void)? = nil
     ) -> some View {
         let source = "discoverVenueGameCard"
         let commentCount = fanChatCount ?? viewModel.fanUpdatesDisplayCommentCount(for: venueEventID)
@@ -13190,9 +13394,13 @@ struct DiscoverScreen: View {
         let _ = logFanReactionRemovedFromVenueCard()
 
         return VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 10) {
+            HStack(alignment: .center, spacing: 6) {
                 if let previewEnergy, previewEnergy.hasBadge {
                     venueGamePreviewEnergyCompactBadge(previewEnergy)
+                }
+
+                if let onVenueEnergyInfo {
+                    VenueEnergyInfoButton(action: onVenueEnergyInfo)
                 }
 
                 Spacer(minLength: 8)
@@ -13552,9 +13760,9 @@ struct DiscoverScreen: View {
     private func venueGamePreviewEnergyHeader(_ energy: VenueGamePreviewEnergy) -> some View {
         let palette = venueGamePreviewEnergyPalette(energy)
 
-        return HStack(alignment: .center, spacing: 8) {
+        return HStack(alignment: .center, spacing: 4) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(energy.label ?? "Quiet") • \(energy.score)")
+                Text(energy.label ?? "Quiet")
                     .font(FGTypography.metadata.weight(.bold))
                     .foregroundStyle(palette.text)
                     .lineLimit(1)
@@ -13610,17 +13818,7 @@ struct DiscoverScreen: View {
     }
 
     private func liveScoreEmoji(for score: Int) -> String {
-        if score >= 40 {
-            return "👑"
-        } else if score >= 16 {
-            return "🚀"
-        } else if score >= 6 {
-            return "🔥"
-        } else if score >= 1 {
-            return "✨"
-        }
-
-        return ""
+        VenueMapEnergyScore.tier(for: score).emoji
     }
     
     
@@ -13741,7 +13939,8 @@ struct DiscoverScreen: View {
                     .font(.caption2.weight(.heavy))
                     .foregroundStyle(isPro ? proVenueGlyphInk.opacity(0.92) : .white)
             } else if liveScore > 0 {
-                Text("\(liveScoreEmoji(for: liveScore)) \(liveScore)")
+                let energyLabel = VenueEnergyEducation.displayLabel(forMapEnergyScore: liveScore)
+                Text(energyLabel.isEmpty ? liveScoreEmoji(for: liveScore) : energyLabel)
                     .font(.caption2)
                     .fontWeight(.bold)
                     .foregroundStyle(isPro ? proVenueGlyphInk.opacity(0.92) : .white)
@@ -13753,7 +13952,7 @@ struct DiscoverScreen: View {
             ZStack {
                 if isDiscoverTabSelected && (hasLiveNow || liveScore >= livePulseThreshold) {
                     LivePulseView(
-                        isTrending: hasLiveNow || liveScore >= 40
+                        isTrending: hasLiveNow || VenueMapEnergyScore.tier(for: liveScore).isTrendingPulse
                     )
                 }
 
@@ -13836,7 +14035,7 @@ struct DiscoverScreen: View {
                             ZStack {
                                 if isDiscoverTabSelected && (hasLiveNow || liveScore >= livePulseThreshold) {
                                     LivePulseView(
-                                        isTrending: hasLiveNow || liveScore >= 40
+                                        isTrending: hasLiveNow || VenueMapEnergyScore.tier(for: liveScore).isTrendingPulse
                                     )
                                 }
 
@@ -13871,7 +14070,8 @@ struct DiscoverScreen: View {
                 .clipShape(Capsule())
 
             if hasLiveNow || liveScore > 0 {
-                Text(hasLiveNow ? "LIVE NOW" : "🔥 \(liveScore) live")
+                let energyLabel = VenueEnergyEducation.displayLabel(forMapEnergyScore: liveScore)
+                Text(hasLiveNow ? "LIVE NOW" : (energyLabel.isEmpty ? "Active" : energyLabel))
                     .font(.caption2)
                     .fontWeight(.bold)
                     .foregroundStyle(.white)
@@ -13949,12 +14149,6 @@ struct DiscoverScreen: View {
                 Text("venues")
                     .font(.caption2)
                     .fontWeight(.bold)
-
-                if case .gameScheduled = displayState, maxEnergy > 0 {
-                    Text("\(maxEnergy)")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.yellow.opacity(0.95))
-                }
 
                 if case .gameScheduled = displayState, let caption {
                     Text(caption)

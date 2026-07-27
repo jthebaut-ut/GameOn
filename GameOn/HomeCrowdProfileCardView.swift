@@ -8,9 +8,14 @@ struct HomeCrowdProfileCardView: View {
     var onChangeHomeCrowd: (() -> Void)? = nil
     var onChooseHomeCrowd: (() -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     private let cardHeight: CGFloat = 112
     private let imageSide: CGFloat = 86
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var subtitleLine: String? {
         guard let summary else { return nil }
@@ -257,7 +262,7 @@ struct HomeCrowdProfileCardView: View {
                         .fixedSize(horizontal: false, vertical: true)
 
                     if isSelfProfile {
-                        Text("Your go-to place to watch games and connect with fans.")
+                        Text(L10n.t("home_venue_subtitle", languageCode: languageCode))
                             .font(.system(size: 10.5, weight: .medium, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                             .lineLimit(2)
@@ -284,9 +289,9 @@ struct HomeCrowdProfileCardView: View {
 
     private var emptyMainLine: String {
         if isSelfProfile {
-            return "Choose your sports home"
+            return L10n.t("home_crowd_empty_self", languageCode: languageCode)
         }
-        return "This fan hasn't picked a Home Venue yet."
+        return L10n.t("home_crowd_empty_other", languageCode: languageCode)
     }
 
     private var emptyPlaceholderColumn: some View {
@@ -313,10 +318,11 @@ struct HomeCrowdProfileCardView: View {
     // MARK: - Shared visuals
 
     private var homeCrowdTitleLabel: some View {
-        Text("HOME VENUE")
+        Text(L10n.t("home_crowd", languageCode: languageCode).uppercased(with: Locale(identifier: languageCode)))
             .font(.system(size: 9.5, weight: .heavy, design: .rounded))
             .foregroundStyle(homeCrowdAccent)
             .tracking(1.08)
+            .accessibilityLabel(L10n.t("home_crowd", languageCode: languageCode))
     }
 
     private var homeCrowdPlaceholderVisual: some View {
@@ -382,7 +388,12 @@ struct HomeCrowdProfileCardView: View {
     private var compactActionRow: some View {
         HStack(spacing: 7) {
             if let onExploreVenue {
-                homeCrowdCapsuleButton(title: "Open Venue", icon: "arrow.up.right", isPrimary: true, action: onExploreVenue)
+                homeCrowdCapsuleButton(
+                    title: L10n.t("open_venue", languageCode: languageCode),
+                    icon: "arrow.up.right",
+                    isPrimary: true,
+                    action: onExploreVenue
+                )
             }
             if let onChangeHomeCrowd {
                 homeCrowdIconButton(showsHomeCrowdBadge: true, action: onChangeHomeCrowd)
@@ -394,7 +405,7 @@ struct HomeCrowdProfileCardView: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 HomeCrowdShieldStarBadge(diameter: 18, visualState: .active)
-                Text("Choose Home Venue")
+                Text(L10n.t("choose_home_crowd", languageCode: languageCode))
                     .font(.system(size: 11.5, weight: .heavy, design: .rounded))
             }
             .foregroundStyle(.white)
@@ -489,7 +500,7 @@ struct HomeCrowdProfileCardView: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Change Home Venue")
+        .accessibilityLabel(L10n.t("choose_home_crowd", languageCode: languageCode))
     }
 
     private var homeCrowdAccent: Color {
@@ -511,21 +522,23 @@ extension View {
         self
             .background {
                 RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .background {
-                        RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color.white.opacity(colorScheme == .dark ? 0.14 : 0.98),
-                                        Color.white.opacity(colorScheme == .dark ? 0.08 : 0.94),
-                                        accent.opacity(colorScheme == .dark ? 0.06 : 0.04)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                    }
+                    .fill(
+                        LinearGradient(
+                            colors: colorScheme == .dark
+                                ? [
+                                    Color(red: 0.12, green: 0.11, blue: 0.16),
+                                    Color(red: 0.09, green: 0.09, blue: 0.13),
+                                    accent.opacity(0.14)
+                                ]
+                                : [
+                                    Color.white.opacity(0.98),
+                                    Color.white.opacity(0.94),
+                                    accent.opacity(0.04)
+                                ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
             }
             .clipShape(RoundedRectangle(cornerRadius: HomeCrowdCardStyle.cornerRadius, style: .continuous))
             .overlay {
@@ -533,8 +546,8 @@ extension View {
                     .strokeBorder(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(colorScheme == .dark ? 0.22 : 0.92),
-                                accent.opacity(0.18)
+                                Color.white.opacity(colorScheme == .dark ? 0.18 : 0.92),
+                                accent.opacity(colorScheme == .dark ? 0.28 : 0.18)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -542,7 +555,7 @@ extension View {
                         lineWidth: 0.85
                     )
             }
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.07), radius: 14, y: 7)
-            .shadow(color: accent.opacity(colorScheme == .dark ? 0.12 : 0.06), radius: 18, y: 4)
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.07), radius: 14, y: 7)
+            .shadow(color: accent.opacity(colorScheme == .dark ? 0.16 : 0.06), radius: 18, y: 4)
     }
 }

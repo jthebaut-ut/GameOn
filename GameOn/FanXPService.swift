@@ -1,7 +1,7 @@
 import Foundation
 import Supabase
 
-/// Centralized internal reputation-signal reads and awards via the legacy `award_fan_xp` RPC.
+/// Fan XP source identifiers. Amounts are authoritative on the server (`fan_xp_amount_for_source` / `claim_fan_xp`).
 enum FanXPSource {
     static let favoriteVenue = "favorite_venue"
     static let venueEventInterest = "venue_event_interest"
@@ -9,6 +9,19 @@ enum FanXPSource {
     static let pickupJoinApproved = "pickup_join_approved"
     static let pickupComplete = "pickup_complete"
     static let friendConnected = "friend_connected"
+
+    /// Server-authoritative amounts (must match `public.fan_xp_amount_for_source`).
+    static func expectedAmount(for source: String) -> Int {
+        switch source {
+        case favoriteVenue: return 2
+        case venueEventInterest: return 5
+        case pickupCreate: return 20
+        case pickupJoinApproved: return 10
+        case pickupComplete: return 15
+        case friendConnected: return 5
+        default: return 0
+        }
+    }
 
     static func rewardSubtitle(for source: String) -> String {
         switch source {
@@ -35,6 +48,7 @@ struct FanXPAwardResult: Decodable {
     let level: Int?
     let title: String?
     let xp_gained: Int?
+    let reason: String?
 }
 
 struct FanXPService {
@@ -77,38 +91,29 @@ struct FanXPService {
         return .rookie
     }
 
+    /// Claims XP for a verified action. Server validates evidence and determines the amount.
+    /// Does not accept a client-chosen XP amount or arbitrary target user id.
     @discardableResult
-    func awardXP(
-        userId: UUID,
-        amount: Int,
+    func claimXP(
         source: String,
-        sourceId: UUID? = nil,
-        sourceKey: String = ""
+        sourceId: UUID
     ) async -> FanXPAwardResult? {
-        guard amount > 0 else { return nil }
-
 #if DEBUG
-        print("[FanXPDebug] awardRequested source=\(source) amount=\(amount) userId=\(userId.uuidString) sourceId=\(sourceId?.uuidString ?? "nil") sourceKey=\(sourceKey)")
+        print("[FanXPDebug] claimRequested source=\(source) sourceId=\(sourceId.uuidString)")
 #endif
 
         struct Params: Encodable {
-            let p_user_id: UUID
-            let p_amount: Int
             let p_source: String
-            let p_source_id: UUID?
-            let p_source_key: String
+            let p_source_id: UUID
         }
 
         do {
             let result: FanXPAwardResult = try await client
                 .rpc(
-                    "award_fan_xp",
+                    "claim_fan_xp",
                     params: Params(
-                        p_user_id: userId,
-                        p_amount: amount,
                         p_source: source,
-                        p_source_id: sourceId,
-                        p_source_key: sourceKey
+                        p_source_id: sourceId
                     )
                 )
                 .execute()
@@ -116,11 +121,11 @@ struct FanXPService {
 
             if result.duplicate == true || result.awarded == false {
 #if DEBUG
-                print("[FanXPDebug] duplicateSkipped source=\(source) totalXP=\(result.total_xp ?? -1)")
+                print("[FanXPDebug] claimSkipped source=\(source) reason=\(result.reason ?? "duplicate_or_rejected") totalXP=\(result.total_xp ?? -1)")
 #endif
             } else if result.awarded == true {
 #if DEBUG
-                print("[FanXPDebug] xpAwarded source=\(source) gained=\(result.xp_gained ?? amount)")
+                print("[FanXPDebug] xpAwarded source=\(source) gained=\(result.xp_gained ?? FanXPSource.expectedAmount(for: source))")
                 print("[FanXPDebug] totalXP=\(result.total_xp ?? -1)")
                 print("[FanXPDebug] level=\(result.level ?? -1)")
                 print("[FanXPDebug] title=\(result.title ?? "")")
@@ -129,7 +134,7 @@ struct FanXPService {
             return result
         } catch {
 #if DEBUG
-            print("[FanXPDebug] awardFailed source=\(source) error=\(error.localizedDescription)")
+            print("[FanXPDebug] claimFailed source=\(source) error=\(error.localizedDescription)")
 #endif
             return nil
         }

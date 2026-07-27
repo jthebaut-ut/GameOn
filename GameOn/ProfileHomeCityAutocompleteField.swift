@@ -7,20 +7,22 @@ struct ProfileHomeCityAutocompleteField: View {
     @Binding var region: String
     @Binding var country: String
     @Binding var displayText: String
+    /// Compact pill field used inside Edit Profile Location rows.
+    var usesCompactPillStyle: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isFocused: Bool
     @StateObject private var controller = ProfileHomeCitySearchController()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: usesCompactPillStyle ? 6 : 8) {
             HStack(spacing: 8) {
                 TextField("Lehi, Utah", text: $displayText)
                     .textInputAutocapitalization(.words)
                     .disableAutocorrection(true)
                     .focused($isFocused)
-                    .font(.system(size: 16, weight: .semibold, design: .rounded))
-                    .profileHomeCityInputStyle(colorScheme: colorScheme)
+                    .font(usesCompactPillStyle ? .body : .system(size: 16, weight: .semibold, design: .rounded))
+                    .modifier(ProfileHomeCityFieldChrome(colorScheme: colorScheme, compact: usesCompactPillStyle))
                     .onChange(of: displayText) { _, newValue in
                         controller.refresh(query: newValue, isFocused: isFocused)
                     }
@@ -36,8 +38,10 @@ struct ProfileHomeCityAutocompleteField: View {
                         clearSelection()
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 16, weight: .semibold))
+                            .font(.system(size: usesCompactPillStyle ? 15 : 16, weight: .semibold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.72))
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Clear home city")
@@ -199,16 +203,33 @@ private final class ProfileHomeCitySearchController: NSObject, ObservableObject,
     }
 }
 
+private struct ProfileHomeCityFieldChrome: ViewModifier {
+    let colorScheme: ColorScheme
+    let compact: Bool
+
+    func body(content: Content) -> some View {
+        if compact {
+            content
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.92))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        } else {
+            content
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.62 : 0.96))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+                }
+        }
+    }
+}
+
 private extension View {
     func profileHomeCityInputStyle(colorScheme: ColorScheme) -> some View {
-        self
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.62 : 0.96))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-            }
+        modifier(ProfileHomeCityFieldChrome(colorScheme: colorScheme, compact: false))
     }
 }

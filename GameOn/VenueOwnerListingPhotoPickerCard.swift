@@ -53,7 +53,7 @@ struct VenueOwnerListingPhotoPickerCard: View {
     let title: String
     let subtitle: String
     @Binding var pickerSelection: PhotosPickerItem?
-    /// After upload to `venue-photos`, includes optional cache-bust query for `AsyncImage`.
+    /// After upload to `venue-photos`, includes optional cache-bust query for remote preview.
     var remotePreviewURL: String
     /// Local JPEG/PNG bytes before upload (business signup while still logged out).
     var localPreviewData: Data?
@@ -184,28 +184,29 @@ struct VenueOwnerListingPhotoPickerCard: View {
     @ViewBuilder
     private func remotePreview(_ url: URL) -> some View {
         if let remoteLoadFailureMessage {
-            AsyncImage(url: url) { phase in
+            CachedRemoteImagePhaseView(url: url, bucket: .venue) { phase in
                 switch phase {
-                case .success(let image):
-                    image
+                case .success(let uiImage):
+                    Image(uiImage: uiImage)
                         .resizable()
                         .scaledToFill()
                 case .failure:
                     remoteLoadFailureView(remoteLoadFailureMessage)
                 case .empty:
                     ProgressView()
-                @unknown default:
-                    remoteLoadFailureView(remoteLoadFailureMessage)
                 }
             }
             .id(trimmedRemote)
         } else {
-            AsyncImage(url: url) { image in
-                image
-                    .resizable()
-                    .scaledToFill()
-            } placeholder: {
-                ProgressView()
+            CachedRemoteImagePhaseView(url: url, bucket: .venue) { phase in
+                switch phase {
+                case .success(let uiImage):
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFill()
+                case .empty, .failure:
+                    ProgressView()
+                }
             }
             .id(trimmedRemote)
         }

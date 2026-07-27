@@ -24,6 +24,13 @@ struct ProfileSettingsSheetHost<Root: View>: View {
     /// Soft parent refresh only while stack is at root (never while a destination is pushed).
     var onSettledRootRefresh: () -> Void
     @ViewBuilder var root: () -> Root
+    @AppStorage(FanGeoAppearancePreference.appStorageKey) private var appearancePreferenceRaw =
+        FanGeoAppearancePreference.system.rawValue
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var appearancePreference: FanGeoAppearancePreference {
+        FanGeoAppearancePreference(rawValue: appearancePreferenceRaw) ?? .system
+    }
 
     var body: some View {
         NavigationStack(path: $navigator.path) {
@@ -55,6 +62,9 @@ struct ProfileSettingsSheetHost<Root: View>: View {
                         .disabled(isCloseDisabled)
                     }
                 }
+                .toolbarBackground(SettingsPremiumChrome.presentationBackground(colorScheme), for: .navigationBar)
+                .toolbarBackground(.visible, for: .navigationBar)
+                .toolbarColorScheme(colorScheme, for: .navigationBar)
                 .onAppear {
 #if DEBUG
                     SettingsNavigationDebug.log(
@@ -69,33 +79,45 @@ struct ProfileSettingsSheetHost<Root: View>: View {
                 }
         }
         .tint(FGColor.accentGreen)
-        .background {
+        // Keep the already-presented Settings sheet aligned with the canonical preference.
+        // WindowGroup `.preferredColorScheme` alone does not reliably update sheet UIKit chrome mid-presentation.
+        .preferredColorScheme(appearancePreference.colorScheme)
+        .background(SettingsPremiumChrome.presentationBackground(colorScheme).ignoresSafeArea())
+        .onChange(of: appearancePreferenceRaw) { _, newRaw in
 #if DEBUG
-            Color.clear
-                .onAppear {
-                    SettingsNavigationDebug.log(
-                        "hostContentAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
-                    )
-                }
+            let preference = FanGeoAppearancePreference(rawValue: newRaw) ?? .system
+            print("[SettingsAppearanceDebug] preferenceChanged=\(preference.rawValue) effectiveColorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
 #endif
         }
         .onAppear {
 #if DEBUG
+            print("[SettingsAppearanceDebug] hostAppear preference=\(appearancePreference.rawValue) colorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
+            SettingsNavigationDebug.log(
+                "hostContentAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
+            )
             SettingsNavigationDebug.log(
                 "hostAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
             )
 #endif
             scheduleSettledRefreshIfNeeded()
 #if DEBUG
-            if ProcessInfo.processInfo.arguments.contains("-SettingsNavSequentialValidation") {
-                scheduleSequentialPathValidation()
-            }
+            // Manual validation / UI testing only; requires the explicit
+            // -FanGeoRunProfileSettingsSequentialNavValidation launch argument.
+            // The coordinator rejects duplicate runs from repeated host appearances.
+            ProfileSettingsSequentialNavValidation.scheduleIfExplicitlyEnabled(
+                navigator: navigator,
+                source: "hostAppear"
+            )
 #endif
         }
         .onDisappear {
 #if DEBUG
             SettingsNavigationDebug.log(
                 "hostDisappear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
+            )
+            ProfileSettingsSequentialNavValidation.cancelRun(
+                navigatorId: navigator.instanceId,
+                reason: "hostDisappear"
             )
 #endif
         }
@@ -113,20 +135,16 @@ struct ProfileSettingsSheetHost<Root: View>: View {
             )
 #endif
             if !presented {
+#if DEBUG
+                ProfileSettingsSequentialNavValidation.cancelRun(
+                    navigatorId: navigator.instanceId,
+                    reason: "sheetDismissed"
+                )
+#endif
                 navigator.reset(reason: "sheetDismissed")
             }
         }
     }
-
-#if DEBUG
-    private func scheduleSequentialPathValidation() {
-        Task { @MainActor in
-            // Wait for sheet settle / privacy token.
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            await ProfileSettingsSequentialNavValidation.run(navigator: navigator)
-        }
-    }
-#endif
 
     private func scheduleSettledRefreshIfNeeded() {
         Task { @MainActor in

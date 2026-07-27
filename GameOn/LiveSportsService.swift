@@ -53,7 +53,8 @@ actor LiveSportsService {
         return try await fetchLiveMatchesReadOnly()
     }
 
-    /// Automatic Live loads: sync-live-matches (if cooldown expired) then re-read. Coalesced across callers.
+    /// Automatic Live loads: read `live_matches` cache only.
+    /// Cache refresh is server-side (`sync-live-matches` cron / score worker) — clients must not invoke that privileged function.
     func fetchLiveMatchesAfterBackgroundSyncIfNeeded() async throws -> [LiveMatch]? {
         guard shouldScheduleBackgroundSync() else {
 #if DEBUG
@@ -73,8 +74,9 @@ actor LiveSportsService {
         print("[LiveDebug] backgroundSyncStarted")
 #endif
         let task = Task<[LiveMatch], Error> {
-            let syncAttempted = await self.triggerCacheSyncIfNeeded(force: false)
-            return try await self.fetchLiveMatchesFromSupabase(cacheSyncAttempted: syncAttempted)
+            // Privileged Edge Function must not be called with user/anon JWT.
+            _ = await self.triggerCacheSyncIfNeeded(force: false)
+            return try await self.fetchLiveMatchesFromSupabase(cacheSyncAttempted: false)
         }
         inFlightBackgroundSync = task
         defer { inFlightBackgroundSync = nil }
@@ -99,8 +101,8 @@ actor LiveSportsService {
         print("[LiveDebug] query_execution_started forceRefresh=\(force)")
 #endif
         let task = Task<[LiveMatch], Error> { [force] in
-            let syncAttempted = await self.triggerCacheSyncIfNeeded(force: force)
-            return try await self.fetchLiveMatchesFromSupabase(cacheSyncAttempted: syncAttempted)
+            _ = await self.triggerCacheSyncIfNeeded(force: force)
+            return try await self.fetchLiveMatchesFromSupabase(cacheSyncAttempted: false)
         }
         inFlightFetch = task
         defer { inFlightFetch = nil }
@@ -555,6 +557,8 @@ actor LiveSportsService {
         })
     }
 
+    /// Client-side sync trigger disabled: `sync-live-matches` is service/cron-only.
+    /// Returns false so callers continue with a read-only `live_matches` fetch.
     private func triggerCacheSyncIfNeeded(force: Bool) async -> Bool {
         let now = Date()
         if !force,
@@ -564,29 +568,9 @@ actor LiveSportsService {
         }
         lastCacheSyncAt = now
 #if DEBUG
-        print("[LiveDebug] cacheSyncStarted")
+        print("[LiveDebug] cacheSyncSkipped reason=serverSideOnly privilegedFunction=sync-live-matches")
 #endif
-        struct SyncResponse: Decodable {
-            let success: Bool?
-            let source: String?
-            let error: String?
-        }
-        do {
-            let response: SyncResponse = try await supabase.functions.invoke(
-                "sync-live-matches",
-                options: FunctionInvokeOptions(method: .post)
-            )
-#if DEBUG
-            print(
-                "[LiveDebug] cacheSyncFinished success=\(response.success ?? false) source=\(response.source ?? "nil") error=\(response.error ?? "nil")"
-            )
-#endif
-        } catch {
-#if DEBUG
-            print("[LiveDebug] apiError=cache_sync \(error.localizedDescription)")
-#endif
-        }
-        return true
+        return false
     }
 
     private func fetchLiveMatchesFromSupabase(

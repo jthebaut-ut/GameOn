@@ -25,13 +25,19 @@ struct PredictionPremiumCard<Content: View>: View {
     var body: some View {
         content()
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.82 : 0.98))
+            // Light: solid white card so it separates from the off-white screen
+            // (translucent cardBackground read as flat). Dark: unchanged.
+            .background(
+                colorScheme == .dark
+                    ? FGColor.cardBackground(colorScheme).opacity(0.82)
+                    : Color.white
+            )
             .clipShape(RoundedRectangle(cornerRadius: PredictionPremiumMetrics.cornerRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: PredictionPremiumMetrics.cornerRadius, style: .continuous)
-                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.38 : 0.28), lineWidth: 1)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.38 : 0.45), lineWidth: 1)
             }
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.06), radius: 10, y: 4)
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.07), radius: 12, y: 5)
     }
 }
 

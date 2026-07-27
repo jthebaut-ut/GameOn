@@ -138,6 +138,22 @@ extension MapViewModel {
         accountMode: AppleAuthAccountMode,
         entryPoint: AppleAuthEntryPoint = .signIn
     ) async {
+        let isSignupEntry = entryPoint == .fanSignup || entryPoint == .businessSignup
+        if isSignupEntry {
+            guard await requireAgeAccessForSignUp() else {
+                if AgeAccessGateService.shared.latestState.isBlockingUnder13 {
+                    AgeAccessDebugLog.event("blocked")
+                }
+                return
+            }
+        }
+
+        let method: SafeLoginMethod = accountMode == .fan ? .appleFan : .appleBusiness
+        let generationOrNil = await MainActor.run {
+            beginSafeLogin(method: method, source: "apple:\(entryPoint.rawValue)")
+        }
+        guard let generation = generationOrNil else { return }
+
         do {
             print("[AppleAuthDebug] supabaseSignInRequestStart=true accountMode=\(accountMode.rawValue) entryPoint=\(entryPoint.rawValue) identityTokenLength=\(identityToken.count) rawNonceLength=\(rawNonce.count) appleEmailProvided=\(email != nil)")
             Self.logAppleIdentityTokenClaims(identityToken, rawNonce: rawNonce)
@@ -160,6 +176,18 @@ extension MapViewModel {
                 )
             )
 
+            guard await MainActor.run(body: { isActiveSafeLoginGeneration(generation) }) else {
+                SafeLoginDebug.log("stale previous-session result ignored phase=applePostSignIn")
+                return
+            }
+
+            await MainActor.run {
+                markSafeLoginPreparingSession(generation: generation)
+                // Fails closed unless this exact UUID was server-confirmed this session.
+                // A sign-up grant is consumed later, once the profile row exists.
+                AgeAccessGateService.shared.bindAuthenticatedUser(session.user.id, reason: .login)
+            }
+
             print("[AppleAuthDebug] supabaseSignInSucceeded=true")
             print("[AppleAuthDebug] currentAuthUserId=\(session.user.id.uuidString.lowercased())")
             print("[AppleAuthDebug] currentAuthUserEmail=\(session.user.email ?? "nil")")
@@ -174,6 +202,9 @@ extension MapViewModel {
 
             if await refreshActiveBanGate(reason: "appleLogin") {
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                await MainActor.run {
+                    clearSafeLoginProgress(generation: generation, reason: "appleBanGate")
+                }
                 return
             }
 
@@ -183,15 +214,41 @@ extension MapViewModel {
                     session: session,
                     sessionEmail: sessionEmail,
                     fullName: fullName,
-                    entryPoint: entryPoint
+                    entryPoint: entryPoint,
+                    loginGeneration: generation
                 )
             case .business:
                 await finishAppleBusinessSignIn(
                     session: session,
                     sessionEmail: sessionEmail,
                     fullName: fullName,
-                    entryPoint: entryPoint
+                    entryPoint: entryPoint,
+                    loginGeneration: generation
                 )
+            }
+
+            await MainActor.run {
+                if isActiveSafeLoginGeneration(generation) {
+                    let succeeded = accountMode == .fan ? isLoggedIn : isVenueOwnerLoggedIn
+                    if succeeded {
+                        completeSafeLoginSuccess(
+                            generation: generation,
+                            accountKind: accountMode == .fan ? "fan" : "business"
+                        )
+                    } else if isAppleFanSignupOnboardingActive || businessEmailVerifiedNeedsVenueSetup {
+                        clearSafeLoginProgress(generation: generation, reason: "appleOnboardingHandoff")
+                    } else {
+                        let message = accountMode == .fan
+                            ? (authErrorMessage.isEmpty ? appleAuthFanMessage : authErrorMessage)
+                            : (venueAuthErrorMessage.isEmpty ? appleAuthBusinessMessage : venueAuthErrorMessage)
+                        failSafeLogin(
+                            generation: generation,
+                            message: message,
+                            accountMode: accountMode,
+                            failurePhase: "appleFinishIncomplete"
+                        )
+                    }
+                }
             }
         } catch {
             let nsError = error as NSError
@@ -207,6 +264,14 @@ extension MapViewModel {
                 isError: true,
                 autoClearAfterSeconds: 8
             )
+            await MainActor.run {
+                failSafeLogin(
+                    generation: generation,
+                    message: "Could not sign in with Apple. Please try again.",
+                    accountMode: accountMode,
+                    failurePhase: "appleSignInError"
+                )
+            }
         }
     }
 
@@ -214,8 +279,13 @@ extension MapViewModel {
         session: Session,
         sessionEmail: String,
         fullName: PersonNameComponents?,
-        entryPoint: AppleAuthEntryPoint
+        entryPoint: AppleAuthEntryPoint,
+        loginGeneration: UInt64
     ) async {
+        guard await MainActor.run(body: { isActiveSafeLoginGeneration(loginGeneration) }) else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=appleFanFinish")
+            return
+        }
         guard OwnerBusinessEmail.isValidStrict(sessionEmail) else {
             await forceLogout(reason: "appleFanMissingEmail", source: "MapViewModel.finishAppleFanSignIn")
             presentAppleAuthMessage(
@@ -351,8 +421,13 @@ extension MapViewModel {
         session: Session,
         sessionEmail: String,
         fullName: PersonNameComponents?,
-        entryPoint: AppleAuthEntryPoint
+        entryPoint: AppleAuthEntryPoint,
+        loginGeneration: UInt64
     ) async {
+        guard await MainActor.run(body: { isActiveSafeLoginGeneration(loginGeneration) }) else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=appleBusinessFinish")
+            return
+        }
         guard OwnerBusinessEmail.isValidStrict(sessionEmail) else {
             await forceLogout(reason: "appleBusinessMissingEmail", source: "MapViewModel.finishAppleBusinessSignIn")
             presentAppleAuthMessage(

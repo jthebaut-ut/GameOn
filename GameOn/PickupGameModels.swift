@@ -1,5 +1,15 @@
 import Foundation
 
+func pickupLocalizedSpotsOpen(_ count: Int, languageCode: String) -> String {
+    let key = count == 1 ? "pickup_spot_open_singular" : "pickup_spots_open_plural"
+    return String(format: L10n.t(key, languageCode: languageCode), count)
+}
+
+func pickupLocalizedSpotsLeft(_ count: Int, languageCode: String) -> String {
+    let key = count == 1 ? "pickup_spot_left_singular" : "pickup_spots_left_plural"
+    return String(format: L10n.t(key, languageCode: languageCode), count)
+}
+
 /// Automatic removal: `remove_after_at` is always `game_start_at` + this many hours (DB trigger + app payloads).
 nonisolated enum PickupGameAutoRemoval {
     static let hoursAfterGameStart: Int = 12
@@ -23,13 +33,17 @@ enum GameType: String, Codable, CaseIterable {
     case scrimmage
 
     var displayTitle: String {
+        displayTitle(languageCode: nil)
+    }
+
+    func displayTitle(languageCode: String?) -> String {
         switch self {
         case .pickup:
-            return "Pickup"
+            return L10n.t("pickup_game_format_pickup", languageCode: languageCode)
         case .practice:
-            return "Practice"
+            return L10n.t("pickup_game_format_practice", languageCode: languageCode)
         case .scrimmage:
-            return "Scrimmage"
+            return L10n.t("pickup_game_format_scrimmage", languageCode: languageCode)
         }
     }
 
@@ -202,15 +216,35 @@ extension PickupGameRow {
     }
 
     var pickupDateWithCompactTimeRange: String? {
+        pickupDateWithCompactTimeRange(locale: .autoupdatingCurrent)
+    }
+
+    func pickupDateWithCompactTimeRange(languageCode: String) -> String? {
+        let code = L10n.normalizedLanguageCode(languageCode)
+        return pickupDateWithCompactTimeRange(
+            locale: Locale(identifier: code.replacingOccurrences(of: "-", with: "_"))
+        )
+    }
+
+    private func pickupDateWithCompactTimeRange(locale: Locale) -> String? {
         guard let start = PickupGameModels.parseSupabaseTimestamptz(game_start_at) else { return nil }
-        let dateText = start.formatted(date: .abbreviated, time: .omitted)
+        let dateStyle = Date.FormatStyle.dateTime
+            .month(.abbreviated)
+            .day()
+            .year()
+            .locale(locale)
+        let timeStyle = Date.FormatStyle.dateTime
+            .hour()
+            .minute()
+            .locale(locale)
+        let dateText = start.formatted(dateStyle)
         let end = end_time.flatMap { PickupGameModels.parseSupabaseTimestamptz($0) }
             ?? PickupGameModels.defaultPickupEndTime(forStart: start)
         if end > start {
-            let range = "\(start.formatted(date: .omitted, time: .shortened)) – \(end.formatted(date: .omitted, time: .shortened))"
+            let range = "\(start.formatted(timeStyle)) – \(end.formatted(timeStyle))"
             return "\(dateText) • \(range)"
         }
-        return start.formatted(date: .abbreviated, time: .shortened)
+        return "\(dateText) • \(start.formatted(timeStyle))"
     }
 
     var gameFormat: GameType {
@@ -518,12 +552,56 @@ enum PickupCreatorRatingDebug {
         alreadyRated: Bool?
     ) {
 #if DEBUG
-        print("[PickupCreatorRatingDebug] pickupGameId=\(pickupGameId.uuidString.lowercased())")
-        print("[PickupCreatorRatingDebug] creatorUserId=\(creatorUserId.uuidString.lowercased())")
-        print("[PickupCreatorRatingDebug] raterUserId=\(raterUserId?.uuidString.lowercased() ?? "nil")")
+        print("===== PICKUP RATING =====")
+        print("[PickupCreatorRatingDebug] event=legacy_submit_trace")
+        print("[PickupCreatorRatingDebug] hasPickupGameId=\(true)")
+        print("[PickupCreatorRatingDebug] hasCreatorUserId=\(true)")
+        print("[PickupCreatorRatingDebug] hasRaterUserId=\(raterUserId != nil)")
         print("[PickupCreatorRatingDebug] rating=\(rating.map(String.init) ?? "nil")")
         print("[PickupCreatorRatingDebug] submitSucceeded=\(submitSucceeded.map { $0 ? "true" : "false" } ?? "nil")")
         print("[PickupCreatorRatingDebug] alreadyRated=\(alreadyRated.map { $0 ? "true" : "false" } ?? "nil")")
+#endif
+    }
+
+    /// Privacy-safe DEBUG diagnostics for the organizer-rating lifecycle.
+    static func lifecycle(_ event: String, details: String = "") {
+#if DEBUG
+        print("===== PICKUP RATING =====")
+        if details.isEmpty {
+            print("[PickupRating] \(event)")
+        } else {
+            print("[PickupRating] \(event) \(details)")
+        }
+#endif
+    }
+}
+
+/// Privacy-safe DEBUG diagnostics for Discover map organizer trust lines.
+enum PickupOrganizerTrustDebug {
+    static func lifecycle(_ event: String, details: String = "") {
+#if DEBUG
+        print("===== PICKUP ORGANIZER TRUST =====")
+        if details.isEmpty {
+            print("[PickupOrganizerTrust] \(event)")
+        } else {
+            print("[PickupOrganizerTrust] \(event) \(details)")
+        }
+#endif
+    }
+
+    static func logResolved(summary: PickupOrganizerSummary) {
+#if DEBUG
+        if summary.ratingCount > 0 {
+            lifecycle(
+                "reputation values resolved",
+                details: "hosted=\(summary.hostedCount) ratings=\(summary.ratingCount) avg=\(summary.averageRating.map { String(format: "%.1f", $0) } ?? "nil")"
+            )
+        } else {
+            lifecycle(
+                "no-rating state resolved",
+                details: "hosted=\(summary.hostedCount)"
+            )
+        }
 #endif
     }
 }
@@ -563,12 +641,16 @@ extension PickupGameRequestRow {
     }
 
     var statusDisplayTitle: String {
+        statusDisplayTitle(languageCode: L10n.defaultLanguageCode)
+    }
+
+    func statusDisplayTitle(languageCode: String) -> String {
         switch status.lowercased() {
-        case "pending": return "Pending"
-        case "approved": return "Approved"
-        case "rejected": return "Rejected"
-        case "cancelled": return "Withdrawn"
-        case "withdrawn": return "Withdrawn"
+        case "pending": return L10n.t("pickup_join_status_pending", languageCode: languageCode)
+        case "approved": return L10n.t("pickup_host_participant_status_approved", languageCode: languageCode)
+        case "rejected": return L10n.t("pickup_join_status_rejected", languageCode: languageCode)
+        case "cancelled", "withdrawn":
+            return L10n.t("pickup_join_status_cancelled", languageCode: languageCode)
         default: return status.capitalized
         }
     }
@@ -695,10 +777,14 @@ enum PickupPlayEnvironment: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var displayTitle: String {
+        displayTitle(languageCode: nil)
+    }
+
+    func displayTitle(languageCode: String?) -> String {
         switch self {
         case .indoor: return "Indoor"
         case .outdoor: return "Outdoor"
-        case .either: return "Indoor or Outdoor"
+        case .either: return L10n.t("pickup_play_env_indoor_or_outdoor", languageCode: languageCode)
         }
     }
 
@@ -720,8 +806,12 @@ enum PickupGameSkillLevel: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var displayTitle: String {
+        displayTitle(languageCode: nil)
+    }
+
+    func displayTitle(languageCode: String?) -> String {
         switch self {
-        case .casual: return "Casual"
+        case .casual: return L10n.t("pickup_skill_casual", languageCode: languageCode)
         case .beginner_friendly: return "Beginner Friendly"
         case .intermediate: return "Intermediate"
         case .competitive: return "Competitive"
@@ -748,8 +838,12 @@ enum PickupParticipantPreference: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var displayTitle: String {
+        displayTitle(languageCode: nil)
+    }
+
+    func displayTitle(languageCode: String?) -> String {
         switch self {
-        case .everyone: return "Everyone Welcome"
+        case .everyone: return L10n.t("pickup_welcome_everyone", languageCode: languageCode)
         case .women_only: return "Women Only"
         case .men_only: return "Men Only"
         case .kids_only: return "Kids Only"
@@ -880,15 +974,13 @@ extension PickupGameRow {
         return now >= start
     }
 
-    /// After start, or after the listing `remove_after_at` moment (post-window), show post-game organizer rating UI.
+    /// Post-game organizer rating: scheduled end reached (matches backend `submit_pickup_creator_rating`).
+    /// Uses `end_time`, or start + 2h when end is missing — not merely game start / remove_after.
     func isPickupCreatorRatingPromptEligible(now: Date = Date()) -> Bool {
-        if hasPickupGameStarted(now: now) { return true }
-        if let rem = remove_after_at,
-           let remDate = PickupGameModels.parseSupabaseTimestamptz(rem),
-           now >= remDate {
-            return true
-        }
-        return false
+        let st = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if st == "cancelled" || st == "canceled" { return false }
+        guard let end = PickupGameModels.endDate(for: self) else { return false }
+        return now >= end
     }
 }
 

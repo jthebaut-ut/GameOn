@@ -26,14 +26,16 @@ enum SettingsPremiumChrome {
     static let scrollCardShadowRadius: CGFloat = 6
     static let scrollCardShadowYOffset: CGFloat = 3
 
+    /// Explicit RGB only — never `Color(.system*)`. UIKit dynamic colors can keep the previous
+    /// interface style inside an already-presented Settings sheet while SwiftUI `colorScheme` updates.
     static func cardFill(_ scheme: ColorScheme) -> Color {
         scheme == .dark
-            ? Color(red: 0.085, green: 0.105, blue: 0.115).opacity(0.72)
-            : Color(.secondarySystemGroupedBackground).opacity(0.96)
+            ? Color(red: 0.085, green: 0.105, blue: 0.115).opacity(0.92)
+            : Color(red: 0.99, green: 0.99, blue: 1.0)
     }
 
     static func cardHighlight(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color.white.opacity(0.035) : Color.white.opacity(0.56)
+        scheme == .dark ? Color.white.opacity(0.035) : Color.white.opacity(0.72)
     }
 
     static func cardStroke(_ scheme: ColorScheme) -> Color {
@@ -76,11 +78,15 @@ enum SettingsPremiumChrome {
         scheme == .dark ? Color.white.opacity(0.055) : Color.black.opacity(0.045)
     }
 
+    static func presentationBackground(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.025, green: 0.032, blue: 0.04)
+            : Color(red: 0.94, green: 0.95, blue: 0.97)
+    }
+
     static func screenBackground(_ scheme: ColorScheme) -> some View {
         ZStack {
-            scheme == .dark
-                ? Color(red: 0.025, green: 0.032, blue: 0.04)
-                : Color(.systemGroupedBackground)
+            presentationBackground(scheme)
             LinearGradient(
                 colors: [
                     Color.white.opacity(scheme == .dark ? 0.035 : 0.56),

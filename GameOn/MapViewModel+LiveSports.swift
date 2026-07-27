@@ -33,6 +33,14 @@ extension MapViewModel {
         await refreshLiveMatchesForCalendar(forceRefresh: forceRefresh)
     }
 
+    /// Equality-guards the featured-events publish: the 15s Live timer refresh usually returns
+    /// the same cached featured events, and an unconditional assign republished identical values.
+    @MainActor
+    func applyActiveFeaturedEventsIfChanged(_ events: [FeaturedEvent]) {
+        guard activeFeaturedEvents != events else { return }
+        activeFeaturedEvents = events
+    }
+
     /// True when ``liveMatches`` is non-empty and was refreshed recently (tab preload skip).
     func liveMatchesAreFreshForTabPreload(within interval: TimeInterval = 90) -> Bool {
         guard !liveMatches.isEmpty, let last = lastLiveMatchesRefreshAt else { return false }
@@ -42,20 +50,25 @@ extension MapViewModel {
     /// Coalesces duplicate non-force refresh requests from Live tab activation (preload, onAppear, onChange).
     @MainActor
     func refreshLiveMatchesForLiveTabActivation(forceRefresh: Bool = false) async {
+        LiveActivationPerf.activation(cachedRows: liveMatches.count, source: "tabActivation")
         guard !forceRefresh else {
+            LiveActivationPerf.refreshStarted(force: true, source: "tabActivation")
             await refreshLiveMatchesForLiveTab(forceRefresh: true)
             return
         }
         if liveMatchesAreFreshForTabPreload(within: 90) {
             TabPerf.refreshSkipped(name: "liveMatches", reason: "activationFresh")
+            LiveActivationPerf.refreshSkipped(reason: "activationFresh")
             return
         }
         if let last = LiveTabActivationRefreshDedup.lastRequestAt,
            Date().timeIntervalSince(last) < LiveTabActivationRefreshDedup.interval {
             TabPerf.refreshSkipped(name: "liveMatches", reason: "activationDedup")
+            LiveActivationPerf.refreshSkipped(reason: "activationDedup")
             return
         }
         LiveTabActivationRefreshDedup.lastRequestAt = Date()
+        LiveActivationPerf.refreshStarted(force: false, source: "tabActivation")
         await refreshLiveMatchesForLiveTab(forceRefresh: false)
     }
 
@@ -64,6 +77,7 @@ extension MapViewModel {
         if let inFlight = liveMatchesRefreshTask {
             TabPerf.duplicateRefreshCoalesced(name: "liveMatches")
             Perf.duplicateTaskCoalesced(name: "liveMatches")
+            SchedulePerf.refreshCoalesced(source: selectedDate == nil ? "liveMatches" : "calendarProGames")
 #if DEBUG
             TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true source=liveMatches force=\(forceRefresh)")
 #endif
@@ -93,7 +107,7 @@ extension MapViewModel {
         let refreshGeneration = LiveMatchesRefreshState.generation
 
         let showBlockingLoader = liveMatches.isEmpty
-        if showBlockingLoader || forceRefresh {
+        if (showBlockingLoader || forceRefresh) && !isLoadingLiveMatches {
             isLoadingLiveMatches = true
         }
 
@@ -105,13 +119,18 @@ extension MapViewModel {
         let featuredEventsTask = Task {
             await LiveSportsService.shared.fetchActiveFeaturedEvents(forceRefresh: forceRefresh)
         }
+        let refreshStartedAt = Date()
         do {
             let matches = try await LiveSportsService.shared.fetchLiveMatches(forceRefresh: forceRefresh)
-            activeFeaturedEvents = await featuredEventsTask.value
+            applyActiveFeaturedEventsIfChanged(await featuredEventsTask.value)
             await applyLiveMatchesFromLiveRefresh(matches)
+            LiveActivationPerf.refreshCompleted(
+                ms: Int(Date().timeIntervalSince(refreshStartedAt) * 1000),
+                rows: matches.count
+            )
 
             if !forceRefresh {
-                if !matches.isEmpty {
+                if !matches.isEmpty, isLoadingLiveMatches {
                     isLoadingLiveMatches = false
                 }
                 scheduleLiveMatchesBackgroundSyncIfNeeded(refreshGeneration: refreshGeneration)
@@ -124,7 +143,7 @@ extension MapViewModel {
 #endif
             liveMatchesLoadError = "Couldn't refresh live games. Showing the latest available results."
             liveMatchesEmptyDebugHint = "Live provider error: \(error.localizedDescription)"
-            activeFeaturedEvents = await featuredEventsTask.value
+            applyActiveFeaturedEventsIfChanged(await featuredEventsTask.value)
         }
 
         if isLoadingLiveMatches {
@@ -175,24 +194,51 @@ extension MapViewModel {
     @MainActor
     private func applyLiveMatchesFromLiveRefreshNow(_ matches: [LiveMatch]) async {
         let diagnostics = await LiveSportsService.shared.lastFetchDiagnostics
+        // Background warm applies step aside for an in-flight tab tap; a visible Live tab never waits.
+        if !isLiveTabSelected {
+            await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: "liveMatchesApply")
+        }
 #if DEBUG
         print("[LiveRefreshDebug] replace_not_append=true previous_count=\(liveMatches.count) incoming_count=\(matches.count)")
 #endif
+        let applyStartedAt = CFAbsoluteTimeGetCurrent()
+        var publishCount = 0
         handleSavedProGameStatusUpdates(from: matches, reason: "liveRefresh")
-        let previousIDs = liveMatches.map(\.id)
-        let incomingIDs = matches.map(\.id)
-        if previousIDs != incomingIDs {
+        // Full-content equality (LiveMatch is Equatable): publish whenever anything visible
+        // changed (scores, minute, status, clock), and skip only byte-identical snapshots.
+        // The previous ID-only comparison dropped same-ID score/status updates entirely.
+        let contentChanged = liveMatches != matches
+        if contentChanged {
             liveMatches = matches
+            publishCount += 1
+            bumpScheduleLiveMatchesContentRevision(reason: "liveRefresh", rows: matches.count)
+            publishCount += 1
+            LiveActivationPerf.publishApplied(rows: matches.count, reason: "contentChanged")
         } else {
             Perf.publishedWriteSkipped(name: "liveMatches", reason: "unchanged")
+            LiveActivationPerf.publishSkippedIdentical(rows: matches.count)
+            SchedulePerf.inventoryPublishSkippedIdentical(rows: matches.count)
         }
         lastLiveMatchesRefreshAt = Date()
-        liveMatchesLoadError = nil
-        liveMatchesEmptyDebugHint = Self.makeLiveMatchesEmptyDebugHint(
+        if liveMatchesLoadError != nil {
+            liveMatchesLoadError = nil
+        }
+        let emptyHint = Self.makeLiveMatchesEmptyDebugHint(
             matches: matches,
             diagnostics: diagnostics
         )
-        invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded()
+        if liveMatchesEmptyDebugHint != emptyHint {
+            liveMatchesEmptyDebugHint = emptyHint
+        }
+        if contentChanged {
+            invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded()
+        }
+        LiveApplyPerf.apply(
+            rowsFetched: matches.count,
+            mainActorApplyMs: (CFAbsoluteTimeGetCurrent() - applyStartedAt) * 1000,
+            publishCount: publishCount,
+            reason: "liveRefresh"
+        )
 #if DEBUG
         logLiveTabAssignment(matches: matches)
 #endif
@@ -327,6 +373,7 @@ extension MapViewModel {
 
         let day = Calendar.current.startOfDay(for: selectedDate)
         let dayKey = String(Int(day.timeIntervalSince1970 / 86_400))
+        SchedulePerf.refreshRequested(source: "proGames", force: forceRefresh)
         if !forceRefresh,
            let lastRefresh = calendarProGamesRefreshAtByDay[dayKey] {
             let age = Date().timeIntervalSince(lastRefresh)
@@ -336,6 +383,7 @@ extension MapViewModel {
                 TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=calendar source=proGames")
                 TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=proGames")
 #endif
+                SchedulePerf.refreshSkippedFresh(source: "proGames", ageSec: age)
                 return
             }
         }
@@ -346,28 +394,30 @@ extension MapViewModel {
         TabPerfDebug.log("[TabPerfDebug] refreshStarted=calendar source=proGames force=\(forceRefresh)")
         print("[CalendarProGamesDebug] selectedDateFetchStarted forceRefresh=\(forceRefresh)")
 #endif
+        SchedulePerf.refreshStarted(source: "proGames", force: forceRefresh)
         let startedAt = Date()
         let featuredEventsTask = Task {
             await LiveSportsService.shared.fetchActiveFeaturedEvents(forceRefresh: forceRefresh)
         }
         do {
             let matches = try await LiveSportsService.shared.fetchLiveMatches(on: selectedDate, forceRefresh: forceRefresh)
-            activeFeaturedEvents = await featuredEventsTask.value
+            applyActiveFeaturedEventsIfChanged(await featuredEventsTask.value)
             mergeCalendarProGameMatches(matches, for: selectedDate)
             liveMatchesLoadError = nil
             invalidateCalendarTabEventsListCache()
             calendarProGamesRefreshAtByDay[dayKey] = Date()
-#if DEBUG
             let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+#if DEBUG
             TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=proGames")
             print("[CalendarProGamesDebug] selectedDateFetchCount=\(matches.count)")
 #endif
+            SchedulePerf.refreshCompleted(source: "proGames", ms: ms, rows: matches.count)
         } catch {
 #if DEBUG
             print("[CalendarProGamesDebug] selectedDateFetchFailed error=\(error.localizedDescription)")
 #endif
             liveMatchesLoadError = L10n.t("couldnt_refresh_pro_sports_games")
-            activeFeaturedEvents = await featuredEventsTask.value
+            applyActiveFeaturedEventsIfChanged(await featuredEventsTask.value)
         }
     }
 
@@ -376,6 +426,16 @@ extension MapViewModel {
         return liveMatches.contains { match in
             match.matchStatus.isHappeningNow && cal.isDate(match.startTime, inSameDayAs: day)
         }
+    }
+
+    @MainActor
+    private func bumpScheduleLiveMatchesContentRevision(reason: String, rows: Int) {
+        scheduleLiveMatchesContentRevision &+= 1
+        SchedulePerf.contentRevisionBumped(
+            revision: scheduleLiveMatchesContentRevision,
+            rows: rows,
+            reason: reason
+        )
     }
 
     @MainActor
@@ -399,7 +459,14 @@ extension MapViewModel {
             return lhs.league.localizedCaseInsensitiveCompare(rhs.league) == .orderedAscending
         }
         handleSavedProGameStatusUpdates(from: matches, reason: "calendarProGamesRefresh")
-        liveMatches = mergedMatches
+        if liveMatches != mergedMatches {
+            liveMatches = mergedMatches
+            bumpScheduleLiveMatchesContentRevision(reason: "calendarDayMerge", rows: mergedMatches.count)
+            SchedulePerf.publishApplied(rows: mergedMatches.count, reason: "calendarDayMerge")
+        } else {
+            Perf.publishedWriteSkipped(name: "liveMatches", reason: "calendarDayMergeUnchanged")
+            SchedulePerf.inventoryPublishSkippedIdentical(rows: mergedMatches.count)
+        }
     }
 
     private static func makeLiveMatchesEmptyDebugHint(
@@ -488,12 +555,46 @@ extension MapViewModel {
         selectedLeagueCountries: Set<String> = [],
         featuredEvent: FeaturedEvent? = nil
     ) -> [LiveMatch] {
-        let cal = Calendar.current
-        let day = cal.startOfDay(for: selectedDate)
+        let matches = Self.calendarProGamesDisplayedPure(
+            liveMatches: liveMatches,
+            selectedDate: selectedDate,
+            searchQuery: searchQuery,
+            sportFilter: sportFilter,
+            worldCupOnly: worldCupOnly,
+            selectedLeagueCountries: selectedLeagueCountries,
+            featuredEvent: featuredEvent
+        )
+#if DEBUG
+        if DebugLogGate.calendarFlagDiagnosticsEnabled {
+            let day = Calendar.current.startOfDay(for: selectedDate)
+            let sport = sportFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("[CalendarProGamesDebug] selectedDate=\(Self.calendarProGamesDebugDateFormatter.string(from: day))")
+            print("[CalendarProGamesDebug] sportFilter=\(sport.isEmpty ? "All" : sport)")
+            print("[CalendarProGamesDebug] worldCupOnly=\(worldCupOnly)")
+            print("[CalendarProGamesDebug] featuredEvent=\(featuredEvent?.slug ?? "nil")")
+            print("[CalendarProGamesDebug] selectedLeagueCountries=\(selectedLeagueCountries.sorted().joined(separator: ","))")
+            print("[CalendarProGamesDebug] filteredCount=\(matches.count)")
+        }
+#endif
+        return matches
+    }
+
+    /// Pure filter/sort for Schedule Pro Games — identical rules to the previous inline implementation.
+    static func calendarProGamesDisplayedPure(
+        liveMatches: [LiveMatch],
+        selectedDate: Date,
+        searchQuery: String,
+        sportFilter: String,
+        worldCupOnly: Bool,
+        selectedLeagueCountries: Set<String>,
+        featuredEvent: FeaturedEvent?,
+        calendar: Calendar = .current
+    ) -> [LiveMatch] {
+        let day = calendar.startOfDay(for: selectedDate)
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let sport = sportFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-        let matches = liveMatches
-            .filter { cal.isDate($0.startTime, inSameDayAs: day) }
+        return liveMatches
+            .filter { calendar.isDate($0.startTime, inSameDayAs: day) }
             .filter { match in
                 guard featuredEvent == nil else { return true }
                 return sport.isEmpty
@@ -519,15 +620,6 @@ extension MapViewModel {
                 }
                 return "\(lhs.awayTeam) \(lhs.homeTeam)".localizedCaseInsensitiveCompare("\(rhs.awayTeam) \(rhs.homeTeam)") == .orderedAscending
             }
-#if DEBUG
-        print("[CalendarProGamesDebug] selectedDate=\(Self.calendarProGamesDebugDateFormatter.string(from: day))")
-        print("[CalendarProGamesDebug] sportFilter=\(sport.isEmpty ? "All" : sport)")
-        print("[CalendarProGamesDebug] worldCupOnly=\(worldCupOnly)")
-        print("[CalendarProGamesDebug] featuredEvent=\(featuredEvent?.slug ?? "nil")")
-        print("[CalendarProGamesDebug] selectedLeagueCountries=\(selectedLeagueCountries.sorted().joined(separator: ","))")
-        print("[CalendarProGamesDebug] filteredCount=\(matches.count)")
-#endif
-        return matches
     }
 
     func calendarProGameDotDates() -> Set<Date> {

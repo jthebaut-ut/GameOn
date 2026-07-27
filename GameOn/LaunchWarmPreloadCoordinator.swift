@@ -18,6 +18,7 @@ final class LaunchWarmPreloadCoordinator {
     ) {
         guard LaunchBootstrapState.didCompleteCriticalBootstrap else {
             print("[LaunchPerf] duplicateSkipped reason=criticalBootstrapIncomplete")
+            StartupPerf.duplicateSkipped(reason: "criticalBootstrapIncomplete")
 #if DEBUG
             print("[StartupPrefetchDebug] skippedReason=criticalBootstrapIncomplete")
 #endif
@@ -25,6 +26,7 @@ final class LaunchWarmPreloadCoordinator {
         }
         let sessionKey = warmPreloadSessionKey(viewModel: viewModel)
         if !forceRefresh, lastCompletedSessionKey == sessionKey {
+            StartupPerf.duplicateSkipped(reason: "sessionAlreadyWarm")
 #if DEBUG
             print("[StartupPrefetchDebug] skippedReason=sessionAlreadyWarm")
 #endif
@@ -32,6 +34,7 @@ final class LaunchWarmPreloadCoordinator {
         }
         guard forceRefresh || LaunchBootstrapState.markWarmPreloadStarted() else {
             print("[LaunchPerf] duplicateSkipped reason=warmPreloadAlreadyStarted")
+            StartupPerf.duplicateSkipped(reason: "warmPreloadAlreadyStarted")
 #if DEBUG
             print("[StartupPrefetchDebug] skippedReason=warmPreloadAlreadyStarted")
 #endif
@@ -63,33 +66,50 @@ final class LaunchWarmPreloadCoordinator {
     ) async {
         let warmStart = Date()
         print("[LaunchPerf] warmPreloadStart")
+        StartupPerf.phase("warmPreloadStart")
+        StartupTaskTracker.enter("warmPreload")
 #if DEBUG
         print("[StartupPrefetchDebug] start")
         print("[StartupPrefetchDebug] tier=0 task=criticalBootstrap cacheHit=true")
 #endif
 
+        // Tiers span seconds, so the session can change underneath them. Anything scheduled for a
+        // session that no longer exists is dropped rather than allowed to publish over the new one.
+        func sessionStillMatches(_ stage: String) -> Bool {
+            guard warmPreloadSessionKey(viewModel: viewModel) == sessionKey else {
+                StartupPerf.staleRejected(name: "warmPreload.\(stage)")
+#if DEBUG
+                print("[StartupOwnership] staleResultDiscarded=warmPreload stage=\(stage)")
+#endif
+                return false
+            }
+            return true
+        }
+
         await runWarmTask(tier: 1, name: "businessOwnerHydration", delayMs: 120) {
             await viewModel.runDeferredBusinessOwnerHydrationAfterLaunch()
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, sessionStillMatches("tier1") else { return }
 
         await runTier1Prefetch(viewModel: viewModel, chatViewModel: chatViewModel)
-        guard !Task.isCancelled else { return }
+        StartupPerf.phase("warmPreloadTier1Complete", ms: Int(Date().timeIntervalSince(warmStart) * 1000))
+        guard !Task.isCancelled, sessionStillMatches("tier2") else { return }
 
         await runTier2Prefetch(viewModel: viewModel, chatViewModel: chatViewModel)
-        guard !Task.isCancelled else { return }
+        StartupPerf.phase("warmPreloadTier2Complete", ms: Int(Date().timeIntervalSince(warmStart) * 1000))
+        guard !Task.isCancelled, sessionStillMatches("tier3") else { return }
 
         await runWarmTask(tier: 3, name: "regionalDiscoverWarmCache", delayMs: 520) {
             await viewModel.warmPreloadRegionalDiscoverCaches(chatViewModel: chatViewModel)
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, sessionStillMatches("pokesBadge") else { return }
 
         await runWarmTask(tier: 2, name: "pokesBadge", delayMs: 120) {
             let canReceive = await MainActor.run { viewModel.canReceiveProfilePokes }
             guard canReceive else { return }
             await viewModel.refreshUnseenPokesBadgeIfNeeded()
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, sessionStillMatches("complete") else { return }
 
         if accountTabVisible {
             print("[LaunchPerf] warmTask skipped name=suggestedFans reason=accountTabVisibleProfileIdentityCardOwnsLoad")
@@ -97,6 +117,9 @@ final class LaunchWarmPreloadCoordinator {
 
         let totalMs = Int(Date().timeIntervalSince(warmStart) * 1000)
         print("[LaunchPerf] warmPreloadEnd ms=\(totalMs)")
+        StartupPerf.phase("warmPreloadEnd", ms: totalMs)
+        StartupTaskTracker.exit("warmPreload")
+        StartupTaskTracker.reportPeak()
 #if DEBUG
         print("[StartupPrefetchDebug] durationMs=\(totalMs)")
 #endif
@@ -208,6 +231,12 @@ final class LaunchWarmPreloadCoordinator {
         await runWarmTask(tier: 2, name: "liveMatchesWarmCache", delayMs: 120) {
             await viewModel.refreshLiveMatchesForLiveTab(forceRefresh: false)
         }
+
+        // Schedule data only — does not mount Calendar UI. Lets first Calendar visit hit warm
+        // strip/list caches instead of rebuilding inventories on the selection frame.
+        await runWarmTask(tier: 2, name: "calendarScheduleCaches", delayMs: 380) {
+            await viewModel.warmCalendarTabCachesInBackground(reason: "launchWarmTier2")
+        }
     }
 
     private func runWarmTask(
@@ -225,7 +254,14 @@ final class LaunchWarmPreloadCoordinator {
         }
         guard !Task.isCancelled else { return }
 
+        // A tab the user just tapped owns the next frames. The wait is bounded, so the task
+        // still runs — it simply does not publish into the same runloop turn as the tap.
+        await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: name)
+        guard !Task.isCancelled else { return }
+
         let taskStart = Date()
+        UserInteractionPriorityGate.noteWarmTaskStarted(name)
+        defer { UserInteractionPriorityGate.noteWarmTaskFinished(name) }
         print("[LaunchPerf] warmTask start name=\(name)")
 #if DEBUG
         print("[StartupPrefetchDebug] tier=\(tier)")

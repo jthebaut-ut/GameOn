@@ -53,13 +53,16 @@ struct SettingsReportedCommentsAdminCard: View {
                                let url = URL(string: report.commenterAvatarURL),
                                !report.commenterAvatarURL.isEmpty {
 
-                                AsyncImage(url: url) { image in
-                                    image
-                                        .resizable()
-                                        .scaledToFill()
-                                } placeholder: {
-                                    Circle()
-                                        .fill(Color.gray.opacity(0.20))
+                                CachedRemoteImagePhaseView(url: url, bucket: .avatar) { phase in
+                                    switch phase {
+                                    case .success(let uiImage):
+                                        Image(uiImage: uiImage)
+                                            .resizable()
+                                            .scaledToFill()
+                                    case .empty, .failure:
+                                        Circle()
+                                            .fill(Color.gray.opacity(0.20))
+                                    }
                                 }
                                 .frame(width: 44, height: 44)
                                 .clipShape(Circle())

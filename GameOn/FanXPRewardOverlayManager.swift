@@ -59,6 +59,19 @@ final class FanXPRewardOverlayManager: ObservableObject {
         startDrainIfNeeded()
     }
 
+#if DEBUG
+    /// Memory-audit only: queued toast count (no behavior change).
+    var debugQueuedCount: Int { queue.count + (presentation == nil ? 0 : 1) }
+#endif
+
+    /// Cancels in-flight toast drain and drops queued presentations (logout / account switch).
+    func clearAll() {
+        drainTask?.cancel()
+        drainTask = nil
+        queue.removeAll(keepingCapacity: false)
+        presentation = nil
+    }
+
     private func startDrainIfNeeded() {
         guard drainTask == nil else { return }
         drainTask = Task { @MainActor [weak self] in
@@ -66,12 +79,14 @@ final class FanXPRewardOverlayManager: ObservableObject {
             defer { drainTask = nil }
 
             while !queue.isEmpty {
+                if Task.isCancelled { break }
                 let next = queue.removeFirst()
                 presentation = next
                 playHaptic(for: next)
 
                 let holdNs: UInt64 = next.isLevelUp ? 3_000_000_000 : 2_200_000_000
                 try? await Task.sleep(nanoseconds: holdNs)
+                if Task.isCancelled { break }
 
                 presentation = nil
                 try? await Task.sleep(nanoseconds: 380_000_000)

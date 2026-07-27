@@ -98,14 +98,29 @@ struct FanGeoZoomableImageFullscreenViewer: View {
             remoteUIImage = nil
             return
         }
+        let requestedURL = url
         remoteUIImage = nil
-        if let cached = await DiscoverMapImageCache.shared.cachedImage(for: url) {
-            guard !Task.isCancelled else { return }
+        if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL, bucket: .detail) {
+            guard !Task.isCancelled else {
+                ImagePerf.waiterCancelled()
+                return
+            }
+            guard case .remoteURL(let current) = source, current == requestedURL else {
+                ImagePerf.staleResultRejected()
+                return
+            }
             remoteUIImage = cached
             return
         }
-        if let loaded = await DiscoverMapImageCache.shared.image(for: url) {
-            guard !Task.isCancelled else { return }
+        if let loaded = await DiscoverMapImageCache.shared.image(for: requestedURL, bucket: .detail) {
+            guard !Task.isCancelled else {
+                ImagePerf.waiterCancelled()
+                return
+            }
+            guard case .remoteURL(let current) = source, current == requestedURL else {
+                ImagePerf.staleResultRejected()
+                return
+            }
             remoteUIImage = loaded
         }
     }

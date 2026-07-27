@@ -6,6 +6,11 @@ import SwiftUI
 /// Owns friends / friend-request state for the Chat tab. Independent of ``MapViewModel``.
 @MainActor
 final class ChatViewModel: ObservableObject {
+    /// Narrow projection consumed by `MainTabView`. Chat remains the sole source of truth;
+    /// this object mirrors only root routing/chrome primitives synchronously on MainActor.
+    let mainTabState = ChatMainTabState()
+    /// Badge-only projection observed by the floating Chat button leaf.
+    let tabBadgeState = ChatTabBadgeState()
 
     private var instanceDebugID: String {
         "\(ObjectIdentifier(self))"
@@ -16,9 +21,22 @@ final class ChatViewModel: ObservableObject {
         print("[ChatViewModelInstanceDebug] init id=\(instanceDebugID)")
         print("[MainActorDebug] ChatViewModel.init actor=MainActor")
 #endif
+        fanProfileAvatarChangeObserver = NotificationCenter.default.addObserver(
+            forName: FanProfileChangeCenter.avatarDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let change = FanProfileChangeCenter.avatarChange(from: notification) else { return }
+            Task { @MainActor [weak self] in
+                self?.applyFanProfileAvatarChange(change)
+            }
+        }
     }
 
     deinit {
+        if let fanProfileAvatarChangeObserver {
+            NotificationCenter.default.removeObserver(fanProfileAvatarChangeObserver)
+        }
 #if DEBUG
         print("[ChatViewModelInstanceDebug] deinit id=\(ObjectIdentifier(self))")
 #endif
@@ -51,6 +69,8 @@ final class ChatViewModel: ObservableObject {
         let inboxKind: ChatInboxConversationKind
         let groupMemberCount: Int
         let isGroupMuted: Bool
+        /// When set, this group inbox row is a pickup-game private chat.
+        let pickupGameId: UUID?
 
         init(
             id: UUID,
@@ -62,7 +82,8 @@ final class ChatViewModel: ObservableObject {
             conversationId: UUID?,
             inboxKind: ChatInboxConversationKind = .direct,
             groupMemberCount: Int = 0,
-            isGroupMuted: Bool = false
+            isGroupMuted: Bool = false,
+                pickupGameId: UUID? = nil
         ) {
             self.id = id
             self.preview = preview
@@ -74,9 +95,11 @@ final class ChatViewModel: ObservableObject {
             self.inboxKind = inboxKind
             self.groupMemberCount = groupMemberCount
             self.isGroupMuted = isGroupMuted
+            self.pickupGameId = pickupGameId
         }
 
         var isGroupConversation: Bool { inboxKind == .group }
+        var isPickupGameChat: Bool { pickupGameId != nil }
     }
 
     struct IncomingRequestDisplay: Identifiable, Hashable {
@@ -91,33 +114,80 @@ final class ChatViewModel: ObservableObject {
         var id: UUID { friendship.id }
     }
 
-    @Published private(set) var friends: [FriendDisplay] = []
-    @Published private(set) var incomingRequests: [IncomingRequestDisplay] = []
-    @Published private(set) var outgoingRequests: [OutgoingRequestDisplay] = []
-    @Published private(set) var pendingBadgeCount: Int = 0
+    @Published private(set) var friends: [FriendDisplay] = [] {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "conversationsOrPresence")
+        }
+    }
+    @Published private(set) var incomingRequests: [IncomingRequestDisplay] = [] {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "friendRequests")
+        }
+    }
+    @Published private(set) var outgoingRequests: [OutgoingRequestDisplay] = [] {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "friendRequests")
+        }
+    }
+    @Published private(set) var pendingBadgeCount: Int = 0 {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "requestBadge")
+            tabBadgeState.setPendingBadgeCount(pendingBadgeCount)
+        }
+    }
     /// Unread peer DMs for the signed-in user (MainTabView private chat tab badge + ``AppIconBadgeSync``). Server source: inbox RPC unread totals / `get_dm_unread_total`; not friend-request counts.
-    @Published private(set) var unreadDirectMessageCount: Int = 0
+    @Published private(set) var unreadDirectMessageCount: Int = 0 {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "unreadBadge")
+            tabBadgeState.setUnreadDirectMessageCount(unreadDirectMessageCount)
+        }
+    }
     /// When non-nil, ``MainTabView`` switches to Chat and ``FriendsTabView`` pushes ``DirectChatView`` for this peer.
-    @Published var pendingDmOpenPreview: UserPreview?
+    @Published var pendingDmOpenPreview: UserPreview? {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "deepLink")
+            mainTabState.setPendingDmOpenPreview(pendingDmOpenPreview)
+        }
+    }
     /// Newly created venue-scoped DM threads that should show the one-time intro banner.
     @Published private(set) var pendingVenueChatIntroConversationIds: Set<UUID> = []
     /// Lightweight in-app banner for an incoming DM while the thread is not open (local only).
-    @Published private(set) var dmInAppNotification: DmInAppNotificationPayload?
+    @Published private(set) var dmInAppNotification: DmInAppNotificationPayload? {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "inAppNotification")
+            mainTabState.setDmInAppNotification(dmInAppNotification)
+        }
+    }
     @Published var errorMessage: String?
     /// Shown when swipe-delete (inbox clear) fails; kept separate from ``errorMessage`` so friend-request errors don’t clash.
     @Published var inboxDeleteError: String?
     /// Shown when Friends directory unfriend fails; kept separate from ``errorMessage``.
     @Published var unfriendError: String?
-    @Published private(set) var requiresSignIn: Bool = false
-    @Published var isLoading: Bool = false
+    @Published private(set) var requiresSignIn: Bool = false {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "authGate")
+            tabBadgeState.setRequiresSignIn(requiresSignIn)
+        }
+    }
+    @Published var isLoading: Bool = false {
+        didSet { MainTabObservationPerf.chatPublished(category: "chatLoading") }
+    }
     /// True while the first inbox load is in flight and there is no cached inbox to show.
-    @Published private(set) var isInboxInitialLoadInFlight: Bool = false
+    @Published private(set) var isInboxInitialLoadInFlight: Bool = false {
+        didSet { MainTabObservationPerf.chatPublished(category: "chatLoading") }
+    }
     /// True while refreshing inbox when cached rows are already visible (stale-while-revalidate).
-    @Published private(set) var isInboxBackgroundRefreshInFlight: Bool = false
+    @Published private(set) var isInboxBackgroundRefreshInFlight: Bool = false {
+        didSet { MainTabObservationPerf.chatPublished(category: "chatLoading") }
+    }
     /// Set after the first inbox load attempt finishes successfully so empty state can appear safely.
-    @Published private(set) var hasCompletedInitialInboxLoad: Bool = false
+    @Published private(set) var hasCompletedInitialInboxLoad: Bool = false {
+        didSet { MainTabObservationPerf.chatPublished(category: "chatLoading") }
+    }
     /// True when the first inbox load failed before any successful result (show retry, not empty).
-    @Published private(set) var initialInboxLoadFailed: Bool = false
+    @Published private(set) var initialInboxLoadFailed: Bool = false {
+        didSet { MainTabObservationPerf.chatPublished(category: "chatLoading") }
+    }
 
     /// Other user id → chip state. Keys only for users with an active friendship row; missing key ⇒ ``FriendshipChipKind.addFriend``.
     @Published private(set) var friendshipChipByOtherUserId: [UUID: FriendshipChipKind] = [:]
@@ -134,6 +204,8 @@ final class ChatViewModel: ObservableObject {
     /// When true, ``MainTabView`` hides the floating tab bar so ``DirectChatView`` composer stays visible.
     @Published var hidesFloatingTabBarForDirectChat: Bool = false {
         didSet {
+            MainTabObservationPerf.chatPublished(category: "navigationChrome")
+            mainTabState.setHidesFloatingTabBarForDirectChat(hidesFloatingTabBarForDirectChat)
 #if DEBUG
             if oldValue != hidesFloatingTabBarForDirectChat {
                 print("[DirectChatNav] activeChanged \(hidesFloatingTabBarForDirectChat) reason=hidesFloatingTabBarForDirectChat")
@@ -151,15 +223,34 @@ final class ChatViewModel: ObservableObject {
     private let directChatService = DirectChatService()
     private let groupChatService = GroupChatService()
     private let socialIdentityService = SocialIdentityService()
+    private let recentlyDeletedService = ChatRecentlyDeletedService()
+
+    /// Server-backed soft/permanent inbox exclusions (`direct` / `group` conversation ids).
+    private var serverExcludedInboxConversationIds: Set<UUID> = []
+    /// True when `get_my_chat_inbox_exclusions` is available and last fetch succeeded.
+    private var serverInboxExclusionsAvailable = false
 
     /// When set, Chat tab opens ``GroupChatView`` for this conversation id.
-    @Published var pendingGroupOpenConversationId: UUID?
+    @Published var pendingGroupOpenConversationId: UUID? {
+        didSet {
+            mainTabState.setPendingGroupOpenConversationId(pendingGroupOpenConversationId)
+        }
+    }
+    /// Pending group invitations for the signed-in user (not active membership).
+    @Published private(set) var pendingGroupInvitations: [GroupPendingInvitationRow] = []
+    @Published private(set) var pendingGroupInvitationPreviews: [UUID: UserPreview] = [:]
     /// Active group member IDs for Chat Inbox avatar clusters, keyed by conversation id (display-ordered).
     @Published private(set) var groupInboxAvatarMemberIdsByConversationId: [UUID: [UUID]] = [:]
     /// Shared identity cache for group inbox member avatars.
     @Published private(set) var groupMemberPreviewByUserId: [UUID: UserPreview] = [:]
+
     private var groupInboxAvatarHydrationGeneration: UInt64 = 0
     private var groupInboxAvatarHydrationTask: Task<Void, Never>?
+    /// Identity of the in-flight / last-completed avatar hydration within the current refresh cycle.
+    private var groupInboxAvatarHydrationKey: String?
+    /// Bumped at the start of each inbox refresh so identical group-ID sets still rehydrate across refreshes.
+    private var groupInboxAvatarHydrationRefreshToken: UInt64 = 0
+    private var lastCompletedGroupInboxAvatarHydrationKey: String?
     private var lastLoadAt: Date?
     private let minRefreshInterval: TimeInterval = 12
     private var lastInboxLoadAt: Date?
@@ -167,6 +258,10 @@ final class ChatViewModel: ObservableObject {
     private var startupLightweightPrefetchTask: Task<StartupChatPrefetchResult, Never>?
     private var lastStartupLightweightPrefetchAt: Date?
     private let startupLightweightPrefetchTTL: TimeInterval = 90
+    /// Coalesces duplicate unread RPCs during launch (critical → warm → post-auth badge).
+    private var unreadDirectMessageRefreshTask: Task<Void, Never>?
+    private var lastUnreadDirectMessageRefreshAt: Date?
+    private let unreadDirectMessageRefreshFreshness: TimeInterval = 12
     private var lastChatTabIntentPreloadAt: Date?
     private var lastChatTabSurfaceRefreshAt: Date?
     private static let chatTabRefreshCoalesceInterval: TimeInterval = 25
@@ -259,6 +354,7 @@ final class ChatViewModel: ObservableObject {
     private var friendRequestRealtimeDebounceTask: Task<Void, Never>?
     /// Debounces ``ensureSignedInSocialRealtimeIfNeeded()`` after app foreground to avoid reconnect storms.
     private var socialRealtimeForegroundTask: Task<Void, Never>?
+    private var fanProfileAvatarChangeObserver: NSObjectProtocol?
     private var ensureSocialRealtimeInFlightTask: Task<Void, Never>?
     private var fullRefreshInFlightTask: Task<Void, Never>?
     private var lastSocialRealtimeEnsureAt: Date?
@@ -357,11 +453,16 @@ final class ChatViewModel: ObservableObject {
         outgoingRequests = []
         pendingBadgeCount = 0
         unreadDirectMessageCount = 0
+        pendingGroupInvitations = []
+        pendingGroupInvitationPreviews = [:]
         groupInboxAvatarMemberIdsByConversationId = [:]
         groupMemberPreviewByUserId = [:]
         groupInboxAvatarHydrationTask?.cancel()
         groupInboxAvatarHydrationTask = nil
         groupInboxAvatarHydrationGeneration &+= 1
+        groupInboxAvatarHydrationKey = nil
+        lastCompletedGroupInboxAvatarHydrationKey = nil
+        groupInboxAvatarHydrationRefreshToken &+= 1
         errorMessage = nil
         inboxDeleteError = nil
         requiresSignIn = signInRequired
@@ -377,6 +478,7 @@ final class ChatViewModel: ObservableObject {
         inboxSummariesRefreshTask = nil
         inboxSummariesRefreshAuthId = nil
         friendshipChipByOtherUserId = [:]
+        ChatFriendsStability.resetForAccountChange()
         currentUserAuthId = nextAuthId
         if let nextAuthId {
             hiddenInboxPeerUserIds = DmInboxHiddenConversationsStore.hiddenPeerUserIds(authId: nextAuthId)
@@ -385,6 +487,8 @@ final class ChatViewModel: ObservableObject {
             hiddenInboxPeerUserIds = []
             hiddenInboxConversationIds = []
         }
+        serverExcludedInboxConversationIds = []
+        serverInboxExclusionsAvailable = false
         hidesFloatingTabBarForDirectChat = false
         blockedUserIds = []
         usersWhoBlockedMeIds = []
@@ -392,6 +496,7 @@ final class ChatViewModel: ObservableObject {
         addFriendSearchResults = []
         addFriendSearchIsLoading = false
         pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
         dmInAppNotification = nil
         activeVisibleConversationId = nil
         chatTabVisibleForDirectReadState = false
@@ -406,6 +511,9 @@ final class ChatViewModel: ObservableObject {
         startupLightweightPrefetchTask?.cancel()
         startupLightweightPrefetchTask = nil
         lastStartupLightweightPrefetchAt = nil
+        unreadDirectMessageRefreshTask?.cancel()
+        unreadDirectMessageRefreshTask = nil
+        lastUnreadDirectMessageRefreshAt = nil
         lastChatTabIntentPreloadAt = nil
         lastChatTabSurfaceRefreshAt = nil
         friendRequestRealtimeDebounceTask?.cancel()
@@ -417,12 +525,37 @@ final class ChatViewModel: ObservableObject {
         fullRefreshInFlightTask?.cancel()
         fullRefreshInFlightTask = nil
         lastSocialRealtimeEnsureAt = nil
+        dmLatencyInboxEventStartByConversationID.removeAll(keepingCapacity: false)
 
-        Task { [weak self] in
-            guard let self else { return }
-            await self.stopInboxRealtimeListener()
-            await self.stopFriendshipsRealtimeListener()
-            await self.stopChatPresenceRealtimeListener()
+        // Cancel listen tasks synchronously so teardown cannot race a remount before async stop finishes.
+        // Detach channel removal — never await websocket unsubscribe on the logout path.
+        let inboxChannel = inboxChannel
+        let friendshipsChannel = friendshipsChannel
+        let presenceChannel = chatPresenceChannel
+        inboxListenTask?.cancel()
+        inboxListenTask = nil
+        friendshipsListenTask?.cancel()
+        friendshipsListenTask = nil
+        chatPresenceListenTask?.cancel()
+        chatPresenceListenTask = nil
+        chatPresenceExpiryTask?.cancel()
+        chatPresenceExpiryTask = nil
+        chatPresenceTrackedUserIds = []
+        self.inboxChannel = nil
+        self.friendshipsChannel = nil
+        friendshipsRealtimeBoundUserId = nil
+        chatPresenceChannel = nil
+
+        Task {
+            if let inboxChannel {
+                await supabase.removeChannel(inboxChannel)
+            }
+            if let friendshipsChannel {
+                await supabase.removeChannel(friendshipsChannel)
+            }
+            if let presenceChannel {
+                await supabase.removeChannel(presenceChannel)
+            }
             await AppIconBadgeSync.apply(count: 0)
         }
 #if DEBUG
@@ -488,6 +621,22 @@ final class ChatViewModel: ObservableObject {
 
     private func performEnsureSignedInSocialRealtime() async {
         guard requiresSignIn == false else { return }
+        // Explicit logout must never restart presence / inbox / friendship realtime mid-pipeline.
+        guard FanGeoExplicitLogoutGuard.isInProgress == false else {
+#if DEBUG
+            print("[PresenceDebug] ensureSkipped reason=logoutInProgress")
+#endif
+            return
+        }
+        // Fail closed: no presence heartbeat, DM inbox, or friendship realtime until the
+        // authoritative age record confirmed this exact UUID for the current policy.
+        guard AgeAccessGateService.shared.allowsSocialSubsystemsForActiveUser() else {
+            AgeAccessRuntimeLog.socialSubsystemBlocked(
+                userId: AgeAccessGateService.shared.activeUserId,
+                subsystem: "chat_presence_realtime"
+            )
+            return
+        }
 #if DEBUG
         print("[BadgeArchitectureDebug] ensureRealtime vm=\(instanceDebugID)")
         print("[MainActorDebug] ensureRealtime actor=MainActor")
@@ -593,10 +742,12 @@ final class ChatViewModel: ObservableObject {
             Task { await stopChatPresenceRealtimeListener() }
             return
         }
+        // Track fan peer *user* ids — `FriendDisplay.id` is the conversation id for
+        // conversation-backed rows and would never match `user_profiles.id`.
         let ids = Set(
             friends
-                .filter { !$0.preview.isDeleted }
-                .map(\.id)
+                .filter { !$0.isGroupConversation && !$0.preview.isDeleted && !$0.preview.isBusinessIdentity }
+                .map(\.preview.id)
         )
         guard !ids.isEmpty else {
             Task { await stopChatPresenceRealtimeListener() }
@@ -607,10 +758,12 @@ final class ChatViewModel: ObservableObject {
            chatPresenceListenTask != nil,
            chatPresenceChannel != nil {
             startChatPresenceExpiryTickerIfNeeded()
+            ChatActivationPerf.presencePeerSet(changed: false, count: ids.count)
             DebugLogGate.debug("[PresenceDebug] subscribeStarted=false reason=alreadyActive onlineUsersCount=\(chatPresenceOnlineCount())")
             return
         }
 
+        ChatActivationPerf.presencePeerSet(changed: true, count: ids.count)
         chatPresenceTrackedUserIds = ids
         chatPresenceListenTask?.cancel()
         chatPresenceListenTask = nil
@@ -691,14 +844,106 @@ final class ChatViewModel: ObservableObject {
             }
             guard let userId = row.id else { continue }
             applyChatPresenceUpdate(userId: userId, lastSeenAtRaw: row.last_seen_at, source: "realtime")
+            let full = ImageDisplayURL.canonicalStorageURLString(row.avatar_url)
+            let thumb = ImageDisplayURL.canonicalStorageURLString(row.avatar_thumbnail_url)
+            if !full.isEmpty || !thumb.isEmpty {
+                applyFanProfileAvatarChange(
+                    FanProfileAvatarChange(
+                        userId: userId,
+                        avatarURL: full.isEmpty ? (thumb) : full,
+                        avatarThumbnailURL: thumb.isEmpty ? nil : thumb
+                    )
+                )
+            }
+        }
+    }
+
+    /// Merges a peer (or self) avatar URL change into inbox / requests / group member caches.
+    func applyFanProfileAvatarChange(_ change: FanProfileAvatarChange) {
+        let userId = change.userId
+        let nextFull = change.avatarURL.isEmpty ? nil : change.avatarURL
+        let nextThumb = change.avatarThumbnailURL
+
+        func previewNeedsUpdate(_ preview: UserPreview) -> Bool {
+            guard preview.id == userId else { return false }
+            let currentFull = ImageDisplayURL.canonicalStorageURLString(preview.avatarURL)
+            let currentThumb = ImageDisplayURL.canonicalStorageURLString(preview.avatarThumbnailURL)
+            let desiredFull = ImageDisplayURL.canonicalStorageURLString(nextFull)
+            let desiredThumb = ImageDisplayURL.canonicalStorageURLString(nextThumb)
+            return currentFull != desiredFull || currentThumb != desiredThumb
+        }
+
+        func updatedPreview(_ preview: UserPreview) -> UserPreview {
+            preview.replacingAvatars(
+                avatarURL: nextFull ?? preview.avatarURL,
+                avatarThumbnailURL: nextThumb ?? preview.avatarThumbnailURL
+            )
+        }
+
+        var friendsChanged = false
+        let nextFriends = friends.map { display -> FriendDisplay in
+            if display.isGroupConversation {
+                return display
+            }
+            guard previewNeedsUpdate(display.preview) else { return display }
+            friendsChanged = true
+            return FriendDisplay(
+                id: display.id,
+                preview: updatedPreview(display.preview),
+                subtitle: display.subtitle,
+                lastMessageAt: display.lastMessageAt,
+                unreadCount: display.unreadCount,
+                isConversationBacked: display.isConversationBacked,
+                conversationId: display.conversationId,
+                inboxKind: display.inboxKind,
+                groupMemberCount: display.groupMemberCount,
+                isGroupMuted: display.isGroupMuted,
+                pickupGameId: display.pickupGameId
+            )
+        }
+        if friendsChanged {
+            friends = nextFriends
+        }
+
+        var incomingChanged = false
+        let nextIncoming = incomingRequests.map { item -> IncomingRequestDisplay in
+            guard previewNeedsUpdate(item.requester) else { return item }
+            incomingChanged = true
+            return IncomingRequestDisplay(friendship: item.friendship, requester: updatedPreview(item.requester))
+        }
+        if incomingChanged {
+            incomingRequests = nextIncoming
+        }
+
+        var outgoingChanged = false
+        let nextOutgoing = outgoingRequests.map { item -> OutgoingRequestDisplay in
+            guard previewNeedsUpdate(item.addressee) else { return item }
+            outgoingChanged = true
+            return OutgoingRequestDisplay(friendship: item.friendship, addressee: updatedPreview(item.addressee))
+        }
+        if outgoingChanged {
+            outgoingRequests = nextOutgoing
+        }
+
+        if let existing = groupMemberPreviewByUserId[userId], previewNeedsUpdate(existing) {
+            groupMemberPreviewByUserId[userId] = updatedPreview(existing)
         }
     }
 
     private func applyChatPresenceUpdate(userId: UUID, lastSeenAtRaw: String?, source: String) {
         let userLow = userId.uuidString.lowercased()
+        let existingVisible = friends.first(where: { $0.preview.id == userId })?.preview.activityStatusVisible
+            ?? incomingRequests.first(where: { $0.requester.id == userId })?.requester.activityStatusVisible
+            ?? outgoingRequests.first(where: { $0.addressee.id == userId })?.addressee.activityStatusVisible
+            ?? true
+        guard existingVisible else {
+            ActivityStatusDebug.lifecycle("activity visibility disabled", details: "source=\(source)")
+            return
+        }
         let isOnline = PresenceOnlineStatus.parse(lastSeenAtRaw).map {
             Date().timeIntervalSince($0) <= PresenceOnlineStatus.onlineWindowSeconds
         } ?? false
+        ActivityStatusDebug.lifecycle("presence record received", details: "source=\(source) online=\(isOnline)")
         DebugLogGate.debug("[PresenceDebug] userOnline=\(isOnline) userId=\(userLow) source=\(source)")
         DebugLogGate.debug("[PresenceDebug] lastSeen=\(lastSeenAtRaw ?? "nil") userId=\(userLow)")
 
@@ -718,12 +963,24 @@ final class ChatViewModel: ObservableObject {
                 conversationId: display.conversationId,
                 inboxKind: display.inboxKind,
                 groupMemberCount: display.groupMemberCount,
-                isGroupMuted: display.isGroupMuted
+                isGroupMuted: display.isGroupMuted,
+                pickupGameId: display.pickupGameId
             )
         }
         if changed {
             friends = nextFriends
             DebugLogGate.debug("[PresenceDebug] onlineUsersCount=\(chatPresenceOnlineCount(in: nextFriends))")
+#if DEBUG
+            if let updated = nextFriends.first(where: { !$0.isGroupConversation && $0.preview.id == userId }) {
+                ChatActivityBadgeDebug.log(
+                    isRegularFan: !updated.preview.isBusinessIdentity && !updated.preview.isDeleted,
+                    lastSeenPresent: updated.preview.lastSeenAtRaw != nil,
+                    visibilityAllowed: updated.preview.activityStatusVisible,
+                    kind: ActivityStatus.resolve(lastSeenAtRaw: updated.preview.lastSeenAtRaw),
+                    source: source == "realtime" ? "realtimeUpdate" : source
+                )
+            }
+#endif
         }
 
         var incomingChanged = false
@@ -756,14 +1013,25 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func refreshChatPresenceSnapshots(reason: String) async {
-        let ids = Array(Set(friends.map(\.id)))
+        // Key by fan peer user id, not `FriendDisplay.id` (conversation id for
+        // conversation-backed rows) — a conversation-id lookup always misses and
+        // used to overwrite valid `lastSeenAtRaw` values with nil.
+        let ids = Array(
+            Set(
+                friends
+                    .filter { !$0.isGroupConversation && !$0.preview.isDeleted && !$0.preview.isBusinessIdentity }
+                    .map(\.preview.id)
+            )
+        )
         guard !ids.isEmpty else { return }
         do {
             let previews = try await socialIdentityService.fetchUserPreviews(for: ids)
             for id in ids {
+                // Skip lookup misses instead of nulling a previously valid timestamp.
+                guard let refreshed = previews[id] else { continue }
                 applyChatPresenceUpdate(
                     userId: id,
-                    lastSeenAtRaw: previews[id]?.lastSeenAtRaw,
+                    lastSeenAtRaw: refreshed.lastSeenAtRaw,
                     source: reason
                 )
             }
@@ -790,17 +1058,22 @@ final class ChatViewModel: ObservableObject {
 
     private func expireStaleChatPresence() {
         let now = Date()
-        let expiringIds = friends.compactMap { display -> UUID? in
-            guard let lastSeen = PresenceOnlineStatus.parse(display.preview.lastSeenAtRaw),
-                  now.timeIntervalSince(lastSeen) > PresenceOnlineStatus.onlineWindowSeconds else {
-                return nil
+        // Re-publish when a row's 2-minute online window just lapsed so green dots /
+        // `Online` pills downgrade to a relative label. Never null `lastSeenAtRaw`:
+        // the compact pill needs the timestamp to render `5m` / `2h` / `1d`.
+        let tickerSlack: TimeInterval = 45 // ticker period (30s) + margin
+        let justExpired = friends.contains { display in
+            guard !display.isGroupConversation,
+                  let lastSeen = PresenceOnlineStatus.parse(display.preview.lastSeenAtRaw) else {
+                return false
             }
-            return display.id
+            let elapsed = now.timeIntervalSince(lastSeen)
+            return elapsed > PresenceOnlineStatus.onlineWindowSeconds
+                && elapsed <= PresenceOnlineStatus.onlineWindowSeconds + tickerSlack
         }
-        guard !expiringIds.isEmpty else { return }
-        for id in expiringIds {
-            applyChatPresenceUpdate(userId: id, lastSeenAtRaw: nil, source: "expiry")
-        }
+        guard justExpired else { return }
+        ActivityStatusDebug.lifecycle("online window lapsed", details: "source=expiry")
+        friends = friends
     }
 
     private func stopChatPresenceRealtimeListener() async {
@@ -831,7 +1104,13 @@ final class ChatViewModel: ObservableObject {
             avatarThumbnailURL: preview.avatarThumbnailURL,
             isBusinessAccount: preview.isBusinessAccount,
             isDeleted: preview.isDeleted,
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: preview.activityStatusVisible ? lastSeenAtRaw : nil,
+            activityStatusVisible: preview.activityStatusVisible,
+            dmConversationId: preview.dmConversationId,
+            businessVenueId: preview.businessVenueId,
+            businessVenueBusinessId: preview.businessVenueBusinessId,
+            businessVenueBusinessName: preview.businessVenueBusinessName,
+            venueScopedThread: preview.venueScopedThread
         )
     }
 
@@ -975,7 +1254,7 @@ final class ChatViewModel: ObservableObject {
             if shouldRefreshInbox {
                 await self.refreshInboxSummaries()
             } else {
-                await self.refreshUnreadDirectMessageCount()
+                await self.refreshUnreadDirectMessageCount(force: true)
             }
             self.badgeRecalculationTask = nil
         }
@@ -1339,7 +1618,8 @@ final class ChatViewModel: ObservableObject {
             conversationId: old.conversationId,
             inboxKind: old.inboxKind,
             groupMemberCount: old.groupMemberCount,
-            isGroupMuted: old.isGroupMuted
+            isGroupMuted: old.isGroupMuted,
+            pickupGameId: old.pickupGameId
         )
         var next = friends
         next[idx] = updated
@@ -1487,11 +1767,12 @@ final class ChatViewModel: ObservableObject {
                 conversationId: old.conversationId ?? row.conversation_id,
                 inboxKind: old.inboxKind,
                 groupMemberCount: old.groupMemberCount,
-                isGroupMuted: old.isGroupMuted
+                isGroupMuted: old.isGroupMuted,
+                pickupGameId: old.pickupGameId
             )
             var next = friends
             next[idx] = updated
-            next.sort { ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast) }
+            next.sort(by: Self.isInboxRowOrderedBefore)
             friends = next
             syncChatPresenceRealtimeIfNeeded(reason: "incomingDmPatchedInbox")
 #if DEBUG
@@ -1592,7 +1873,7 @@ final class ChatViewModel: ObservableObject {
 
         var next = friends.filter { !inboxDisplayMatchesInboundMessage($0, row: row) }
         next.insert(display, at: 0)
-        next.sort { ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast) }
+        next.sort(by: Self.isInboxRowOrderedBefore)
         friends = next
         syncChatPresenceRealtimeIfNeeded(reason: "incomingDmReappearedInbox")
         let totalUnread = next.reduce(0) { $0 + $1.unreadCount }
@@ -1616,13 +1897,16 @@ final class ChatViewModel: ObservableObject {
         inboxUnreadDebounceTask = nil
         inboxMissingPeerReconcileTask?.cancel()
         inboxMissingPeerReconcileTask = nil
-        if let task = inboxListenTask {
-            task.cancel()
-            _ = await task.result
-            inboxListenTask = nil
-        }
 
+        let task = inboxListenTask
+        inboxListenTask = nil
+        task?.cancel()
+        // removeChannel first so postgresChange AsyncStreams finish; awaiting task.result
+        // before channel removal hangs logout / sign-out cleanup forever.
         await removeInboxRealtimeChannelOnly()
+        if let task {
+            _ = await task.result
+        }
     }
 
     private func removeFriendshipsChannelOnly() async {
@@ -1758,14 +2042,14 @@ final class ChatViewModel: ObservableObject {
         friendRequestRealtimeDebounceTask?.cancel()
         friendRequestRealtimeDebounceTask = nil
 
-        if let task = friendshipsListenTask {
-            task.cancel()
-            _ = await task.result
-            friendshipsListenTask = nil
-        }
-
-        await removeFriendshipsChannelOnly()
+        let task = friendshipsListenTask
+        friendshipsListenTask = nil
         friendshipsRealtimeBoundUserId = nil
+        task?.cancel()
+        await removeFriendshipsChannelOnly()
+        if let task {
+            _ = await task.result
+        }
 #if DEBUG
         print("[RealtimeLifecycle] stopping friendship listener")
 #endif
@@ -1777,7 +2061,7 @@ final class ChatViewModel: ObservableObject {
             clearForSignOut()
             return
         }
-        await refreshUnreadDirectMessageCount()
+        await refreshUnreadDirectMessageCount(force: true)
         await refreshFriendRequestListsOnly()
         noteChatTabIntentPreloadCompleted()
     }
@@ -1853,7 +2137,34 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// Refreshes the Chat tab badge for unread peer DMs (no friendship / request counts).
-    func refreshUnreadDirectMessageCount() async {
+    /// - Parameter force: When true, bypasses launch freshness coalesce (realtime, tab intent, auth change).
+    ///   Still waits for any in-flight refresh before starting a new one to avoid racing publishers.
+    func refreshUnreadDirectMessageCount(force: Bool = false) async {
+        if let inFlight = unreadDirectMessageRefreshTask {
+            StartupPerf.taskCoalesced(name: "unreadDirectMessageCount")
+            DebugLogGate.debug("[NotificationPerf] chatUnreadCoalesced reason=inFlight force=\(force)")
+            await inFlight.value
+            if !force { return }
+        } else if !force,
+                  let last = lastUnreadDirectMessageRefreshAt,
+                  Date().timeIntervalSince(last) < unreadDirectMessageRefreshFreshness {
+            StartupPerf.duplicateSkipped(reason: "unreadDirectMessageFresh")
+            DebugLogGate.debug("[NotificationPerf] chatUnreadSkipped reason=freshCache")
+            return
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performUnreadDirectMessageCountRefresh()
+        }
+        unreadDirectMessageRefreshTask = task
+        await task.value
+        if unreadDirectMessageRefreshTask == task {
+            unreadDirectMessageRefreshTask = nil
+        }
+    }
+
+    private func performUnreadDirectMessageCountRefresh() async {
         let startedAt = Date()
         guard let me = try? await directChatService.currentUserId() else {
             clearForSignOut()
@@ -1868,6 +2179,7 @@ final class ChatViewModel: ObservableObject {
             return
         }
         await setUnreadDirectMessageCountAndSyncAppIcon(n, source: "rpc_total_refresh")
+        lastUnreadDirectMessageRefreshAt = Date()
         DebugLogGate.debug("[NotificationPerf] chatUnreadFinished durationMs=\(Int(Date().timeIntervalSince(startedAt) * 1000)) unread=\(n)")
         DebugLogGate.debug("[RealtimeChainDebug] refreshSucceeded table=conversation_read_state key=unreadDirectMessageCount")
         DebugLogGate.debug("[UnreadBadgeDebug] conversationId=rpc_total_refresh")
@@ -1878,6 +2190,18 @@ final class ChatViewModel: ObservableObject {
 
     /// Launch warm path: refreshes only the DM unread badge and inbox summaries, never message bodies.
     func prefetchLightweightStartupChatData() async -> StartupChatPrefetchResult {
+        // No DM/badge prefetch until the authoritative age record confirmed this UUID.
+        if !AgeAccessGateService.shared.allowsSocialSubsystemsForActiveUser() {
+            AgeAccessRuntimeLog.socialSubsystemBlocked(
+                userId: AgeAccessGateService.shared.activeUserId,
+                subsystem: "chat_startup_prefetch"
+            )
+            return StartupChatPrefetchResult(
+                dmBadgePrefetched: false,
+                inboxSummariesPrefetched: false,
+                skippedReason: "ageAccessUnresolved"
+            )
+        }
         if let inFlight = startupLightweightPrefetchTask {
             DebugLogGate.debug("[NotificationPerf] chatStartupPrefetchCoalesced=true")
             DebugLogGate.debug("[StartupPrefetchDebug] skippedReason=chatInFlight")
@@ -1987,6 +2311,7 @@ final class ChatViewModel: ObservableObject {
 
     func refreshInboxSummaries() async {
         if let inFlight = inboxSummariesRefreshTask {
+            ChatActivationPerf.inboxRefreshCoalesced(source: "inboxSummaries")
 #if DEBUG
             print("[ChatBootstrap] joinedExistingRequest")
 #endif
@@ -1994,6 +2319,7 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
+        ChatActivationPerf.inboxRefreshRequested(source: "inboxSummaries")
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performRefreshInboxSummaries()
@@ -2004,6 +2330,45 @@ final class ChatViewModel: ObservableObject {
             inboxSummariesRefreshTask = nil
             inboxSummariesRefreshAuthId = nil
         }
+    }
+
+    /// Accepts a pending group invitation; returns the conversation id on success.
+    @MainActor
+    func acceptGroupInvitation(_ invitation: GroupPendingInvitationRow) async throws -> UUID {
+        let conversationId = try await groupChatService.acceptInvitation(invitationId: invitation.invitation_id)
+        pendingGroupInvitations.removeAll { $0.invitation_id == invitation.invitation_id }
+        await refreshInboxSummaries()
+        return conversationId
+    }
+
+    /// Declines a pending group invitation.
+    @MainActor
+    func declineGroupInvitation(_ invitation: GroupPendingInvitationRow) async throws {
+        try await groupChatService.declineInvitation(invitationId: invitation.invitation_id)
+        pendingGroupInvitations.removeAll { $0.invitation_id == invitation.invitation_id }
+    }
+
+    /// Patches cached group inbox mute without a full inbox reload (Group Info mute toggle).
+    @MainActor
+    func patchGroupInboxMuted(conversationId: UUID, isMuted: Bool) {
+        guard let index = friends.firstIndex(where: {
+            $0.isGroupConversation && $0.conversationId == conversationId
+        }) else { return }
+        let existing = friends[index]
+        guard existing.isGroupMuted != isMuted else { return }
+        friends[index] = FriendDisplay(
+            id: existing.id,
+            preview: existing.preview,
+            subtitle: existing.subtitle,
+            lastMessageAt: existing.lastMessageAt,
+            unreadCount: existing.unreadCount,
+            isConversationBacked: existing.isConversationBacked,
+            conversationId: existing.conversationId,
+            inboxKind: existing.inboxKind,
+            groupMemberCount: existing.groupMemberCount,
+            isGroupMuted: isMuted,
+            pickupGameId: existing.pickupGameId
+        )
     }
 
     private func performRefreshInboxSummaries() async {
@@ -2020,6 +2385,8 @@ final class ChatViewModel: ObservableObject {
         }
         inboxSummariesRefreshAuthId = me
         noteAuthenticatedChatSession(userId: me, source: "inboxSummaries")
+        groupInboxAvatarHydrationRefreshToken &+= 1
+        lastCompletedGroupInboxAvatarHydrationKey = nil
 
         let hadCachedRows = !friends.filter(\.isConversationBacked).isEmpty
         if hadCachedRows {
@@ -2035,18 +2402,42 @@ final class ChatViewModel: ObservableObject {
         do {
             let inboxFetchStartedAt = CFAbsoluteTimeGetCurrent()
             async let dmRowsTask = directChatService.fetchInboxSummaries()
+            ChatActivationPerf.groupInboxRPCStarted()
             async let groupRowsTask = groupChatService.fetchInboxSummaries()
+            async let pendingGroupInvitesTask = groupChatService.fetchPendingInvitationsForMe()
+            async let exclusionsTask: Void = refreshServerInboxExclusionsIfAvailable()
             let rows = try await dmRowsTask
             let groupRows = (try? await groupRowsTask) ?? []
+            let pendingGroupInvites = (try? await pendingGroupInvitesTask) ?? []
+            _ = await exclusionsTask
+            ChatActivationPerf.inboxRPC(
+                ms: Int((CFAbsoluteTimeGetCurrent() - inboxFetchStartedAt) * 1000),
+                dmRows: rows.count,
+                groupRows: groupRows.count
+            )
 #if DEBUG
             ChatLoadPerf.inboxFetchMs(Int((CFAbsoluteTimeGetCurrent() - inboxFetchStartedAt) * 1000))
 #endif
             guard stillCurrentChatAccount(me, context: "inboxSummariesAfterFetch") else { return }
 
+            let fastBuildStartedAt = CFAbsoluteTimeGetCurrent()
             let dmVisible = buildInboxFriendDisplays(from: rows, me: me, participantPreviews: [:], profileLookupAttempted: false)
             let groupVisible = buildGroupInboxDisplays(from: groupRows, me: me)
-            let visible = mergeInboxDisplays(direct: dmVisible, groups: groupVisible)
-            friends = visible
+            // Fast path is conversation-only. Preserve previously published accepted friends that
+            // do not yet have a DM thread so the Friends tab does not flicker 4 → 3 → 4 while
+            // enrichment re-merges them (see ``preservingAcceptedFriendsDirectoryRows``).
+            let dmWithAcceptedDirectory = preservingAcceptedFriendsDirectoryRows(
+                over: dmVisible,
+                source: "fastPath"
+            )
+            let visible = mergeInboxDisplays(direct: dmWithAcceptedDirectory, groups: groupVisible)
+            ChatActivationPerf.snapshotBuildMs(
+                (CFAbsoluteTimeGetCurrent() - fastBuildStartedAt) * 1000,
+                source: "fastPath"
+            )
+            applyInboxFriendsSnapshot(visible, source: "fastPath")
+            pendingGroupInvitations = pendingGroupInvites
+            await hydratePendingGroupInvitationPreviews(for: pendingGroupInvites)
             scheduleGroupInboxAvatarHydration(groupConversationIds: groupRows.map(\.conversation_id), me: me)
             let totalUnread = visible.reduce(0) { $0 + $1.unreadCount }
             await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "refresh_inbox_summaries_fast")
@@ -2076,28 +2467,12 @@ final class ChatViewModel: ObservableObject {
                 await self?.enrichInboxSummariesAfterFirstPaint(
                     me: me,
                     rows: rows,
+                    fallbackGroupRows: groupRows,
                     refreshStartedAt: refreshStartedAt,
                     finishInitialLoadIfStillPending: false
                 )
-                // Re-merge groups after DM enrichment so group rows are not dropped.
-                if let self {
-                    let refreshedGroups = (try? await self.groupChatService.fetchInboxSummaries()) ?? groupRows
-                    await MainActor.run {
-                        let dmOnly = self.friends.filter { !$0.isGroupConversation }
-                        let groups = self.buildGroupInboxDisplays(from: refreshedGroups, me: me)
-                        self.friends = self.mergeInboxDisplays(direct: dmOnly, groups: groups)
-                        self.scheduleGroupInboxAvatarHydration(
-                            groupConversationIds: refreshedGroups.map(\.conversation_id),
-                            me: me
-                        )
-                        let total = self.friends.reduce(0) { $0 + $1.unreadCount }
-                        Task { await self.setUnreadDirectMessageCountAndSyncAppIcon(total, source: "refresh_inbox_after_enrich") }
-                        self.isInboxBackgroundRefreshInFlight = false
-                    }
-                } else {
-                    await MainActor.run {
-                        self?.isInboxBackgroundRefreshInFlight = false
-                    }
+                await MainActor.run {
+                    self?.isInboxBackgroundRefreshInFlight = false
                 }
             }
         } catch {
@@ -2136,9 +2511,52 @@ final class ChatViewModel: ObservableObject {
 #if DEBUG
             print("[ChatBootstrap] staleResultIgnored")
 #endif
+            ChatCounterpartDebug.log("stale session result ignored context=\(context)")
             return false
         }
         return true
+    }
+
+    /// Publishes a rebuilt inbox snapshot only when it differs from the current list.
+    /// A refresh recomputes an identical array in the common "nothing changed" case; skipping the
+    /// assignment avoids a redundant `objectWillChange` that would invalidate the whole tab shell
+    /// (`MainTabView` observes this view model). Row identity and order come from the caller.
+    @discardableResult
+    private func applyInboxFriendsSnapshot(_ next: [FriendDisplay], source: String) -> Bool {
+        let token = ChatFriendsStability.beginRefresh(source: source)
+        let nextDirectoryIds = friendsDirectoryMembershipIds(in: next)
+        ChatFriendsStability.stage("afterMerge", refreshToken: token, ids: nextDirectoryIds)
+        ChatFriendsStability.publishedDirectory(refreshToken: token, ids: nextDirectoryIds)
+
+        guard friends != next else {
+            ChatActivationPerf.snapshotReused(source: source)
+            ChatActivationPerf.noteReused()
+            return false
+        }
+        let publishStartedAt = CFAbsoluteTimeGetCurrent()
+        friends = next
+        ChatActivationPerf.publishMs(
+            (CFAbsoluteTimeGetCurrent() - publishStartedAt) * 1000,
+            rows: next.count,
+            source: source
+        )
+        ChatActivationPerf.snapshotPublished(rows: next.count, source: source)
+        ChatActivationPerf.notePublished()
+        return true
+    }
+
+    /// Peer user ids that the Friends tab would show for this snapshot (accepted + directory-eligible).
+    private func friendsDirectoryMembershipIds(in displays: [FriendDisplay]) -> Set<UUID> {
+        Set(
+            displays.compactMap { display -> UUID? in
+                guard !display.isGroupConversation else { return nil }
+                guard !display.preview.isDeleted else { return nil }
+                guard !display.preview.isBusinessVenueConversation else { return nil }
+                if display.preview.isBusinessAccount && display.isConversationBacked { return nil }
+                guard friendshipChipByOtherUserId[display.preview.id] == .friends else { return nil }
+                return display.preview.id
+            }
+        )
     }
 
     private func buildInboxFriendDisplays(
@@ -2147,14 +2565,35 @@ final class ChatViewModel: ObservableObject {
         participantPreviews: [UUID: UserPreview],
         profileLookupAttempted: Bool
     ) -> [FriendDisplay] {
-        let displays = rows.map { row -> FriendDisplay in
+        var seenConversationIds = Set<UUID>()
+        let displays: [FriendDisplay] = rows.compactMap { row -> FriendDisplay? in
+            if let conversationId = row.conversation_id {
+                if seenConversationIds.contains(conversationId) {
+                    ChatCounterpartDebug.log("duplicate conversation row detected")
+                    return nil
+                }
+                seenConversationIds.insert(conversationId)
+            }
+
             let preview = inboxPreview(
                 for: row,
                 resolvedPreview: participantPreviews[row.friend_user_id],
                 profileLookupAttempted: profileLookupAttempted
             )
-            logChatRowDebug(preview: preview)
-            logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
+            if DebugLogGate.verboseChatInboxRowLogging {
+                logChatRowDebug(preview: preview)
+                logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
+                logCounterpartMapping(row: row, preview: preview)
+#if DEBUG
+                ChatActivityBadgeDebug.log(
+                    isRegularFan: !preview.isBusinessIdentity && !preview.isDeleted,
+                    lastSeenPresent: preview.lastSeenAtRaw != nil,
+                    visibilityAllowed: profileLookupAttempted ? preview.activityStatusVisible : nil,
+                    kind: ActivityStatus.resolve(lastSeenAtRaw: preview.lastSeenAtRaw),
+                    source: profileLookupAttempted ? "previewEnrichment" : "inboxRPC"
+                )
+#endif
+            }
 
             let rawPreview = ChatInboxPreviewFormatting.previewLine(
                 body: row.last_message_body,
@@ -2185,7 +2624,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func buildGroupInboxDisplays(from rows: [GroupInboxSummaryRow], me: UUID) -> [FriendDisplay] {
-        rows.map { row in
+        let displays = rows.map { row -> FriendDisplay in
             let preview = UserPreview(
                 id: row.conversation_id,
                 displayName: row.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2219,26 +2658,84 @@ final class ChatViewModel: ObservableObject {
                 conversationId: row.conversation_id,
                 inboxKind: .group,
                 groupMemberCount: max(0, row.member_count),
-                isGroupMuted: row.is_muted == true
+                isGroupMuted: row.is_muted == true,
+                pickupGameId: row.pickup_game_id
             )
+        }
+        return applyHiddenInboxPeerFilter(displays)
+    }
+
+    private func hydratePendingGroupInvitationPreviews(for invitations: [GroupPendingInvitationRow]) async {
+        let inviterIds = Array(Set(invitations.map(\.inviter_user_id)))
+        guard !inviterIds.isEmpty else {
+            await MainActor.run { pendingGroupInvitationPreviews = [:] }
+            return
+        }
+        if let fetched = try? await socialIdentityService.fetchUserPreviews(for: inviterIds) {
+            await MainActor.run { pendingGroupInvitationPreviews = fetched }
         }
     }
 
+    /// Stable key for equivalent avatar hydration work within one refresh cycle.
+    private func groupInboxAvatarHydrationIdentityKey(
+        groupConversationIds: [UUID],
+        me: UUID,
+        refreshToken: UInt64
+    ) -> String {
+        let sortedIds = groupConversationIds
+            .map { $0.uuidString.lowercased() }
+            .sorted()
+            .joined(separator: ",")
+        return "t\(refreshToken)|u\(me.uuidString.lowercased())|g\(sortedIds)"
+    }
+
     private func scheduleGroupInboxAvatarHydration(groupConversationIds: [UUID], me: UUID) {
-        let ids = Array(Set(groupConversationIds))
+        let ids = Array(Set(groupConversationIds)).sorted { $0.uuidString < $1.uuidString }
         let active = Set(ids)
         groupInboxAvatarMemberIdsByConversationId = groupInboxAvatarMemberIdsByConversationId.filter {
             active.contains($0.key)
         }
+
+        let refreshToken = groupInboxAvatarHydrationRefreshToken
+        let key = groupInboxAvatarHydrationIdentityKey(
+            groupConversationIds: ids,
+            me: me,
+            refreshToken: refreshToken
+        )
+
+        // Same group/member context already in flight → join; do not cancel/restart.
+        if groupInboxAvatarHydrationTask != nil,
+           groupInboxAvatarHydrationKey == key {
+            ChatActivationPerf.avatarHydrationJoined(groupCount: ids.count)
+            return
+        }
+
+        // Same context already completed for this refresh cycle → skip duplicate.
+        if groupInboxAvatarHydrationTask == nil,
+           lastCompletedGroupInboxAvatarHydrationKey == key {
+            ChatActivationPerf.avatarHydrationSkippedIdentical(groupCount: ids.count)
+            return
+        }
+
         groupInboxAvatarHydrationGeneration &+= 1
         let generation = groupInboxAvatarHydrationGeneration
+        groupInboxAvatarHydrationKey = key
         groupInboxAvatarHydrationTask?.cancel()
+        ChatActivationPerf.avatarHydrationStarted(groupCount: ids.count)
         groupInboxAvatarHydrationTask = Task { [weak self] in
-            await self?.hydrateGroupInboxAvatars(
+            guard let self else { return }
+            await self.hydrateGroupInboxAvatars(
                 groupConversationIds: ids,
                 me: me,
                 generation: generation
             )
+            await MainActor.run {
+                guard self.groupInboxAvatarHydrationGeneration == generation else { return }
+                self.lastCompletedGroupInboxAvatarHydrationKey = key
+                if self.groupInboxAvatarHydrationTask != nil {
+                    self.groupInboxAvatarHydrationTask = nil
+                }
+            }
         }
     }
 
@@ -2261,23 +2758,23 @@ final class ChatViewModel: ObservableObject {
             guard generation == groupInboxAvatarHydrationGeneration else { return }
             guard stillCurrentChatAccount(me, context: "groupInboxAvatarMembers") else { return }
 
-            var membersByConversation: [UUID: [(userId: UUID, joinedAt: String)]] = [:]
-            for row in memberRows {
-                membersByConversation[row.conversation_id, default: []].append(
-                    (userId: row.user_id, joinedAt: row.joined_at)
-                )
-            }
-
-            var nextIdsByConversation: [UUID: [UUID]] = [:]
-            var allMemberIds = Set<UUID>()
-            for conversationId in groupConversationIds {
-                let ordered = GroupInboxAvatarMembership.orderedAvatarMemberIds(
-                    members: membersByConversation[conversationId] ?? [],
+            // Membership grouping/ordering is pure and scales with members, so keep it off the MainActor.
+            let membershipStartedAt = CFAbsoluteTimeGetCurrent()
+            let membership = await Task.detached(priority: .userInitiated) {
+                ChatInboxSnapshotBuilder.groupAvatarMembership(
+                    memberRows: memberRows,
+                    conversationIds: groupConversationIds,
                     currentUserId: me
                 )
-                nextIdsByConversation[conversationId] = ordered
-                allMemberIds.formUnion(ordered)
-            }
+            }.value
+            ChatActivationPerf.offMainWorkMs(
+                (CFAbsoluteTimeGetCurrent() - membershipStartedAt) * 1000,
+                name: "groupAvatarMembership"
+            )
+            guard !Task.isCancelled else { return }
+            guard generation == groupInboxAvatarHydrationGeneration else { return }
+            let nextIdsByConversation = membership.memberIdsByConversationId
+            let allMemberIds = membership.referencedMemberIds
 
             // Seed from friends / existing cache before network.
             var seededPreviews = groupMemberPreviewByUserId
@@ -2294,13 +2791,22 @@ final class ChatViewModel: ObservableObject {
             guard generation == groupInboxAvatarHydrationGeneration else { return }
             guard stillCurrentChatAccount(me, context: "groupInboxAvatarPreviews") else { return }
 
-            var mergedPreviews = seededPreviews
-            for (id, preview) in fetched {
-                mergedPreviews[id] = preview
-            }
             // Keep only members referenced by current inbox groups (plus any still-needed cache hits).
+            let mergeStartedAt = CFAbsoluteTimeGetCurrent()
+            let seeded = seededPreviews
+            let fetchedPreviews = fetched
             let referenced = allMemberIds
-            mergedPreviews = mergedPreviews.filter { referenced.contains($0.key) }
+            let mergedPreviews = await Task.detached(priority: .userInitiated) {
+                ChatInboxSnapshotBuilder.mergedGroupMemberPreviews(
+                    seeded: seeded,
+                    fetched: fetchedPreviews,
+                    referenced: referenced
+                )
+            }.value
+            ChatActivationPerf.offMainWorkMs(
+                (CFAbsoluteTimeGetCurrent() - mergeStartedAt) * 1000,
+                name: "groupMemberPreviewMerge"
+            )
 
             await MainActor.run {
                 guard generation == groupInboxAvatarHydrationGeneration else { return }
@@ -2323,14 +2829,27 @@ final class ChatViewModel: ObservableObject {
         for row in groups {
             byKey["group:\(row.id.uuidString.lowercased())"] = row
         }
-        return byKey.values.sorted {
-            ($0.lastMessageAt ?? .distantPast) > ($1.lastMessageAt ?? .distantPast)
-        }
+        return byKey.values.sorted(by: Self.isInboxRowOrderedBefore)
     }
 
+    /// Shared inbox comparator (recency first, deterministic tie-break) so refresh merges and
+    /// Realtime patches can never disagree about the position of equal-timestamp rows.
+    private static func isInboxRowOrderedBefore(_ lhs: FriendDisplay, _ rhs: FriendDisplay) -> Bool {
+        ChatInboxSnapshotBuilder.isOrderedBefore(
+            lhsLastMessageAt: lhs.lastMessageAt,
+            lhsId: lhs.id,
+            rhsLastMessageAt: rhs.lastMessageAt,
+            rhsId: rhs.id
+        )
+    }
+
+    /// Second (and final) pass of a refresh: resolves DM profiles, folds in accepted friends without
+    /// a thread, and reuses the fast-path group summaries. Everything is merged into one snapshot
+    /// before publishing so group rows never momentarily vanish while DM enrichment is applied.
     private func enrichInboxSummariesAfterFirstPaint(
         me: UUID,
         rows: [DmInboxSummaryRow],
+        fallbackGroupRows: [GroupInboxSummaryRow],
         refreshStartedAt: CFAbsoluteTime,
         finishInitialLoadIfStillPending: Bool
     ) async {
@@ -2346,22 +2865,41 @@ final class ChatViewModel: ObservableObject {
         }
         guard !Task.isCancelled else { return }
         guard stillCurrentChatAccount(me, context: "inboxEnrichmentStart") else { return }
+        ChatActivationPerf.enrichmentStarted()
+        let enrichmentStartedAt = CFAbsoluteTimeGetCurrent()
         do {
+            // Group inbox already fetched on the fast path with the same RPC/session/filters.
+            // Reuse that immutable snapshot — a second get_group_inbox_summaries within the same
+            // refresh cycle is redundant; Realtime + the next refresh cover intervening changes.
+            ChatActivationPerf.groupInboxRPCReused()
+            let groupRows = fallbackGroupRows
             let participantPreviews = try await fetchDmParticipantPreviews(for: rows)
             guard !Task.isCancelled else { return }
             guard stillCurrentChatAccount(me, context: "inboxEnrichmentAfterProfiles") else { return }
 
-            var visible = buildInboxFriendDisplays(
+            var direct = buildInboxFriendDisplays(
                 from: rows,
                 me: me,
                 participantPreviews: participantPreviews,
                 profileLookupAttempted: true
             )
-            visible = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: visible)
+            direct = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: direct)
             guard !Task.isCancelled else { return }
             guard stillCurrentChatAccount(me, context: "inboxEnrichmentBeforeApply") else { return }
 
-            friends = visible
+            let buildStartedAt = CFAbsoluteTimeGetCurrent()
+            let groups = buildGroupInboxDisplays(from: groupRows, me: me)
+            let visible = mergeInboxDisplays(direct: direct, groups: groups)
+            ChatActivationPerf.snapshotBuildMs(
+                (CFAbsoluteTimeGetCurrent() - buildStartedAt) * 1000,
+                source: "enrichment"
+            )
+
+            applyInboxFriendsSnapshot(visible, source: "enrichment")
+            scheduleGroupInboxAvatarHydration(
+                groupConversationIds: groupRows.map(\.conversation_id),
+                me: me
+            )
             syncChatPresenceRealtimeIfNeeded(reason: "inboxSummariesEnriched")
 #if DEBUG
             print("[BadgeSyncDebug] chat list updated (enriched)")
@@ -2374,7 +2912,19 @@ final class ChatViewModel: ObservableObject {
 
             lastInboxLoadAt = Date()
             noteAuthenticatedChatSession(userId: me, source: "inboxSummariesEnriched")
+            ChatActivationPerf.enrichmentFinished(
+                ms: Int((CFAbsoluteTimeGetCurrent() - enrichmentStartedAt) * 1000),
+                applied: true
+            )
+            ChatActivationPerf.stableInboxReady(
+                ms: Int((CFAbsoluteTimeGetCurrent() - refreshStartedAt) * 1000),
+                rows: visible.count
+            )
         } catch {
+            ChatActivationPerf.enrichmentFinished(
+                ms: Int((CFAbsoluteTimeGetCurrent() - enrichmentStartedAt) * 1000),
+                applied: false
+            )
             if ignoreCancellationIfNeeded(error, context: "inbox_summaries_enrichment") { return }
             // Keep fast-path rows; enrichment retries on next refresh.
         }
@@ -2407,42 +2957,106 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Swipe-delete from inbox: hides the thread for this user and best-effort clears server history when RPC exists.
-    /// Does not remove the friendship; only clears/hides the thread per server rules when available.
+    /// Swipe-delete from inbox: per-user soft-delete (Recently Deleted). Does not leave groups.
+    /// Does not remove friendships. Shared history remains for other participants.
     func clearInboxConversation(peerUserId: UUID, conversationId: UUID? = nil) async {
 #if DEBUG
         print("[DMDelete] delete tapped friendUserId=\(peerUserId.uuidString.lowercased()) conversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
 #endif
         inboxDeleteError = nil
-        hideInboxConversationLocally(peerUserId: peerUserId, conversationId: conversationId)
+
+        let inboxRow = friends.first(where: {
+            if let conversationId { return $0.conversationId == conversationId }
+            return $0.preview.id == peerUserId && $0.isConversationBacked
+        })
+        let isGroup = inboxRow?.isGroupConversation == true
+        let serverKind = isGroup ? "group" : "direct"
+
+        let cid: UUID
+        if let conversationId {
+            cid = conversationId
+        } else if isGroup {
+            inboxDeleteError = L10n.t("chat_recently_deleted_delete_failed")
+            return
+        } else {
+            do {
+                cid = try await directChatService.startDirectConversation(friendUserId: peerUserId)
+            } catch {
+                inboxDeleteError = error.localizedDescription
+                return
+            }
+        }
+
+        // Optimistic local hide — rolled back if server soft-delete fails.
+        hideInboxConversationLocally(peerUserId: peerUserId, conversationId: cid)
 #if DEBUG
         print("[DMDelete] local remove friendUserId=\(peerUserId.uuidString.lowercased())")
 #endif
 
         do {
-            let cid: UUID
-            if let conversationId {
-                cid = conversationId
-            } else {
-                cid = try await directChatService.startDirectConversation(friendUserId: peerUserId)
-            }
-            try await directChatService.clearDirectConversation(conversationId: cid)
+            try await recentlyDeletedService.softDelete(kind: serverKind, conversationId: cid)
+            serverExcludedInboxConversationIds.insert(cid)
+            serverInboxExclusionsAvailable = true
 #if DEBUG
-            print("[DMDelete] server hide success conversationId=\(cid.uuidString.lowercased())")
+            print("[DMDelete] server soft-delete success conversationId=\(cid.uuidString.lowercased()) kind=\(serverKind)")
 #endif
         } catch {
 #if DEBUG
             print(
-                "[DMDelete] server hide error friendUserId=\(peerUserId.uuidString.lowercased()) " +
+                "[DMDelete] server soft-delete error friendUserId=\(peerUserId.uuidString.lowercased()) " +
                 "error=\(error.localizedDescription)"
             )
 #endif
+            // Keep optimistic hide only when the RPC is missing (migration not applied yet)
+            // so the known group-hide client filter still works offline of the new backend.
+            if Self.isMissingRPCError(error) {
+                // Client-only fallback: UserDefaults hide + group filter (pre-migration).
+#if DEBUG
+                print("[DMDelete] soft-delete RPC missing; keeping local hide fallback")
+#endif
+            } else {
+                revealInboxConversationIfHidden(conversationId: cid, peerUserId: peerUserId, reason: "softDeleteFailed")
+                inboxDeleteError = error.localizedDescription
+                await refreshInboxSummaries()
+                return
+            }
         }
 
         await refreshInboxSummaries()
 #if DEBUG
         print("[DMDelete] inbox refreshed friendUserId=\(peerUserId.uuidString.lowercased())")
 #endif
+    }
+
+    func fetchRecentlyDeletedConversations() async throws -> [RecentlyDeletedChatConversationRow] {
+        try await recentlyDeletedService.fetchRecentlyDeleted()
+    }
+
+    func restoreRecentlyDeletedConversation(_ row: RecentlyDeletedChatConversationRow) async throws {
+        try await recentlyDeletedService.restore(kind: row.serverKindParam, conversationId: row.conversation_id)
+        serverExcludedInboxConversationIds.remove(row.conversation_id)
+        revealInboxConversationIfHidden(
+            conversationId: row.conversation_id,
+            peerUserId: row.peer_user_id,
+            reason: "recentlyDeletedRestore"
+        )
+    }
+
+    func permanentlyDeleteRecentlyDeletedConversation(_ row: RecentlyDeletedChatConversationRow) async throws {
+        try await recentlyDeletedService.permanentlyDelete(kind: row.serverKindParam, conversationId: row.conversation_id)
+        serverExcludedInboxConversationIds.insert(row.conversation_id)
+        hideInboxConversationLocally(
+            peerUserId: row.peer_user_id ?? row.conversation_id,
+            conversationId: row.conversation_id
+        )
+    }
+
+    private static func isMissingRPCError(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        return text.contains("could not find the function")
+            || text.contains("pgrst202")
+            || text.contains("404")
+            || text.contains("does not exist")
     }
 
     func previewForLoadedDmParticipant(userId: UUID, conversationId: UUID? = nil) -> UserPreview? {
@@ -2471,7 +3085,12 @@ final class ChatViewModel: ObservableObject {
         surface: String,
         conversationId: UUID? = nil
     ) async -> UserPreview {
-        if fallback.isBusinessVenueConversation {
+        let sessionAuthId = currentUserAuthId
+        // Fan viewers keep venue/business peer identity locked.
+        // Business viewers must resolve the fan counterpart even when a stale venue preview was seeded.
+        if fallback.isBusinessVenueConversation,
+           !ChatDMCounterpartResolution.isBusinessSession(mapViewModel: mapViewModel) {
+            ChatCounterpartDebug.log("counterpart type=business surface=\(surface) venuePeerPreserved=true")
             return fallback
         }
         if fallback.isDeleted {
@@ -2481,16 +3100,45 @@ final class ChatViewModel: ObservableObject {
 
         do {
             if let resolved = try await socialIdentityService.fetchUserPreviews(for: [userId])[userId] {
-                logDeletedUserRenderDebug(surface: surface, preview: resolved)
-                patchLoadedDmParticipantPreview(resolved, conversationId: conversationId ?? fallback.dmConversationId)
-                return resolved
+                if let sessionAuthId, currentUserAuthId != sessionAuthId {
+                    ChatCounterpartDebug.log("stale session result ignored surface=\(surface)")
+                    return fallback
+                }
+                let merged = UserPreview(
+                    id: resolved.id,
+                    displayName: resolved.displayName,
+                    username: resolved.username,
+                    email: resolved.email,
+                    avatarURL: resolved.avatarURL,
+                    avatarThumbnailURL: resolved.avatarThumbnailURL,
+                    isBusinessAccount: false,
+                    isDeleted: resolved.isDeleted,
+                    lastSeenAtRaw: resolved.lastSeenAtRaw,
+                    dmConversationId: conversationId ?? fallback.dmConversationId ?? resolved.dmConversationId,
+                    businessVenueId: nil,
+                    businessVenueBusinessId: nil,
+                    businessVenueBusinessName: nil,
+                    venueScopedThread: fallback.venueScopedThread || fallback.isVenueScopedDirectMessage
+                )
+                logDeletedUserRenderDebug(surface: surface, preview: merged)
+                ChatCounterpartDebug.log(
+                    "fan identity resolved surface=\(surface) hasHandle=\(!merged.publicHandleLine.isEmpty) hasAvatar=\(!(merged.avatarURL ?? "").isEmpty || !(merged.avatarThumbnailURL ?? "").isEmpty)"
+                )
+                patchLoadedDmParticipantPreview(merged, conversationId: conversationId ?? fallback.dmConversationId)
+                return merged
             }
         } catch {
             // Treat unresolved fan identities as deleted for DM presentation; the messages remain intact.
         }
 
+        if let sessionAuthId, currentUserAuthId != sessionAuthId {
+            ChatCounterpartDebug.log("stale session result ignored surface=\(surface) phase=deletedFallback")
+            return fallback
+        }
+
         let deleted = deletedUserPreview(userId: userId, email: fallback.email)
         logDeletedUserRenderDebug(surface: surface, preview: deleted)
+        ChatCounterpartDebug.log("fallback identity used surface=\(surface) reason=profileMissing")
         patchLoadedDmParticipantPreview(deleted, conversationId: conversationId ?? fallback.dmConversationId)
         return deleted
     }
@@ -2605,6 +3253,9 @@ final class ChatViewModel: ObservableObject {
                         "[ProfileShareDebug] failed kind=\(recipient.inboxKind.rawValue) displayId=\(recipient.id.uuidString.lowercased()) peer=\(recipient.preview.id.uuidString.lowercased()) conversationId=\(recipient.conversationId?.uuidString.lowercased() ?? "nil") error=\(error)"
                     )
 #endif
+                    if AgeAccessBackendDenial.handle(error, requestUserId: nil) {
+                        return L10n.t("share_profile_failed")
+                    }
                     lastFailure = L10n.t("share_profile_failed")
                 }
             }
@@ -2619,6 +3270,7 @@ final class ChatViewModel: ObservableObject {
 #if DEBUG
             print("[ProfileShareDebug] outerFailure error=\(error)")
 #endif
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
             return L10n.t("share_profile_failed")
         }
     }
@@ -2645,9 +3297,11 @@ final class ChatViewModel: ObservableObject {
 
     func refresh() async {
         if let inFlight = fullRefreshInFlightTask {
+            ChatActivationPerf.inboxRefreshCoalesced(source: "fullRefresh")
             await inFlight.value
             return
         }
+        ChatActivationPerf.inboxRefreshRequested(source: "fullRefresh")
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performFullRefresh()
@@ -2672,12 +3326,16 @@ final class ChatViewModel: ObservableObject {
                 await stopFriendshipsRealtimeListener()
             }
             noteAuthenticatedChatSession(userId: me, source: "fullRefresh")
+            groupInboxAvatarHydrationRefreshToken &+= 1
+            lastCompletedGroupInboxAvatarHydrationKey = nil
             await reloadModerationBlockSets()
             async let accepted = service.fetchAcceptedFriendships(for: me)
             async let incoming = service.fetchIncomingFriendRequestsVisible(for: me)
             async let outgoing = service.fetchOutgoingFriendRequestsVisible(for: me)
             async let inbox = directChatService.fetchInboxSummaries()
+            async let exclusionsTask: Void = refreshServerInboxExclusionsIfAvailable()
             let (accRows, inRows, outRows, inboxRows) = try await (accepted, incoming, outgoing, inbox)
+            _ = await exclusionsTask
             let participantPreviews = try await fetchDmParticipantPreviews(for: inboxRows)
 
             let previewIds = Set(
@@ -2687,42 +3345,23 @@ final class ChatViewModel: ObservableObject {
             let previewsById = try await socialIdentityService.fetchUserPreviews(for: Array(previewIds))
 
             let inboxFiltered = inboxRows.filter { !isEitherDirectionBlocked(with: $0.friend_user_id) }
-            var friendDisplays = inboxFiltered.map { row -> FriendDisplay in
-                let preview = inboxPreview(
-                    for: row,
-                    resolvedPreview: participantPreviews[row.friend_user_id],
-                    profileLookupAttempted: true
-                )
-                logChatRowDebug(preview: preview)
-                logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
-
-                let rawPreview = ChatInboxPreviewFormatting.previewLine(
-                    body: row.last_message_body,
-                    isFromCurrentUser: row.last_message_sender_id == me
-                )
-
-                let lastAt = Self.parseISO8601(row.last_message_created_at)
-                let unread = max(0, row.unread_count ?? 0)
-                let kind: ChatInboxConversationKind = {
-                    if preview.isBusinessVenueConversation || preview.isBusinessAccount { return .business }
-                    return .direct
-                }()
-                return FriendDisplay(
-                    id: row.conversation_id ?? preview.id,
-                    preview: preview,
-                    subtitle: rawPreview,
-                    lastMessageAt: lastAt,
-                    unreadCount: unread,
-                    isConversationBacked: true,
-                    conversationId: row.conversation_id,
-                    inboxKind: kind
-                )
-            }
+            var friendDisplays = buildInboxFriendDisplays(
+                from: inboxFiltered,
+                me: me,
+                participantPreviews: participantPreviews,
+                profileLookupAttempted: true
+            )
             friendDisplays = try await mergeAcceptedFriendsMissingFromInbox(me: me, inboxDisplays: friendDisplays)
             friendDisplays = applyHiddenInboxPeerFilter(friendDisplays)
+            ChatActivationPerf.groupInboxRPCStarted()
             let groupRows = (try? await groupChatService.fetchInboxSummaries()) ?? []
             let groupDisplays = buildGroupInboxDisplays(from: groupRows, me: me)
-            friends = mergeInboxDisplays(direct: friendDisplays, groups: groupDisplays)
+            let fullRefreshVisible = mergeInboxDisplays(direct: friendDisplays, groups: groupDisplays)
+            applyInboxFriendsSnapshot(fullRefreshVisible, source: "fullRefresh")
+            ChatActivationPerf.stableInboxReady(
+                ms: Int((CFAbsoluteTimeGetCurrent() - fullRefreshStartedAt) * 1000),
+                rows: fullRefreshVisible.count
+            )
             scheduleGroupInboxAvatarHydration(groupConversationIds: groupRows.map(\.conversation_id), me: me)
             syncChatPresenceRealtimeIfNeeded(reason: "fullRefreshLoaded")
 #if DEBUG
@@ -2802,26 +3441,17 @@ final class ChatViewModel: ObservableObject {
             await awardFriendConnectedXP(friendship: friendship)
         } catch {
             if ignoreCancellationIfNeeded(error, context: "friend_request_accept") { return }
+            if AgeAccessBackendDenial.handle(error, requestUserId: nil) { return }
             errorMessage = error.localizedDescription
         }
     }
 
     private func awardFriendConnectedXP(friendship: FriendshipRow) async {
         guard let map = mapViewModel else { return }
-        guard let me = try? await service.currentUserId() else { return }
-        let otherId = friendship.requester_id == me ? friendship.addressee_id : friendship.requester_id
+        // `claim_fan_xp` awards both accepted friendship participants server-side.
         await map.awardFanXP(
-            userId: me,
-            amount: 5,
             source: FanXPSource.friendConnected,
             sourceId: friendship.id
-        )
-        await map.awardFanXP(
-            userId: otherId,
-            amount: 5,
-            source: FanXPSource.friendConnected,
-            sourceId: friendship.id,
-            showToast: false
         )
     }
 
@@ -2852,6 +3482,7 @@ final class ChatViewModel: ObservableObject {
             }
             incomingRequests = snapshot
             pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
+            if AgeAccessBackendDenial.handle(error, requestUserId: nil) { return }
             errorMessage = error.localizedDescription
             await refreshFriendRequestListsOnly()
         }
@@ -3033,6 +3664,7 @@ final class ChatViewModel: ObservableObject {
             await refreshFriendRequestListsOnly()
         } catch {
             if ignoreCancellationIfNeeded(error, context: "friend_request_send") { return }
+            if AgeAccessBackendDenial.handle(error, requestUserId: nil) { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -3103,6 +3735,9 @@ final class ChatViewModel: ObservableObject {
             return .success
         } catch {
             await refreshAfterFriendLookupAttempt()
+            if AgeAccessBackendDenial.handle(error, requestUserId: nil) {
+                return .informational(L10n.t("share_profile_failed"))
+            }
             return await resolveAddFriendLookupOutcomeAfterError(error, target: target)
         }
     }
@@ -3347,13 +3982,16 @@ final class ChatViewModel: ObservableObject {
 
     /// Accepted friends without a DM thread yet still appear in the Friends directory (presentation only; inbox RPC unchanged).
     private func applyHiddenInboxPeerFilter(_ displays: [FriendDisplay]) -> [FriendDisplay] {
-        guard !hiddenInboxPeerUserIds.isEmpty || !hiddenInboxConversationIds.isEmpty else { return displays }
+        guard !hiddenInboxPeerUserIds.isEmpty
+                || !hiddenInboxConversationIds.isEmpty
+                || !serverExcludedInboxConversationIds.isEmpty else {
+            return displays
+        }
         return displays.filter { display in
             guard display.isConversationBacked else { return true }
-            // Group hide uses conversation id only (preview.id is the group id, not a peer).
-            if let conversationId = display.conversationId,
-               hiddenInboxConversationIds.contains(conversationId) {
-                return false
+            if let conversationId = display.conversationId {
+                if hiddenInboxConversationIds.contains(conversationId) { return false }
+                if serverExcludedInboxConversationIds.contains(conversationId) { return false }
             }
             if display.isGroupConversation {
                 return true
@@ -3363,6 +4001,34 @@ final class ChatViewModel: ObservableObject {
                 return false
             }
             return true
+        }
+    }
+
+    private func refreshServerInboxExclusionsIfAvailable() async {
+        do {
+            let keys = try await recentlyDeletedService.fetchExclusions()
+            let nextExcluded = Set(keys.map(\.conversation_id))
+            let previouslyExcluded = serverExcludedInboxConversationIds
+            serverExcludedInboxConversationIds = nextExcluded
+            serverInboxExclusionsAvailable = true
+            if let authId = currentUserAuthId {
+                for id in nextExcluded {
+                    DmInboxHiddenConversationsStore.hide(conversationId: id, authId: authId)
+                    hiddenInboxConversationIds.insert(id)
+                }
+                // Auto-restore / manual restore: clear local hide for ids no longer excluded.
+                for id in previouslyExcluded.subtracting(nextExcluded) {
+                    DmInboxHiddenConversationsStore.unhide(conversationId: id, authId: authId)
+                    hiddenInboxConversationIds.remove(id)
+                }
+            }
+        } catch {
+            if Self.isMissingRPCError(error) {
+                serverInboxExclusionsAvailable = false
+            }
+#if DEBUG
+            print("[DMDelete] exclusions fetch failed error=\(error.localizedDescription)")
+#endif
         }
     }
 
@@ -3377,12 +4043,44 @@ final class ChatViewModel: ObservableObject {
                 hiddenInboxPeerUserIds.insert(peerUserId)
             }
         }
+        let removedConversationRows = friends.filter {
+            guard $0.isConversationBacked else { return false }
+            if let conversationId {
+                return $0.conversationId == conversationId
+            }
+            return $0.preview.id == peerUserId && $0.conversationId == nil
+        }
         friends.removeAll {
             guard $0.isConversationBacked else { return false }
             if let conversationId {
                 return $0.conversationId == conversationId
             }
             return $0.preview.id == peerUserId && $0.conversationId == nil
+        }
+        // Soft-delete hides the Chats row only. Accepted friends must remain in the Friends
+        // directory — promote the removed conversation row into a directory-only entry when needed.
+        let stillAccepted = friendshipChipByOtherUserId[peerUserId] == .friends
+            || friendshipChipByOtherUserId.isEmpty
+        let alreadyInDirectory = friends.contains {
+            !$0.isConversationBacked && $0.preview.id == peerUserId
+        }
+        if stillAccepted, !alreadyInDirectory,
+           let preview = removedConversationRows.first(where: { $0.preview.id == peerUserId })?.preview {
+            friends.append(
+                FriendDisplay(
+                    id: peerUserId,
+                    preview: preview,
+                    subtitle: ChatInboxPreviewFormatting.previewLine(body: nil, isFromCurrentUser: false),
+                    lastMessageAt: nil,
+                    unreadCount: 0,
+                    isConversationBacked: false,
+                    conversationId: nil
+                )
+            )
+            ChatFriendsStability.preserved(
+                refreshToken: ChatFriendsStability.beginRefresh(source: "softDeletePromoteDirectory"),
+                ids: [peerUserId]
+            )
         }
         let totalUnread = friends.reduce(0) { $0 + $1.unreadCount }
         Task { await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "clear_inbox_conversation_local") }
@@ -3455,6 +4153,16 @@ final class ChatViewModel: ObservableObject {
         inboxDisplays: [FriendDisplay]
     ) async throws -> [FriendDisplay] {
         let accepted = try await service.fetchAcceptedFriendships(for: me)
+        let token = ChatFriendsStability.beginRefresh(source: "mergeAcceptedFriends")
+        let acceptedIds = Set(accepted.compactMap { row -> UUID? in
+            guard (row.requester_entity_type ?? "user").lowercased() == "user",
+                  (row.addressee_entity_type ?? "user").lowercased() == "user" else {
+                return nil
+            }
+            return row.requester_id == me ? row.addressee_id : row.requester_id
+        })
+        ChatFriendsStability.stage("sourceAcceptedFriendIds", refreshToken: token, ids: acceptedIds)
+
         let inboxPeerUserIds = Set(inboxDisplays.map(\.preview.id))
         let missingIds: [UUID] = accepted.compactMap { row in
             guard (row.requester_entity_type ?? "user").lowercased() == "user",
@@ -3463,15 +4171,26 @@ final class ChatViewModel: ObservableObject {
             }
             let other = row.requester_id == me ? row.addressee_id : row.requester_id
             guard !inboxPeerUserIds.contains(other) else { return nil }
-            guard !isEitherDirectionBlocked(with: other) else { return nil }
+            if isEitherDirectionBlocked(with: other) {
+                ChatFriendsStability.drop(reason: "blocked", refreshToken: token, id: other)
+                return nil
+            }
             return other
         }
+        ChatFriendsStability.stage(
+            "afterBlockFilterMissingFromInbox",
+            refreshToken: token,
+            ids: Set(missingIds)
+        )
         guard !missingIds.isEmpty else { return inboxDisplays }
 
         let previews = try await socialIdentityService.fetchUserPreviews(for: missingIds)
         var merged = inboxDisplays
         for pid in missingIds {
             let preview = previews[pid] ?? deletedUserPreview(userId: pid)
+            if previews[pid] == nil {
+                ChatFriendsStability.drop(reason: "missingPreviewUsedFallback", refreshToken: token, id: pid)
+            }
             logDeletedUserRenderDebug(surface: "dm_inbox", preview: preview)
             merged.append(
                 FriendDisplay(
@@ -3486,6 +4205,62 @@ final class ChatViewModel: ObservableObject {
             )
         }
         return merged
+    }
+
+    /// Keeps previously published accepted-friend directory rows across a conversation-only
+    /// fast-path publish. Enrichment still re-fetches accepted friendships authoritatively;
+    /// this only prevents a valid friend from vanishing between publish 1 and publish 2.
+    ///
+    /// A row is preserved only when:
+    /// - it is not conversation-backed (Friends-directory-only entry)
+    /// - its peer is not already represented by an inbox row
+    /// - it is not blocked either direction
+    /// - chip state still says `.friends`, or chips have not loaded yet (cold gap)
+    private func preservingAcceptedFriendsDirectoryRows(
+        over inboxSnapshot: [FriendDisplay],
+        source: String
+    ) -> [FriendDisplay] {
+        let token = ChatFriendsStability.beginRefresh(source: "preserveDirectory:\(source)")
+        let inboxPeerIds = Set(inboxSnapshot.map(\.preview.id))
+        var preservedIds = Set<UUID>()
+        var keep: [FriendDisplay] = []
+
+        for display in friends {
+            guard !display.isConversationBacked else { continue }
+            guard !display.isGroupConversation else { continue }
+            let peerId = display.preview.id
+            if inboxPeerIds.contains(peerId) {
+                ChatFriendsStability.drop(
+                    reason: "supersededByInboxRow",
+                    refreshToken: token,
+                    id: peerId
+                )
+                continue
+            }
+            if isEitherDirectionBlocked(with: peerId) {
+                ChatFriendsStability.drop(reason: "blocked", refreshToken: token, id: peerId)
+                continue
+            }
+            if display.preview.isDeleted {
+                ChatFriendsStability.drop(reason: "deletedPreview", refreshToken: token, id: peerId)
+                continue
+            }
+            if !friendshipChipByOtherUserId.isEmpty,
+               friendshipChipByOtherUserId[peerId] != .friends {
+                ChatFriendsStability.drop(
+                    reason: "notAcceptedFriendChip",
+                    refreshToken: token,
+                    id: peerId
+                )
+                continue
+            }
+            keep.append(display)
+            preservedIds.insert(peerId)
+        }
+
+        ChatFriendsStability.preserved(refreshToken: token, ids: preservedIds)
+        guard !keep.isEmpty else { return inboxSnapshot }
+        return inboxSnapshot + keep
     }
 
     private func resolveAddFriendLookupOutcomeAfterError(
@@ -3642,6 +4417,9 @@ final class ChatViewModel: ObservableObject {
         let updateStartedAt = CFAbsoluteTimeGetCurrent()
         let clamped = max(0, newValue)
         let oldValue = unreadDirectMessageCount
+        // Skip no-op republishes so Chat leaves and the badge projection stay quiet when
+        // a refresh recomputes the same unread total.
+        guard oldValue != clamped else { return }
         unreadDirectMessageCount = clamped
 #if DEBUG
         print("[RealtimeChainDebug] uiStateUpdated table=conversation_read_state key=unreadDirectMessageCount oldValue=\(oldValue) newValue=\(clamped)")
@@ -3685,6 +4463,26 @@ final class ChatViewModel: ObservableObject {
             }
         }
         friendshipChipByOtherUserId = next
+
+        // Drop Friends-directory-only rows that are no longer accepted. Conversation-backed
+        // inbox rows stay (DM history / Chats list); the Friends tab filters them via chips.
+        let before = friends
+        let pruned = before.filter { display in
+            if display.isConversationBacked || display.isGroupConversation { return true }
+            return next[display.preview.id] == .friends
+        }
+        if pruned.count != before.count {
+            let removed = Set(before.map(\.preview.id)).subtracting(pruned.map(\.preview.id))
+            let token = ChatFriendsStability.beginRefresh(source: "chipStatePrune")
+            for id in removed {
+                ChatFriendsStability.drop(
+                    reason: "authoritativeChipNoLongerFriends",
+                    refreshToken: token,
+                    id: id
+                )
+            }
+            friends = pruned
+        }
     }
 
     private func fetchDmParticipantPreviews(for rows: [DmInboxSummaryRow]) async throws -> [UUID: UserPreview] {
@@ -3722,7 +4520,8 @@ final class ChatViewModel: ObservableObject {
                 conversationId: existing.conversationId,
                 inboxKind: existing.inboxKind,
                 groupMemberCount: existing.groupMemberCount,
-                isGroupMuted: existing.isGroupMuted
+                isGroupMuted: existing.isGroupMuted,
+                pickupGameId: existing.pickupGameId
             )
             return
         }
@@ -3738,7 +4537,8 @@ final class ChatViewModel: ObservableObject {
             conversationId: existing.conversationId,
             inboxKind: existing.inboxKind,
             groupMemberCount: existing.groupMemberCount,
-            isGroupMuted: existing.isGroupMuted
+            isGroupMuted: existing.isGroupMuted,
+            pickupGameId: existing.pickupGameId
         )
     }
 
@@ -3776,7 +4576,12 @@ final class ChatViewModel: ObservableObject {
         resolvedPreview: UserPreview? = nil,
         profileLookupAttempted: Bool = false
     ) -> UserPreview {
-        if row.venue_id != nil {
+        let presentAsBusinessVenue = ChatDMCounterpartResolution.shouldPresentAsBusinessVenuePeer(
+            row: row,
+            mapViewModel: mapViewModel
+        )
+
+        if presentAsBusinessVenue {
             let venueName = row.venue_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let businessName = row.friend_business_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let fallbackName = row.friend_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -3796,6 +4601,9 @@ final class ChatViewModel: ObservableObject {
             )
         }
 
+        // Business session viewing a venue-scoped thread: counterpart is the fan (`friend_user_id`).
+        // Never attach venue/business peer metadata so Watch Spot chrome cannot appear.
+
         let isDeleted = row.friend_is_deleted == true
             || OwnerBusinessEmail.normalized(row.friend_email ?? "").hasSuffix("@deleted.fangeo.local")
             || row.friend_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) == "Deleted User"
@@ -3804,7 +4612,8 @@ final class ChatViewModel: ObservableObject {
             return deletedUserPreview(userId: row.friend_user_id, email: row.friend_email)
         }
 
-        if row.friend_is_business == true {
+        if row.friend_is_business == true,
+           !ChatDMCounterpartResolution.isBusinessSession(mapViewModel: mapViewModel) {
             let businessName = row.friend_business_display_name?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
             let fallbackName = row.friend_display_name?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) ?? ""
             let email = row.friend_email?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
@@ -3818,25 +4627,75 @@ final class ChatViewModel: ObservableObject {
                 avatarURL: nil,
                 avatarThumbnailURL: nil,
                 isBusinessAccount: true,
-                lastSeenAtRaw: resolvedPreview?.lastSeenAtRaw
+                lastSeenAtRaw: resolvedPreview?.lastSeenAtRaw,
+                dmConversationId: row.conversation_id
             )
         }
 
         if let resolvedPreview {
-            return resolvedPreview
+            let venueScoped = row.venue_id != nil
+            return UserPreview(
+                id: resolvedPreview.id,
+                displayName: resolvedPreview.displayName,
+                username: resolvedPreview.username,
+                email: resolvedPreview.email,
+                avatarURL: resolvedPreview.avatarURL,
+                avatarThumbnailURL: resolvedPreview.avatarThumbnailURL,
+                isBusinessAccount: false,
+                isDeleted: resolvedPreview.isDeleted,
+                lastSeenAtRaw: resolvedPreview.lastSeenAtRaw,
+                dmConversationId: row.conversation_id ?? resolvedPreview.dmConversationId,
+                businessVenueId: nil,
+                businessVenueBusinessId: nil,
+                businessVenueBusinessName: nil,
+                venueScopedThread: venueScoped
+            )
         }
 
         if profileLookupAttempted {
             return deletedUserPreview(userId: row.friend_user_id, email: row.friend_email)
         }
 
-        return fallbackPreview(
-            userId: row.friend_user_id,
-            displayName: row.friend_display_name,
+        // Neutral placeholder when a business session still has venue-labeled RPC fields
+        // and fan profile enrichment has not returned yet.
+        let rpcName = row.friend_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let looksLikeSelfVenueLabel = ChatDMCounterpartResolution.isBusinessSession(mapViewModel: mapViewModel)
+            && row.venue_id != nil
+            && (row.friend_is_business == true || !(row.venue_name?.isEmpty ?? true))
+        let displayName: String = {
+            if looksLikeSelfVenueLabel {
+                ChatCounterpartDebug.log("fallback identity used reason=neutralPendingFanEnrichment")
+                return "FanGeo User"
+            }
+            return rpcName.isEmpty ? "FanGeo User" : rpcName
+        }()
+
+        return UserPreview(
+            id: row.friend_user_id,
+            displayName: displayName,
             email: row.friend_email,
-            avatarURL: row.friend_avatar_url,
-            avatarThumbnailURL: row.friend_avatar_thumbnail_url
+            avatarURL: looksLikeSelfVenueLabel ? nil : row.friend_avatar_url,
+            avatarThumbnailURL: looksLikeSelfVenueLabel ? nil : row.friend_avatar_thumbnail_url,
+            venueScopedThread: row.venue_id != nil
         )
+    }
+
+    private func logCounterpartMapping(row: DmInboxSummaryRow, preview: UserPreview) {
+        let context = ChatDMCounterpartResolution.sessionContext(mapViewModel: mapViewModel)
+        let counterpart: ChatDMCounterpartResolution.CounterpartType = {
+            if preview.isBusinessVenueConversation || preview.isBusinessAccount { return .business }
+            if preview.isDeleted { return .unknown }
+            return .fan
+        }()
+        ChatCounterpartDebug.log("conversation mapped")
+        ChatCounterpartDebug.log("current session context=\(context.rawValue)")
+        ChatCounterpartDebug.log("current participant matched=true")
+        ChatCounterpartDebug.log("counterpart participant selected=true")
+        ChatCounterpartDebug.log("counterpart type=\(counterpart.rawValue)")
+        ChatCounterpartDebug.log(
+            "fan identity resolved=\(counterpart == .fan) hasHandle=\(!preview.publicHandleLine.isEmpty) hasAvatar=\(!(preview.avatarURL ?? "").isEmpty || !(preview.avatarThumbnailURL ?? "").isEmpty)"
+        )
+        _ = row
     }
 
     private func logDeletedUserRenderDebug(surface: String, preview: UserPreview) {
@@ -3875,5 +4734,67 @@ final class ChatViewModel: ObservableObject {
     private func shortDate(from iso: String) -> String {
         let trimmed = String(iso.prefix(10))
         return trimmed.isEmpty ? iso : trimmed
+    }
+}
+
+/// Small root-shell projection. `ChatViewModel` remains authoritative and mirrors these values
+/// synchronously from property observers; there is no polling, duplicate computation, or Combine
+/// subscription lifecycle to manage.
+@MainActor
+final class ChatMainTabState: ObservableObject {
+    @Published private(set) var pendingDmOpenPreview: UserPreview?
+    @Published private(set) var pendingGroupOpenConversationId: UUID?
+    @Published private(set) var dmInAppNotification: ChatViewModel.DmInAppNotificationPayload?
+    @Published private(set) var hidesFloatingTabBarForDirectChat = false
+
+    func setPendingDmOpenPreview(_ value: UserPreview?) {
+        guard pendingDmOpenPreview != value else { return }
+        pendingDmOpenPreview = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
+    }
+
+    func setPendingGroupOpenConversationId(_ value: UUID?) {
+        guard pendingGroupOpenConversationId != value else { return }
+        pendingGroupOpenConversationId = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
+    }
+
+    func setDmInAppNotification(_ value: ChatViewModel.DmInAppNotificationPayload?) {
+        guard dmInAppNotification != value else { return }
+        dmInAppNotification = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "inAppNotification")
+    }
+
+    func setHidesFloatingTabBarForDirectChat(_ value: Bool) {
+        guard hidesFloatingTabBarForDirectChat != value else { return }
+        hidesFloatingTabBarForDirectChat = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "navigationChrome")
+    }
+
+}
+
+/// Badge-only projection observed below the root shell.
+@MainActor
+final class ChatTabBadgeState: ObservableObject {
+    @Published private(set) var unreadDirectMessageCount = 0
+    @Published private(set) var pendingBadgeCount = 0
+    @Published private(set) var requiresSignIn = false
+
+    func setUnreadDirectMessageCount(_ value: Int) {
+        guard unreadDirectMessageCount != value else { return }
+        unreadDirectMessageCount = value
+        MainTabObservationPerf.projectionPublished(scope: "badgeLeaf", category: "unreadBadge")
+    }
+
+    func setPendingBadgeCount(_ value: Int) {
+        guard pendingBadgeCount != value else { return }
+        pendingBadgeCount = value
+        MainTabObservationPerf.projectionPublished(scope: "badgeLeaf", category: "requestBadge")
+    }
+
+    func setRequiresSignIn(_ value: Bool) {
+        guard requiresSignIn != value else { return }
+        requiresSignIn = value
+        MainTabObservationPerf.projectionPublished(scope: "badgeLeaf", category: "authGate")
     }
 }

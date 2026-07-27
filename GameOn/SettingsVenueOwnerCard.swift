@@ -61,6 +61,18 @@ struct SettingsVenueOwnerCard: View {
     @State private var showBusinessSignupPassword = false
     @State private var showBusinessSignupConfirmPassword = false
     @State private var showBusinessLoginPassword = false
+    /// Local sign-in email draft — typing must not republish ``MapViewModel.venueOwnerEmail``.
+    @State private var businessLoginEmailDraft = ""
+    @State private var didInitializeBusinessLoginEmailDraft = false
+    @FocusState private var businessLoginFocusedField: BusinessLoginFocusField?
+#if DEBUG
+    @State private var businessLoginFormInstanceId = UUID()
+#endif
+
+    private enum BusinessLoginFocusField: Hashable {
+        case email
+        case password
+    }
 
     @State private var signupBusinessName = ""
     @State private var signupBusinessHandle = ""
@@ -398,6 +410,11 @@ struct SettingsVenueOwnerCard: View {
             // `businessSignupStep` on `.account` when that step is not visible — that caused
             // Continue to fall through into venue submission and surface "Location name missing".
             syncBusinessSignupStepToVisibleFlow(reason: "showVenueRegisterModeChanged")
+            if isRegister {
+                // Registration owns shared email; allow sign-in draft to re-init afterward.
+                didInitializeBusinessLoginEmailDraft = false
+                businessLoginFocusedField = nil
+            }
             if !isRegister {
                 venueSignupPoliciesAccepted = false
                 signupBusinessName = ""
@@ -474,7 +491,14 @@ struct SettingsVenueOwnerCard: View {
             applyApplePendingBusinessSignupState()
         }
         .onChange(of: viewModel.venueOwnerEmail) { _, _ in
+            // Registration still binds shared email. Sign-in typing uses local draft and
+            // only publishes on commit (submit / forgot password / intentional preserve).
             viewModel.clearResumePendingBusinessSetupIfLoginEmailChanged()
+            viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailEdited")
+        }
+        .onChange(of: businessLoginEmailDraft) { _, _ in
+            guard businessAuthEntryMode == .signIn else { return }
+            // Local-only: clear Apple banner without publishing venueOwnerEmail.
             viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailEdited")
         }
         .onChange(of: venuePassword) { _, _ in
@@ -492,8 +516,23 @@ struct SettingsVenueOwnerCard: View {
             }
         }
         .onDisappear {
+            // Real sheet teardown (or card removal). Preserve typed email into the model once.
+            commitBusinessLoginEmailDraftIfNeeded()
+            businessLoginFocusedField = nil
+            didInitializeBusinessLoginEmailDraft = false
             viewModel.clearAppleAuthMessage(accountMode: .business, reason: "sheetClosed")
+#if DEBUG
+            print("[BusinessLoginFocusDebug] cardDisappear formId=\(businessLoginFormInstanceId.uuidString)")
+#endif
         }
+#if DEBUG
+        .onAppear {
+            print("[BusinessLoginFocusDebug] cardAppear formId=\(businessLoginFormInstanceId.uuidString)")
+        }
+        .onChange(of: businessLoginFocusedField) { _, newValue in
+            print("[BusinessLoginFocusDebug] focusChanged field=\(String(describing: newValue)) formId=\(businessLoginFormInstanceId.uuidString)")
+        }
+#endif
         .onChange(of: signupCountry) { _, newCountry in
             BusinessLocationCountryPolicy.clearDefaultRegionIfNeeded(&signupState, whenCountryChangesTo: newCountry)
 #if DEBUG
@@ -584,10 +623,61 @@ struct SettingsVenueOwnerCard: View {
     }
 
     private func returnToBusinessAuthChoice() {
+        businessLoginFocusedField = nil
+        commitBusinessLoginEmailDraftIfNeeded()
         businessAuthEntryMode = .choice
         showVenueRegisterMode = false
         viewModel.venueAuthErrorMessage = ""
         viewModel.clearAppleAuthMessage(accountMode: .business, reason: "accountModeChanged")
+#if DEBUG
+        print("[BusinessLoginFocusDebug] returnToOptions formId=\(businessLoginFormInstanceId.uuidString)")
+#endif
+    }
+
+    private func initializeBusinessLoginEmailDraftIfNeeded() {
+        guard !didInitializeBusinessLoginEmailDraft else { return }
+        businessLoginEmailDraft = viewModel.venueOwnerEmail
+        didInitializeBusinessLoginEmailDraft = true
+#if DEBUG
+        print(
+            "[BusinessLoginFocusDebug] loginDraftInitialized formId=\(businessLoginFormInstanceId.uuidString) hasPrefill=\(!viewModel.venueOwnerEmail.isEmpty)"
+        )
+#endif
+    }
+
+    private func commitBusinessLoginEmailDraftIfNeeded() {
+        guard didInitializeBusinessLoginEmailDraft || !businessLoginEmailDraft.isEmpty else { return }
+        let next = businessLoginEmailDraft
+        guard next != viewModel.venueOwnerEmail else { return }
+        viewModel.venueOwnerEmail = next
+    }
+
+    private func toggleBusinessLoginPasswordVisibilitySafely() {
+        let wasPasswordFocused = businessLoginFocusedField == .password
+#if DEBUG
+        print(
+            "[BusinessLoginFocusDebug] passwordVisibilityToggle begin wasFocused=\(wasPasswordFocused) visible=\(showBusinessLoginPassword) formId=\(businessLoginFormInstanceId.uuidString)"
+        )
+#endif
+        businessLoginFocusedField = nil
+        DispatchQueue.main.async {
+            showBusinessLoginPassword.toggle()
+#if DEBUG
+            print(
+                "[BusinessLoginFocusDebug] passwordVisibilityToggle swapped visible=\(showBusinessLoginPassword)"
+            )
+#endif
+            DispatchQueue.main.async {
+                if wasPasswordFocused {
+                    businessLoginFocusedField = .password
+                }
+#if DEBUG
+                print(
+                    "[BusinessLoginFocusDebug] passwordVisibilityToggle restoreFocus=\(wasPasswordFocused)"
+                )
+#endif
+            }
+        }
     }
 
     private var businessOwnerSignInContent: some View {
@@ -607,21 +697,24 @@ struct SettingsVenueOwnerCard: View {
             appleBusinessMessageBanner
 
             if !isApplePendingBusinessSignup {
-                TextField("Business email", text: $viewModel.venueOwnerEmail)
+                TextField("Business email", text: $businessLoginEmailDraft)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.emailAddress)
+                    .textContentType(.username)
+                    .focused($businessLoginFocusedField, equals: .email)
+                    .submitLabel(.next)
+                    .onSubmit { businessLoginFocusedField = .password }
                     .fanGeoInputFieldStyle()
 
-                businessSignupPasswordField(
-                    placeholder: "Business owner password",
-                    text: $venuePassword,
-                    isVisible: $showBusinessLoginPassword
-                )
+                businessLoginPasswordField
 
                 Button {
 #if DEBUG
                     print("[BusinessPasswordResetDebug] forgotPasswordTapped=true")
+                    print("[BusinessLoginFocusDebug] forgotPassword formId=\(businessLoginFormInstanceId.uuidString)")
 #endif
+                    businessLoginFocusedField = nil
+                    commitBusinessLoginEmailDraftIfNeeded()
                     guard viewModel.canPresentPasswordResetRequestSheet() else {
                         showBusinessPasswordResetSheet = false
                         return
@@ -638,24 +731,83 @@ struct SettingsVenueOwnerCard: View {
                 .frame(maxWidth: .infinity, alignment: .trailing)
 
                 FGPrimaryButton(
-                    title: "Sign In as Business Owner",
-                    isDisabled: !authTermsAccepted
+                    title: viewModel.isSafeLoginInFlight
+                        ? L10n.t("login_logging_you_in", languageCode: appLanguageRaw)
+                        : "Sign In as Business Owner",
+                    isDisabled: !authTermsAccepted || viewModel.isSafeLoginInFlight
                 ) {
-                    Task {
-                        await MainActor.run {
-                            viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailPasswordSignIn")
-                        }
-                        await viewModel.loginVenueOwner(
-                            email: viewModel.venueOwnerEmail,
-                            password: venuePassword
-                        )
-                        await MainActor.run {
-                            venuePassword = ""
-                        }
-                    }
+                    submitBusinessLogin()
                 }
             }
         }
+        .onAppear {
+            initializeBusinessLoginEmailDraftIfNeeded()
+#if DEBUG
+            print("[BusinessLoginFocusDebug] signInContentAppear formId=\(businessLoginFormInstanceId.uuidString)")
+#endif
+        }
+        .onDisappear {
+            // Mode switch (choice/register) — clear focus only; do not treat as sheet dismissal.
+            businessLoginFocusedField = nil
+#if DEBUG
+            print("[BusinessLoginFocusDebug] signInContentDisappear formId=\(businessLoginFormInstanceId.uuidString)")
+#endif
+        }
+    }
+
+    private func submitBusinessLogin() {
+#if DEBUG
+        print("[BusinessLoginFocusDebug] signInSubmit formId=\(businessLoginFormInstanceId.uuidString)")
+#endif
+        guard !viewModel.isSafeLoginInFlight else {
+            SafeLoginDebug.log("duplicate login ignored source=SettingsVenueOwnerCard")
+            return
+        }
+        businessLoginFocusedField = nil
+        commitBusinessLoginEmailDraftIfNeeded()
+        viewModel.clearAppleAuthMessage(accountMode: .business, reason: "emailPasswordSignIn")
+        viewModel.submitBusinessEmailLogin(
+            email: viewModel.venueOwnerEmail,
+            password: venuePassword,
+            source: "SettingsVenueOwnerCard"
+        )
+    }
+
+    private var businessLoginPasswordField: some View {
+        HStack(spacing: 10) {
+            Group {
+                if showBusinessLoginPassword {
+                    TextField("Business owner password", text: $venuePassword)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.password)
+                        .font(FGTypography.body)
+                } else {
+                    SecureField("Business owner password", text: $venuePassword)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.password)
+                        .font(FGTypography.body)
+                }
+            }
+            .focused($businessLoginFocusedField, equals: .password)
+            .submitLabel(.go)
+            .onSubmit { submitBusinessLogin() }
+            // Stable container identity — do not key on visibility or credentials.
+            .id("businessLoginPasswordInput")
+
+            Button {
+                toggleBusinessLoginPasswordVisibilitySafely()
+            } label: {
+                Image(systemName: showBusinessLoginPassword ? "eye.slash" : "eye")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showBusinessLoginPassword ? "Hide password" : "Show password")
+        }
+        .fanGeoInputFieldStyle()
     }
 
     private var businessSignupWizard: some View {

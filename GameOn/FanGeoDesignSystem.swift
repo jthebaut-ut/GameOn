@@ -105,8 +105,35 @@ enum FGColor {
     }
 }
 
-/// Opaque / semantic UIKit-backed colors for sheet content so layered glass on device does not stack with near-white translucency.
+/// Opaque / semantic surfaces resolved from SwiftUI `ColorScheme` (not UIKit trait snapshots).
+/// UIKit `UIColor.system*` can lag behind `.preferredColorScheme` inside already-presented sheets.
 enum FGAdaptiveSurface {
+    static func sheetRoot(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.025, green: 0.032, blue: 0.04)
+            : Color(red: 0.94, green: 0.95, blue: 0.97)
+    }
+
+    static func cardElevated(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.11, green: 0.12, blue: 0.14)
+            : Color(red: 0.99, green: 0.99, blue: 1.0)
+    }
+
+    static func controlFill(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color(red: 0.14, green: 0.15, blue: 0.17)
+            : Color(red: 0.93, green: 0.94, blue: 0.96)
+    }
+
+    static func capsuleUnselected(_ scheme: ColorScheme) -> Color {
+        scheme == .dark
+            ? Color.white.opacity(0.10)
+            : Color.black.opacity(0.06)
+    }
+
+    /// Legacy parameterless accessors — resolve against the current trait collection only as a
+    /// last resort for call sites that have not yet been migrated to scheme-aware APIs.
     static var sheetRoot: Color { Color(.systemGroupedBackground) }
     static var cardElevated: Color { Color(.secondarySystemGroupedBackground) }
     static var controlFill: Color { Color(.tertiarySystemGroupedBackground) }
@@ -134,7 +161,7 @@ struct FanGeoPagePurposeHeader: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(FGTypography.screenTitle)
                 .foregroundStyle(FGColor.primaryText(colorScheme))
@@ -195,6 +222,16 @@ private struct FGGlowShadowModifier: ViewModifier {
 }
 
 enum FGInteractionHaptics {
+    /// Pays the one-time Taptic Engine handoff away from a user gesture.
+    ///
+    /// The first `UISelectionFeedbackGenerator` in a process establishes the haptic server
+    /// connection on the main thread; without this, that cost lands on whichever control the
+    /// user touches first after launch — in practice the floating tab bar.
+    @MainActor
+    static func prewarm() {
+        UISelectionFeedbackGenerator().prepare()
+    }
+
     static func selection() {
         UISelectionFeedbackGenerator().selectionChanged()
     }

@@ -2,9 +2,45 @@ import Foundation
 import Supabase
 
 extension MapViewModel {
+    /// Account-appear / startup preferences hydration. Freshness window + in-flight dedup keep
+    /// repeated Account visits from re-hitting `user_profiles`. Local edits publish immediately via
+    /// ``saveFanIdentityPreferences``, and account changes rekey the freshness owner, so a stale
+    /// window can never hide a legitimate change.
+    private static let fanIdentityPreferencesFreshnessInterval: TimeInterval = 5 * 60
+
     @MainActor
-    func loadFanIdentityPreferencesFromProfile() async {
+    func loadFanIdentityPreferencesFromProfile(forceRefresh: Bool = false) async {
         guard let authId = currentUserAuthId else { return }
+
+        if !forceRefresh, let inFlight = fanIdentityPreferencesLoadTask {
+            AccountActivationPerf.refreshDeduplicated(name: "fanIdentityPreferences")
+            await inFlight.value
+            return
+        }
+
+        if !forceRefresh,
+           lastFanIdentityPreferencesLoadUserId == authId,
+           let last = lastFanIdentityPreferencesLoadAt {
+            let age = Date().timeIntervalSince(last)
+            if age < Self.fanIdentityPreferencesFreshnessInterval {
+                AccountActivationPerf.refreshSkippedFresh(
+                    name: "fanIdentityPreferences",
+                    ageMs: Int(age * 1000)
+                )
+                return
+            }
+        }
+
+        let task = Task<Void, Never> { [weak self] in
+            await self?.loadFanIdentityPreferencesFromProfileNow(authId: authId)
+        }
+        fanIdentityPreferencesLoadTask = task
+        await task.value
+        fanIdentityPreferencesLoadTask = nil
+    }
+
+    @MainActor
+    private func loadFanIdentityPreferencesFromProfileNow(authId: UUID) async {
         struct Row: Decodable {
             let fan_identity_preferences: FanIdentityPreferences?
         }
@@ -16,7 +52,13 @@ extension MapViewModel {
                 .limit(1)
                 .execute()
                 .value
+            guard currentUserAuthId == authId else {
+                AccountActivationPerf.log("staleResultIgnored context=fanIdentityPreferences")
+                return
+            }
             currentUserFanIdentityPreferences = rows.first?.fan_identity_preferences ?? .empty
+            lastFanIdentityPreferencesLoadAt = Date()
+            lastFanIdentityPreferencesLoadUserId = authId
         } catch {
 #if DEBUG
             print("[FanIdentityPrefs] load_failed error=\(error.localizedDescription)")

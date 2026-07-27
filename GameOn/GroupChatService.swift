@@ -35,13 +35,88 @@ final class GroupChatService {
         return try decodeUUID(from: data)
     }
 
-    func addMembers(conversationId: UUID, memberIds: [UUID]) async throws {
+    /// Ensures the private pickup-game conversation exists and the caller is an active member.
+    /// Server derives membership from organizer + approved joiners (migration 20260893).
+    func ensurePickupGameConversation(pickupGameId: UUID) async throws -> UUID {
+        struct Params: Encodable {
+            let p_pickup_game_id: UUID
+        }
+        let data = try await client
+            .rpc(
+                "ensure_pickup_game_group_conversation",
+                params: Params(p_pickup_game_id: pickupGameId)
+            )
+            .execute()
+            .data
+        return try decodeUUID(from: data)
+    }
+
+    /// Creates pending invitations. Returns the number of newly created invites (0 if all were already pending/members).
+    func addMembers(conversationId: UUID, memberIds: [UUID]) async throws -> Int {
         struct Params: Encodable {
             let p_conversation_id: UUID
             let p_member_ids: [UUID]
         }
-        try await client
+        let data = try await client
             .rpc("add_group_members", params: Params(p_conversation_id: conversationId, p_member_ids: memberIds))
+            .execute()
+            .data
+        if let count = try? JSONDecoder().decode(Int.self, from: data) {
+            return count
+        }
+        if let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let count = Int(raw) {
+            return count
+        }
+        return 0
+    }
+
+    func fetchPendingInvitationsForMe() async throws -> [GroupPendingInvitationRow] {
+        try await client
+            .rpc("list_pending_group_invitations_for_me")
+            .execute()
+            .value
+    }
+
+    func fetchPendingInvitations(conversationId: UUID) async throws -> [GroupConversationPendingInviteRow] {
+        struct Params: Encodable {
+            let p_conversation_id: UUID
+        }
+        return try await client
+            .rpc(
+                "list_pending_group_invitations_for_conversation",
+                params: Params(p_conversation_id: conversationId)
+            )
+            .execute()
+            .value
+    }
+
+    func acceptInvitation(invitationId: UUID) async throws -> UUID {
+        struct Params: Encodable {
+            let p_invitation_id: UUID
+        }
+        let data = try await client
+            .rpc("accept_group_invitation", params: Params(p_invitation_id: invitationId))
+            .execute()
+            .data
+        return try decodeUUID(from: data)
+    }
+
+    func declineInvitation(invitationId: UUID) async throws {
+        struct Params: Encodable {
+            let p_invitation_id: UUID
+        }
+        try await client
+            .rpc("decline_group_invitation", params: Params(p_invitation_id: invitationId))
+            .execute()
+    }
+
+    func cancelInvitation(invitationId: UUID) async throws {
+        struct Params: Encodable {
+            let p_invitation_id: UUID
+        }
+        try await client
+            .rpc("cancel_group_invitation", params: Params(p_invitation_id: invitationId))
             .execute()
     }
 
@@ -78,6 +153,7 @@ final class GroupChatService {
             let p_conversation_id: UUID
             let p_muted: Bool
         }
+        // SECURITY DEFINER RPC — must not fall back to direct table UPDATE.
         try await client
             .rpc("set_group_conversation_muted", params: Params(p_conversation_id: conversationId, p_muted: muted))
             .execute()

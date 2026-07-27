@@ -62,6 +62,12 @@ final class PresenceService {
     }
 
     func startIfNeeded(userID: UUID?, isAuthenticated: Bool, reason: String) {
+        if FanGeoExplicitLogoutGuard.isInProgress {
+#if DEBUG
+            print("[PresenceDebug] heartbeatSkipped reason=logoutInProgress")
+#endif
+            return
+        }
         guard isAuthenticated, let userID else {
             stop(reason: "\(reason).notAuthenticated")
             return
@@ -94,6 +100,7 @@ final class PresenceService {
         lastSentAt = nil
         clearHeartbeatLocation()
 #if DEBUG
+        ActivityStatusDebug.lifecycle("heartbeat stopped", details: "reason=\(reason)")
         print("[PresenceDebug] heartbeatStopped reason=\(reason)")
 #endif
     }
@@ -110,7 +117,8 @@ final class PresenceService {
            let lastSentAt,
            now.timeIntervalSince(lastSentAt) < Self.minimumWriteSpacingSeconds {
 #if DEBUG
-            print("[PresenceDebug] heartbeatSkipped reason=throttled userId=\(userID.uuidString.lowercased())")
+            ActivityStatusDebug.lifecycle("heartbeat skipped because timestamp is fresh", details: "reason=throttled")
+            print("[PresenceDebug] heartbeatSkipped reason=throttled")
             print("[FansNearby] heartbeat write result=skipped reason=throttled")
 #endif
             return
@@ -121,10 +129,17 @@ final class PresenceService {
         let lat = latestHeartbeatLatitude
         let lng = latestHeartbeatLongitude
 #if DEBUG
-        print("[PresenceDebug] heartbeatSent userId=\(userID.uuidString.lowercased()) timestamp=\(timestamp) reason=\(reason) hasNearbyCoords=\(lat != nil && lng != nil)")
+        ActivityStatusDebug.lifecycle("heartbeat started", details: "reason=\(reason) force=\(force)")
+        print("[PresenceDebug] heartbeatSent timestamp=\(timestamp) reason=\(reason) hasNearbyCoords=\(lat != nil && lng != nil)")
 #endif
         Task.detached(priority: .utility) {
-            _ = await Self.performHeartbeatWrite(userID: userID, timestamp: timestamp, lat: lat, lng: lng)
+            let result = await Self.performHeartbeatWrite(userID: userID, timestamp: timestamp, lat: lat, lng: lng)
+#if DEBUG
+            if result == "success" || result == "missing" {
+                ActivityStatusDebug.lifecycle("heartbeat completed", details: "result=\(result)")
+            }
+#endif
+            _ = result
         }
     }
 
@@ -253,6 +268,8 @@ struct UserPreview: Identifiable, Hashable, Codable {
     let isDeleted: Bool
     /// ISO timestamp from user_profiles.last_seen_at; online state is computed, not stored.
     let lastSeenAtRaw: String?
+    /// False when the peer disabled Activity status privacy (client must not show presence).
+    let activityStatusVisible: Bool
     /// When set, ``DirectChatView`` opens this thread without calling friend-only start RPCs.
     let dmConversationId: UUID?
     /// Fan-initiated business venue DM context.
@@ -260,6 +277,8 @@ struct UserPreview: Identifiable, Hashable, Codable {
     let businessVenueBusinessId: UUID?
     /// Business display name shown under the venue title in inbox/DM header.
     let businessVenueBusinessName: String?
+    /// True when the thread is venue-scoped even if the peer presents as a fan (business inbox).
+    let venueScopedThread: Bool
 
     init(
         id: UUID,
@@ -271,10 +290,12 @@ struct UserPreview: Identifiable, Hashable, Codable {
         isBusinessAccount: Bool = false,
         isDeleted: Bool = false,
         lastSeenAtRaw: String? = nil,
+        activityStatusVisible: Bool = true,
         dmConversationId: UUID? = nil,
         businessVenueId: UUID? = nil,
         businessVenueBusinessId: UUID? = nil,
-        businessVenueBusinessName: String? = nil
+        businessVenueBusinessName: String? = nil,
+        venueScopedThread: Bool = false
     ) {
         self.id = id
         self.displayName = isDeleted ? "Deleted User" : displayName
@@ -284,11 +305,13 @@ struct UserPreview: Identifiable, Hashable, Codable {
         self.avatarThumbnailURL = isDeleted ? nil : avatarThumbnailURL
         self.isBusinessAccount = isBusinessAccount
         self.isDeleted = isDeleted
-        self.lastSeenAtRaw = isDeleted ? nil : lastSeenAtRaw
+        self.activityStatusVisible = isDeleted ? false : activityStatusVisible
+        self.lastSeenAtRaw = (isDeleted || !self.activityStatusVisible) ? nil : lastSeenAtRaw
         self.dmConversationId = dmConversationId
         self.businessVenueId = businessVenueId
         self.businessVenueBusinessId = businessVenueBusinessId
         self.businessVenueBusinessName = businessVenueBusinessName
+        self.venueScopedThread = venueScopedThread || businessVenueId != nil
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -301,10 +324,12 @@ struct UserPreview: Identifiable, Hashable, Codable {
         case isBusinessAccount
         case isDeleted
         case lastSeenAtRaw
+        case activityStatusVisible
         case dmConversationId
         case businessVenueId
         case businessVenueBusinessId
         case businessVenueBusinessName
+        case venueScopedThread
     }
 
     init(from decoder: Decoder) throws {
@@ -318,11 +343,16 @@ struct UserPreview: Identifiable, Hashable, Codable {
         avatarThumbnailURL = decodedDeleted ? nil : try container.decodeIfPresent(String.self, forKey: .avatarThumbnailURL)
         isBusinessAccount = try container.decodeIfPresent(Bool.self, forKey: .isBusinessAccount) ?? false
         isDeleted = decodedDeleted
-        lastSeenAtRaw = decodedDeleted ? nil : try container.decodeIfPresent(String.self, forKey: .lastSeenAtRaw)
+        let decodedVisible = try container.decodeIfPresent(Bool.self, forKey: .activityStatusVisible) ?? true
+        activityStatusVisible = decodedDeleted ? false : decodedVisible
+        let decodedLastSeen = decodedDeleted ? nil : try container.decodeIfPresent(String.self, forKey: .lastSeenAtRaw)
+        lastSeenAtRaw = activityStatusVisible ? decodedLastSeen : nil
         dmConversationId = try container.decodeIfPresent(UUID.self, forKey: .dmConversationId)
         businessVenueId = try container.decodeIfPresent(UUID.self, forKey: .businessVenueId)
         businessVenueBusinessId = try container.decodeIfPresent(UUID.self, forKey: .businessVenueBusinessId)
         businessVenueBusinessName = try container.decodeIfPresent(String.self, forKey: .businessVenueBusinessName)
+        let decodedVenueScoped = try container.decodeIfPresent(Bool.self, forKey: .venueScopedThread) ?? false
+        venueScopedThread = decodedVenueScoped || businessVenueId != nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -335,20 +365,27 @@ struct UserPreview: Identifiable, Hashable, Codable {
         try container.encodeIfPresent(avatarThumbnailURL, forKey: .avatarThumbnailURL)
         try container.encode(isBusinessAccount, forKey: .isBusinessAccount)
         try container.encode(isDeleted, forKey: .isDeleted)
+        try container.encode(activityStatusVisible, forKey: .activityStatusVisible)
         try container.encodeIfPresent(lastSeenAtRaw, forKey: .lastSeenAtRaw)
         try container.encodeIfPresent(dmConversationId, forKey: .dmConversationId)
         try container.encodeIfPresent(businessVenueId, forKey: .businessVenueId)
         try container.encodeIfPresent(businessVenueBusinessId, forKey: .businessVenueBusinessId)
         try container.encodeIfPresent(businessVenueBusinessName, forKey: .businessVenueBusinessName)
+        try container.encode(venueScopedThread, forKey: .venueScopedThread)
     }
 
     var isBusinessIdentity: Bool {
         isBusinessAccount
     }
 
-    /// Fan-initiated thread with a specific business venue (not a fan peer DM).
+    /// Peer presents as a business/venue counterpart (fan viewing business). Not set for business viewing a fan.
     var isBusinessVenueConversation: Bool {
-        businessVenueId != nil
+        businessVenueId != nil && isBusinessAccount
+    }
+
+    /// Thread was created as a venue-scoped DM (either participant).
+    var isVenueScopedDirectMessage: Bool {
+        venueScopedThread || businessVenueId != nil
     }
 
     var canOpenPublicProfile: Bool {

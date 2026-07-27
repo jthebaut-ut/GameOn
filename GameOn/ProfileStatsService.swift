@@ -47,6 +47,10 @@ actor ProfileStatsService {
         cache.removeValue(forKey: userId)
     }
 
+    func clearAll() {
+        cache.removeAll(keepingCapacity: false)
+    }
+
     private func loadPickupGamesCount(userId: UUID) async -> Int {
         struct Row: Decodable {
             let pickup_game_id: UUID?

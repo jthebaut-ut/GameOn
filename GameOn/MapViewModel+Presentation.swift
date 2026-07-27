@@ -38,20 +38,26 @@ extension MapViewModel {
         calendarTabSelectedDate.formatted(date: .abbreviated, time: .omitted)
     }
 
-    /// Calendar tab day dots (today onward only), respecting ``calendarTabGameFilter``.
-    func calendarTabEventDotDatesForPicker() -> Set<Date> {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        let merged: Set<Date>
+    /// Calendar tab day dots (today onward only), matching the **same effective inventory** as the Schedule list.
+    /// Discover RPC dot caches remain for Discover map; Schedule dots must not diverge from the visible list.
+    func calendarTabEventDotDatesForPicker(
+        proSportFilter: String = "All",
+        proLeagueCountries: Set<String> = [],
+        proFeaturedEvent: FeaturedEvent? = nil
+    ) -> Set<Date> {
         switch calendarTabGameFilter {
         case .venueGames:
-            merged = venueGameCalendarDotDates
+            return calendarTabListConsistentVenueDotDates()
         case .pickupGames:
-            merged = pickupGameCalendarDotDates
+            return calendarTabListConsistentPickupDotDates()
         case .proGames:
-            merged = calendarProGameDotDates()
+            return calendarTabListConsistentProDotDates(
+                sportFilter: proSportFilter,
+                worldCupOnly: false,
+                selectedLeagueCountries: proFeaturedEvent == nil ? proLeagueCountries : [],
+                featuredEvent: proFeaturedEvent
+            )
         }
-        return Set(merged.filter { cal.startOfDay(for: $0) >= today })
     }
 
     func calendarTabCalendarDotPaletteForFilter() -> DiscoverCalendarDotPalette? {
@@ -66,14 +72,8 @@ extension MapViewModel {
     }
 
     var calendarTabCalendarDotsLoading: Bool {
-        switch calendarTabGameFilter {
-        case .venueGames:
-            return isLoadingVenueCalendarDots
-        case .pickupGames:
-            return isLoadingPickupCalendarDots
-        case .proGames:
-            return isLoadingProGameCalendarDots
-        }
+        // Schedule dots are derived from already-loaded list inventories (no separate RPC wait).
+        false
     }
 
     func goingCount(for bar: BarVenue) -> Int {

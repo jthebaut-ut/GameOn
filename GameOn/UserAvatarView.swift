@@ -144,6 +144,7 @@ private struct SmoothCachedAvatarImage: View {
 
     @State private var uiImage: UIImage?
     @State private var imageOpacity = 0.0
+    @State private var loadToken: UInt64 = 0
 
     var body: some View {
         Group {
@@ -158,25 +159,29 @@ private struct SmoothCachedAvatarImage: View {
         }
         .frame(width: size, height: size)
         .task(id: url.absoluteString) {
+            let requestedURL = url
+            let token = loadToken &+ 1
+            loadToken = token
             imageOpacity = 0
             uiImage = nil
 
-            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: url, bucket: .avatar) {
-                guard !Task.isCancelled else { return }
-                uiImage = cached
+            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL, bucket: .avatar) {
+                guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
+                if uiImage !== cached {
+                    uiImage = cached
+                }
                 imageOpacity = 1
 #if DEBUG
                 ProfileAvatarDebug.avatarRenderSource("cache")
-                ProfileAvatarDebug.avatarImageLoadFinished(url: url, succeeded: true, detail: "memory_cache_hit")
+                ProfileAvatarDebug.avatarImageLoadFinished(url: requestedURL, succeeded: true, detail: "memory_cache_hit")
 #endif
                 return
             }
 
-            guard let loaded = await DiscoverMapImageCache.shared.image(for: url, bucket: .avatar),
-                  !Task.isCancelled else {
+            guard let loaded = await DiscoverMapImageCache.shared.image(for: requestedURL, bucket: .avatar) else {
 #if DEBUG
                 ProfileAvatarDebug.avatarImageLoadFinished(
-                    url: url,
+                    url: requestedURL,
                     succeeded: false,
                     detail: Task.isCancelled ? "task_cancelled" : "discover_map_image_cache_returned_nil"
                 )
@@ -184,15 +189,30 @@ private struct SmoothCachedAvatarImage: View {
 #endif
                 return
             }
-            uiImage = loaded
+            guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
+            if uiImage !== loaded {
+                uiImage = loaded
+            }
 #if DEBUG
             ProfileAvatarDebug.avatarRenderSource("server")
-            ProfileAvatarDebug.avatarImageLoadFinished(url: url, succeeded: true, detail: "network_or_disk_decode_ok")
+            ProfileAvatarDebug.avatarImageLoadFinished(url: requestedURL, succeeded: true, detail: "network_or_disk_decode_ok")
 #endif
             withAnimation(.easeOut(duration: 0.22)) {
                 imageOpacity = 1
             }
         }
+    }
+
+    private func isCurrentLoad(token: UInt64, requestedURL: URL) -> Bool {
+        if Task.isCancelled {
+            ImagePerf.waiterCancelled()
+            return false
+        }
+        if loadToken != token || url != requestedURL {
+            ImagePerf.staleResultRejected()
+            return false
+        }
+        return true
     }
 }
 

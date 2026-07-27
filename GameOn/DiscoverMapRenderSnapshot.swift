@@ -7,12 +7,13 @@ nonisolated struct DiscoverMapRenderSnapshotKey: Equatable, @unchecked Sendable 
     let mapDisplayMode: DiscoverMapDisplayMode
     let searchText: String
     let venueIDFilterFingerprint: String
+    let focusedExternalGameId: String
     let visibleLatitudeDeltaBucket: String
     let venueCount: Int
     let eventRowCount: Int
 }
 
-nonisolated struct DiscoverVenuePinRenderItem: Identifiable, @unchecked Sendable {
+nonisolated struct DiscoverVenuePinRenderItem: Identifiable, Equatable, @unchecked Sendable {
     let id: UUID
     let bar: BarVenue
     let selectedDayGames: [SportsEvent]
@@ -48,6 +49,7 @@ nonisolated struct DiscoverMapRenderSnapshot: @unchecked Sendable {
             mapDisplayMode: .allSpots,
             searchText: "",
             venueIDFilterFingerprint: "",
+            focusedExternalGameId: "",
             visibleLatitudeDeltaBucket: "",
             venueCount: 0,
             eventRowCount: 0
@@ -56,6 +58,42 @@ nonisolated struct DiscoverMapRenderSnapshot: @unchecked Sendable {
         venuePinsByID: [:],
         venueClustersByID: [:]
     )
+
+    /// Full-field render equality, deliberately excluding only `builtAt` (a
+    /// timestamp that changes on every build and is never read for behavior).
+    ///
+    /// This is an EXPLICIT structural comparison, not a hash: any real change to
+    /// pin/cluster geometry, membership, energy, live state, going totals, game
+    /// lists, or the render key returns `false` (so the snapshot still publishes).
+    /// It can only ever be *more* conservative than needed — it never drops a
+    /// user-visible update — which is why skipping an identical publish is
+    /// provably output-equivalent for every downstream consumer.
+    func hasIdenticalRenderContent(to other: DiscoverMapRenderSnapshot) -> Bool {
+        guard key == other.key else { return false }
+
+        // Pins: DiscoverVenuePinRenderItem is fully Equatable (all stored fields).
+        guard venuePinsByID.count == other.venuePinsByID.count else { return false }
+        for (id, pin) in venuePinsByID {
+            guard let otherPin = other.venuePinsByID[id], pin == otherPin else { return false }
+        }
+
+        // Clusters: compared field-by-field because CLLocationCoordinate2D is not Equatable.
+        guard venueClustersByID.count == other.venueClustersByID.count else { return false }
+        for (id, cluster) in venueClustersByID {
+            guard let otherCluster = other.venueClustersByID[id] else { return false }
+            guard cluster.count == otherCluster.count,
+                  cluster.maxEnergyScore == otherCluster.maxEnergyScore,
+                  cluster.dominantSport == otherCluster.dominantSport,
+                  cluster.hasLiveNow == otherCluster.hasLiveNow,
+                  cluster.venueIDs == otherCluster.venueIDs,
+                  cluster.bars == otherCluster.bars,
+                  cluster.coordinate.latitude == otherCluster.coordinate.latitude,
+                  cluster.coordinate.longitude == otherCluster.coordinate.longitude
+            else { return false }
+        }
+
+        return true
+    }
 }
 
 private nonisolated struct DiscoverMapSnapshotDetachedInput: @unchecked Sendable {
@@ -66,9 +104,13 @@ private nonisolated struct DiscoverMapSnapshotDetachedInput: @unchecked Sendable
     let mapDisplayModeRawValue: String
     let searchQuery: String
     let venueIDFilter: Set<UUID>?
+    /// When non-nil, pin/cluster energy uses only venue_events for this ``external_game_id``.
+    let focusedExternalGameId: String?
     let visibleLatitudeDelta: Double
     let venueEventIDsByKey: [String: UUID]
     let venueEventInterestCounts: [UUID: Int]
+    let venueEventVibeCounts: [UUID: [String: Int]]
+    let venueEventUniqueCommenterCounts: [UUID: Int]
     let venueEventRows: [VenueEventRow]
     let liveWindowHours: Int
 }
@@ -132,6 +174,17 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
                     hasLiveNow = hasLiveNow || gameIsLive
                 }
 
+                let pinEnergy = pinEnergyScore(
+                    bar: bar,
+                    gamesToday: gamesToday,
+                    eventIDsByTitle: eventIDsByTitle,
+                    liveNowByTitle: liveNowByTitle,
+                    input: input
+                )
+
+                let focusedLive = focusedGameHasLiveNow(venueID: bar.id, input: input)
+                let pinHasLiveNow = focusedLive ?? hasLiveNow
+
                 pinItems[bar.id] = DiscoverVenuePinRenderItem(
                     id: bar.id,
                     bar: bar,
@@ -140,8 +193,8 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
                     goingTotalsByGameTitle: goingByTitle,
                     liveNowByGameTitle: liveNowByTitle,
                     goingTotal: goingTotal,
-                    pinEnergyScore: goingTotal,
-                    hasLiveNow: hasLiveNow
+                    pinEnergyScore: pinEnergy,
+                    hasLiveNow: pinHasLiveNow
                 )
             }
 
@@ -163,12 +216,9 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
                     try checkCancellation(checkpoint: "clusterAssembly")
                     guard let pin = pinItems[bar.id] else { continue }
                     clusterHasLiveNow = clusterHasLiveNow || pin.hasLiveNow
-                    for game in pin.selectedDayGames {
-                        let gameScore = pin.goingTotalsByGameTitle[game.title] ?? 0
-                        if gameScore > maxEnergyScore {
-                            maxEnergyScore = gameScore
-                            dominantSport = game.sport
-                        }
+                    if pin.pinEnergyScore > maxEnergyScore {
+                        maxEnergyScore = pin.pinEnergyScore
+                        dominantSport = pin.selectedDayGames.first?.sport ?? bar.primarySport
                     }
                 }
 
@@ -222,7 +272,12 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
         guard !venue.isPickupPlayPlace else { return false }
 
         if let venueFilter = input.venueIDFilter {
-            return venueFilter.contains(venue.id)
+            guard venueFilter.contains(venue.id) else { return false }
+        }
+
+        if let focused = normalizedFocusedExternalGameId(input),
+           !venueHostsFocusedExternalGame(venue.id, focusedExternalGameId: focused, input: input) {
+            return false
         }
 
         try checkCancellation(checkpoint: "venueLoop")
@@ -240,6 +295,41 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
             return true
         }
         return !sportScopedEvents.isEmpty
+    }
+
+    private static func normalizedFocusedExternalGameId(_ input: DiscoverMapSnapshotDetachedInput) -> String? {
+        let raw = input.focusedExternalGameId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return raw.isEmpty ? nil : raw
+    }
+
+    private static func venueHostsFocusedExternalGame(
+        _ venueID: UUID,
+        focusedExternalGameId: String,
+        input: DiscoverMapSnapshotDetachedInput
+    ) -> Bool {
+        input.venueEventRows.contains { row in
+            guard row.venue_id == venueID else { return false }
+            let rowGameID = row.external_game_id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard rowGameID == focusedExternalGameId else { return false }
+            let status = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            if !status.isEmpty, status != "active" { return false }
+            return true
+        }
+    }
+
+    private static func focusedGameRows(
+        for venueID: UUID,
+        focusedExternalGameId: String,
+        input: DiscoverMapSnapshotDetachedInput
+    ) -> [VenueEventRow] {
+        input.venueEventRows.filter { row in
+            guard row.venue_id == venueID else { return false }
+            let rowGameID = row.external_game_id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard rowGameID == focusedExternalGameId else { return false }
+            let status = row.admin_status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            if !status.isEmpty, status != "active" { return false }
+            return true
+        }
     }
 
     private static func selectedDayEvents(
@@ -411,6 +501,108 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
         return now >= start && now <= liveEnd
     }
 
+    private static func focusedGameHasLiveNow(
+        venueID: UUID,
+        input: DiscoverMapSnapshotDetachedInput
+    ) -> Bool? {
+        guard let focused = normalizedFocusedExternalGameId(input) else { return nil }
+        let rows = focusedGameRows(for: venueID, focusedExternalGameId: focused, input: input)
+        guard !rows.isEmpty else { return false }
+        let now = Date()
+        for row in rows {
+            guard let start = parseScheduledStart(row.scheduled_start_at) else { continue }
+            let liveEnd = start.addingTimeInterval(TimeInterval(input.liveWindowHours * 3600))
+            if now >= start && now <= liveEnd {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func pinEnergyScore(
+        bar: BarVenue,
+        gamesToday: [SportsEvent],
+        eventIDsByTitle: [String: UUID],
+        liveNowByTitle: [String: Bool],
+        input: DiscoverMapSnapshotDetachedInput
+    ) -> Int {
+        if let focused = normalizedFocusedExternalGameId(input) {
+            return focusedGamePinEnergyScore(venueID: bar.id, focusedExternalGameId: focused, input: input)
+        }
+
+        var activities: [VenueMapEnergyScore.EventActivity] = []
+        activities.reserveCapacity(gamesToday.count)
+        for game in gamesToday {
+            guard let eventID = eventIDsByTitle[game.title] else { continue }
+            activities.append(
+                VenueMapEnergyScore.eventActivity(
+                    goingCount: input.venueEventInterestCounts[eventID] ?? 0,
+                    vibeCounts: input.venueEventVibeCounts[eventID] ?? [:],
+                    uniqueCommenterCount: input.venueEventUniqueCommenterCounts[eventID] ?? 0,
+                    isLiveNow: liveNowByTitle[game.title] ?? false
+                )
+            )
+        }
+        let breakdown = VenueMapEnergyScore.score(events: activities)
+#if DEBUG
+        if breakdown.total >= VenueMapEnergyScore.hotPulseThreshold || breakdown.liveBonus > 0 {
+            // Targeted: only log Hot+/LIVE pins during snapshot builds.
+            VenueMapEnergyScore.debugLog(
+                venueName: bar.name,
+                venueId: bar.id,
+                breakdown: breakdown,
+                activityTotals: activities.reduce(
+                    into: VenueMapEnergyScore.EventActivity(
+                        goingCount: 0, atmosphereCount: 0, crowdedCount: 0, tvCount: 0,
+                        soundCount: 0, seatingCount: 0, uniqueCommenterCount: 0, isLiveNow: false
+                    )
+                ) { acc, next in
+                    acc.goingCount += next.goingCount
+                    acc.atmosphereCount += next.atmosphereCount
+                    acc.crowdedCount += next.crowdedCount
+                    acc.tvCount += next.tvCount
+                    acc.soundCount += next.soundCount
+                    acc.seatingCount += next.seatingCount
+                    acc.uniqueCommenterCount += next.uniqueCommenterCount
+                    acc.isLiveNow = acc.isLiveNow || next.isLiveNow
+                }
+            )
+        }
+#endif
+        return breakdown.total
+    }
+
+    /// Selected-game pin energy: only venue_events for the focused ``external_game_id``.
+    private static func focusedGamePinEnergyScore(
+        venueID: UUID,
+        focusedExternalGameId: String,
+        input: DiscoverMapSnapshotDetachedInput
+    ) -> Int {
+        let rows = focusedGameRows(for: venueID, focusedExternalGameId: focusedExternalGameId, input: input)
+        guard !rows.isEmpty else { return 0 }
+
+        let now = Date()
+        var activities: [VenueMapEnergyScore.EventActivity] = []
+        activities.reserveCapacity(rows.count)
+        for row in rows {
+            guard let eventID = row.id else { continue }
+            let isLive: Bool = {
+                guard let start = parseScheduledStart(row.scheduled_start_at) else { return false }
+                let liveEnd = start.addingTimeInterval(TimeInterval(input.liveWindowHours * 3600))
+                return now >= start && now <= liveEnd
+            }()
+            activities.append(
+                VenueMapEnergyScore.eventActivity(
+                    goingCount: input.venueEventInterestCounts[eventID] ?? 0,
+                    vibeCounts: input.venueEventVibeCounts[eventID] ?? [:],
+                    uniqueCommenterCount: input.venueEventUniqueCommenterCounts[eventID] ?? 0,
+                    isLiveNow: isLive
+                )
+            )
+        }
+        return VenueMapEnergyScore.scoreTotal(events: activities)
+    }
+
     private static func parseScheduledStart(_ raw: String?) -> Date? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
@@ -431,7 +623,9 @@ private nonisolated enum DiscoverMapRenderSnapshotBuilder {
 extension MapViewModel {
     /// Coalesces rapid snapshot invalidations (e.g. bars + venueEventRows during venue load) into one detached build.
     func scheduleDiscoverMapRenderSnapshotRebuild(reason: String) {
+        MapRenderPerf.rebuildRequested(reason: reason)
         if suppressDiscoverSnapshotRebuilds {
+            MapRenderPerf.rebuildSuppressed(reason: reason)
 #if DEBUG
             print("[PerfPhase1B] snapshotRebuildSuppressed reason=\(reason)")
 #endif
@@ -439,6 +633,7 @@ extension MapViewModel {
         }
 
         if discoverSnapshotRebuildCoalesceTask != nil {
+            MapRenderPerf.rebuildCoalesced(reason: reason)
 #if DEBUG
             print("[PerfPhase1B] snapshotRebuildCoalesced reason=\(reason)")
 #endif
@@ -492,8 +687,10 @@ extension MapViewModel {
 
     private func performDiscoverMapRenderSnapshotRebuild(reason: String) {
         let buildStart = Date()
+        MapRenderPerf.buildStarted(reason: reason)
         if let previousTask = activeDiscoverSnapshotTask, !previousTask.isCancelled {
             previousTask.cancel()
+            MapRenderPerf.previousBuildCancelled()
             #if DEBUG
             print("[DiscoverSnapshotPerf] previousTaskCancelled=true")
             #endif
@@ -508,6 +705,8 @@ extension MapViewModel {
         let capturedEventRowCount = venueEventRows.count
         let capturedVenueIDFilter = discoverSearchVenueIDFilter
         let capturedVenueIDFilterFingerprint = discoverSearchVenueIDFilterFingerprint(capturedVenueIDFilter)
+        let capturedFocusedExternalGameId = discoverFocusedProGame?.externalGameId
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let input = DiscoverMapSnapshotDetachedInput(
             bars: bars,
             events: events,
@@ -516,9 +715,12 @@ extension MapViewModel {
             mapDisplayModeRawValue: mapDisplayMode.rawValue,
             searchQuery: effectiveDiscoverSearchQuery,
             venueIDFilter: capturedVenueIDFilter,
+            focusedExternalGameId: discoverFocusedProGame?.externalGameId,
             visibleLatitudeDelta: visibleLatitudeDelta,
             venueEventIDsByKey: venueEventIDsByKey,
             venueEventInterestCounts: venueEventInterestCounts,
+            venueEventVibeCounts: venueEventVibeCounts,
+            venueEventUniqueCommenterCounts: venueEventUniqueCommenterCounts,
             venueEventRows: venueEventRows,
             liveWindowHours: FanGeoLiveEnergyTiming.liveWindowHours
         )
@@ -554,6 +756,7 @@ extension MapViewModel {
             guard let self else { return }
 
             guard self.discoverMapRenderSnapshotGeneration == generation else {
+                MapRenderPerf.staleBuildIgnored(reason: reason)
                 #if DEBUG
                 print("[DiscoverMapSnapshotDebug] detachedBuildDiscardedStale=true")
                 #endif
@@ -567,15 +770,14 @@ extension MapViewModel {
                 mapDisplayMode: capturedMapDisplayMode,
                 searchText: capturedSearchText,
                 venueIDFilterFingerprint: capturedVenueIDFilterFingerprint,
+                focusedExternalGameId: capturedFocusedExternalGameId,
                 visibleLatitudeDeltaBucket: String(format: "%.5f", capturedVisibleLatitudeDelta),
                 venueCount: output.venueCount,
                 eventRowCount: capturedEventRowCount
             )
 
-            #if DEBUG
             let publishStart = Date()
-            #endif
-            self.applyDiscoverMapRenderSnapshot(
+            let published = self.applyDiscoverMapRenderSnapshot(
                 DiscoverMapRenderSnapshot(
                     key: key,
                     builtAt: output.builtAt,
@@ -583,10 +785,30 @@ extension MapViewModel {
                     venueClustersByID: output.venueClustersByID
                 )
             )
-
-            #if DEBUG
             let publishMs = Int(Date().timeIntervalSince(publishStart) * 1000)
             let buildMs = Int(Date().timeIntervalSince(buildStart) * 1000)
+            MapRenderPerf.buildCompleted(
+                reason: reason,
+                venues: output.venuePinsByID.count,
+                clusters: output.venueClustersByID.count,
+                buildMs: buildMs
+            )
+            if published {
+                MapRenderPerf.publishApplied(
+                    reason: reason,
+                    venues: output.venuePinsByID.count,
+                    clusters: output.venueClustersByID.count,
+                    publishMs: publishMs
+                )
+            } else {
+                MapRenderPerf.publishSkippedIdentical(
+                    reason: reason,
+                    venues: output.venuePinsByID.count,
+                    clusters: output.venueClustersByID.count
+                )
+            }
+
+            #if DEBUG
             print("[DiscoverMapSnapshotDebug] publishSnapshotMainActorMs=\(publishMs)")
             print("[DiscoverMapSnapshotDebug] rebuild reason=\(reason)")
             print("[DiscoverMapSnapshotDebug] venueCount=\(output.venuePinsByID.count)")
@@ -604,6 +826,8 @@ extension MapViewModel {
             mapDisplayMode: mapDisplayMode,
             searchText: debouncedDiscoverSearchText,
             venueIDFilterFingerprint: discoverSearchVenueIDFilterFingerprint(discoverSearchVenueIDFilter),
+            focusedExternalGameId: discoverFocusedProGame?.externalGameId
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
             visibleLatitudeDeltaBucket: String(format: "%.5f", visibleLatitudeDelta),
             venueCount: venueCount,
             eventRowCount: venueEventRows.count

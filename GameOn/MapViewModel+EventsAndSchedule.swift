@@ -57,6 +57,7 @@ extension MapViewModel {
                 TabPerfDebug.log("[TabPerfDebug] usedCachedData=true tab=calendar source=pickupSources")
                 TabPerfDebug.log("[TabPerfDebug] refreshSkippedReason=fresh tab=calendar source=pickupSources reason=\(reason)")
 #endif
+                SchedulePerf.refreshSkippedFresh(source: "pickupSources:\(reason)", ageSec: age)
                 return
             }
         }
@@ -65,6 +66,7 @@ extension MapViewModel {
 #if DEBUG
             TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=calendar source=pickupSources reason=\(reason)")
 #endif
+            SchedulePerf.refreshCoalesced(source: "pickupSources:\(reason)")
             await existing.value
             return
         }
@@ -75,6 +77,7 @@ extension MapViewModel {
 
         let startedAt = Date()
         AppPerfDebug.networkFetchStarted(tab: "calendar", source: "pickupSources:\(reason)")
+        SchedulePerf.refreshStarted(source: "pickupSources:\(reason)", force: forceRefresh)
 #if DEBUG
         print("[CalendarPickupPublicMode] personalStateHidden=true reason=refreshCalendarTabPickupSources")
         TabPerfDebug.log("[TabPerfDebug] refreshStarted=calendar source=pickupSources force=\(forceRefresh) reason=\(reason)")
@@ -93,6 +96,7 @@ extension MapViewModel {
 #if DEBUG
         TabPerfDebug.log("[TabPerfDebug] refreshDurationMs=\(ms) tab=calendar source=pickupSources reason=\(reason)")
 #endif
+        SchedulePerf.refreshCompleted(source: "pickupSources:\(reason)", ms: ms, rows: pickupGamesForDiscoverMap.count)
     }
 
 #if DEBUG
@@ -271,9 +275,15 @@ extension MapViewModel {
         if let last = lastCalendarTabBecameActiveAt,
            Date().timeIntervalSince(last) < 8 {
             TabPerf.refreshSkipped(name: "calendarTabActivation", reason: "freshCache")
+            SchedulePerf.refreshSkippedFresh(source: "calendarTabActivation", ageSec: Date().timeIntervalSince(last))
             return
         }
         lastCalendarTabBecameActiveAt = Date()
+        SchedulePerf.activation(
+            source: "noteCalendarTabBecameActive",
+            cachedProRows: 0,
+            inventoryRows: liveMatches.count
+        )
         AppPerfDebug.deferredWork(tab: "calendar", work: "calendarTabActivation", source: "noteCalendarTabBecameActive")
         Task { @MainActor in
             await Task.yield()
@@ -308,12 +318,27 @@ extension MapViewModel {
         let key = calendarEventsListCacheKey(selectedDay: selectedDate, searchQuery: searchQuery, filter: filter)
         if let entry = calendarEventsListCache[key],
            Date().timeIntervalSince(entry.storedAt) < Self.calendarEventsListCacheTTL {
+            SchedulePerf.dateCache(hit: true, filtered: entry.events.count, revision: scheduleDataGeneration)
             return entry.events
         }
 
+        let buildStarted = CFAbsoluteTimeGetCurrent()
         let built = buildCalendarTabDisplayedEvents(selectedDate: selectedDate, searchQuery: searchQuery, filter: filter)
+        let buildMs = (CFAbsoluteTimeGetCurrent() - buildStarted) * 1000
+        SchedulePerf.snapshotBuild(
+            ms: buildMs,
+            filtered: built.count,
+            inventory: events.count,
+            reason: "venuePickupList:\(filter.rawValue)"
+        )
+        if let prior = calendarEventsListCache[key], prior.events == built {
+            calendarEventsListCache[key] = (storedAt: Date(), events: prior.events)
+            SchedulePerf.publishSkippedIdentical(rows: built.count, reason: "venuePickupList")
+            return prior.events
+        }
         calendarEventsListCache[key] = (storedAt: Date(), events: built)
         pruneCalendarEventsListCacheIfNeeded()
+        SchedulePerf.dateCache(hit: false, filtered: built.count, revision: scheduleDataGeneration)
         return built
     }
 
@@ -460,6 +485,192 @@ extension MapViewModel {
             return scope.ids.contains(bar.id) || scope.loweredNames.contains(bar.name.lowercased())
         }
         return false
+    }
+
+    /// Same predicates as ``calendarTabVenueSportsEvents`` (sport + Discover-area viewport), without day/search.
+    /// Used so Schedule calendar dots match the visible Watch list.
+    func calendarTabListConsistentVenueDotDates() -> Set<Date> {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        var days = Set<Date>()
+        for event in events {
+            guard event.league == "Venue Event" else { continue }
+            let day = cal.startOfDay(for: event.date)
+            guard day >= today else { continue }
+            guard selectedSport == "All" || event.sport == selectedSport else { continue }
+            guard calendarTabVenueEventIsInMapViewport(event) else { continue }
+            days.insert(day)
+        }
+        return days
+    }
+
+    /// Schedule Play orange dots: **month availability** from ``pickupGameCalendarDotDates``.
+    ///
+    /// Must NOT derive from ``pickupGamesForDiscoverMap`` — that array is **selected-day scoped**,
+    /// so rebuilding dots from it collapses `{Jul30, Jul31}` → `{selectedDate}` on every date tap.
+    func calendarTabListConsistentPickupDotDates() -> Set<Date> {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        return Set(
+            pickupGameCalendarDotDates
+                .map { cal.startOfDay(for: $0) }
+                .filter { $0 >= today }
+        )
+    }
+
+    /// Same predicates as ``calendarProGamesDisplayed`` across all loaded matches (no search), for Schedule Pro dots.
+    func calendarTabListConsistentProDotDates(
+        sportFilter: String,
+        worldCupOnly: Bool = false,
+        selectedLeagueCountries: Set<String> = [],
+        featuredEvent: FeaturedEvent? = nil
+    ) -> Set<Date> {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let sport = sportFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        var days = Set<Date>()
+        for match in liveMatches {
+            let day = cal.startOfDay(for: match.startTime)
+            guard day >= today else { continue }
+            if featuredEvent == nil {
+                let sportOk = sport.isEmpty
+                    || sport.localizedCaseInsensitiveCompare("All") == .orderedSame
+                    || match.sport.localizedCaseInsensitiveCompare(sport) == .orderedSame
+                    || SportFilterCatalog.storedSport(match.sport, matchesSearchQuery: sport)
+                guard sportOk else { continue }
+            }
+            if let featuredEvent {
+                guard LiveMatchFilters.matchesFeaturedEvent(match, featuredEvent: featuredEvent) else { continue }
+            } else if worldCupOnly {
+                guard LiveMatchFilters.isFifaWorldCupMatch(match) else { continue }
+            }
+            if featuredEvent == nil {
+                guard LiveMatchFilters.matchesLeagueCountry(match, selectedCountries: selectedLeagueCountries) else {
+                    continue
+                }
+            }
+            days.insert(day)
+        }
+        return days
+    }
+
+    /// Single-pass strip inventory for the Schedule date strip.
+    ///
+    /// Semantically equivalent to checking `!calendarScreenDisplayedEvents(...).isEmpty` /
+    /// `!calendarProGamesDisplayed(...).isEmpty` for each strip day, but avoids rebuilding and
+    /// sorting a full day list seven times during every Calendar body evaluation (the dominant
+    /// first-open MainActor cost).
+    func calendarTabStripDaysWithListInventory(
+        stripDates: [Date],
+        filter: CalendarTabGameFilter,
+        proSportFilter: String = "All",
+        proLeagueCountries: Set<String> = [],
+        proFeaturedEvent: FeaturedEvent? = nil
+    ) -> Set<Date> {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        var stripDays = Set<Date>()
+        stripDays.reserveCapacity(stripDates.count)
+        for date in stripDates {
+            let day = cal.startOfDay(for: date)
+            guard day >= today else { continue }
+            stripDays.insert(day)
+        }
+        guard !stripDays.isEmpty else { return [] }
+
+        switch filter {
+        case .venueGames:
+            var result = Set<Date>()
+            for event in events {
+                guard event.league == "Venue Event" else { continue }
+                let day = cal.startOfDay(for: event.date)
+                guard stripDays.contains(day) else { continue }
+                guard selectedSport == "All" || event.sport == selectedSport else { continue }
+                guard calendarTabVenueEventIsInMapViewport(event) else { continue }
+                result.insert(day)
+                if result.count == stripDays.count { break }
+            }
+            return result
+        case .pickupGames:
+            let now = Date()
+            var result = Set<Date>()
+            for row in pickupGamesForDiscoverMap {
+                guard calendarTabPickupRowPassesListingFilters(row, now: now) else { continue }
+                guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
+                let day = cal.startOfDay(for: start)
+                guard stripDays.contains(day) else { continue }
+                guard selectedSport == "All" || row.sport == selectedSport else { continue }
+                result.insert(day)
+                if result.count == stripDays.count { break }
+            }
+            return result
+        case .proGames:
+            let sport = proSportFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = Set<Date>()
+            for match in liveMatches {
+                let day = cal.startOfDay(for: match.startTime)
+                guard stripDays.contains(day) else { continue }
+                if proFeaturedEvent == nil {
+                    let sportOk = sport.isEmpty
+                        || sport.localizedCaseInsensitiveCompare("All") == .orderedSame
+                        || match.sport.localizedCaseInsensitiveCompare(sport) == .orderedSame
+                        || SportFilterCatalog.storedSport(match.sport, matchesSearchQuery: sport)
+                    guard sportOk else { continue }
+                }
+                if let featuredEvent = proFeaturedEvent {
+                    guard LiveMatchFilters.matchesFeaturedEvent(match, featuredEvent: featuredEvent) else { continue }
+                }
+                if proFeaturedEvent == nil {
+                    guard LiveMatchFilters.matchesLeagueCountry(match, selectedCountries: proLeagueCountries) else {
+                        continue
+                    }
+                }
+                result.insert(day)
+                if result.count == stripDays.count { break }
+            }
+            return result
+        }
+    }
+
+    /// Warm Schedule caches without selecting the Calendar tab (data only — no UI mount).
+    /// Safe to call from launch warm preload; joins existing in-flight work and respects TTLs.
+    func warmCalendarTabCachesInBackground(reason: String) async {
+        CalendarActivationPerf.log("warmStarted reason=\(reason)")
+        if canFanUsePickupGamesUI {
+            await refreshCalendarTabPickupSources(forceRefresh: false, reason: "warm:\(reason)")
+        }
+        // Populate month-dot caches silently even while Calendar is not selected.
+        loadCalendarTabCalendarDotsAroundMonth(
+            calendarTabSelectedDate,
+            reason: "warm_preload_\(reason)",
+            allowWhenNotSelected: true
+        )
+        // Pre-seed the 7-day strip list cache so first Calendar body hits warm entries.
+        preseedCalendarEventsListCacheForVisibleStrip(reason: reason)
+        CalendarActivationPerf.log("warmFinished reason=\(reason)")
+    }
+
+    /// Builds (and caches) venue/pickup lists for the visible date-strip window without publishing UI.
+    private func preseedCalendarEventsListCacheForVisibleStrip(reason: String) {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let selectedDay = calendar.startOfDay(for: calendarTabSelectedDate)
+        let sixDaysFromToday = calendar.date(byAdding: .day, value: 6, to: today) ?? today
+        let startDay = (today...sixDaysFromToday).contains(selectedDay) ? today : selectedDay
+        let stripDates = (0..<7).compactMap { calendar.date(byAdding: .day, value: $0, to: startDay) }
+        let started = CFAbsoluteTimeGetCurrent()
+        for date in stripDates {
+            _ = calendarScreenDisplayedEvents(selectedDate: date, searchQuery: "", filter: .venueGames)
+            _ = calendarScreenDisplayedEvents(selectedDate: date, searchQuery: "", filter: .pickupGames)
+        }
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        CalendarActivationPerf.stripInventoryBuilt(ms: ms, days: stripDates.count, cacheHit: false)
+        SchedulePerf.snapshotBuild(
+            ms: ms,
+            filtered: stripDates.count,
+            inventory: events.count,
+            reason: "warmStripPreseed:\(reason)"
+        )
     }
 
     private func calendarTabVenueSportsEvents(for selectedDate: Date, searchQuery: String) -> [SportsEvent] {
@@ -960,7 +1171,8 @@ extension MapViewModel {
         }
         Task {
             if discoverMapContentMode == .pickupGames, discoverPickupSubMode == .games {
-                await refreshPickupGamesForDiscoverMap()
+                // Sport is part of month-dot cache identity; preserving avoids wipe→selected-day replace collapse.
+                await refreshPickupGamesForDiscoverMap(preservePickupCalendarDotDatesCache: true)
             } else if discoverMapContentMode == .pickupGames, discoverPickupSubMode == .places {
                 await refreshPickupPlacesForDiscoverMap(force: pickupPlacesForDiscoverMap.isEmpty)
             }

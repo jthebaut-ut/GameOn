@@ -2,6 +2,11 @@ import SwiftUI
 
 /// Fan sign-in only (registration uses ``FanSignupView``).
 struct SettingsFanLoginCard: View {
+    private enum FanLoginFocusField: Hashable {
+        case email
+        case password
+    }
+
     @ObservedObject var viewModel: MapViewModel
     @Binding var email: String
     @Binding var password: String
@@ -10,6 +15,7 @@ struct SettingsFanLoginCard: View {
     @State private var localTermsAccepted = false
     @State private var showFanPasswordResetSheet = false
     @State private var showFanLoginPassword = false
+    @FocusState private var focusedField: FanLoginFocusField?
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
@@ -19,6 +25,10 @@ struct SettingsFanLoginCard: View {
 
     private var isApplePendingFanProfileSetup: Bool {
         viewModel.isAppleFanSignupOnboardingActive
+    }
+
+    private var isLoginBusy: Bool {
+        viewModel.isSafeLoginInFlight
     }
 
     var body: some View {
@@ -53,19 +63,18 @@ struct SettingsFanLoginCard: View {
                 }
 
                 FGSecondaryButton(title: "Log Out", systemImage: "rectangle.portrait.and.arrow.right") {
-                    Task {
-                        await viewModel.logoutUser()
-                        email = ""
-                        password = ""
-                    }
+                    email = ""
+                    password = ""
+                    viewModel.beginSafeUserLogout(source: "SettingsFanLoginCard")
                 }
             } else {
                 FanGeoAuthTermsAcceptanceView(isAccepted: resolvedTermsAccepted)
+                    .disabled(isLoginBusy)
 
                 FanGeoAppleSignInButton(
                     viewModel: viewModel,
                     accountMode: .fan,
-                    isEnabled: resolvedTermsAccepted.wrappedValue
+                    isEnabled: resolvedTermsAccepted.wrappedValue && !isLoginBusy
                 )
 
                 if !viewModel.appleAuthFanMessage.isEmpty {
@@ -81,6 +90,11 @@ struct SettingsFanLoginCard: View {
                     TextField("Email", text: $email)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.emailAddress)
+                        .textContentType(.username)
+                        .focused($focusedField, equals: .email)
+                        .submitLabel(.next)
+                        .onSubmit { focusedField = .password }
+                        .disabled(isLoginBusy)
                         .fanGeoInputFieldStyle()
 
                     fanLoginPasswordField(
@@ -88,6 +102,7 @@ struct SettingsFanLoginCard: View {
                         text: $password,
                         isVisible: $showFanLoginPassword
                     )
+                    .disabled(isLoginBusy)
                 }
 
                 if !isApplePendingFanProfileSetup {
@@ -95,6 +110,7 @@ struct SettingsFanLoginCard: View {
 #if DEBUG
                         print("[FanPasswordResetDebug] forgotPasswordTapped=true")
 #endif
+                        guard !isLoginBusy else { return }
                         guard viewModel.canPresentPasswordResetRequestSheet() else {
                             showFanPasswordResetSheet = false
                             return
@@ -109,21 +125,20 @@ struct SettingsFanLoginCard: View {
                     }
                     .buttonStyle(.plain)
                     .frame(maxWidth: .infinity, alignment: .trailing)
+                    .disabled(isLoginBusy)
 
                     FGPrimaryButton(
-                        title: "Login",
-                        isDisabled: !resolvedTermsAccepted.wrappedValue
+                        title: isLoginBusy
+                            ? L10n.t("login_logging_you_in", languageCode: appLanguageRaw)
+                            : "Login",
+                        isDisabled: !resolvedTermsAccepted.wrappedValue || isLoginBusy
                     ) {
-                        Task {
-                            await MainActor.run {
-                                viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "emailPasswordSignIn")
-                            }
-                            await viewModel.loginUser(email: email, password: password)
-                            await MainActor.run {
-                                password = ""
-                            }
-                        }
+                        submitFanLogin()
                     }
+                    .accessibilityLabel("Login")
+                    .accessibilityValue(isLoginBusy
+                        ? L10n.t("login_logging_you_in", languageCode: appLanguageRaw)
+                        : "")
                 }
 
                 if !viewModel.emailVerifiedSignInNotice.isEmpty {
@@ -167,8 +182,8 @@ struct SettingsFanLoginCard: View {
                         .foregroundStyle(FGColor.accentBlue)
                 }
                 .buttonStyle(.plain)
-                .disabled(!resolvedTermsAccepted.wrappedValue)
-                .opacity(resolvedTermsAccepted.wrappedValue ? 1 : 0.55)
+                .disabled(!resolvedTermsAccepted.wrappedValue || isLoginBusy)
+                .opacity(resolvedTermsAccepted.wrappedValue && !isLoginBusy ? 1 : 0.55)
             }
         }
         .onChange(of: email) { _, _ in
@@ -176,6 +191,11 @@ struct SettingsFanLoginCard: View {
         }
         .onChange(of: password) { _, _ in
             viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "passwordEdited")
+        }
+        .onChange(of: viewModel.isLoggedIn) { _, loggedIn in
+            if loggedIn {
+                password = ""
+            }
         }
         .onDisappear {
             viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "sheetClosed")
@@ -192,6 +212,17 @@ struct SettingsFanLoginCard: View {
         }
     }
 
+    private func submitFanLogin() {
+        // Dismiss keyboard so the first Login tap is never consumed by focus dismissal alone.
+        focusedField = nil
+        viewModel.clearAppleAuthMessage(accountMode: .fan, reason: "emailPasswordSignIn")
+        viewModel.submitFanEmailLogin(
+            email: email,
+            password: password,
+            source: "SettingsFanLoginCard"
+        )
+    }
+
     private func fanLoginPasswordField(
         placeholder: String,
         text: Binding<String>,
@@ -202,12 +233,20 @@ struct SettingsFanLoginCard: View {
                 TextField(placeholder, text: text)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .textContentType(.password)
                     .font(FGTypography.body)
+                    .focused($focusedField, equals: .password)
+                    .submitLabel(.go)
+                    .onSubmit { submitFanLogin() }
             } else {
                 SecureField(placeholder, text: text)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+                    .textContentType(.password)
                     .font(FGTypography.body)
+                    .focused($focusedField, equals: .password)
+                    .submitLabel(.go)
+                    .onSubmit { submitFanLogin() }
             }
 
             Button {
@@ -219,6 +258,7 @@ struct SettingsFanLoginCard: View {
                     .frame(width: 28, height: 28)
             }
             .buttonStyle(.plain)
+            .disabled(isLoginBusy)
             .accessibilityLabel(isVisible.wrappedValue ? "Hide password" : "Show password")
         }
         .fanGeoInputFieldStyle()

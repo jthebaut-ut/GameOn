@@ -822,8 +822,70 @@ extension MapViewModel {
         return false
     }
 
+    /// Window in which an identical validation is reused instead of repeating the same RPC set.
+    private static let businessOwnerSessionFlagsFreshnessWindow: TimeInterval = 2.0
+
+    /// Identifies "the same validation": anything that would change the outcome locally.
+    private func businessOwnerSessionFlagsIdentity() -> String {
+        [
+            currentUserAuthId?.uuidString.lowercased() ?? "nil",
+            OwnerBusinessEmail.normalized(venueOwnerEmail),
+            hasAuthenticatedVenueOwnerSession ? "1" : "0",
+            venueOwnerMode ? "1" : "0",
+            isVenueOwnerLoggedIn ? "1" : "0"
+        ].joined(separator: "|")
+    }
+
+    /// Coalescing front door for business-owner session validation.
+    ///
+    /// Both Discover triggers stay in place; an equivalent call that arrives while one is in flight
+    /// (or moments after it finished) observes that result instead of issuing the RPCs again.
+    /// Callers that must re-check server state pass `allowsRecentResultReuse: false`.
     @discardableResult
-    func ensureBusinessOwnerSessionFlagsIfPossible(context: String) async -> Bool {
+    func ensureBusinessOwnerSessionFlagsIfPossible(
+        context: String,
+        allowsRecentResultReuse: Bool = true
+    ) async -> Bool {
+        let identity = businessOwnerSessionFlagsIdentity()
+
+        if let inFlight = businessOwnerSessionFlagsEnsureTask,
+           businessOwnerSessionFlagsEnsureIdentity == identity {
+#if DEBUG
+            print("[BusinessSessionPerf] validationCoalesced=true context=\(context)")
+#endif
+            StartupPerf.taskCoalesced(name: "ensureBusinessOwnerSessionFlags")
+            return await inFlight.value
+        }
+
+        if allowsRecentResultReuse,
+           let last = businessOwnerSessionFlagsLastValidation,
+           last.identity == identity,
+           Date().timeIntervalSince(last.at) < Self.businessOwnerSessionFlagsFreshnessWindow {
+#if DEBUG
+            print("[BusinessSessionPerf] validationSkippedFresh=true context=\(context)")
+#endif
+            StartupPerf.duplicateSkipped(reason: "ensureBusinessOwnerSessionFlagsFresh")
+            return last.result
+        }
+
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            return await self.performEnsureBusinessOwnerSessionFlagsIfPossible(context: context)
+        }
+        businessOwnerSessionFlagsEnsureTask = task
+        businessOwnerSessionFlagsEnsureIdentity = identity
+
+        let result = await task.value
+
+        if businessOwnerSessionFlagsEnsureTask == task {
+            businessOwnerSessionFlagsEnsureTask = nil
+            businessOwnerSessionFlagsEnsureIdentity = nil
+        }
+        businessOwnerSessionFlagsLastValidation = (identity: identity, result: result, at: Date())
+        return result
+    }
+
+    private func performEnsureBusinessOwnerSessionFlagsIfPossible(context: String) async -> Bool {
         logBusinessOwnerSessionFlags(context: "\(context)_before")
 
         if await businessBanGuardBlocks(path: context, action: "ensureBusinessOwnerSessionFlagsIfPossible") {
@@ -886,6 +948,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserProfileBackgroundKey = .fangeo
         isAuthSessionRestoringForProfilePresentation = false
         isUserProfileLoadingForPresentation = false
         hasLoadedUserProfileForPresentation = false
@@ -990,7 +1053,12 @@ extension MapViewModel {
             return false
         }
 
-        guard await claimAccountIdentity(.business, context: context) else {
+        // Restore-only: see `fanSessionRestore` above for why inconclusive failures preserve.
+        guard await claimAccountIdentity(
+            .business,
+            context: context,
+            inconclusiveFailurePolicy: .preserveSession
+        ) else {
             logBusinessOwnerSessionFlags(context: "\(context)_account_identity_blocked")
             return false
         }
@@ -1010,6 +1078,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
         currentUserLiveVisibilityMode = .allFriends
         currentUserSelectedLiveVisibilityFriendIDs = []
@@ -1041,10 +1110,12 @@ extension MapViewModel {
         UserDefaults.standard.removeObject(forKey: "cachedUserHomeRegion")
         UserDefaults.standard.removeObject(forKey: "cachedUserHomeCountry")
         UserDefaults.standard.removeObject(forKey: "cachedUserShowHomeCity")
+        UserDefaults.standard.removeObject(forKey: "cachedUserProfileBackgroundKey")
         UserDefaults.standard.removeObject(forKey: "cachedUserLiveVisibilityEnabled")
         UserDefaults.standard.removeObject(forKey: "cachedUserLiveVisibilityMode")
         UserDefaults.standard.removeObject(forKey: "cachedUserSelectedLiveVisibilityFriendIDs")
         UserDefaults.standard.removeObject(forKey: "cachedUserDiscoverableByFans")
+        UserDefaults.standard.removeObject(forKey: "cachedUserActivityStatusVisible")
     }
 
     /// Clears authenticated/private session caches that must never survive logout, session loss, or account switching.
@@ -1076,6 +1147,7 @@ extension MapViewModel {
         currentUserDisplayName = ""
         currentUserUsername = ""
         currentUserBio = ""
+        currentUserProfileBackgroundKey = .fangeo
         clearCurrentUserProfileLocalCache()
         resetProfilePresentationLoadStateForNewAuth()
         bumpCurrentUserAvatarDisplayRefresh()
@@ -1367,6 +1439,7 @@ extension MapViewModel {
 #endif
                     if applied {
                         print("USER PROFILE LOADED")
+                        await refreshProfileXP()
                     }
                     return applied
                 }
@@ -1428,6 +1501,16 @@ extension MapViewModel {
             AccountSwitchDebug.logoutCleanup(accountId: logoutAccountId, generation: expectedGeneration)
         }
 
+#if DEBUG
+        if MemoryAuditProbe.isEnabled {
+            let store = fanUpdatesStore
+            MemoryAuditProbe.log(
+                "logout_before_clear",
+                details: "commentsEvents=\(store.venueEventComments.count) vibes=\(store.venueEventVibeCounts.count) appChannel=\(store.fanChatAppLevelRealtimeChannel != nil) warmTask=\(userPreferencesWarmCacheTask != nil) goingPrefetch=\(fanUpdatesGoingProfilePrefetchTasks.count) socialPrefetch=\(discoverVisibleSocialPrefetchTasksByKey.count) dashPreload=\(businessDashboardPreloadTask != nil) fanXPQueue=\(fanXPRewardOverlay.debugQueuedCount) predictionVenue=\(venueEventPredictionSummaries.count) predictionPro=\(proGamePredictionSummaries.count)"
+            )
+        }
+#endif
+
         profileLoadTask?.cancel()
         profileLoadTask = nil
         profileLoadOwnerUserId = nil
@@ -1440,11 +1523,18 @@ extension MapViewModel {
         currentUserProfileCreatedAt = ""
         currentUserIsBusinessAccount = false
         isBusinessOwnerSessionRestorePending = false
+        deferredBusinessOwnerHydrationTask?.cancel()
+        deferredBusinessOwnerHydrationTask = nil
         activeBusinessAccountBan = nil
         isBusinessBanGatePresented = false
         isCheckingActiveBusinessBan = false
         currentUserFanXP = .rookie
         currentUserFanIdentityPreferences = .empty
+        fanIdentityPreferencesLoadTask?.cancel()
+        fanIdentityPreferencesLoadTask = nil
+        lastFanIdentityPreferencesLoadAt = nil
+        lastFanIdentityPreferencesLoadUserId = nil
+        lastMyPickupOrganizerSummaryRefreshAt = nil
         currentUserHomeCrowdVenueId = nil
         currentUserHomeCrowdVenue = nil
         discoverFocusVenueId = nil
@@ -1455,12 +1545,15 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
         currentUserLiveVisibilityMode = .allFriends
         currentUserSelectedLiveVisibilityFriendIDs = []
         currentUserDiscoverableByFans = true
+        currentUserActivityStatusVisible = true
         isUpdatingLiveVisibilitySetting = false
         isUpdatingProfileDiscoverabilitySetting = false
+        isUpdatingActivityStatusVisibilitySetting = false
         currentUserAuthId = nil
         FanGeoUserEntitlements.reset()
         clearUnseenPokesBadgeState()
@@ -1470,6 +1563,7 @@ extension MapViewModel {
         ProfilePhase1PersonalizationCache.clear(for: nil)
 
         Task { await GameReminderNotificationService.shared.cancelAllProGameReminders() }
+        Task { await GameReminderNotificationService.shared.cancelAllPickupCreatorRatingReminders() }
         savedProGames = []
         favoriteTeamProGames = []
         favoriteTeamProGameAlertOverrides = [:]
@@ -1497,6 +1591,10 @@ extension MapViewModel {
         pendingFollowingMapPickupGameSnapshot = nil
         clearFollowingTabCaches()
         clearFollowingInterestedOnlyDefaults()
+        pendingPickupCreatorRatingNotificationDeepLink = nil
+        pendingPickupPlayingHighlightGameID = nil
+        clearPendingSaveProGameIntent()
+        presentSaveProGameSignInPrompt = false
 
         goingUserProfiles = []
         goingProfilesByVenueEventID = [:]
@@ -1522,6 +1620,8 @@ extension MapViewModel {
         lastFollowingTodayPlansLoadAt = nil
         followingTabGlobalRefreshTask?.cancel()
         followingTabGlobalRefreshTask = nil
+        followingJoinRequestsLoadTask?.cancel()
+        followingJoinRequestsLoadTask = nil
         myPickupGamesLightweightLoadTask?.cancel()
         myPickupGamesLightweightLoadTask = nil
         lastMyPickupGamesLightweightLoadAt = nil
@@ -1543,8 +1643,20 @@ extension MapViewModel {
         pickupGamesFollowingTabCache.removeAll()
         pickupJoinRequestLatestByPickupGameIdForFan.removeAll()
         pickupCreatorPublicRatingStatsByUserId = [:]
+        pickupOrganizerSummaryByUserId = [:]
+        pickupOrganizerSummaryFetchedAtByUserId = [:]
+        pickupOrganizerSummaryInFlightUserIds = []
+        pickupOrganizerSummaryFetchGenerationByUserId = [:]
+        myPickupOrganizerSummary = .empty
+        myPickupOrganizerSummaryLoadedForUserId = nil
         pickupGameIdsWithMyCreatorRating = []
+        pickupMyCreatorRatingValueByGameId = [:]
+        pickupMyCreatorRatingCreatedAtByGameId = [:]
+        pickupCreatorRatingPostSubmitPromptGameIds = []
+        pickupCreatorRatingDeferredGameIds = []
+        pickupCreatorRatingSessionUserId = nil
         pickupMyLatestJoinRequestByGameId = [:]
+        clearPickupGameRosterCaches()
         pickupCreatorDisplayNameByUserId = [:]
         pickupCreatorAvatarThumbnailURLByUserId = [:]
         pickupCreatorAvatarURLByUserId = [:]
@@ -1556,11 +1668,39 @@ extension MapViewModel {
         venueEventVibeWriteInFlightKeys = []
         venueUserStarRatings = [:]
         venueRatingContributionCount = [:]
+        venueRatingStatsByVenueId = [:]
+
+        // Memory: cancel orphan session Tasks and drop regenerable user-scoped Fan Updates state.
+        // Realtime channels for comments/pickup/fan-chat are already torn down in ``forceLogout``
+        // *before* signOut; this Task is a best-effort residual cleanup for other call sites.
+        userPreferencesWarmCacheTask?.cancel()
+        userPreferencesWarmCacheTask = nil
+        for task in fanUpdatesGoingProfilePrefetchTasks.values { task.cancel() }
+        fanUpdatesGoingProfilePrefetchTasks.removeAll(keepingCapacity: false)
+        for task in discoverVisibleSocialPrefetchTasksByKey.values { task.cancel() }
+        discoverVisibleSocialPrefetchTasksByKey.removeAll(keepingCapacity: false)
+        fanXPRewardOverlay.clearAll()
+        venueEventPredictionSummaries.removeAll(keepingCapacity: false)
+        proGamePredictionSummaries.removeAll(keepingCapacity: false)
+        fanUpdatesStore.clearSessionScopedStateForLogout()
+        Task { await ProfileStatsService.shared.clearAll() }
+        ProGamePredictionService.shared.clearAllCachedSummaries()
+        VenueEventPredictionService.shared.clearAllCachedSummaries()
+
         Task { [weak self] in
             await self?.removeAllVenueEventCommentsRealtimeListeners()
+            await self?.stopFanChatAppLevelRealtime()
             await self?.stopPickupJoinRequestBadgeRealtime()
             await self?.stopFollowingPickupRealtime()
             await self?.stopPickupInviteRealtime()
+#if DEBUG
+            if MemoryAuditProbe.isEnabled {
+                MemoryAuditProbe.log(
+                    "logout_after_clear",
+                    details: "commentsEvents=\(self?.fanUpdatesStore.venueEventComments.count ?? -1) appChannel=\(self?.fanUpdatesStore.fanChatAppLevelRealtimeChannel != nil)"
+                )
+            }
+#endif
         }
 
         venueOwnerEmail = ""
@@ -1865,10 +2005,10 @@ extension MapViewModel {
     }
 
     private static let userProfileSelectColumns =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_business_account,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,is_deleted,created_at,last_seen_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,ad_free_enabled,home_city,home_region,home_country,show_home_city"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_business_account,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,activity_status_visible,is_deleted,created_at,last_seen_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,ad_free_enabled,home_city,home_region,home_country,show_home_city,profile_background_key"
 
     private static let userProfileIdentitySelectColumns =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,profile_background_key"
 
     private struct UserProfileIdentityRow: Decodable {
         let id: UUID?
@@ -1948,6 +2088,105 @@ extension MapViewModel {
 #endif
     }
 
+    /// Cancels authenticated Realtime listen tasks and detaches channel removal so logout never
+    /// waits forever on websocket unsubscribe acknowledgements or `for await` streams.
+    /// Normal UI leave-paths still use the awaited ``stop*`` helpers (which now removeChannel
+    /// *before* awaiting task completion).
+    @MainActor
+    private func abandonAuthenticatedRealtimeForLogout() {
+        SafeLogoutDebug.step("abandon_realtime_begin")
+
+        var channels: [RealtimeChannelV2] = []
+
+        venueOwnerAnalyticsDebounceTask?.cancel()
+        venueOwnerAnalyticsDebounceTask = nil
+        venueOwnerAnalyticsRealtimeTask?.cancel()
+        venueOwnerAnalyticsRealtimeTask = nil
+        if let ch = venueOwnerAnalyticsRealtimeChannel {
+            channels.append(ch)
+            venueOwnerAnalyticsRealtimeChannel = nil
+        }
+
+        fanChatAppLevelRealtimeResubscribeTask?.cancel()
+        fanChatAppLevelRealtimeResubscribeTask = nil
+        fanChatAppLevelRealtimeTask?.cancel()
+        fanChatAppLevelRealtimeTask = nil
+        fanUpdatesStore.crowdReactionVibeRealtimeRefreshTask?.cancel()
+        fanUpdatesStore.crowdReactionVibeRealtimeRefreshTask = nil
+        if let ch = fanChatAppLevelRealtimeChannel {
+            channels.append(ch)
+            fanChatAppLevelRealtimeChannel = nil
+        }
+        fanChatAppLevelRealtimeTrackedEventIDs = []
+
+        pickupInviteRealtimeDebounceTask?.cancel()
+        pickupInviteRealtimeDebounceTask = nil
+        pickupInviteRealtimeTask?.cancel()
+        pickupInviteRealtimeTask = nil
+        pickupInviteRealtimeBoundUserId = nil
+        if let ch = pickupInviteRealtimeChannel {
+            channels.append(ch)
+            pickupInviteRealtimeChannel = nil
+        }
+
+        pickupJoinRequestBadgeDebounceTask?.cancel()
+        pickupJoinRequestBadgeDebounceTask = nil
+        pickupJoinRequestBadgeRealtimeTask?.cancel()
+        pickupJoinRequestBadgeRealtimeTask = nil
+        pickupJoinRequestBadgeRealtimeOwnerUserId = nil
+        pickupJoinRequestBadgeRealtimeTrackedGameIds = nil
+        if let ch = pickupJoinRequestBadgeRealtimeChannel {
+            channels.append(ch)
+            pickupJoinRequestBadgeRealtimeChannel = nil
+        }
+
+        pickupFollowingRealtimeDebounceTask?.cancel()
+        pickupFollowingRealtimeDebounceTask = nil
+        pickupFollowingRealtimeTask?.cancel()
+        pickupFollowingRealtimeTask = nil
+        if let ch = pickupFollowingRealtimeChannel {
+            channels.append(ch)
+            pickupFollowingRealtimeChannel = nil
+        }
+
+        fanSingleSessionRealtimeDebounceTask?.cancel()
+        fanSingleSessionRealtimeDebounceTask = nil
+        fanSingleSessionRealtimeTask?.cancel()
+        fanSingleSessionRealtimeTask = nil
+        if let ch = fanSingleSessionRealtimeChannel {
+            channels.append(ch)
+            fanSingleSessionRealtimeChannel = nil
+        }
+
+        let commentIDs = Array(
+            Set(venueEventCommentsRealtimeTasks.keys)
+                .union(venueEventCommentsRealtimeChannels.keys)
+                .union(venueEventCommentsRealtimeListenerTokens.keys)
+        )
+        for venueEventID in commentIDs {
+            venueEventCommentsRealtimeTasks[venueEventID]?.cancel()
+            venueEventCommentsRealtimeTasks[venueEventID] = nil
+            venueEventCommentsRealtimeListenerTokens[venueEventID] = nil
+            venueEventCommentsRealtimeReadyIDs.remove(venueEventID)
+            venueEventCommentsRealtimeSubscribeStartedAt[venueEventID] = nil
+            venueEventCommentsRealtimeLastEventAt[venueEventID] = nil
+            if let ch = venueEventCommentsRealtimeChannels.removeValue(forKey: venueEventID) {
+                channels.append(ch)
+            }
+        }
+
+        let channelCount = channels.count
+        for channel in channels {
+            Task {
+                await supabase.removeChannel(channel)
+            }
+        }
+        SafeLogoutDebug.step(
+            "abandon_realtime_dispatched",
+            detail: "channelCount=\(channelCount) commentSheets=\(commentIDs.count)"
+        )
+    }
+
     @discardableResult
     func forceLogout(reason: String, source: String) async -> Bool {
         let destructiveAllowed = destructiveLogoutAllowed(reason: reason, source: source)
@@ -1960,14 +2199,17 @@ extension MapViewModel {
             await markTransientMissingSessionPreserved(reason: reason, source: source)
             return false
         }
-        let requiresSuccessfulRemoteSignOut = reason == "explicitUserLogout" || source == "MapViewModel.logoutUser"
+
+        SafeLogoutDebug.step("forceLogout_enter", detail: "reason=\(reason) source=\(source)")
 
         let (logoutAccountId, cleanupGeneration) = await MainActor.run { () -> (UUID?, UInt64) in
+            AgeAccessGateService.shared.handleLogoutOrAccountSwitch()
             let accountId = currentUserAuthId
             let generation = bumpAccountProfileGeneration(reason: reason, accountId: accountId)
             clearLogoutProfilePresentationImmediately(for: accountId)
             return (accountId, generation)
         }
+        SafeLogoutDebug.step("generation_bumped", detail: "accountId=\(logoutAccountId?.uuidString.lowercased() ?? "nil")")
 
         let snapshot = await MainActor.run {
             (
@@ -1986,29 +2228,49 @@ extension MapViewModel {
         print("[AuthForceLogoutDebug] authState=\(snapshot.authState)")
         print("[AuthForceLogoutDebug] callStack=\(Thread.callStackSymbols.joined(separator: " | "))")
 
-        await PushNotificationRegistrationService.shared.deleteCurrentTokenForCurrentSession(reason: "forceLogout")
-
-        do {
-            logBusinessLogoutTrace("supabaseSignOutCalled=true")
-            try await supabase.auth.signOut()
-#if DEBUG
-            print("[AuthForceLogoutDebug] signOutSuccess=true")
-#endif
-        } catch {
-            print("[AuthForceLogoutDebug] signOutSuccess=false error=\(error.localizedDescription)")
-            if requiresSuccessfulRemoteSignOut {
-                await MainActor.run {
-                    authErrorMessage = "Could not log out. Please check your connection and try again."
-                    venueAuthErrorMessage = authErrorMessage
-                }
-                return false
-            }
+        // Tear down Realtime *before* signOut, without awaiting websocket unsubscribe acks.
+        // Awaiting listen-task completion before removeChannel (or awaiting removeChannel on a
+        // dying socket after signOut) was the logout hang root cause.
+        SafeLogoutDebug.step("realtime_teardown_begin")
+        await MainActor.run {
+            abandonAuthenticatedRealtimeForLogout()
         }
+        SafeLogoutDebug.step("realtime_teardown_completed")
 
-        await stopVenueOwnerAnalyticsRealtime()
-        await removeAllVenueEventCommentsRealtimeListeners()
-        await clearFanActiveSessionOnLogout()
+        SafeLogoutDebug.step("push_token_delete_begin")
+        // Best-effort: never block logout on PostgREST / network for token deletion.
+        let pushUserId = logoutAccountId
+        Task {
+            await PushNotificationRegistrationService.shared.deleteCurrentTokenForCurrentSession(
+                reason: "forceLogout",
+                knownUserId: pushUserId
+            )
+            SafeLogoutDebug.step("push_token_delete_completed_background")
+        }
+        SafeLogoutDebug.step("push_token_delete_dispatched")
 
+        // Never call the awaited stopFanSingleSessionRealtime / clearFanActiveSessionOnLogout
+        // path from explicit logout — removeChannel + task.result can hang forever, and a
+        // lifecycle race can recreate the channel between abandonRealtime and this step.
+        SafeLogoutDebug.step("single_session_clear_begin")
+        await MainActor.run {
+            abandonFanSingleSessionForLogout(knownUserId: logoutAccountId)
+        }
+        SafeLogoutDebug.step("single_session_clear_completed")
+
+        // Local session invalidation must ALWAYS complete for the UI to leave loggingOut, and
+        // must never await the Supabase `/logout` network call. Remote revocation is dispatched
+        // separately as best effort and can never keep the overlay up.
+        SafeLogoutDebug.step("local_supabase_session_invalidation_begin")
+        let localResult = await invalidateLocalAuthenticatedSessionForExplicitLogout(
+            logoutAccountId: logoutAccountId,
+            generation: cleanupGeneration
+        )
+        await MainActor.run { safeLogoutLocalSessionInvalidated = localResult.succeeded }
+        SafeLogoutDebug.step("local_supabase_session_invalidation_completed", detail: "result=\(localResult)")
+
+        SafeLogoutDebug.step("local_fangeo_auth_clear_begin")
+        SafeLogoutDebug.step("clear_session_caches_begin")
         await MainActor.run {
             clearAuthenticatedSessionCaches(
                 expectedGeneration: cleanupGeneration,
@@ -2021,10 +2283,107 @@ extension MapViewModel {
             isAdminLoggedIn = false
             markAuthSignedOut(reason: reason)
         }
+        SafeLogoutDebug.step("clear_session_caches_completed")
+        SafeLogoutDebug.step("local_auth_state_cleared")
+        SafeLogoutDebug.step("local_fangeo_auth_clear_completed")
+        SafeLogoutDebug.step("view_models_reset_completed")
 
         clearPersistedAccountMode()
         UserDefaults.standard.set(true, forKey: Self.didExplicitlyLogoutKey)
+        SafeLogoutDebug.step("explicit_logout_marker_set")
+        SafeLogoutDebug.step("blocking_logout_pipeline_returned")
         return true
+    }
+
+    /// Outcome of clearing the *local* Supabase session for an explicit user logout.
+    /// Never reflects remote `/logout` revocation — that is dispatched separately as best effort.
+    enum LocalLogoutResult: CustomStringConvertible, Sendable {
+        /// No reusable session existed to begin with.
+        case noSessionPresent
+        /// The SDK's own local removal (inside `signOut`) took effect before the deadline.
+        case clearedBySDK
+        /// The SDK removal stalled; the truly-local keychain purge invalidated the session.
+        case clearedByLocalFallback
+        /// A reusable session could not be confirmed cleared — the caller must not report success.
+        case failed
+
+        var succeeded: Bool {
+            switch self {
+            case .noSessionPresent, .clearedBySDK, .clearedByLocalFallback: return true
+            case .failed: return false
+            }
+        }
+
+        var description: String {
+            switch self {
+            case .noSessionPresent: return "noSessionPresent"
+            case .clearedBySDK: return "clearedBySDK"
+            case .clearedByLocalFallback: return "clearedByLocalFallback"
+            case .failed: return "failed"
+            }
+        }
+    }
+
+    /// Clears the locally persisted Supabase session so the blocking UI can leave `loggingOut`
+    /// promptly. It **never** awaits the remote `/logout` network call.
+    ///
+    /// Root cause this replaces: `AuthClient.signOut(scope:)` removes the local session and
+    /// then awaits a `/logout` POST for every scope except `.others`. The previous
+    /// `withTaskGroup` "timeout" could not bound it — a structured group cannot return until
+    /// all children finish, and the child awaiting the SDK sign-out never finished when the
+    /// network hung and the SDK task ignored cancellation.
+    ///
+    /// Strategy (all network-independent for the blocking path):
+    /// 1. Stop the SDK auto-refresh loop so it cannot re-persist a session after removal.
+    /// 2. Dispatch full remote+local sign-out as detached best effort (captures the access
+    ///    token, emits `.signedOut`, hits `/logout`) — never awaited here.
+    /// 3. Bounded, wall-clock confirmation that the local session is gone (the SDK's local
+    ///    removal runs before its network call, so this normally succeeds within a tick).
+    /// 4. If the SDK removal is blocked past the deadline, purge the keychain directly.
+    @MainActor
+    private func invalidateLocalAuthenticatedSessionForExplicitLogout(
+        logoutAccountId: UUID?,
+        generation: UInt64
+    ) async -> LocalLogoutResult {
+        logBusinessLogoutTrace("localSessionInvalidationBegin scope=local")
+
+        let invalidator = ExplicitLogoutLocalInvalidator(
+            stopAutoRefresh: { await supabase.auth.stopAutoRefresh() },
+            hasLocalSession: { supabase.auth.currentSession != nil },
+            dispatchRemoteBestEffort: { [weak self] in
+                self?.dispatchRemoteLogoutBestEffort(
+                    logoutAccountId: logoutAccountId,
+                    generation: generation
+                )
+            },
+            directLocalPurge: { purgeSupabaseLocalAuthSessionStorage() }
+        )
+        return await invalidator.run()
+    }
+
+    /// Fire-and-forget remote sign-out / token revocation. Never awaited by the logout UI
+    /// pipeline, so a hung or non-cancellable network call cannot keep the overlay up.
+    ///
+    /// The logout account + generation are captured for logging and to make the intent
+    /// explicit; this work only touches SDK auth state (not app/UI state), so a late
+    /// completion after a *different* account signs in cannot alter the new session.
+    @MainActor
+    private func dispatchRemoteLogoutBestEffort(logoutAccountId: UUID?, generation: UInt64) {
+        let accountText = logoutAccountId?.uuidString.lowercased() ?? "nil"
+        // Unstructured, top-level Task: independent of the logout pipeline's lifetime and
+        // never cancelled when `forceLogout` returns.
+        Task {
+            do {
+                try await supabase.auth.signOut(scope: .local)
+                SafeLogoutDebug.step("remote_logout_completed", detail: "account=\(accountText) gen=\(generation)")
+            } catch {
+                SafeLogoutDebug.step(
+                    "remote_logout_failed",
+                    detail: "account=\(accountText) gen=\(generation) error=\(error.localizedDescription)"
+                )
+            }
+        }
+        SafeLogoutDebug.step("remote_logout_dispatched", detail: "account=\(accountText) gen=\(generation)")
     }
 
     private func logSessionRestored(_ restored: Bool, reason: String, userId: UUID? = nil) {
@@ -2192,10 +2551,12 @@ extension MapViewModel {
 #endif
         currentUserNationalTeam = profile.nationalTeamIdentity
         applyCurrentUserHomeCityFromProfile(profile)
+        currentUserProfileBackgroundKey = profile.resolvedProfileBackgroundKey
         currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
         currentUserLiveVisibilityMode = profile.liveVisibilityMode
         currentUserSelectedLiveVisibilityFriendIDs = profile.selectedLiveVisibilityFriendIDs
         currentUserDiscoverableByFans = profile.discoverableByFans
+        currentUserActivityStatusVisible = profile.activityStatusVisible
         currentUserAuthId = authId
         FanGeoUserEntitlements.apply(adFreeEnabled: profile.adFreeEnabled)
         bumpCurrentUserAvatarDisplayRefresh()
@@ -2403,9 +2764,29 @@ extension MapViewModel {
     }
 
     /// Public URLs for a full-size avatar and its list thumbnail (see ``ImageCompression/UploadPreset-swift.enum.avatarThumbnail``).
+    /// `replaced*` are prior objects to delete only after the profile row successfully points at the new URLs.
     struct UploadedAvatarURLs: Sendable {
         let fullURL: String
         let thumbnailURL: String
+        let replacedFullURL: String?
+        let replacedThumbnailURL: String?
+
+        init(
+            fullURL: String,
+            thumbnailURL: String,
+            replacedFullURL: String? = nil,
+            replacedThumbnailURL: String? = nil
+        ) {
+            self.fullURL = fullURL
+            self.thumbnailURL = thumbnailURL
+            self.replacedFullURL = replacedFullURL
+            self.replacedThumbnailURL = replacedThumbnailURL
+        }
+    }
+
+    /// Unique object name under `user-avatars/{uid}/` so each successful upload changes the public URL.
+    static func makeVersionedAvatarFileName() -> String {
+        "avatar-\(UUID().uuidString.lowercased()).jpg"
     }
 
     private static func companionAvatarThumbnailFileName(for fullFileName: String) -> String {
@@ -2421,6 +2802,14 @@ extension MapViewModel {
         let fanEmail = OwnerBusinessEmail.normalized(email)
         guard OwnerBusinessEmail.isValidStrict(fanEmail) else {
             await MainActor.run { authErrorMessage = OwnerBusinessEmail.invalidOwnerEmailUserMessage }
+            return
+        }
+
+        guard await requireAgeAccessForSignUp(email: fanEmail) else {
+            let message = AgeAccessGateService.shared.latestState.isBlockingUnder13
+                ? L10n.t("age_gate_under13_body")
+                : L10n.t("age_gate_confirmation_body")
+            await MainActor.run { authErrorMessage = message }
             return
         }
 
@@ -2491,6 +2880,10 @@ extension MapViewModel {
 
             await persistAccountModeForActiveAuthSession(.fanUser)
 
+            // Profile row now exists: hand this sign-up's single-use age grant to the
+            // server so the authoritative record — not a local cache — grants access.
+            await claimAgeAccessSignUpOwnership(userId: activeSession.user.id, email: fanEmail)
+
             if (try? await supabase.auth.session) != nil {
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
             }
@@ -2510,10 +2903,24 @@ extension MapViewModel {
         }
     }
 
-    func loginUser(email: String, password: String) async {
+    func loginUser(email: String, password: String, loginGeneration: UInt64? = nil) async {
+        let generationOrNil: UInt64? = await MainActor.run {
+            if let loginGeneration { return loginGeneration }
+            return beginSafeLogin(method: .emailPasswordFan, source: "loginUserLegacy")
+        }
+        guard let generation = generationOrNil else { return }
+
         let fanEmail = OwnerBusinessEmail.normalized(email)
         guard OwnerBusinessEmail.isValidStrict(fanEmail) else {
-            await MainActor.run { authErrorMessage = OwnerBusinessEmail.invalidOwnerEmailUserMessage }
+            await MainActor.run {
+                authErrorMessage = OwnerBusinessEmail.invalidOwnerEmailUserMessage
+                failSafeLogin(
+                    generation: generation,
+                    message: OwnerBusinessEmail.invalidOwnerEmailUserMessage,
+                    accountMode: .fan,
+                    failurePhase: "validation"
+                )
+            }
             return
         }
 
@@ -2523,9 +2930,26 @@ extension MapViewModel {
                 password: password
             )
 
+            guard await MainActor.run(body: { isActiveSafeLoginGeneration(generation) }) else {
+                SafeLoginDebug.log("stale previous-session result ignored phase=postSignIn")
+                return
+            }
+
+            await MainActor.run {
+                markSafeLoginPreparingSession(generation: generation)
+            }
+
             guard let session = try? await supabase.auth.session else {
                 await forceLogout(reason: "loginUserSessionMissingAfterSignIn", source: "MapViewModel.loginUser")
-                await MainActor.run { authErrorMessage = "Unable to login." }
+                await MainActor.run {
+                    authErrorMessage = "Unable to login."
+                    failSafeLogin(
+                        generation: generation,
+                        message: "Unable to login.",
+                        accountMode: .fan,
+                        failurePhase: "sessionMissing"
+                    )
+                }
                 return
             }
 
@@ -2535,12 +2959,21 @@ extension MapViewModel {
                     authErrorMessage = "Please verify your email before signing in."
                     markEmailVerificationPending(email: fanEmail, kind: .fan)
                     print("[EmailVerifyDebug] signInBlockedUnconfirmed=true")
+                    failSafeLogin(
+                        generation: generation,
+                        message: "Please verify your email before signing in.",
+                        accountMode: .fan,
+                        failurePhase: "emailUnconfirmed"
+                    )
                 }
                 return
             }
 
             if await refreshActiveBanGate(reason: "emailPasswordFanLogin") {
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                await MainActor.run {
+                    clearSafeLoginProgress(generation: generation, reason: "banGate")
+                }
                 return
             }
 
@@ -2550,6 +2983,18 @@ extension MapViewModel {
             if let draft = pendingFanEmailSignupDraft,
                OwnerBusinessEmail.normalized(draft.email) == fanEmail {
                 _ = await completePendingEmailFanSignupAfterConfirmation(session: session, draft: draft)
+                await MainActor.run {
+                    if isLoggedIn {
+                        completeSafeLoginSuccess(generation: generation, accountKind: "fan")
+                    } else {
+                        failSafeLogin(
+                            generation: generation,
+                            message: authErrorMessage,
+                            accountMode: .fan,
+                            failurePhase: "pendingSignup"
+                        )
+                    }
+                }
                 return
             }
 
@@ -2558,11 +3003,27 @@ extension MapViewModel {
                 print("[AuthAccountTypeGate] fan login blocked businessEmail=\(fanEmail)")
 #endif
                 await undoPartialSupabaseSessionAfterAccountTypeMismatch()
-                await MainActor.run { authErrorMessage = Self.fanLoginBlockedBecauseBusinessMessage }
+                await MainActor.run {
+                    authErrorMessage = Self.fanLoginBlockedBecauseBusinessMessage
+                    failSafeLogin(
+                        generation: generation,
+                        message: Self.fanLoginBlockedBecauseBusinessMessage,
+                        accountMode: .fan,
+                        failurePhase: "accountTypeGate"
+                    )
+                }
                 return
             }
 
             guard await claimAccountIdentity(.fan, context: "loginUser") else {
+                await MainActor.run {
+                    failSafeLogin(
+                        generation: generation,
+                        message: authErrorMessage,
+                        accountMode: .fan,
+                        failurePhase: "claimIdentity"
+                    )
+                }
                 return
             }
 
@@ -2571,10 +3032,31 @@ extension MapViewModel {
                 sessionEmail: fanEmail,
                 source: "loginUser"
             ) {
+                await MainActor.run {
+                    failSafeLogin(
+                        generation: generation,
+                        message: authErrorMessage,
+                        accountMode: .fan,
+                        failurePhase: "deletedAccountGate"
+                    )
+                }
                 return
             }
 
             if !(await checkCurrentUserAdminStatus()) {
+                await MainActor.run {
+                    failSafeLogin(
+                        generation: generation,
+                        message: authErrorMessage,
+                        accountMode: .fan,
+                        failurePhase: "adminStatus"
+                    )
+                }
+                return
+            }
+
+            guard await MainActor.run(body: { isActiveSafeLoginGeneration(generation) }) else {
+                SafeLoginDebug.log("stale previous-session result ignored phase=beginFanLoginSession")
                 return
             }
 
@@ -2593,38 +3075,64 @@ extension MapViewModel {
                     bumpCurrentUserAvatarDisplayRefresh()
                 }
                 FanGeoStartupGuidePreferences.migrateLegacyGlobalPreferenceIfNeeded(for: session.user.id)
+                SafeLoginDebug.log("minimum profile/preferences loading started")
             }
 
             await persistAccountModeForActiveAuthSession(.fanUser)
 
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
 
-            await registerFanActiveSessionOnLogin()
-            // Logout clears FavoriteTeamsStore AppStorage; force a server reload so Profile does not keep "Add Team".
+            await MainActor.run {
+                completeSafeLoginSuccess(generation: generation, accountKind: "fan")
+            }
+
+            // Secondary hydration — must not block authenticated root.
             Task {
+                await registerFanActiveSessionOnLogin()
                 await loadFavoriteTeamsFromSupabase(forceRefresh: true)
                 await refreshUserPersonalizationInBackground()
             }
         } catch {
             await MainActor.run {
+                guard isActiveSafeLoginGeneration(generation) else {
+                    SafeLoginDebug.log("stale previous-session result ignored phase=catch")
+                    return
+                }
+                // Never wipe a successfully established session from a racing older attempt.
+                if isLoggedIn, currentUserAuthId != nil {
+                    SafeLoginDebug.log("stale previous-session result ignored phase=catchAlreadyAuthenticated")
+                    return
+                }
+
                 isLoggedIn = false
                 currentUserAuthId = nil
                 markAuthSignedOut(reason: "loginUserError")
 
                 let message = error.localizedDescription.lowercased()
+                let userMessage: String
 
                 if Self.isUnconfirmedEmailAuthError(error) {
-                    authErrorMessage = "Please verify your email before signing in."
+                    userMessage = "Please verify your email before signing in."
+                    authErrorMessage = userMessage
                     emailVerifiedSignInNotice = ""
                     markEmailVerificationPending(email: fanEmail, kind: .fan)
                     print("[EmailVerifyDebug] signInBlockedUnconfirmed=true")
                 } else if message.contains("invalid login credentials") {
-                    authErrorMessage = "No account found or incorrect password."
+                    userMessage = "No account found or incorrect password."
+                    authErrorMessage = userMessage
                     emailVerifiedSignInNotice = ""
                 } else {
-                    authErrorMessage = "Unable to login."
+                    userMessage = "Unable to login."
+                    authErrorMessage = userMessage
                     emailVerifiedSignInNotice = ""
                 }
+
+                failSafeLogin(
+                    generation: generation,
+                    message: userMessage,
+                    accountMode: .fan,
+                    failurePhase: "signInError"
+                )
             }
 
             print("LOGIN ERROR:", error)
@@ -3241,13 +3749,20 @@ extension MapViewModel {
 #if DEBUG
         print("[Auth] logout requested")
 #endif
+        SafeLogoutDebug.step("logoutUser_enter", detail: "reason=\(reason)")
         let preservedAuthErrorMessage = preserveAuthErrorMessage ? await MainActor.run { authErrorMessage } : ""
+
+        await MainActor.run {
+            AgeAccessGateService.shared.handleLogoutOrAccountSwitch()
+        }
+        SafeLogoutDebug.step("age_access_gate_cleared")
 
         let didLogout = await forceLogout(reason: reason, source: "MapViewModel.logoutUser")
         guard didLogout else {
 #if DEBUG
             print("[Auth] logout failed; local auth state preserved")
 #endif
+            SafeLogoutDebug.step("logoutUser_forceLogout_returned_false")
             return false
         }
 
@@ -3261,7 +3776,395 @@ extension MapViewModel {
         print("[Auth] local auth state cleared")
         print("[Auth] explicit logout marker set")
 #endif
+        SafeLogoutDebug.step("logoutUser_return_true")
         return true
+    }
+
+    /// True while the shared safe-logout overlay should block authenticated UI / tab bar.
+    var isSafeLogoutBlockingUI: Bool {
+        switch safeLogoutPhase {
+        case .loggingOut, .failed:
+            return true
+        case .idle:
+            return false
+        }
+    }
+
+    /// True while shared safe-login progress should block competing auth actions / sheet dismissal.
+    var isSafeLoginBlockingUI: Bool {
+        switch safeLoginPhase {
+        case .authenticating, .preparingSession:
+            return true
+        case .idle:
+            return false
+        }
+    }
+
+    var isSafeLoginInFlight: Bool {
+        isSafeLoginBlockingUI
+    }
+
+    /// Suppress new authenticated profile/tab activation work during logout.
+    var shouldSuppressAuthenticatedRefreshForSafeLogout: Bool {
+        safeLogoutPhase == .loggingOut || FanGeoExplicitLogoutGuard.isInProgress
+    }
+
+    /// Single authoritative user-initiated logout. Progress is session-owned, not Settings `@State`.
+    @MainActor
+    func beginSafeUserLogout(source: String) {
+        if isSafeLoginInFlight {
+            SafeLogoutDebug.log("logout blocked loginInFlight source=\(source)")
+            return
+        }
+        if safeLogoutPhase == .loggingOut {
+            SafeLogoutDebug.log("duplicate request ignored source=\(source)")
+            return
+        }
+        if let existing = safeLogoutTask, !existing.isCancelled {
+            SafeLogoutDebug.log("duplicate request ignored inFlight source=\(source)")
+            return
+        }
+
+        safeLogoutSource = source
+        safeLogoutFailureMessage = ""
+        safeLogoutNeedsDiscoverReset = false
+        safeLogoutLocalSessionInvalidated = false
+        safeLogoutWatchdogTask?.cancel()
+        safeLogoutWatchdogTask = nil
+        safeLogoutPhase = .loggingOut
+        safeLogoutStartedAt = Date()
+        // Authoritative in-progress guard: every realtime/presence/session startup must refuse
+        // authenticated work while this is true, even before isLoggedIn flips.
+        FanGeoExplicitLogoutGuard.isInProgress = true
+        SafeLogoutDebug.step("explicit_logout_guard_enabled")
+        SafeLogoutDebug.beginPipeline(source: source)
+        SafeLogoutDebug.log("logout requested source=\(source)")
+        SafeLogoutDebug.log("state changed to logging out")
+        SafeLogoutDebug.log("authenticated refresh suppression enabled")
+
+        // Cancel any leftover listen tasks / channels immediately so a lifecycle callback
+        // cannot re-attach them between this moment and forceLogout's abandon pass.
+        PresenceService.shared.stop(reason: "explicitLogoutBegin")
+        ActivityStatusMinuteClock.shared.stop(reason: "explicitLogoutBegin")
+        abandonAuthenticatedRealtimeForLogout()
+        abandonFanSingleSessionForLogout(knownUserId: currentUserAuthId)
+
+        safeLogoutTask = Task { @MainActor [weak self] in
+            defer {
+                // Always clear the task reference — cancellation / unexpected exit must not
+                // leave a permanently non-nil handle that blocks future logout attempts.
+                self?.safeLogoutTask = nil
+            }
+            guard let self else { return }
+            SafeLogoutDebug.step("logoutUser_begin")
+            let didLogout = await self.logoutUser(reason: "explicitUserLogout")
+            guard !Task.isCancelled else {
+                SafeLogoutDebug.step("logout_cancelled")
+                FanGeoExplicitLogoutGuard.isInProgress = false
+                return
+            }
+            if didLogout {
+                SafeLogoutDebug.step("logoutUser_succeeded")
+                SafeLogoutDebug.log("auth sign-out completed")
+                SafeLogoutDebug.log("local cleanup completed")
+                self.safeLogoutNeedsDiscoverReset = true
+                SafeLogoutDebug.step("discover_reset_requested")
+                SafeLogoutDebug.step("present_signed_out_root_requested")
+                SafeLogoutDebug.log("root session changed to signed out")
+                // Keep `loggingOut` until MainTabView selects Discover and acknowledges settlement.
+                // Independent watchdog guarantees the overlay clears even if that ack is missed.
+                self.startSafeLogoutUISettlementWatchdog()
+            } else {
+                let message = self.authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? self.venueAuthErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : self.authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                self.safeLogoutFailureMessage = message
+                self.safeLogoutPhase = .failed
+                FanGeoExplicitLogoutGuard.isInProgress = false
+                SafeLogoutDebug.endPipeline(success: false)
+                SafeLogoutDebug.log("failure and recovery path messageEmpty=\(message.isEmpty)")
+            }
+        }
+    }
+
+    /// Network-independent watchdog: if MainTabView never acknowledges the signed-out Discover
+    /// root (e.g. the root remounted and the `onChange` was missed), this finalizes the overlay
+    /// itself — but only after confirming the logout genuinely succeeded locally. It can never
+    /// fabricate success while a reusable session might remain.
+    @MainActor
+    private func startSafeLogoutUISettlementWatchdog() {
+        safeLogoutWatchdogTask?.cancel()
+        safeLogoutWatchdogTask = Task { @MainActor [weak self] in
+            // Short main-actor window for the normal MainTabView acknowledgement first.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, !Task.isCancelled else { return }
+            guard self.safeLogoutPhase == .loggingOut else { return }
+            guard !self.isLoggedIn,
+                  !self.isVenueOwnerLoggedIn,
+                  self.safeLogoutLocalSessionInvalidated,
+                  UserDefaults.standard.bool(forKey: Self.didExplicitlyLogoutKey) else {
+                SafeLogoutDebug.step("ui_settlement_watchdog_skipped_conditions_unmet")
+                return
+            }
+            SafeLogoutDebug.step("ui_settlement_watchdog_fired")
+            self.acknowledgeSafeLogoutUISettled(reason: "watchdogFallback")
+        }
+    }
+
+    @MainActor
+    func retrySafeUserLogout() {
+        SafeLogoutDebug.log("retry requested source=\(safeLogoutSource)")
+        let source = safeLogoutSource.isEmpty ? "retrySafeUserLogout" : safeLogoutSource
+        safeLogoutWatchdogTask?.cancel()
+        safeLogoutWatchdogTask = nil
+        safeLogoutPhase = .idle
+        FanGeoExplicitLogoutGuard.isInProgress = false
+        beginSafeUserLogout(source: source)
+    }
+
+    @MainActor
+    func cancelSafeLogoutFailureUI() {
+        guard safeLogoutPhase == .failed else { return }
+        safeLogoutWatchdogTask?.cancel()
+        safeLogoutWatchdogTask = nil
+        safeLogoutPhase = .idle
+        safeLogoutFailureMessage = ""
+        FanGeoExplicitLogoutGuard.isInProgress = false
+        SafeLogoutDebug.log("failure UI dismissed")
+    }
+
+    /// Call from MainTabView after Discover is selected and authenticated roots are no longer interactive.
+    @MainActor
+    func acknowledgeSafeLogoutUISettled(reason: String) {
+        guard safeLogoutPhase == .loggingOut else { return }
+        guard !isLoggedIn, !isVenueOwnerLoggedIn else { return }
+        // Idempotent: the normal MainTabView ack and the watchdog both route here; the first
+        // one wins and cancels the other.
+        safeLogoutWatchdogTask?.cancel()
+        safeLogoutWatchdogTask = nil
+        safeLogoutNeedsDiscoverReset = false
+        safeLogoutPhase = .idle
+        FanGeoExplicitLogoutGuard.isInProgress = false
+        let ms: Int
+        if let started = safeLogoutStartedAt {
+            ms = Int(Date().timeIntervalSince(started) * 1000)
+        } else {
+            ms = -1
+        }
+        safeLogoutStartedAt = nil
+        SafeLogoutDebug.step("discover_reset_acknowledged", detail: "reason=\(reason)")
+        SafeLogoutDebug.step("present_login_or_discover_root", detail: "reason=\(reason)")
+        SafeLogoutDebug.step("overlay_cleared")
+        SafeLogoutDebug.log("signed-out root appeared reason=\(reason)")
+        SafeLogoutDebug.log("progress presentation cleared")
+        SafeLogoutDebug.log("total logout durationMs=\(ms)")
+        SafeLogoutDebug.endPipeline(success: true)
+    }
+
+    // MARK: - Safe login coordinator
+
+    /// Begins a session-owned login transition. Returns a generation token, or `nil` if ignored.
+    @MainActor
+    @discardableResult
+    func beginSafeLogin(method: SafeLoginMethod, source: String) -> UInt64? {
+        if isSafeLogoutBlockingUI {
+            SafeLoginDebug.log("login blocked logoutIncomplete source=\(source) method=\(method.rawValue)")
+            authErrorMessage = "Please wait until sign-out finishes, then try again."
+            venueAuthErrorMessage = authErrorMessage
+            return nil
+        }
+        if isSafeLoginInFlight {
+            SafeLoginDebug.log("duplicate login ignored source=\(source) method=\(method.rawValue)")
+            return nil
+        }
+        if let existing = safeLoginTask, !existing.isCancelled {
+            SafeLoginDebug.log("duplicate login ignored inFlight source=\(source) method=\(method.rawValue)")
+            return nil
+        }
+
+        safeLoginGeneration &+= 1
+        let generation = safeLoginGeneration
+        safeLoginMethod = method
+        safeLoginSource = source
+        safeLoginStartedAt = Date()
+        safeLoginAuthCompletedAt = nil
+        safeLoginNeedsDiscoverReset = false
+        safeLoginPhase = .authenticating
+        authErrorMessage = ""
+        venueAuthErrorMessage = ""
+        SafeLoginDebug.log("login tap received source=\(source) method=\(method.rawValue)")
+        SafeLoginDebug.log("validation started")
+        SafeLoginDebug.log("validation completed")
+        SafeLoginDebug.log("authentication started method=\(method.rawValue)")
+        SafeLoginDebug.log("state changed to authenticating")
+        return generation
+    }
+
+    @MainActor
+    func markSafeLoginPreparingSession(generation: UInt64) {
+        guard generation == safeLoginGeneration else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=preparingSession")
+            return
+        }
+        guard safeLoginPhase == .authenticating || safeLoginPhase == .preparingSession else { return }
+        if safeLoginAuthCompletedAt == nil {
+            safeLoginAuthCompletedAt = Date()
+            if let started = safeLoginStartedAt {
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                SafeLoginDebug.log("authentication succeeded tapToAuthMs=\(ms)")
+            } else {
+                SafeLoginDebug.log("authentication succeeded")
+            }
+            SafeLoginDebug.log("authenticated user ID changed")
+        }
+        if safeLoginPhase != .preparingSession {
+            safeLoginPhase = .preparingSession
+            SafeLoginDebug.log("session preparation started")
+            SafeLoginDebug.log("state changed to preparingSession")
+            SafeLoginDebug.log("account type resolution started")
+            SafeLoginDebug.log("previous-account caches cleared")
+        }
+    }
+
+    @MainActor
+    func completeSafeLoginSuccess(generation: UInt64, accountKind: String) {
+        guard generation == safeLoginGeneration else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=success")
+            return
+        }
+        guard isSafeLoginInFlight else { return }
+
+        SafeLoginDebug.log("account type resolution completed kind=\(accountKind)")
+        SafeLoginDebug.log("minimum profile/preferences loading completed")
+        SafeLoginDebug.log("authenticated root transition started")
+        safeLoginNeedsDiscoverReset = true
+        safeLoginPhase = .idle
+        safeLoginTask = nil
+
+        let tapToRootMs: Int
+        let tapToAuthMs: Int
+        if let started = safeLoginStartedAt {
+            tapToRootMs = Int(Date().timeIntervalSince(started) * 1000)
+        } else {
+            tapToRootMs = -1
+        }
+        if let started = safeLoginStartedAt, let authAt = safeLoginAuthCompletedAt {
+            tapToAuthMs = Int(authAt.timeIntervalSince(started) * 1000)
+        } else {
+            tapToAuthMs = -1
+        }
+        safeLoginStartedAt = nil
+        safeLoginAuthCompletedAt = nil
+        SafeLoginDebug.log("secondary hydration started")
+        SafeLoginDebug.log("login state cleared")
+        SafeLoginDebug.log("tapToAuthenticationMs=\(tapToAuthMs)")
+        SafeLoginDebug.log("tapToAuthenticatedRootMs=\(tapToRootMs)")
+    }
+
+    /// Call from MainTabView after Discover is forced for the new authenticated session.
+    @MainActor
+    func acknowledgeSafeLoginUISettled(reason: String) {
+        guard safeLoginNeedsDiscoverReset else { return }
+        safeLoginNeedsDiscoverReset = false
+        SafeLoginDebug.log("authenticated root appeared reason=\(reason)")
+    }
+
+    @MainActor
+    func failSafeLogin(
+        generation: UInt64,
+        message: String,
+        accountMode: AppleAuthAccountMode = .fan,
+        failurePhase: String
+    ) {
+        guard generation == safeLoginGeneration else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=failure")
+            return
+        }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        safeLoginPhase = .idle
+        safeLoginTask = nil
+        safeLoginNeedsDiscoverReset = false
+        safeLoginStartedAt = nil
+        safeLoginAuthCompletedAt = nil
+        switch accountMode {
+        case .fan:
+            authErrorMessage = trimmed.isEmpty ? "Unable to login." : trimmed
+        case .business:
+            venueAuthErrorMessage = trimmed.isEmpty ? "Unable to login venue owner." : trimmed
+        }
+        SafeLoginDebug.log("authentication failed phase=\(failurePhase)")
+        SafeLoginDebug.log("failure phase and recovery path=\(failurePhase)")
+        SafeLoginDebug.log("login state cleared")
+    }
+
+    /// Clears login progress without forcing an error (onboarding / gate handoff).
+    @MainActor
+    func clearSafeLoginProgress(generation: UInt64, reason: String) {
+        guard generation == safeLoginGeneration else {
+            SafeLoginDebug.log("stale previous-session result ignored phase=clear")
+            return
+        }
+        safeLoginPhase = .idle
+        safeLoginTask = nil
+        safeLoginNeedsDiscoverReset = false
+        safeLoginStartedAt = nil
+        safeLoginAuthCompletedAt = nil
+        SafeLoginDebug.log("login state cleared reason=\(reason)")
+    }
+
+    /// True when this login generation is still the active in-flight attempt.
+    @MainActor
+    func isActiveSafeLoginGeneration(_ generation: UInt64) -> Bool {
+        generation == safeLoginGeneration && isSafeLoginInFlight
+    }
+
+    /// Fan email/password login owned by the session coordinator (survives sheet reconstruction).
+    @MainActor
+    func submitFanEmailLogin(email: String, password: String, source: String) {
+        guard let generation = beginSafeLogin(method: .emailPasswordFan, source: source) else { return }
+        safeLoginTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.safeLoginTask = nil }
+            await self.loginUser(email: email, password: password, loginGeneration: generation)
+            // Safety net if loginUser returned without completing/failing the coordinator.
+            if self.isActiveSafeLoginGeneration(generation) {
+                if self.isLoggedIn {
+                    self.completeSafeLoginSuccess(generation: generation, accountKind: "fan")
+                } else {
+                    let message = self.authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.failSafeLogin(
+                        generation: generation,
+                        message: message.isEmpty ? "Unable to login." : message,
+                        accountMode: .fan,
+                        failurePhase: "loginUserEarlyReturn"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Business email/password login owned by the session coordinator.
+    @MainActor
+    func submitBusinessEmailLogin(email: String, password: String, source: String) {
+        guard let generation = beginSafeLogin(method: .emailPasswordBusiness, source: source) else { return }
+        safeLoginTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.safeLoginTask = nil }
+            await self.loginVenueOwner(email: email, password: password, loginGeneration: generation)
+            if self.isActiveSafeLoginGeneration(generation) {
+                if self.isVenueOwnerLoggedIn {
+                    self.completeSafeLoginSuccess(generation: generation, accountKind: "business")
+                } else {
+                    let message = self.venueAuthErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.failSafeLogin(
+                        generation: generation,
+                        message: message.isEmpty ? "Unable to login venue owner." : message,
+                        accountMode: .business,
+                        failurePhase: "loginVenueOwnerEarlyReturn"
+                    )
+                }
+            }
+        }
     }
 
     func hasValidSession() async -> Bool {
@@ -3328,7 +4231,13 @@ extension MapViewModel {
         sessionEmail: String,
         clearVenueOwnerCaches: Bool
     ) async {
-        guard await claimAccountIdentity(.fan, context: "fanSessionRestore") else {
+        // Restore-only: the session already exists, so only a server-confirmed account-type
+        // conflict may tear it down. Cancellation or a network blip must leave it untouched.
+        guard await claimAccountIdentity(
+            .fan,
+            context: "fanSessionRestore",
+            inconclusiveFailurePolicy: .preserveSession
+        ) else {
             return
         }
 
@@ -3359,10 +4268,14 @@ extension MapViewModel {
             currentUserHomeRegion = UserDefaults.standard.string(forKey: "cachedUserHomeRegion") ?? ""
             currentUserHomeCountry = UserDefaults.standard.string(forKey: "cachedUserHomeCountry") ?? ""
             currentUserShowHomeCity = UserDefaults.standard.object(forKey: "cachedUserShowHomeCity") as? Bool ?? false
+            currentUserProfileBackgroundKey = ProfileBackgroundCatalog.resolveKey(
+                UserDefaults.standard.string(forKey: "cachedUserProfileBackgroundKey")
+            )
             currentUserLiveVisibilityEnabled = UserDefaults.standard.object(forKey: "cachedUserLiveVisibilityEnabled") as? Bool ?? true
             currentUserLiveVisibilityMode = cachedLiveVisibilityMode()
             currentUserSelectedLiveVisibilityFriendIDs = cachedSelectedLiveVisibilityFriendIDs()
             currentUserDiscoverableByFans = UserDefaults.standard.object(forKey: "cachedUserDiscoverableByFans") as? Bool ?? true
+            currentUserActivityStatusVisible = UserDefaults.standard.object(forKey: "cachedUserActivityStatusVisible") as? Bool ?? true
             currentUserEmail = sessionEmail
             isLoggedIn = !sessionEmail.isEmpty
             isVenueOwnerLoggedIn = false
@@ -3637,10 +4550,14 @@ extension MapViewModel {
                         currentUserHomeRegion = UserDefaults.standard.string(forKey: "cachedUserHomeRegion") ?? ""
                         currentUserHomeCountry = UserDefaults.standard.string(forKey: "cachedUserHomeCountry") ?? ""
                         currentUserShowHomeCity = UserDefaults.standard.object(forKey: "cachedUserShowHomeCity") as? Bool ?? false
+                        currentUserProfileBackgroundKey = ProfileBackgroundCatalog.resolveKey(
+                            UserDefaults.standard.string(forKey: "cachedUserProfileBackgroundKey")
+                        )
                         currentUserLiveVisibilityEnabled = UserDefaults.standard.object(forKey: "cachedUserLiveVisibilityEnabled") as? Bool ?? true
                         currentUserLiveVisibilityMode = cachedLiveVisibilityMode()
                         currentUserSelectedLiveVisibilityFriendIDs = cachedSelectedLiveVisibilityFriendIDs()
                         currentUserDiscoverableByFans = UserDefaults.standard.object(forKey: "cachedUserDiscoverableByFans") as? Bool ?? true
+            currentUserActivityStatusVisible = UserDefaults.standard.object(forKey: "cachedUserActivityStatusVisible") as? Bool ?? true
                         currentUserAuthId = session.user.id
                         markAuthSignedIn(reason: "adminSessionRestore")
                         clearVenueOwnerOwnedBusinessCaches()
@@ -3890,6 +4807,7 @@ extension MapViewModel {
 #endif
 
                 print("USER PROFILE LOADED")
+                await refreshProfileXP()
             } else {
 #if DEBUG
                 print("[ProfilePersistenceDebug] existingProfileFound=false")
@@ -3962,8 +4880,14 @@ extension MapViewModel {
     }
 
     /// Writes avatar URLs to `user_profiles` without touching identity/handle fields.
+    /// Publishes ``FanProfileChangeCenter`` only after the profile row update succeeds.
     @discardableResult
-    func persistUserProfileAvatar(fullURL: String, thumbnailURL: String?) async -> String? {
+    func persistUserProfileAvatar(
+        fullURL: String,
+        thumbnailURL: String?,
+        replacedFullURL: String? = nil,
+        replacedThumbnailURL: String? = nil
+    ) async -> String? {
         let session: Session
         do {
             session = try await supabase.auth.session
@@ -4004,20 +4928,109 @@ extension MapViewModel {
                 .eq("id", value: authIdKey)
                 .execute()
 
+            let change = FanProfileAvatarChange(
+                userId: authId,
+                avatarURL: canonFull,
+                avatarThumbnailURL: finalThumb
+            )
             await MainActor.run {
                 currentUserAvatarURL = canonFull
                 currentUserAvatarThumbnailURL = finalThumb ?? ""
                 bumpCurrentUserAvatarDisplayRefresh()
                 cacheCurrentUserProfileLocally()
+                applyFanProfileAvatarChangeToLocalCaches(change)
             }
+            FanProfileChangeCenter.postAvatarChange(change)
 #if DEBUG
             ProfileAvatarDebug.profileUpdated(avatarURLPresent: true)
 #endif
+            Task {
+                await deleteReplacedStorageObjectIfNeeded(
+                    oldPublicURL: replacedFullURL,
+                    newPublicURL: canonFull,
+                    bucket: "user-avatars"
+                )
+                await deleteReplacedStorageObjectIfNeeded(
+                    oldPublicURL: replacedThumbnailURL,
+                    newPublicURL: finalThumb ?? canonFull,
+                    bucket: "user-avatars"
+                )
+            }
             return nil
         } catch {
             print("ERROR PERSISTING USER AVATAR:", error)
+            // Orphan cleanup: remove newly uploaded objects that never became the profile URL.
+            Task {
+                await deleteReplacedStorageObjectIfNeeded(
+                    oldPublicURL: canonFull,
+                    newPublicURL: "",
+                    bucket: "user-avatars"
+                )
+                if let finalThumb, !finalThumb.isEmpty {
+                    await deleteReplacedStorageObjectIfNeeded(
+                        oldPublicURL: finalThumb,
+                        newPublicURL: "",
+                        bucket: "user-avatars"
+                    )
+                }
+            }
             return "Couldn't save your avatar. Please try again."
         }
+    }
+
+    /// Merges a coarse avatar URL change into MapViewModel profile presentation caches.
+    @MainActor
+    func applyFanProfileAvatarChangeToLocalCaches(_ change: FanProfileAvatarChange) {
+        let userId = change.userId
+        let full = change.avatarURL
+        let thumb = change.avatarThumbnailURL
+
+        func patched(_ row: UserProfileRow) -> UserProfileRow {
+            UserProfileRow(
+                id: row.id,
+                email: row.email,
+                display_name: row.display_name,
+                username: row.username,
+                bio: row.bio,
+                avatar_url: full.isEmpty ? row.avatar_url : full,
+                avatar_thumbnail_url: thumb ?? row.avatar_thumbnail_url,
+                is_business_account: row.is_business_account,
+                admin_status: row.admin_status,
+                live_visibility_enabled: row.live_visibility_enabled,
+                live_visibility_mode: row.live_visibility_mode,
+                selected_live_visibility_friend_ids: row.selected_live_visibility_friend_ids,
+                discoverable_by_fans: row.discoverable_by_fans,
+                activity_status_visible: row.activity_status_visible,
+                is_deleted: row.is_deleted,
+                created_at: row.created_at,
+                last_seen_at: row.last_seen_at,
+                national_team_country_code: row.national_team_country_code,
+                national_team_country_name: row.national_team_country_name,
+                national_team_flag: row.national_team_flag,
+                national_team_supporter_label: row.national_team_supporter_label,
+                national_team_updated_at: row.national_team_updated_at,
+                ad_free_enabled: row.ad_free_enabled,
+                home_city: row.home_city,
+                home_region: row.home_region,
+                home_country: row.home_country,
+                show_home_city: row.show_home_city,
+                profile_background_key: row.profile_background_key
+            )
+        }
+
+        for (key, row) in userProfilesByEmail where row.id == userId {
+            userProfilesByEmail[key] = patched(row)
+        }
+        if let row = pickupJoinRequesterProfileByUserId[userId] {
+            pickupJoinRequesterProfileByUserId[userId] = patched(row)
+        }
+        goingUserProfiles = goingUserProfiles.map { $0.id == userId ? patched($0) : $0 }
+        for eventID in goingProfilesByVenueEventID.keys {
+            goingProfilesByVenueEventID[eventID] = goingProfilesByVenueEventID[eventID]?.map {
+                $0.id == userId ? patched($0) : $0
+            }
+        }
+        ProfilePhase1PersonalizationCache.applyAvatarChange(change)
     }
 
     /// Upserts `user_profiles` keyed by authenticated user id. Returns `nil` on success, or a user-visible error string.
@@ -4370,6 +5383,13 @@ extension MapViewModel {
                     currentUserAvatarURL = finalAvatarURL
                     currentUserAvatarThumbnailURL = finalAvatarThumbnailURL ?? ""
                     bumpCurrentUserAvatarDisplayRefresh()
+                    let change = FanProfileAvatarChange(
+                        userId: authId,
+                        avatarURL: finalAvatarURL,
+                        avatarThumbnailURL: finalAvatarThumbnailURL
+                    )
+                    applyFanProfileAvatarChangeToLocalCaches(change)
+                    FanProfileChangeCenter.postAvatarChange(change)
                 } else if !finalAvatarURL.isEmpty {
                     currentUserAvatarURL = finalAvatarURL
                     currentUserAvatarThumbnailURL = finalAvatarThumbnailURL ?? ""
@@ -4494,6 +5514,52 @@ extension MapViewModel {
         }
     }
 
+    func setActivityStatusVisible(_ visible: Bool) async {
+        let session: Session
+        do {
+            session = try await supabase.auth.session
+        } catch {
+            await MainActor.run {
+                socialActionToastText = "Sign in to update activity status."
+                socialActionToastIsError = true
+            }
+            return
+        }
+
+        let previous = await MainActor.run { currentUserActivityStatusVisible }
+        guard previous != visible else { return }
+
+        await MainActor.run {
+            currentUserActivityStatusVisible = visible
+            isUpdatingActivityStatusVisibilitySetting = true
+            cacheCurrentUserProfileLocally()
+        }
+
+        do {
+            try await supabase
+                .from("user_profiles")
+                .update(UserProfileActivityStatusVisibilityPatch(activity_status_visible: visible))
+                .eq("id", value: session.user.id.uuidString.lowercased())
+                .execute()
+            await MainActor.run {
+                isUpdatingActivityStatusVisibilitySetting = false
+            }
+            ActivityStatusDebug.lifecycle(
+                visible ? "activity visibility enabled" : "activity visibility disabled",
+                details: "saved=true"
+            )
+        } catch {
+            await MainActor.run {
+                currentUserActivityStatusVisible = previous
+                isUpdatingActivityStatusVisibilitySetting = false
+                cacheCurrentUserProfileLocally()
+                socialActionToastText = "Couldn’t update activity status. Please try again."
+                socialActionToastIsError = true
+            }
+            ActivityStatusDebug.lifecycle("statistics request failed", details: "reason=activity_visibility_save")
+        }
+    }
+
     @discardableResult
     func saveNationalTeamIdentity(_ identity: NationalTeamIdentity) async -> String? {
         let session: Session
@@ -4595,6 +5661,39 @@ extension MapViewModel {
             Self.logPostgrestError("[HomeCityDebug] save failed", error)
 #endif
             return "Couldn’t save your home city. Please try again."
+        }
+    }
+
+    @discardableResult
+    func saveUserProfileBackgroundKey(_ key: ProfileBackgroundKey) async -> String? {
+        let session: Session
+        do {
+            session = try await supabase.auth.session
+        } catch {
+            return "Sign in to update your profile background."
+        }
+
+        let resolved = ProfileBackgroundCatalog.resolveKey(key.rawValue)
+        let patch = UserProfileBackgroundPatch(profile_background_key: resolved.rawValue)
+
+        do {
+            try await supabase
+                .from("user_profiles")
+                .update(patch)
+                .eq("id", value: session.user.id.uuidString.lowercased())
+                .execute()
+
+            await MainActor.run {
+                currentUserProfileBackgroundKey = resolved
+                cacheCurrentUserProfileLocally()
+                publicProfileBioRevision &+= 1
+            }
+            return nil
+        } catch {
+#if DEBUG
+            Self.logPostgrestError("[ProfileBackground] save failed", error)
+#endif
+            return "Couldn’t save your profile background. Please try again."
         }
     }
 
@@ -4897,7 +5996,9 @@ extension MapViewModel {
     }
 
     /// Uploads full + thumbnail JPEGs to `user-avatars` under `{auth_user_uuid}/` (RLS: first path segment must equal `auth.uid()`).
-    func uploadUserAvatar(data: Data, fileName: String) async -> UploadedAvatarURLs? {
+    /// Always uses a unique versioned object path so the public URL changes on every successful upload.
+    /// Does not delete the previous object — callers must delete via ``UploadedAvatarURLs/replacedFullURL`` only after the profile row is updated.
+    func uploadUserAvatar(data: Data, fileName: String? = nil) async -> UploadedAvatarURLs? {
         do {
             let session = try await supabase.auth.session
             let authUserId = session.user.id
@@ -4907,11 +6008,9 @@ extension MapViewModel {
 #endif
             let folder = authUserId.uuidString.lowercased()
 
-            let normalizedFileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalizedFileName.isEmpty else {
-                print("INVALID AVATAR FILE NAME")
-                return nil
-            }
+            let requested = (fileName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            _ = requested // Call sites may still pass a hint; uploads always use a unique versioned path.
+            let normalizedFileName = Self.makeVersionedAvatarFileName()
 
             let pathFull = "\(folder)/\(normalizedFileName)"
             let thumbName = Self.companionAvatarThumbnailFileName(for: normalizedFileName)
@@ -4930,7 +6029,7 @@ extension MapViewModel {
                     data: uploadFull,
                     options: FileOptions(
                         contentType: "image/jpeg",
-                        upsert: true
+                        upsert: false
                     )
                 )
 
@@ -4941,7 +6040,7 @@ extension MapViewModel {
                     data: uploadThumb,
                     options: FileOptions(
                         contentType: "image/jpeg",
-                        upsert: true
+                        upsert: false
                     )
                 )
 
@@ -4955,13 +6054,16 @@ extension MapViewModel {
             let fullStr = ImageDisplayURL.canonicalStorageURLString(publicFull.absoluteString)
             let thumbStr = ImageDisplayURL.canonicalStorageURLString(publicThumb.absoluteString)
 
-            await deleteReplacedStorageObjectIfNeeded(oldPublicURL: oldFull.isEmpty ? nil : oldFull, newPublicURL: fullStr, bucket: "user-avatars")
-            await deleteReplacedStorageObjectIfNeeded(oldPublicURL: oldThumb.isEmpty ? nil : oldThumb, newPublicURL: thumbStr, bucket: "user-avatars")
-
 #if DEBUG
             ProfileAvatarDebug.uploadSucceeded(urlPresent: !fullStr.isEmpty)
+            assert(fullStr != oldFull || oldFull.isEmpty, "Avatar upload must produce a new public URL")
 #endif
-            return UploadedAvatarURLs(fullURL: fullStr, thumbnailURL: thumbStr)
+            return UploadedAvatarURLs(
+                fullURL: fullStr,
+                thumbnailURL: thumbStr,
+                replacedFullURL: oldFull.isEmpty ? nil : oldFull,
+                replacedThumbnailURL: oldThumb.isEmpty ? nil : oldThumb
+            )
 
         } catch {
             print("ERROR UPLOADING USER AVATAR:", error)
@@ -5144,10 +6246,12 @@ extension MapViewModel {
         UserDefaults.standard.set(currentUserLiveVisibilityEnabled, forKey: "cachedUserLiveVisibilityEnabled")
         UserDefaults.standard.set(currentUserLiveVisibilityMode.rawValue, forKey: "cachedUserLiveVisibilityMode")
         UserDefaults.standard.set(currentUserDiscoverableByFans, forKey: "cachedUserDiscoverableByFans")
+        UserDefaults.standard.set(currentUserActivityStatusVisible, forKey: "cachedUserActivityStatusVisible")
         UserDefaults.standard.set(currentUserHomeCity, forKey: "cachedUserHomeCity")
         UserDefaults.standard.set(currentUserHomeRegion, forKey: "cachedUserHomeRegion")
         UserDefaults.standard.set(currentUserHomeCountry, forKey: "cachedUserHomeCountry")
         UserDefaults.standard.set(currentUserShowHomeCity, forKey: "cachedUserShowHomeCity")
+        UserDefaults.standard.set(currentUserProfileBackgroundKey.rawValue, forKey: "cachedUserProfileBackgroundKey")
         UserDefaults.standard.set(
             currentUserSelectedLiveVisibilityFriendIDs.map { $0.uuidString.lowercased() }.sorted(),
             forKey: "cachedUserSelectedLiveVisibilityFriendIDs"

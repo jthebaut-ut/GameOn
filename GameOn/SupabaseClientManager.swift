@@ -13,6 +13,35 @@ let supabase = SupabaseClient(
     )
 )
 
+/// The Supabase Auth SDK's documented default local-session storage key
+/// (`Sources/Auth/Internal/Constants.swift`: `defaultStorageKey = "supabase.auth.token"`).
+///
+/// The client above is created without a custom `storageKey`, so this default applies and
+/// the truly-local logout purge below must use the same key.
+let supabaseDefaultAuthStorageKey = "supabase.auth.token"
+
+/// Synchronously removes the locally persisted Supabase auth session using the SDK's own
+/// public ``KeychainLocalStorage`` adapter and documented default storage key. Fully local
+/// and network-independent.
+///
+/// This is the bounded fallback for explicit logout: `AuthClient.signOut` removes the local
+/// session as an actor-isolated step *before* its `/logout` network call, but if that actor
+/// is blocked (e.g. a hung token refresh), the awaited removal can stall. A freshly
+/// constructed `KeychainLocalStorage()` targets the exact same keychain service
+/// (`supabase.gotrue.swift`) and item the client uses (the client uses the default local
+/// storage), so removing the key here provably invalidates the reusable session.
+///
+/// Returns `true` when no reusable session remains afterwards (`currentSession == nil`).
+@discardableResult
+func purgeSupabaseLocalAuthSessionStorage() -> Bool {
+    let storage = KeychainLocalStorage()
+    try? storage.remove(key: supabaseDefaultAuthStorageKey)
+    // PKCE code verifier is scoped to `<storageKey>-code-verifier`; drop it too so a partial
+    // in-flight sign-in cannot leave reusable auth material behind.
+    try? storage.remove(key: "\(supabaseDefaultAuthStorageKey)-code-verifier")
+    return supabase.auth.currentSession == nil
+}
+
 enum SupabaseAuthSessionResolution {
     case active(Session)
     case missingSession

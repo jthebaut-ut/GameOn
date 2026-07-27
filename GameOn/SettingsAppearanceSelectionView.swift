@@ -31,7 +31,7 @@ struct FanGeoAppearanceSelectionView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .listRowBackground(FGAdaptiveSurface.cardElevated)
+                    .listRowBackground(FGAdaptiveSurface.cardElevated(colorScheme))
                 }
             } footer: {
                 Text("System Default follows your iPhone appearance. Light and Dark override FanGeo locally on this device.")
@@ -39,7 +39,7 @@ struct FanGeoAppearanceSelectionView: View {
             }
         }
         .scrollContentBackground(.hidden)
-        .background(FGAdaptiveSurface.sheetRoot.ignoresSafeArea())
+        .background(FGAdaptiveSurface.sheetRoot(colorScheme).ignoresSafeArea())
         .tint(FGColor.accentGreen)
     }
 }

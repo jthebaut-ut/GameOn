@@ -29,7 +29,9 @@ struct LiveScreen: View {
 
     @ObservedObject var viewModel: MapViewModel
     @ObservedObject private var fanUpdatesStore: FanUpdatesRealtimeStore
-    @ObservedObject var chatViewModel: ChatViewModel
+    /// Intentionally not `@ObservedObject`: Chat publishes must not rebuild Live.
+    /// Friendship chips for live-energy use equality-gated `@State` via `onReceive`.
+    let chatViewModel: ChatViewModel
     @Binding var selectedTab: MainTabView.AppTab
 
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
@@ -38,6 +40,7 @@ struct LiveScreen: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeSheet: LiveScreenActiveSheet?
+    @State private var acceptedFriendUserIDs: Set<UUID> = []
     @State private var fanFeatureGateAlertMessage: String?
     @State private var liveAutoRefreshTask: Task<Void, Never>?
     @State private var liveGamesSportFilter: LiveSportVisualType?
@@ -216,15 +219,30 @@ struct LiveScreen: View {
     ) {
         _viewModel = ObservedObject(wrappedValue: viewModel)
         _fanUpdatesStore = ObservedObject(wrappedValue: viewModel.fanUpdatesStore)
-        _chatViewModel = ObservedObject(wrappedValue: chatViewModel)
+        self.chatViewModel = chatViewModel
         _selectedTab = selectedTab
     }
 
-    private var acceptedFriendUserIDs: Set<UUID> {
-        guard viewModel.canUseFanSocialFeatures else { return [] }
-        return Set(chatViewModel.friendshipChipByOtherUserId.compactMap { userID, kind in
-            kind == .friends ? userID : nil
-        })
+    private func refreshAcceptedFriendUserIDs(
+        from chips: [UUID: ChatViewModel.FriendshipChipKind]? = nil,
+        reason: String
+    ) {
+        let source = chips ?? chatViewModel.friendshipChipByOtherUserId
+        let next: Set<UUID>
+        if viewModel.canUseFanSocialFeatures {
+            next = Set(source.compactMap { userID, kind in
+                kind == .friends ? userID : nil
+            })
+        } else {
+            next = []
+        }
+        guard next != acceptedFriendUserIDs else {
+            SwiftUIRecompPerf.identicalSnapshotSkipped(source: "live.acceptedFriends.\(reason)", rows: next.count)
+            return
+        }
+        acceptedFriendUserIDs = next
+        SwiftUIRecompPerf.immutableSnapshotPublished(source: "live.acceptedFriends.\(reason)", rows: next.count)
+        SwiftUIRecompPerf.rootInvalidated(screen: "Live", source: "acceptedFriends.\(reason)")
     }
 
     private var isBusinessLiveAudienceUser: Bool {
@@ -268,6 +286,13 @@ struct LiveScreen: View {
             liveMatchesHasher.combine(match.id)
             liveMatchesHasher.combine(match.matchStatus)
             liveMatchesHasher.combine(match.startTime.timeIntervalSince1970)
+            // Score/clock fields must participate: the memoized snapshot stores LiveMatch
+            // value copies, so a score-only update with identical IDs would otherwise
+            // cache-hit and keep rendering stale scores in the Live cards.
+            liveMatchesHasher.combine(match.scoreHome)
+            liveMatchesHasher.combine(match.scoreAway)
+            liveMatchesHasher.combine(match.minute)
+            liveMatchesHasher.combine(match.liveClockText)
         }
         var savedHasher = Hasher()
         savedHasher.combine(viewModel.savedProGames.count)
@@ -622,6 +647,7 @@ struct LiveScreen: View {
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "Live")
         liveRootContent
             .sheet(item: $activeSheet) { sheet in
                 liveScreenSheetContent(for: sheet)
@@ -640,6 +666,7 @@ struct LiveScreen: View {
                 Text(fanFeatureGateAlertMessage ?? "")
             }
             .onAppear {
+                refreshAcceptedFriendUserIDs(reason: "appear")
                 applyLiveLeagueCountryFilterFirstUseDefaultIfNeeded()
                 logLiveFeedRefresh(reason: "appear")
                 logLiveAudienceDebug()
@@ -655,6 +682,12 @@ struct LiveScreen: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 updateLiveAutoRefreshForCurrentState(scheduleActivationRefresh: phase == .active && selectedTab == .live)
+            }
+            .onChange(of: viewModel.canUseFanSocialFeatures) { _, _ in
+                refreshAcceptedFriendUserIDs(reason: "socialGate")
+            }
+            .onReceive(chatViewModel.$friendshipChipByOtherUserId) { chips in
+                refreshAcceptedFriendUserIDs(from: chips, reason: "friendshipChips")
             }
     }
 
@@ -2576,6 +2609,7 @@ struct LiveScreen: View {
                 }
                 guard !viewModel.isLoadingLiveMatches else { continue }
 
+                LiveActivationPerf.timerTick()
                 refreshLiveMatches(forceRefresh: false)
 #if DEBUG
                 print("[PerfPhase1] liveAutoRefresh forceRefresh=false reason=timer")
@@ -2689,6 +2723,14 @@ struct LiveScreen: View {
                 }
             }
         }
+        .task(id: rows.map(\.id).joined(separator: "|")) {
+            let creatorIds = Set(rows.compactMap { row -> UUID? in
+                if case .pickup(let pickup) = row { return pickup.creator_user_id }
+                return nil
+            })
+            guard !creatorIds.isEmpty else { return }
+            await viewModel.loadPickupCreatorProfilesIfNeeded(creatorUserIds: creatorIds)
+        }
     }
 
     @ViewBuilder
@@ -2744,18 +2786,15 @@ struct LiveScreen: View {
     }
 
     private func liveVenuesPickupPickupRow(_ row: PickupGameRow, compact: Bool = false) -> some View {
-        let model = LivePickupCardModelBuilder.build(row: row)
-        return Button {
-            openPickupGameFromLive(row)
-        } label: {
-            LivePickupRichCard(
-                model: model,
-                compact: compact,
-                relevanceLabel: isPickupUserRelevant(row) ? userPickupRelevanceLabel(row) : nil
-            )
-        }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985, hapticOnPress: true))
-        .accessibilityHint(L10n.t("live_open_pickup_hint", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let model = LivePickupCardModelBuilder.build(row: row, languageCode: languageCode)
+        return LivePickupRichCard(
+            viewModel: viewModel,
+            model: model,
+            compact: compact,
+            relevanceLabel: isPickupUserRelevant(row) ? userPickupRelevanceLabel(row) : nil,
+            onOpenDetails: { openPickupGameFromLive(row) }
+        )
     }
 
     private func openPickupGameFromLive(_ row: PickupGameRow) {
@@ -4249,10 +4288,14 @@ struct LiveMatchDetailSheet: View {
     @ViewBuilder
     private var discoverWatchSpotsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(L10n.t("discover_pro_game_watch_spots_title", languageCode: languageCode))
+            Text("Top venues for this game")
                 .font(FGTypography.cardTitle)
                 .foregroundStyle(FGColor.primaryText(colorScheme))
                 .accessibilityAddTraits(.isHeader)
+
+            Text("Based on live fan activity")
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
 
             switch watchSpotsState {
             case .idle, .loading:
@@ -4343,6 +4386,18 @@ struct LiveMatchDetailSheet: View {
                 }
 
                 HStack(spacing: 8) {
+                    if !spot.energyCaption.isEmpty {
+                        Text(spot.energyCaption)
+                            .font(FGTypography.metadata.weight(.bold))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(1)
+                    } else if spot.isLiveNow {
+                        Text("LIVE")
+                            .font(FGTypography.metadata.weight(.bold))
+                            .foregroundStyle(FGColor.dangerRed)
+                            .lineLimit(1)
+                    }
+
                     Text(L10n.t("discover_pro_game_watch_spot_showing_status", languageCode: languageCode))
                         .font(FGTypography.metadata.weight(.bold))
                         .foregroundStyle(FGColor.intentWatch)
@@ -4352,6 +4407,13 @@ struct LiveMatchDetailSheet: View {
                             Capsule(style: .continuous)
                                 .fill(FGColor.intentWatch.opacity(colorScheme == .dark ? 0.18 : 0.12))
                         )
+
+                    if spot.goingCount > 0 {
+                        Text(spot.goingCount == 1 ? "1 Going" : "\(spot.goingCount) Going")
+                            .font(FGTypography.metadata.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .lineLimit(1)
+                    }
 
                     if let distanceText {
                         Text(distanceText)
@@ -4380,6 +4442,8 @@ struct LiveMatchDetailSheet: View {
             [
                 bar.name,
                 location,
+                spot.energyCaption.isEmpty ? nil : spot.energyCaption,
+                spot.goingCount > 0 ? "\(spot.goingCount) Going" : nil,
                 L10n.t("discover_pro_game_watch_spot_showing_status", languageCode: languageCode),
                 distanceText
             ]

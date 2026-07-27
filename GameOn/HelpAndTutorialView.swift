@@ -4,6 +4,7 @@ import SwiftUI
 
 enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
     case discover
+    case venueEnergy
     case live
     case calendar
     case going
@@ -15,6 +16,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
     var title: String {
         switch self {
         case .discover: return "Discover"
+        case .venueEnergy: return "Venue Energy"
         case .live: return "Live"
         case .calendar: return "Calendar"
         case .going: return "Going"
@@ -27,6 +29,8 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
         switch self {
         case .discover:
             return "Find sports bars, pickup games, and sports communities."
+        case .venueEnergy:
+            return "Understand Starting, Active, Hot, and Trending on Discover."
         case .live:
             return "Follow live games, scores, predictions, and activity."
         case .calendar:
@@ -43,7 +47,9 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
     var detail: String {
         switch self {
         case .discover:
-            return "Explore the map to find sports bars, pickup games, watch parties, and sports communities near you. Save places you like and discover where fans gather."
+            return "Explore the map to find sports bars, pickup games, watch parties, and sports communities near you. Save places you like and discover where fans gather. Venue Energy on Discover shows how active a watch spot is for the selected day."
+        case .venueEnergy:
+            return VenueEnergyEducation.intro
         case .live:
             return "Follow live professional games, scores, predictions, and fan activity in real time. See where fans are gathering and what's happening right now."
         case .calendar:
@@ -60,6 +66,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
     var systemImage: String {
         switch self {
         case .discover: return "map.fill"
+        case .venueEnergy: return "flame.fill"
         case .live: return "dot.radiowaves.left.and.right"
         case .calendar: return "calendar.badge.clock"
         case .going: return "heart.fill"
@@ -71,6 +78,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
     var tint: Color {
         switch self {
         case .discover: return FGColor.accentGreen
+        case .venueEnergy: return Color.orange
         case .live: return FGColor.dangerRed
         case .calendar: return Color(red: 0.58, green: 0.42, blue: 0.94)
         case .going: return FGColor.accentGreen
@@ -107,7 +115,11 @@ struct HelpAndTutorialView: View {
             DiscoverHelpSheet(accountUserId: accountUserId)
         }
         .sheet(item: $selectedQuickGuide) { topic in
-            FanGeoQuickGuideInfoSheet(topic: topic)
+            if topic == .venueEnergy {
+                VenueEnergyHowItWorksSheet(audience: .fan)
+            } else {
+                FanGeoQuickGuideInfoSheet(topic: topic)
+            }
         }
     }
 

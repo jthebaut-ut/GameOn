@@ -418,14 +418,16 @@ struct FanGeoIdentitySetupView: View {
         guard let data = try? await item.loadTransferable(type: Data.self) else { return }
         let previewImage = UIImage(data: data)
         localAvatarPreviewImage = previewImage
-        let fileName = "avatar-\(Int(Date().timeIntervalSince1970)).jpg"
+        let fileName = MapViewModel.makeVersionedAvatarFileName()
         guard let urls = await viewModel.uploadUserAvatar(data: data, fileName: fileName) else {
             localAvatarPreviewImage = nil
             return
         }
         if let err = await viewModel.persistUserProfileAvatar(
             fullURL: urls.fullURL,
-            thumbnailURL: urls.thumbnailURL
+            thumbnailURL: urls.thumbnailURL,
+            replacedFullURL: urls.replacedFullURL,
+            replacedThumbnailURL: urls.replacedThumbnailURL
         ) {
             localAvatarPreviewImage = nil
             errorMessage = err

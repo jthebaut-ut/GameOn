@@ -3,12 +3,29 @@ import CoreLocation
 import SwiftUI
 
 enum CompactGameTimeFormatter {
-    static func timeWithZone(for date: Date, timeZoneOption: FanGeoTimeZonePreference) -> String {
-        let zone = timeZone(for: timeZoneOption)
+    /// Thread-safe reusable `DateFormatter` cache keyed by time-zone identifier.
+    /// `timeWithZone(for:)` is called per schedule/live row on each render; a fresh
+    /// `DateFormatter()` allocation per call was a measurable main-thread cost.
+    private static let hmmaFormatterLock = NSLock()
+    private static var hmmaFormattersByZone: [String: DateFormatter] = [:]
+
+    private static func hmmaFormatter(for zone: TimeZone) -> DateFormatter {
+        hmmaFormatterLock.lock()
+        defer { hmmaFormatterLock.unlock() }
+        if let cached = hmmaFormattersByZone[zone.identifier] {
+            return cached
+        }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = zone
         formatter.dateFormat = "h:mm a"
+        hmmaFormattersByZone[zone.identifier] = formatter
+        return formatter
+    }
+
+    static func timeWithZone(for date: Date, timeZoneOption: FanGeoTimeZonePreference) -> String {
+        let zone = timeZone(for: timeZoneOption)
+        let formatter = hmmaFormatter(for: zone)
         let displayed = "\(formatter.string(from: date)) \(timeZoneOption.shortAbbreviation(at: date))"
         TimeZoneDebug.gameDateConverted(
             identifier: timeZoneOption.identifier,
@@ -288,6 +305,8 @@ nonisolated enum VenueGameExpiration {
 }
 
 // Completed games stay visible in Going for 48 hours, then move out of the active Going view.
+// NOTE: Going → Play → Playing pickup cards use ``GoingPickupPlayingCompletedVisibility`` instead
+// (rating-aware retention). Hosting / venue / pro still use this 48h rule.
 nonisolated enum GoingTabCompletedGameVisibility {
     static let postCompletionVisibilityHours = 48
     private static let postCompletionVisibilityInterval: TimeInterval = TimeInterval(48 * 60 * 60)
@@ -371,6 +390,38 @@ nonisolated enum GoingTabCompletedGameVisibility {
         default:
             return 2 * 3600
         }
+    }
+}
+
+/// Going → Play → Playing completed-card visibility (per authenticated participant).
+/// Unrated eligible completed games never auto-clear. Rated games auto-clear 7 days after
+/// the authoritative ``pickup_game_creator_ratings.created_at`` (or local submit time).
+nonisolated enum GoingPickupPlayingCompletedVisibility {
+    static let postRatingRetentionDays = 7
+    private static let postRatingRetentionInterval: TimeInterval =
+        TimeInterval(postRatingRetentionDays * 24 * 60 * 60)
+
+    static func autoClearDeadline(ratedAt: Date) -> Date {
+        ratedAt.addingTimeInterval(postRatingRetentionInterval)
+    }
+
+    /// Whether a Playing join card should remain visible for the current user.
+    static func isVisible(
+        game: PickupGameRow,
+        manuallyCleared: Bool,
+        hasRated: Bool,
+        ratedAt: Date?,
+        now: Date = Date()
+    ) -> Bool {
+        if manuallyCleared { return false }
+        guard GoingTabCompletedGameVisibility.isPickupGameCompleted(game, now: now) else {
+            return true
+        }
+        if hasRated {
+            guard let ratedAt else { return true }
+            return now < autoClearDeadline(ratedAt: ratedAt)
+        }
+        return true
     }
 }
 
@@ -1256,6 +1307,7 @@ struct UserProfileRow: Decodable {
     let live_visibility_mode: String?
     let selected_live_visibility_friend_ids: [UUID]?
     let discoverable_by_fans: Bool?
+    let activity_status_visible: Bool?
     let is_deleted: Bool?
     let created_at: String?
     let last_seen_at: String?
@@ -1269,6 +1321,8 @@ struct UserProfileRow: Decodable {
     let home_region: String?
     let home_country: String?
     let show_home_city: Bool?
+    /// Curated background catalog key (`fangeo`, `soccer`, …). Nil/unknown → FanGeo default.
+    let profile_background_key: String?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -1284,6 +1338,7 @@ struct UserProfileRow: Decodable {
         case live_visibility_mode
         case selected_live_visibility_friend_ids
         case discoverable_by_fans
+        case activity_status_visible
         case is_deleted
         case created_at
         case last_seen_at
@@ -1297,6 +1352,7 @@ struct UserProfileRow: Decodable {
         case home_region
         case home_country
         case show_home_city
+        case profile_background_key
     }
 
     init(
@@ -1313,6 +1369,7 @@ struct UserProfileRow: Decodable {
         live_visibility_mode: String? = nil,
         selected_live_visibility_friend_ids: [UUID]? = nil,
         discoverable_by_fans: Bool? = nil,
+        activity_status_visible: Bool? = nil,
         is_deleted: Bool? = nil,
         created_at: String? = nil,
         last_seen_at: String? = nil,
@@ -1325,7 +1382,8 @@ struct UserProfileRow: Decodable {
         home_city: String? = nil,
         home_region: String? = nil,
         home_country: String? = nil,
-        show_home_city: Bool? = nil
+        show_home_city: Bool? = nil,
+        profile_background_key: String? = nil
     ) {
         self.id = id
         self.email = email
@@ -1340,6 +1398,7 @@ struct UserProfileRow: Decodable {
         self.live_visibility_mode = live_visibility_mode
         self.selected_live_visibility_friend_ids = selected_live_visibility_friend_ids
         self.discoverable_by_fans = discoverable_by_fans
+        self.activity_status_visible = activity_status_visible
         self.is_deleted = is_deleted
         self.created_at = created_at
         self.last_seen_at = last_seen_at
@@ -1353,6 +1412,7 @@ struct UserProfileRow: Decodable {
         self.home_region = home_region
         self.home_country = home_country
         self.show_home_city = show_home_city
+        self.profile_background_key = profile_background_key
     }
 
     init(from decoder: Decoder) throws {
@@ -1369,6 +1429,7 @@ struct UserProfileRow: Decodable {
         live_visibility_enabled = try c.decodeIfPresent(Bool.self, forKey: .live_visibility_enabled)
         live_visibility_mode = try c.decodeIfPresent(String.self, forKey: .live_visibility_mode)
         discoverable_by_fans = try c.decodeIfPresent(Bool.self, forKey: .discoverable_by_fans)
+        activity_status_visible = try c.decodeIfPresent(Bool.self, forKey: .activity_status_visible)
         is_deleted = try c.decodeIfPresent(Bool.self, forKey: .is_deleted)
         created_at = try c.decodeIfPresent(String.self, forKey: .created_at)
         last_seen_at = try c.decodeIfPresent(String.self, forKey: .last_seen_at)
@@ -1382,6 +1443,7 @@ struct UserProfileRow: Decodable {
         home_region = try c.decodeIfPresent(String.self, forKey: .home_region)
         home_country = try c.decodeIfPresent(String.self, forKey: .home_country)
         show_home_city = try c.decodeIfPresent(Bool.self, forKey: .show_home_city)
+        profile_background_key = try c.decodeIfPresent(String.self, forKey: .profile_background_key)
 
         if let ids = try? c.decodeIfPresent([UUID].self, forKey: .selected_live_visibility_friend_ids) {
             selected_live_visibility_friend_ids = ids
@@ -1420,6 +1482,10 @@ struct UserProfileRow: Decodable {
         discoverable_by_fans ?? true
     }
 
+    var activityStatusVisible: Bool {
+        activity_status_visible ?? true
+    }
+
     var isDeletedAccount: Bool {
         if is_deleted == true { return true }
         let normalizedEmail = OwnerBusinessEmail.normalized(email ?? "")
@@ -1453,6 +1519,10 @@ struct UserProfileRow: Decodable {
 
     var showsHomeCityOnProfile: Bool {
         show_home_city == true
+    }
+
+    var resolvedProfileBackgroundKey: ProfileBackgroundKey {
+        ProfileBackgroundCatalog.resolveKey(profile_background_key)
     }
 
     func isVisibleForLiveFriendPresence(to viewerUserID: UUID?) -> Bool {
@@ -1627,6 +1697,10 @@ struct UserProfileDiscoverabilityPatch: Encodable {
     let discoverable_by_fans: Bool
 }
 
+struct UserProfileActivityStatusVisibilityPatch: Encodable {
+    let activity_status_visible: Bool
+}
+
 struct UserProfileNationalTeamPatch: Encodable {
     let national_team_country_code: String?
     let national_team_country_name: String?
@@ -1642,6 +1716,10 @@ struct UserProfileHomeCityPatch: Encodable {
     let show_home_city: Bool
 }
 
+struct UserProfileBackgroundPatch: Encodable {
+    let profile_background_key: String
+}
+
 struct FavoriteVenueRow: Decodable {
     let id: UUID?
     let user_email: String?
@@ -1654,7 +1732,7 @@ struct FavoriteVenueInsert: Encodable {
 }
 
 /// One row in the Following tab “I’m Going” list (global fetch; not tied to Discover map region).
-struct FollowingGoingDisplayItem: Identifiable {
+struct FollowingGoingDisplayItem: Identifiable, Equatable {
     let id: UUID
     let venueEvent: VenueEventRow
     let bar: BarVenue
@@ -1685,14 +1763,14 @@ enum PickupFollowingJoinRequestPillKind: String, Equatable {
     case withdrawing
     case canceledByOrganizer
 
-    var title: String {
+    func title(languageCode: String) -> String {
         switch self {
-        case .pending: return "Pending"
-        case .approved: return "Approved"
-        case .declined: return "Rejected"
-        case .cancelled: return "Cancelled"
-        case .withdrawing: return "Withdrawing…"
-        case .canceledByOrganizer: return "Canceled"
+        case .pending: return L10n.t("pickup_join_status_pending", languageCode: languageCode)
+        case .approved: return L10n.t("pickup_host_participant_status_approved", languageCode: languageCode)
+        case .declined: return L10n.t("pickup_join_status_rejected", languageCode: languageCode)
+        case .cancelled: return L10n.t("pickup_join_status_cancelled", languageCode: languageCode)
+        case .withdrawing: return L10n.t("pickup_join_status_withdrawing", languageCode: languageCode)
+        case .canceledByOrganizer: return L10n.t("pickup_join_status_canceled", languageCode: languageCode)
         }
     }
 }
@@ -1714,18 +1792,19 @@ struct PickupGameJoinRequestCardDisplay: Identifiable, Equatable {
     let spotsRemainingSummary: String?
 }
 
-enum VenueEventCommentDeliveryState: String, Equatable {
+nonisolated enum VenueEventCommentDeliveryState: String, Equatable, Sendable {
     case pending
     case sent
     case failed
 }
 
-enum FanChatCommentReactionType: String, Codable, Equatable {
+nonisolated enum FanChatCommentReactionType: String, Codable, Equatable, Sendable {
     case up
     case down
 }
 
-struct VenueEventCommentRow: Decodable, Identifiable {
+/// Fan-chat / venue-event comment row (pure Decodable value; safe off MainActor).
+nonisolated struct VenueEventCommentRow: Decodable, Identifiable, Sendable {
     let id: UUID?
     let venue_event_id: UUID?
     let user_email: String?

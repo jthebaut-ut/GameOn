@@ -22,6 +22,7 @@ extension MapViewModel {
     func refreshFollowingTabDataGloballyUnlessFresh() async {
         if shouldSkipFollowingTabGlobalRefresh() {
             TabPerf.refreshSkipped(name: "followingGlobal", reason: "freshCache")
+            GoingActivationPerf.refreshSkipped(reason: "freshCache", source: "followingGlobal")
             AppPerfDebug.networkFetchFinished(
                 tab: "following",
                 source: "followingGlobal",
@@ -84,6 +85,8 @@ extension MapViewModel {
     func refreshFollowingTabDataGlobally() async {
         if let inFlight = followingTabGlobalRefreshTask {
             TabPerf.duplicateRefreshCoalesced(name: "followingGlobal")
+            GoingActivationPerf.refreshCoalesced(source: "followingGlobal")
+            GoingActivationPerf.refreshJoined(source: "followingGlobal")
             Perf.duplicateTaskCoalesced(name: "followingGlobal")
 #if DEBUG
             TabPerfDebug.log("[TabPerfDebug] refreshCoalesced=true tab=going source=followingGlobal")
@@ -95,6 +98,7 @@ extension MapViewModel {
 
         let startedAt = Date()
         TabPerf.refreshStarted(name: "followingGlobal")
+        GoingActivationPerf.refreshStarted(source: "followingGlobal")
         AppPerfDebug.networkFetchStarted(tab: "following", source: "followingGlobal")
         let task = Task<Void, Never> { [weak self] in
             guard let self else { return }
@@ -105,10 +109,12 @@ extension MapViewModel {
         followingTabGlobalRefreshTask = nil
         let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
         TabPerf.refreshFinished(name: "followingGlobal", durationMs: ms)
+        GoingActivationPerf.refreshCompleted(source: "followingGlobal", ms: ms)
         AppPerfDebug.networkFetchFinished(tab: "following", source: "followingGlobal", durationMs: ms)
     }
 
     private func refreshFollowingTabDataGloballyNow() async {
+        let networkStartedAt = Date()
         guard let interestEmail = await strictNormalizedSessionEmailForSocialTables() else {
             clearFollowingTabCachesPreservingPickupJoinState()
             return
@@ -127,7 +133,13 @@ extension MapViewModel {
             savedBars = try await fetchBarsForFavoriteVenueIDs(orderedFavoriteIds)
             barsById = Dictionary(uniqueKeysWithValues: savedBars.map { ($0.id, $0) })
             let orderedSaved = orderedFavoriteIds.compactMap { barsById[$0] }
-            followingTabSavedVenues = orderedSaved
+            if followingTabSavedVenues != orderedSaved {
+                followingTabSavedVenues = orderedSaved
+                GoingActivationPerf.publishApplied(name: "followingTabSavedVenues", rows: orderedSaved.count)
+            } else {
+                Perf.publishedWriteSkipped(name: "followingTabSavedVenues", reason: "unchanged")
+                GoingActivationPerf.publishSkippedIdentical(name: "followingTabSavedVenues", rows: orderedSaved.count)
+            }
         } catch {
 #if DEBUG
             print("ERROR refreshFollowingTabDataGlobally favorites:", error)
@@ -261,16 +273,26 @@ extension MapViewModel {
             let favoriteVenuesCount = followingTabSavedVenues.count
             let userGoingVenueEventsCount = activeServerGoingEventIDs.count
             let userInterestedVenueEventsCount = localInterestedOnly.count
+            let snapshotBuildStartedAt = CFAbsoluteTimeGetCurrent()
             goingItems = Self.sortFollowingGoingItemsChronologically(goingItems)
+            let snapshotBuildMs = (CFAbsoluteTimeGetCurrent() - snapshotBuildStartedAt) * 1000
 
             let finalFollowingItemsCount = goingItems.count
 
-            applyFollowingTabVenuePlanSnapshot(
+            let applyStartedAt = CFAbsoluteTimeGetCurrent()
+            let publishedSnapshot = applyFollowingTabVenuePlanSnapshot(
                 FollowingTabVenuePlanSnapshot(
                     goingItems: goingItems,
                     interestCounts: totals,
                     userVenueEventInterestIDs: activeServerGoingEventIDs
                 )
+            )
+            GoingApplyPerf.apply(
+                networkMs: Int(Date().timeIntervalSince(networkStartedAt) * 1000),
+                snapshotBuildMs: snapshotBuildMs,
+                mainActorApplyMs: (CFAbsoluteTimeGetCurrent() - applyStartedAt) * 1000,
+                publishCount: publishedSnapshot,
+                reason: "followingGlobal"
             )
             await reconcileGameRemindersAfterFollowingRefresh()
 
@@ -304,11 +326,39 @@ extension MapViewModel {
         let userVenueEventInterestIDs: Set<UUID>
     }
 
+    /// Returns the number of `@Published` writes actually performed.
     @MainActor
-    private func applyFollowingTabVenuePlanSnapshot(_ snapshot: FollowingTabVenuePlanSnapshot) {
-        followingTabGoingItems = snapshot.goingItems
-        followingTabGoingInterestCounts = snapshot.interestCounts
-        followingTabUserVenueEventInterestIDs = snapshot.userVenueEventInterestIDs
+    @discardableResult
+    private func applyFollowingTabVenuePlanSnapshot(_ snapshot: FollowingTabVenuePlanSnapshot) -> Int {
+        let goingChanged = followingTabGoingItems != snapshot.goingItems
+        let countsChanged = followingTabGoingInterestCounts != snapshot.interestCounts
+        let idsChanged = followingTabUserVenueEventInterestIDs != snapshot.userVenueEventInterestIDs
+        guard goingChanged || countsChanged || idsChanged else {
+            Perf.publishedWriteSkipped(name: "followingTabVenuePlanSnapshot", reason: "unchanged")
+            GoingActivationPerf.publishSkippedIdentical(
+                name: "followingTabVenuePlanSnapshot",
+                rows: snapshot.goingItems.count
+            )
+            return 0
+        }
+        var publishCount = 0
+        if goingChanged {
+            followingTabGoingItems = snapshot.goingItems
+            publishCount += 1
+        }
+        if countsChanged {
+            followingTabGoingInterestCounts = snapshot.interestCounts
+            publishCount += 1
+        }
+        if idsChanged {
+            followingTabUserVenueEventInterestIDs = snapshot.userVenueEventInterestIDs
+            publishCount += 1
+        }
+        GoingActivationPerf.publishApplied(
+            name: "followingTabVenuePlanSnapshot",
+            rows: snapshot.goingItems.count
+        )
+        return publishCount
     }
 
     private func fetchOrderedFavoriteVenueIDs(userEmail: String) async throws -> [UUID] {
@@ -453,7 +503,7 @@ extension MapViewModel {
         return BarVenue(
             id: UUID(),
             name: name,
-            address: "Address unavailable",
+            address: VenueAddressPlaceholder.sentinel,
             phone: "",
             primarySport: sport,
             distance: "",

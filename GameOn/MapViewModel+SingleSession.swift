@@ -17,6 +17,7 @@ extension MapViewModel {
 
     /// After successful fan login / sign-up: claim this device as the active session.
     func registerFanActiveSessionOnLogin() async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         guard isEligibleForFanSingleSessionEnforcement else { return }
         guard let userId = currentUserAuthId else { return }
 
@@ -45,6 +46,13 @@ extension MapViewModel {
     }
 
     func startFanSingleSessionRealtimeIfNeeded() async {
+        // Explicit logout owns session teardown — never recreate the channel mid-pipeline.
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else {
+#if DEBUG
+            print("[SingleSessionDebug] startSkipped reason=logoutInProgress")
+#endif
+            return
+        }
         guard isEligibleForFanSingleSessionEnforcement, let userId = currentUserAuthId else {
             await stopFanSingleSessionRealtime()
             return
@@ -66,40 +74,72 @@ extension MapViewModel {
         fanSingleSessionRealtimeDebounceTask?.cancel()
         fanSingleSessionRealtimeDebounceTask = nil
 
-        if let task = fanSingleSessionRealtimeTask {
-            task.cancel()
-            _ = await task.result
-            fanSingleSessionRealtimeTask = nil
-        }
+        let task = fanSingleSessionRealtimeTask
+        let channel = fanSingleSessionRealtimeChannel
+        fanSingleSessionRealtimeTask = nil
+        fanSingleSessionRealtimeChannel = nil
 
-        if let channel = fanSingleSessionRealtimeChannel {
+        // Remove channel before awaiting the listen task — otherwise `for await` on the
+        // postgresChange stream never ends and logout hangs forever.
+        task?.cancel()
+        if let channel {
             await supabase.removeChannel(channel)
-            fanSingleSessionRealtimeChannel = nil
+        }
+        if let task {
+            _ = await task.result
         }
     }
 
-    /// On fan logout: clear local id; clear remote only when it still matches this device.
-    func clearFanActiveSessionOnLogout() async {
-        await stopFanSingleSessionRealtime()
+    /// Explicit-logout path: cancel and nil local single-session state synchronously.
+    /// Never awaits `removeChannel` or listen-task completion — those are detached best-effort.
+    @MainActor
+    func abandonFanSingleSessionForLogout(knownUserId: UUID? = nil) {
+        SafeLogoutDebug.step("single_session_local_abandon_begin")
 
-        guard let userId = currentUserAuthId else {
-            FanSingleSessionStore.clearLocalSessionId()
-            return
-        }
+        fanSingleSessionRealtimeDebounceTask?.cancel()
+        fanSingleSessionRealtimeDebounceTask = nil
 
+        let task = fanSingleSessionRealtimeTask
+        let channel = fanSingleSessionRealtimeChannel
+        fanSingleSessionRealtimeTask = nil
+        fanSingleSessionRealtimeChannel = nil
+        task?.cancel()
+
+        let userId = knownUserId ?? currentUserAuthId
         let local = FanSingleSessionStore.localSessionId()
-        if let local,
-           case .remote(let remote) = await fetchRemoteActiveSessionId(userId: userId),
-           remote == local {
-            _ = await patchRemoteActiveSession(userId: userId, sessionId: nil)
+        FanSingleSessionStore.clearLocalSessionId()
+        SafeLogoutDebug.step("single_session_local_abandon_completed")
+
+        if let channel {
+            Task {
+                await supabase.removeChannel(channel)
+            }
         }
 
-        FanSingleSessionStore.clearLocalSessionId()
+        if let userId, let local {
+            SafeLogoutDebug.step("single_session_remote_cleanup_dispatched")
+            Task {
+                if case .remote(let remote) = await self.fetchRemoteActiveSessionId(userId: userId),
+                   remote == local {
+                    _ = await self.patchRemoteActiveSession(userId: userId, sessionId: nil)
+                }
+            }
+        }
+    }
+
+    /// Non-blocking cleanup used by logout-like paths. Prefer this over ``stopFanSingleSessionRealtime``
+    /// whenever the caller must not wait on websocket unsubscribe acknowledgements.
+    func clearFanActiveSessionOnLogout(knownUserId: UUID? = nil) async {
+        // Must not call the awaited ``stopFanSingleSessionRealtime`` — that can hang forever.
+        await MainActor.run {
+            abandonFanSingleSessionForLogout(knownUserId: knownUserId)
+        }
     }
 
     // MARK: - Core check
 
     private func enforceFanSingleSessionFromRemoteCheck(source: String) async {
+        guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         guard isEligibleForFanSingleSessionEnforcement else { return }
         guard !isPerformingSingleSessionLogout else { return }
         guard !UserDefaults.standard.bool(forKey: "didExplicitlyLogout") else { return }

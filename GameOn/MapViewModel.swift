@@ -129,6 +129,31 @@ final class MapViewModel: ObservableObject {
     var automaticTimeZoneChangeObserver: AutomaticTimeZoneChangeObserver?
     @Published var isLoggedIn: Bool = false
     @Published var authSessionState: FanGeoAuthSessionState = .signedOut
+    /// Session-owned logout UI phase. Progress overlay must not live in Settings `@State`.
+    @Published var safeLogoutPhase: SafeLogoutPhase = .idle
+    @Published var safeLogoutFailureMessage: String = ""
+    /// MainTabView observes this to force Discover after a successful safe logout (without mounting Account).
+    @Published var safeLogoutNeedsDiscoverReset = false
+    /// Source string for the in-flight safe logout (DEBUG / dedupe).
+    var safeLogoutSource: String = ""
+    var safeLogoutTask: Task<Void, Never>?
+    var safeLogoutStartedAt: Date?
+    /// Network-independent watchdog that clears the logout overlay if MainTabView's
+    /// `safeLogoutNeedsDiscoverReset` acknowledgement is missed (e.g. the root remounted).
+    var safeLogoutWatchdogTask: Task<Void, Never>?
+    /// True once the local Supabase session has been provably invalidated for the in-flight
+    /// logout. The watchdog refuses to finalize the overlay unless this is set.
+    var safeLogoutLocalSessionInvalidated = false
+    /// Session-owned login UI phase. Progress overlay must not live in auth-sheet `@State`.
+    @Published var safeLoginPhase: SafeLoginPhase = .idle
+    /// MainTabView observes this to force Discover after a successful safe login (account-switch safety).
+    @Published var safeLoginNeedsDiscoverReset = false
+    var safeLoginMethod: SafeLoginMethod?
+    var safeLoginSource: String = ""
+    var safeLoginGeneration: UInt64 = 0
+    var safeLoginTask: Task<Void, Never>?
+    var safeLoginStartedAt: Date?
+    var safeLoginAuthCompletedAt: Date?
     /// Last fan login email used when a deleted tombstone profile blocked entry (support contact UI).
     @Published var blockedDeletedAccountAttemptEmail: String = ""
     /// Last business login email used when a deleted business tombstone blocked entry (support contact UI).
@@ -160,6 +185,13 @@ final class MapViewModel: ObservableObject {
     @Published var isCheckingActiveBusinessBan = false
     @Published var isBusinessBanGatePresented = false
     @Published var isBusinessOwnerSessionRestorePending = false
+    /// Single-flight deferred business hydration after launch (auth restore + warm preload share this).
+    var deferredBusinessOwnerHydrationTask: Task<Void, Never>?
+    /// Single-flight + short freshness gate for `ensureBusinessOwnerSessionFlagsIfPossible`, so
+    /// near-simultaneous triggers (Discover `.task` and `onAppear`) share one round of RPCs.
+    var businessOwnerSessionFlagsEnsureTask: Task<Bool, Never>?
+    var businessOwnerSessionFlagsEnsureIdentity: String?
+    var businessOwnerSessionFlagsLastValidation: (identity: String, result: Bool, at: Date)?
     var authSessionRestoreID: UUID?
     /// Bumped whenever private authenticated state is explicitly cleared so sibling view models can synchronously wipe their own caches.
     @Published var privateSessionClearNonce: UUID = UUID()
@@ -482,6 +514,9 @@ final class MapViewModel: ObservableObject {
     @Published var venueEventInterestCounts: [UUID: Int] = [:] {
         didSet {
             scheduleDiscoverMapRenderSnapshotRebuild(reason: "venueEventInterestCounts")
+            if discoverFocusedProGame != nil {
+                scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "interestCounts")
+            }
         }
     }
     let venueGameCardSnapshotStore = VenueGameCardSnapshotStore()
@@ -615,7 +650,29 @@ final class MapViewModel: ObservableObject {
     @Published var reportedCommentDisplays: [ReportedCommentDisplay] = []
     var venueEventVibeCounts: [UUID: [String: Int]] {
         get { fanUpdatesStore.venueEventVibeCounts }
-        set { fanUpdatesStore.venueEventVibeCounts = newValue }
+        set {
+            let previous = fanUpdatesStore.venueEventVibeCounts
+            fanUpdatesStore.venueEventVibeCounts = newValue
+            if previous != newValue {
+                scheduleDiscoverMapRenderSnapshotRebuild(reason: "venueEventVibeCounts")
+                if discoverFocusedProGame != nil {
+                    scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "vibeCounts")
+                }
+            }
+        }
+    }
+    var venueEventUniqueCommenterCounts: [UUID: Int] {
+        get { fanUpdatesStore.venueEventUniqueCommenterCounts }
+        set {
+            let previous = fanUpdatesStore.venueEventUniqueCommenterCounts
+            fanUpdatesStore.venueEventUniqueCommenterCounts = newValue
+            if previous != newValue {
+                scheduleDiscoverMapRenderSnapshotRebuild(reason: "venueEventUniqueCommenterCounts")
+                if discoverFocusedProGame != nil {
+                    scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "commenterCounts")
+                }
+            }
+        }
     }
     var myVenueEventVibes: [UUID: Set<String>] {
         get { fanUpdatesStore.myVenueEventVibes }
@@ -706,8 +763,13 @@ final class MapViewModel: ObservableObject {
     /// True while schedule data is re-fetched but existing ``events``/UI should stay visible (Phase 1 perf).
     @Published var isRefreshingDiscoverEvents: Bool = false
     @Published var liveMatches: [LiveMatch] = []
+    /// Bumped when ``liveMatches`` content changes (scores/status/minute/membership), not only count.
+    /// Schedule Pro Games display cache + rebuild observe this so live updates publish without relying on count churn.
+    @Published var scheduleLiveMatchesContentRevision: UInt64 = 0
     @Published var activeFeaturedEvents: [FeaturedEvent] = FeaturedEvent.fallbackEvents
     @Published var savedProGames: [SavedProGame] = []
+    /// Lookup tables for saved-game hydration against ``liveMatches``; rebuilt when the snapshot changes.
+    var liveMatchHydrationIndexCache: LiveMatchHydrationIndex?
     var savedProGamesFetchTask: Task<Void, Never>?
     var lastSavedProGamesFetchAt: Date?
     var lastSavedProGamesFetchUserId: UUID?
@@ -781,6 +843,9 @@ final class MapViewModel: ObservableObject {
         didSet {
             scheduleFanChatAppLevelRealtimeForLoadedVenueEvents()
             scheduleDiscoverMapRenderSnapshotRebuild(reason: "venueEventRows")
+            if discoverFocusedProGame != nil {
+                scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "venueEventRows")
+            }
 #if DEBUG
             print("[VenueGameCardStoreDebug] initialTrigger source=venueEventRows")
 #endif
@@ -800,6 +865,8 @@ final class MapViewModel: ObservableObject {
     /// Bottom-tab Calendar selected (updated by ``MainTabView``); gates calendar-only preload/enrichment while tab is preserved off-screen.
     var isCalendarTabSelected = false
     var isLiveTabSelected = false
+    /// Bottom-tab Discover selected (updated by ``MainTabView``); used only for Phase 3 off-tab perf instrumentation.
+    var isDiscoverTabSelectedForEnrichment = true
     var scheduleTabInteractionProtected = false
     var liveSportsDataRefreshDepth = 0
     var pendingDeferredLiveMatches: [LiveMatch]?
@@ -850,6 +917,8 @@ final class MapViewModel: ObservableObject {
     @Published var currentUserHomeRegion: String = ""
     @Published var currentUserHomeCountry: String = ""
     @Published var currentUserShowHomeCity: Bool = false
+    /// Curated profile background catalog key (default FanGeo).
+    @Published var currentUserProfileBackgroundKey: ProfileBackgroundKey = .fangeo
     @Published var isAuthSessionRestoringForProfilePresentation: Bool = false
     @Published var isUserProfileLoadingForPresentation: Bool = false
     @Published var hasLoadedUserProfileForPresentation: Bool = false
@@ -858,8 +927,10 @@ final class MapViewModel: ObservableObject {
     @Published var currentUserLiveVisibilityMode: LiveVisibilityMode = .allFriends
     @Published var currentUserSelectedLiveVisibilityFriendIDs: Set<UUID> = []
     @Published var currentUserDiscoverableByFans: Bool = true
+    @Published var currentUserActivityStatusVisible: Bool = true
     @Published var isUpdatingLiveVisibilitySetting: Bool = false
     @Published var isUpdatingProfileDiscoverabilitySetting: Bool = false
+    @Published var isUpdatingActivityStatusVisibilitySetting: Bool = false
     /// Bumped after avatar profile save (and related clears) so UI uses a new `?v=` display URL while stored URLs stay canonical.
     @Published var currentUserAvatarDisplayRefreshToken: UUID = UUID()
     var authenticatedBusinessDisplayNameForSocialFeatures: String {
@@ -963,6 +1034,10 @@ final class MapViewModel: ObservableObject {
     @Published var requestedMainTabRaw: String?
     /// Pro game reminder notification tap → Going tab / Pro Games / match detail.
     @Published var pendingProGameNotificationDeepLink: ProGameNotificationDeepLinkRequest?
+    /// Deep link from a pickup end-of-game rating local notification → Going → Play → Playing.
+    @Published var pendingPickupCreatorRatingNotificationDeepLink: PickupCreatorRatingNotificationDeepLinkRequest?
+    /// Briefly highlights the Playing card targeted by a pickup rating notification deep link.
+    @Published var pendingPickupPlayingHighlightGameID: UUID?
     @Published var pendingSupportReplyNotificationDeepLink: SupportReplyNotificationDeepLinkRequest?
     /// Discover Activity Panel → Going / Account focus (consumed once by destination screens).
     @Published var pendingDiscoverTodayDashboardNav: DiscoverTodayDashboardNavIntent?
@@ -970,6 +1045,19 @@ final class MapViewModel: ObservableObject {
     @Published var pendingScheduleProGameNav: ScheduleProGameNavIntent?
     /// Brief Schedule Pro Games card highlight after Discover handoff.
     @Published var scheduleProGameHighlightStableKey: String?
+    /// Focused professional game on Discover (`LiveMatch.id` == `VenueEventRow.external_game_id`).
+    /// When set: map energy / Top venues are game-specific; when nil: selected-day venue energy.
+    @Published var discoverFocusedProGame: DiscoverFocusedProGame? = nil {
+        didSet {
+            guard oldValue != discoverFocusedProGame else { return }
+            scheduleDiscoverMapRenderSnapshotRebuild(reason: "discoverFocusedProGame")
+            scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: "focusChanged")
+        }
+    }
+    /// Ranked Top venues for ``discoverFocusedProGame`` in the current map region (energy DESC).
+    @Published var discoverTopVenuesForFocusedGame: [DiscoverProGameWatchSpot] = []
+    @Published var discoverTopVenuesForFocusedGameState: DiscoverProGameWatchSpotsLoadState = .idle
+    var discoverTopVenuesRefreshTask: Task<Void, Never>?
     /// Eligible Discover banner announcements for carousel presentation (sorted).
     @Published var discoverBannerAnnouncements: [FanGeoAnnouncement] = []
     /// Resolved promoted venues for sponsored announcement cards (outside current map bounds).
@@ -980,6 +1068,14 @@ final class MapViewModel: ObservableObject {
     @Published var presentFanUserAuthSheetFromDiscover: Bool = false
     /// Initial mode for ``SettingsUserAuthSheet`` when opened from Discover guest prompts.
     @Published var fanUserAuthSheetOpenInRegisterMode: Bool = false
+    /// Guest heart-tap on a pro game: present the save-games sign-in prompt sheet.
+    @Published var presentSaveProGameSignInPrompt: Bool = false
+    /// Match the guest intended to favorite; completed once after successful fan login.
+    var pendingSaveProGameMatch: LiveMatch?
+    /// Tab to restore after login (`live` / `calendar` / `following`).
+    var pendingSaveProGameReturnTabRaw: String?
+    /// Dedupes automatic pending-favorite completion across auth change observers.
+    var pendingSaveProGameCompletionToken: UUID?
     /// Following → Saved Venues: Discover tab consumes this to focus the map (see ``MapViewModel+FollowingMapNavigation``).
     @Published var pendingFollowingMapVenueID: UUID?
     /// Venue snapshot from Following so navigation works when ``bars`` does not yet include this id (map region elsewhere).
@@ -1073,6 +1169,12 @@ final class MapViewModel: ObservableObject {
     @Published var pendingPickupGameJoinRequestCount: Int = 0
     /// Phase 2: latest join request from the current user per game (Discover detail / button state).
     @Published var pickupMyLatestJoinRequestByGameId: [UUID: PickupGameRequestRow] = [:]
+    /// Privacy-safe public roster from `get_pickup_game_roster` (organizer + approved; pending only for organizer).
+    @Published var pickupGameRosterByGameId: [UUID: PickupGameRosterPayload] = [:]
+    /// In-flight roster fetches (dedupe concurrent detail + sheet loads).
+    @Published var pickupGameRosterInFlightGameIds: Set<UUID> = []
+    /// Last roster load error per game (debug / sheet banner).
+    @Published var pickupGameRosterErrorByGameId: [UUID: String] = [:]
     /// Phase 2: resolved creator display names for pickup detail (never stores email in UI).
     @Published var pickupCreatorDisplayNameByUserId: [UUID: String] = [:]
     /// Creator profile fields from `user_profiles` for pickup detail avatar (no schema change).
@@ -1212,6 +1314,8 @@ final class MapViewModel: ObservableObject {
     /// Last successful Following pickup join-card reload; non-published so tab freshness checks do not redraw roots.
     var lastSuccessfulFollowingJoinRequestsRefreshAt: Date?
     var lastSuccessfulFollowingJoinRequestsRefreshUserId: UUID?
+    /// In-flight Following join-list reload; coalesces concurrent activation/foreground callers.
+    var followingJoinRequestsLoadTask: Task<Void, Never>?
     /// Last successful Following pickup join-list reload (Games to Play).
     @Published var lastJoinStatusRefreshAt: Date?
     /// Latest join request status string per pickup game id after the last reload (`pending`, `approved`, …).
@@ -1226,8 +1330,36 @@ final class MapViewModel: ObservableObject {
     var pickupGamesFollowingTabCache: [UUID: PickupGameRow] = [:]
     /// Organizer pickup trust line (avg stars + count); from ``pickup_creator_public_rating_stats`` RPC.
     @Published var pickupCreatorPublicRatingStatsByUserId: [UUID: PickupCreatorPublicRatingStats] = [:]
+    /// Own-profile pickup organizer aggregates (`pickup_organizer_profile_summary`).
+    @Published var myPickupOrganizerSummary: PickupOrganizerSummary = .empty
+    var myPickupOrganizerSummaryLoadedForUserId: UUID?
+    /// Last successful own-organizer-summary load; gates the Account-appear refresh so repeated
+    /// visits within the window reuse cached aggregates (explicit force still bypasses it).
+    var lastMyPickupOrganizerSummaryRefreshAt: Date?
+    /// Fan identity preferences (`fan_identity_preferences`) load freshness + in-flight dedup.
+    var fanIdentityPreferencesLoadTask: Task<Void, Never>?
+    var lastFanIdentityPreferencesLoadAt: Date?
+    var lastFanIdentityPreferencesLoadUserId: UUID?
+    /// Discover / map card organizer aggregates (`pickup_organizer_profile_summary`), keyed by organizer.
+    @Published var pickupOrganizerSummaryByUserId: [UUID: PickupOrganizerSummary] = [:]
+    /// Last successful fetch time for ``pickupOrganizerSummaryByUserId`` freshness gating.
+    var pickupOrganizerSummaryFetchedAtByUserId: [UUID: Date] = [:]
+    /// In-flight organizer IDs for summary batching (dedupe concurrent card opens).
+    var pickupOrganizerSummaryInFlightUserIds: Set<UUID> = []
+    /// Per-organizer fetch generation so older in-flight responses cannot overwrite a newer forced refresh.
+    var pickupOrganizerSummaryFetchGenerationByUserId: [UUID: UInt64] = [:]
     /// Pickup games the current user has already submitted an organizer rating for.
     @Published var pickupGameIdsWithMyCreatorRating: Set<UUID> = []
+    /// Submitted star values keyed by pickup game (for “Rated” history UI).
+    @Published var pickupMyCreatorRatingValueByGameId: [UUID: Int] = [:]
+    /// Authoritative rating timestamps (`pickup_game_creator_ratings.created_at`) for post-rating Going retention.
+    @Published var pickupMyCreatorRatingCreatedAtByGameId: [UUID: Date] = [:]
+    /// Session-only: show Clear Now / Keep for Later once immediately after a successful rating submit.
+    @Published var pickupCreatorRatingPostSubmitPromptGameIds: Set<UUID> = []
+    /// Session-scoped “Not now” deferrals — keyed by authenticated user, cleared on logout.
+    @Published var pickupCreatorRatingDeferredGameIds: Set<UUID> = []
+    /// User id that owns ``pickupCreatorRatingDeferredGameIds`` / rating caches.
+    var pickupCreatorRatingSessionUserId: UUID?
 
     // MARK: - Venue owner analytics (realtime)
 
@@ -1239,6 +1371,10 @@ final class MapViewModel: ObservableObject {
     var pickupJoinRequestBadgeRealtimeTask: Task<Void, Never>?
     var pickupJoinRequestBadgeRealtimeChannel: RealtimeChannelV2?
     var pickupJoinRequestBadgeDebounceTask: Task<Void, Never>?
+    /// Owner + tracked-game-id signature of the *active* pickup join-request badge channel, so
+    /// repeated Account visits reuse the live subscription instead of tearing it down + recreating it.
+    var pickupJoinRequestBadgeRealtimeOwnerUserId: UUID?
+    var pickupJoinRequestBadgeRealtimeTrackedGameIds: [UUID]?
     /// Realtime: requester’s join rows + followed pickup games (Following → Games to Play).
     var pickupFollowingRealtimeTask: Task<Void, Never>?
     var pickupFollowingRealtimeChannel: RealtimeChannelV2?
@@ -1259,10 +1395,12 @@ final class MapViewModel: ObservableObject {
     var pickupFollowingActivityPrimed: Bool = false
     /// Per-game signature last acknowledged by the user (Games to Play visible or per-card refresh).
     var pickupFollowingSeenActivitySignatureByGameId: [UUID: String] = [:]
-    /// User’s 1–5 star rating per venue (local only).
+    /// User’s 1–5 star rating per venue (local mirror of server `venue_ratings`).
     @Published var venueUserStarRatings: [UUID: Int] = [:]
-    /// How many times the user saved a rating (drives review count display).
+    /// Legacy local save counters (no longer authoritative for community counts).
     @Published var venueRatingContributionCount: [UUID: Int] = [:]
+    /// Server aggregates from `get_venue_rating_stats` / `upsert_my_venue_rating`.
+    @Published var venueRatingStatsByVenueId: [UUID: VenueRatingStats] = [:]
 
     enum MapPinDisplayMode {
         case simple
@@ -1278,16 +1416,49 @@ final class MapViewModel: ObservableObject {
     let reminderMinuteOptions = [15, 30, 60, 120, 180, 1440]
     let repeatMinuteOptions = [15, 30, 60, 120]
 
+    private var fanProfileAvatarChangeObserver: NSObjectProtocol?
+
     init() {
         #if DEBUG
         print("[FanUpdatesStoreMigrationDebug] RemovedMapViewModelBridge=true")
         #endif
         restorePendingBusinessEmailSignupDraftIfNeeded()
         clearSavedProGamesForSessionBoundary()
+        fanProfileAvatarChangeObserver = NotificationCenter.default.addObserver(
+            forName: FanProfileChangeCenter.avatarDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let change = FanProfileChangeCenter.avatarChange(from: notification) else { return }
+            Task { @MainActor [weak self] in
+                self?.applyFanProfileAvatarChangeToLocalCaches(change)
+            }
+        }
     }
 
-    func applyDiscoverMapRenderSnapshot(_ snapshot: DiscoverMapRenderSnapshot) {
+    deinit {
+        if let fanProfileAvatarChangeObserver {
+            NotificationCenter.default.removeObserver(fanProfileAvatarChangeObserver)
+        }
+    }
+
+    /// Publishes a freshly built Discover map snapshot, skipping the publication
+    /// when the new snapshot has render-identical content to the current one.
+    ///
+    /// Skipping an identical publish is output-equivalent: the map, activity
+    /// panel, and wow-moment consumers derive their state from the snapshot's
+    /// render content (or from `discoverMapRenderSnapshotGeneration`, which is
+    /// bumped independently in `performDiscoverMapRenderSnapshotRebuild`), so an
+    /// identical snapshot would produce identical UI. Returns `true` when the
+    /// snapshot was actually published.
+    @discardableResult
+    func applyDiscoverMapRenderSnapshot(_ snapshot: DiscoverMapRenderSnapshot) -> Bool {
+        if snapshot.hasIdenticalRenderContent(to: discoverMapRenderSnapshot) {
+            Perf.publishedWriteSkipped(name: "discoverMapRenderSnapshot", reason: "identicalRenderContent")
+            return false
+        }
         discoverMapRenderSnapshot = snapshot
+        return true
     }
 
     // MARK: - Discover / map venue_events fetch cache (region + sport + date window)
@@ -1386,6 +1557,17 @@ final class MapViewModel: ObservableObject {
     var proGameCalendarDotDatesCache: [String: (dates: Set<Date>, fetchedAt: Date)] = [:]
     /// Last Discover map bounds bucket used for venue calendar dots (see ``discoverBoundsBucketString()``).
     var lastVenueCalendarDotBoundsBucket: String?
+    /// Last non-nil Discover map viewport (session). Used when the live camera briefly reports nil.
+    var lastStableDiscoverMapBounds: PickupGameMapBounds?
+    /// While the Discover date picker is open, month-dot loads use this frozen geographic snapshot.
+    var discoverDatePickerGeographicFreezeActive: Bool = false
+    var discoverDatePickerFrozenMapBounds: PickupGameMapBounds?
+    /// One deferred month-dot retry after bounds become available (no polling).
+    var pendingPickupMonthDotRetryAfterBounds: (
+        monthStart: Date,
+        reason: String,
+        requestID: UUID
+    )?
     /// Debounced refresh of Discover venue calendar dots after map viewport / bar set changes.
     var discoverVenueCalendarDotPreloadTask: Task<Void, Never>?
 

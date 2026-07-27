@@ -19,6 +19,7 @@ struct MapVenuePreviewCard: View {
     
     @State private var fanUpdatesSheetEvent: FanUpdatesSheetEvent?
     @State private var fanFeatureBlockedMessage: String?
+    @State private var showVenueEnergyInfo = false
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     private var visibleLivePresenceProfiles: [UserProfileRow] {
@@ -158,8 +159,16 @@ struct MapVenuePreviewCard: View {
             )
             
             VStack(alignment: .leading, spacing: 10) {
-                if let previewEnergy, previewEnergy.hasBadge {
-                    venueGamePreviewEnergyHeader(previewEnergy)
+                HStack(alignment: .center, spacing: 2) {
+                    if let previewEnergy, previewEnergy.hasBadge {
+                        venueGamePreviewEnergyHeader(previewEnergy)
+                    }
+
+                    VenueEnergyInfoButton(action: {
+                        showVenueEnergyInfo = true
+                    })
+
+                    Spacer(minLength: 0)
                 }
 
                 mapVenuePreviewGameActionRow(venueEventID: venueEventID)
@@ -204,9 +213,10 @@ struct MapVenuePreviewCard: View {
                 venueEventID: event.id
             )
         }
+        .sheet(isPresented: $showVenueEnergyInfo) {
+            VenueEnergyHowItWorksSheet(audience: .fan)
         }
-            
-    
+        }
         HStack {
             Button(action: onDirections) {
                 Label(L10n.t("directions", languageCode: appLanguageRaw), systemImage: "map.fill")
@@ -486,7 +496,7 @@ struct MapVenuePreviewCard: View {
         let palette = venueGamePreviewEnergyPalette(energy)
 
         return VStack(alignment: .leading, spacing: 2) {
-            Text("\(energy.label ?? "Quiet") • \(energy.score)")
+            Text(energy.label ?? "Quiet")
                 .font(.caption.weight(.bold))
                 .foregroundStyle(palette.text)
                 .lineLimit(1)

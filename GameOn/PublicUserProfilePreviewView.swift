@@ -11,6 +11,8 @@ struct PublicUserProfilePreviewView: View {
     var onDismiss: () -> Void = {}
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @AppStorage(FavoriteTeamsStore.appStorageKey) private var favoriteTeamIDsRaw: String = ""
+    @AppStorage(FavoriteTeamsStore.primaryTeamIDAppStorageKey) private var primaryFavoriteTeamIDRaw: String = ""
 
     @State private var profile: PublicUserProfileData?
     @State private var isLoading = true
@@ -36,8 +38,22 @@ struct PublicUserProfilePreviewView: View {
         isSelfPreview || userId == viewModel.currentUserAuthId && viewModel.publicProfileIsSelfPreview
     }
 
+    /// Live My Team overlay for self-preview so national-fan sport labels never go stale.
+    private var presentationProfile: PublicUserProfileData? {
+        guard let profile else { return nil }
+        guard viewingAsSelfPreview else { return profile }
+        let localTeams = FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
+        return profile.seededForSelfPreview(
+            homeCrowd: viewModel.currentUserHomeCrowdVenue,
+            openToPreferences: viewModel.currentUserFanIdentityPreferences,
+            primaryFavoriteTeamID: primaryFavoriteTeamIDRaw,
+            favoriteTeams: localTeams,
+            profileBackgroundKey: viewModel.currentUserProfileBackgroundKey
+        )
+    }
+
     private var profileContentHorizontalPadding: CGFloat {
-        PublicProfileSheetLayout.horizontalPadding()
+        ProfileHeroMetrics.outerInset(screenWidth: nil)
     }
 
     var body: some View {
@@ -47,9 +63,9 @@ struct PublicUserProfilePreviewView: View {
                     if viewingAsSelfPreview {
                         selfPreviewBanner
                     }
-                    if isLoading, profile == nil {
+                    if isLoading, presentationProfile == nil {
                         loadingSkeleton
-                    } else if let profile {
+                    } else if let profile = presentationProfile {
                         // Self-preview loader sets isPubliclyVisible; keep banner+content when projection loaded.
                         if !profile.isPubliclyVisible {
                             profileUnavailableState
@@ -69,6 +85,9 @@ struct PublicUserProfilePreviewView: View {
                 .profileReadableContentWidth()
             }
             .background(sheetBackground.ignoresSafeArea())
+            .toolbarBackground(sheetBackgroundColor, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(colorScheme, for: .navigationBar)
             .navigationTitle("Fan Profile")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -182,6 +201,19 @@ struct PublicUserProfilePreviewView: View {
             await loadProfile()
             await loadPokeSummary(for: userId)
         }
+        .onReceive(NotificationCenter.default.publisher(for: FanProfileChangeCenter.avatarDidChangeNotification)) { notification in
+            guard let change = FanProfileChangeCenter.avatarChange(from: notification),
+                  change.userId == userId,
+                  let current = profile else { return }
+            let nextFull = change.avatarURL.isEmpty ? current.avatarURL : change.avatarURL
+            let nextThumb = change.avatarThumbnailURL ?? current.avatarThumbnailURL
+            let curFull = ImageDisplayURL.canonicalStorageURLString(current.avatarURL)
+            let curThumb = ImageDisplayURL.canonicalStorageURLString(current.avatarThumbnailURL)
+            let newFull = ImageDisplayURL.canonicalStorageURLString(nextFull)
+            let newThumb = ImageDisplayURL.canonicalStorageURLString(nextThumb)
+            guard curFull != newFull || curThumb != newThumb else { return }
+            profile = current.replacingAvatars(avatarURL: nextFull, avatarThumbnailURL: nextThumb)
+        }
         .onChange(of: viewModel.publicProfileOpenToRevision) { _, _ in
             guard userId == viewModel.currentUserAuthId else { return }
             Task { await loadProfile() }
@@ -203,9 +235,6 @@ struct PublicUserProfilePreviewView: View {
 
     @ViewBuilder
     private func profileContent(_ data: PublicUserProfileData) -> some View {
-        let sportItems = PublicProfileOpenToSplit.sportItems(from: data.openToItems)
-        let socialItems = PublicProfileOpenToSplit.socialItems(from: data.openToItems)
-
         VStack(spacing: PublicProfileSheetLayout.sectionSpacing) {
             PublicProfileRedesignHero(
                 data: data,
@@ -217,76 +246,62 @@ struct PublicUserProfilePreviewView: View {
                 pokeTitle: pokeButtonTitle,
                 isPokeDisabled: isPokeActionDisabled,
                 isPokeInFlight: isPokeInFlight,
-                onAddFriend: { Task { await requestFriendship(userId: data.userId) } },
-                onCancelRequest: { showCancelFriendRequestConfirmation = true },
-                onMessage: { Task { await messageFriend(data) } },
+                onAddFriend: {
+                    guard !viewingAsSelfPreview else { return }
+                    Task { await requestFriendship(userId: data.userId) }
+                },
+                onCancelRequest: {
+                    guard !viewingAsSelfPreview else { return }
+                    showCancelFriendRequestConfirmation = true
+                },
+                onMessage: {
+                    guard !viewingAsSelfPreview else { return }
+                    Task { await messageFriend(data) }
+                },
                 onEditProfile: { onDismiss() },
-                onShare: { showShareFanProfileSheet = true },
-                onReport: { showReportFanSheet = true },
-                onBlock: { showBlockFanConfirmation = true },
-                onPoke: { Task { await sendPoke(to: data.userId) } }
+                onShare: {
+                    guard !viewingAsSelfPreview else { return }
+                    showShareFanProfileSheet = true
+                },
+                onReport: {
+                    guard !viewingAsSelfPreview else { return }
+                    showReportFanSheet = true
+                },
+                onBlock: {
+                    guard !viewingAsSelfPreview else { return }
+                    showBlockFanConfirmation = true
+                },
+                onPoke: {
+                    guard !viewingAsSelfPreview else { return }
+                    Task { await sendPoke(to: data.userId) }
+                }
             )
             .onAppear {
 #if DEBUG
-                print("[PublicProfileRedesign] rendered user_id=\(data.userId.uuidString.lowercased()) mutual=\(data.mutualFansCount) avatars=\(data.mutualFanAvatars.count) selfPreview=\(viewingAsSelfPreview)")
+                print("[PublicProfileRedesign] rendered user_id=\(data.userId.uuidString.lowercased()) mutual=\(data.mutualFansCount) avatars=\(data.mutualFanAvatars.count) selfPreview=\(viewingAsSelfPreview) openTo=\(data.openToItems.count) homeCrowd=\(data.homeCrowd?.venueId.uuidString.lowercased() ?? "nil")")
 #endif
             }
 
-            PublicProfileMutualFansSection(
-                count: data.mutualFansCount,
-                avatars: data.mutualFanAvatars,
+            PublicProfileBelowHeroStack(
+                data: data,
                 isSelfPreview: viewingAsSelfPreview,
-                targetUserId: data.userId,
-                onSelectFan: viewingAsSelfPreview
+                onSelectMutualFan: viewingAsSelfPreview
                     ? nil
                     : { fanId in
                         viewModel.presentPublicProfile(
                             userId: fanId,
                             context: "mutual_friends"
                         )
-                    }
-            )
-            .frame(maxWidth: .infinity)
-
-            PublicProfileFanSnapshotView(data: data)
-                .frame(maxWidth: .infinity)
-
-            PublicProfileTeamsIFollowSection(
-                data: data,
-                isSelfPreview: viewingAsSelfPreview,
-                onChooseTeam: viewingAsSelfPreview ? { onDismiss() } : nil
-            )
-            .frame(maxWidth: .infinity)
-
-            PublicProfileSportsIPlaySection(
-                items: sportItems,
-                isSelfPreview: viewingAsSelfPreview,
-                onAddSports: viewingAsSelfPreview ? { onDismiss() } : nil
-            )
-            .frame(maxWidth: .infinity)
-
-            PublicProfileSocialOpenToSection(items: socialItems)
-                .frame(maxWidth: .infinity)
-
-            PublicProfileHomeWatchSpotSection(
-                summary: data.homeCrowd,
-                isSelfPreview: viewingAsSelfPreview,
-                onViewSpot: {
+                    },
+                onChooseTeam: viewingAsSelfPreview ? { onDismiss() } : nil,
+                onAddSports: viewingAsSelfPreview ? { onDismiss() } : nil,
+                onViewHomeWatchSpot: {
                     guard let venueId = data.homeCrowd?.venueId else { return }
                     onDismiss()
                     viewModel.focusDiscoverOnVenue(venueId)
                 },
-                onChooseSpot: viewingAsSelfPreview ? { onDismiss() } : nil
+                onChooseHomeWatchSpot: viewingAsSelfPreview ? { onDismiss() } : nil
             )
-            .frame(maxWidth: .infinity)
-
-            if data.organizerStats?.hasPublicOrganizerRatings == true || data.pickupHostedCount > 0 {
-                PublicProfilePickupOrganizerCard(
-                    creatorUserId: data.userId,
-                    stats: data.organizerStats,
-                    compact: true
-                )
-            }
 
             if let friendActionError, !friendActionError.isEmpty {
                 inlineError(friendActionError)
@@ -433,25 +448,25 @@ struct PublicUserProfilePreviewView: View {
     private var loadingSkeleton: some View {
         VStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.72))
+                .fill(FGColor.cardBackground(colorScheme))
                 .frame(height: 168)
                 .redacted(reason: .placeholder)
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.62))
+                .fill(FGColor.cardBackground(colorScheme))
                 .frame(height: 44)
                 .redacted(reason: .placeholder)
             HStack(spacing: 10) {
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.62))
+                    .fill(FGColor.cardBackground(colorScheme))
                     .frame(height: 176)
                     .redacted(reason: .placeholder)
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.62))
+                    .fill(FGColor.cardBackground(colorScheme))
                     .frame(height: 176)
                     .redacted(reason: .placeholder)
             }
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.06 : 0.62))
+                .fill(FGColor.cardBackground(colorScheme))
                 .frame(height: 120)
                 .redacted(reason: .placeholder)
             ProgressView().tint(FGColor.accentGreen).padding(.top, 4)
@@ -475,9 +490,12 @@ struct PublicUserProfilePreviewView: View {
         )
     }
 
+    private var sheetBackgroundColor: Color {
+        FGColor.background(colorScheme)
+    }
+
     private var sheetBackground: some View {
-        Color(red: 0.94, green: 0.95, blue: 0.97)
-            .opacity(colorScheme == .dark ? 0.92 : 1)
+        sheetBackgroundColor
     }
 
     // MARK: - Actions
@@ -502,7 +520,9 @@ struct PublicUserProfilePreviewView: View {
         var cached = viewModel.cachedUserProfileRowForPublicProfile(userId: userId)
         if cached == nil,
            let friend = chatViewModel.friends.first(where: { $0.preview.id == userId }) {
-            cached = PublicUserProfileService.userProfileRow(from: friend.preview)
+            // Seed identity/name from chat, but do not freeze chat avatar snapshots as authoritative.
+            // Fresh RPC / profile fetch must supply the current avatar URL.
+            cached = PublicUserProfileService.userProfileRow(from: friend.preview, includeAvatars: false)
         }
         if userId == viewModel.currentUserAuthId {
             cached = viewModel.currentUserProfileRowForPublicProfileCache()
@@ -514,12 +534,39 @@ struct PublicUserProfilePreviewView: View {
             isSelfPreview: viewingAsSelfPreview
         )
 
+        // If chat inbox already merged a newer avatar URL (realtime / shared event), prefer it over
+        // an older cached row — but never overwrite a successful network identity with a blank chat seed.
+        if let friend = chatViewModel.friends.first(where: { $0.preview.id == userId }) {
+            let chatFull = ImageDisplayURL.canonicalStorageURLString(friend.preview.avatarURL)
+            let chatThumb = ImageDisplayURL.canonicalStorageURLString(friend.preview.avatarThumbnailURL)
+            let loadedFull = ImageDisplayURL.canonicalStorageURLString(loaded.avatarURL)
+            let loadedThumb = ImageDisplayURL.canonicalStorageURLString(loaded.avatarThumbnailURL)
+            if !chatFull.isEmpty, chatFull != loadedFull || (!chatThumb.isEmpty && chatThumb != loadedThumb) {
+                // Prefer the URL that looks versioned/newer by string inequality only when chat was
+                // updated after inbox merge; if load returned empty avatars, fill from chat.
+                if loadedFull.isEmpty && loadedThumb.isEmpty {
+                    loaded = loaded.replacingAvatars(
+                        avatarURL: chatFull.isEmpty ? nil : chatFull,
+                        avatarThumbnailURL: chatThumb.isEmpty ? nil : chatThumb
+                    )
+                }
+            }
+        }
+
         if viewingAsSelfPreview {
             // Prefer freshly loaded public projection; only fill gaps from owner state so
             // self-preview never shows owner empty-states for already-configured data.
+            // Seed live My Team so national-fan sport subtitle matches the Account strip.
             loaded = loaded.seededForSelfPreview(
                 homeCrowd: viewModel.currentUserHomeCrowdVenue,
-                openToPreferences: viewModel.currentUserFanIdentityPreferences
+                openToPreferences: viewModel.currentUserFanIdentityPreferences,
+                primaryFavoriteTeamID: UserDefaults.standard.string(
+                    forKey: FavoriteTeamsStore.primaryTeamIDAppStorageKey
+                ),
+                favoriteTeams: FavoriteTeamsStore.resolvedTeams(
+                    from: UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
+                ),
+                profileBackgroundKey: viewModel.currentUserProfileBackgroundKey
             )
         }
 
@@ -610,6 +657,7 @@ struct PublicUserProfilePreviewView: View {
             await loadPokeSummary(for: targetUserId)
         } catch {
             await MainActor.run {
+                _ = AgeAccessBackendDenial.handle(error, requestUserId: nil)
                 pokeActionError = "Couldn't send poke. Try again."
                 isPokeInFlight = false
             }

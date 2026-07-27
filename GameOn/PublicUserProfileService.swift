@@ -20,11 +20,15 @@ struct PublicUserProfileData {
     let bio: String?
     let avatarURL: String?
     let avatarThumbnailURL: String?
+    /// Authoritative Fan XP total from `user_xp` (defaults to 0).
+    let totalXP: Int
     let reputation: FanReputationProfile
     let organizerStats: PickupCreatorPublicRatingStats?
     let favoriteTeams: [FavoriteTeam]
     let primaryFavoriteTeamID: String?
     let nationalTeam: NationalTeamIdentity?
+    /// Resolved curated background key (always safe; defaults to FanGeo).
+    let profileBackgroundKey: ProfileBackgroundKey
     let isBusinessAccount: Bool
     /// True when `user_profiles` row was loaded from network or cache (not purely synthetic).
     let hasResolvedIdentity: Bool
@@ -45,9 +49,13 @@ struct PublicUserProfileData {
     let homeCityDisplayLine: String?
     let pickupHostedCount: Int
     let pickupJoinedCount: Int
+    /// Latest eligible hosted-game `created_at` from organizer summary RPC (nil when none).
+    let lastPickupGameCreatedAt: Date?
     let socialHighlightLabels: [String]
     let personalityTags: [String]
     let sharedTeamNames: [String]
+    /// Privacy-gated `last_seen_at` for Last active UI (nil when hidden / unavailable).
+    let lastSeenAtRaw: String?
 
     var publicHandleDisplayLine: String {
         FanGeoHandleRules.handleDisplayLine(
@@ -57,21 +65,78 @@ struct PublicUserProfileData {
         )
     }
 
+    func replacingAvatars(avatarURL: String?, avatarThumbnailURL: String?) -> PublicUserProfileData {
+        PublicUserProfileData(
+            userId: userId,
+            displayName: displayName,
+            publicHandleLine: publicHandleLine,
+            profileCreatedAt: profileCreatedAt,
+            bio: bio,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            totalXP: totalXP,
+            reputation: reputation,
+            organizerStats: organizerStats,
+            favoriteTeams: favoriteTeams,
+            primaryFavoriteTeamID: primaryFavoriteTeamID,
+            nationalTeam: nationalTeam,
+            profileBackgroundKey: profileBackgroundKey,
+            isBusinessAccount: isBusinessAccount,
+            hasResolvedIdentity: hasResolvedIdentity,
+            isPubliclyVisible: isPubliclyVisible,
+            isDiscoverableByFans: isDiscoverableByFans,
+            memberSinceLabel: memberSinceLabel,
+            openToItems: openToItems,
+            mutualFansCount: mutualFansCount,
+            mutualFanAvatars: mutualFanAvatars,
+            sharedTeamsCount: sharedTeamsCount,
+            venueCount: venueCount,
+            venueCards: venueCards,
+            homeCrowd: homeCrowd,
+            homeCityDisplayLine: homeCityDisplayLine,
+            pickupHostedCount: pickupHostedCount,
+            pickupJoinedCount: pickupJoinedCount,
+            lastPickupGameCreatedAt: lastPickupGameCreatedAt,
+            socialHighlightLabels: socialHighlightLabels,
+            personalityTags: personalityTags,
+            sharedTeamNames: sharedTeamNames,
+            lastSeenAtRaw: lastSeenAtRaw
+        )
+    }
+
     /// Self-preview only: fill gaps from already-loaded owner state without changing public visibility rules.
+    /// Prefer the owner's live My Team selection so national-fan sport subtitles stay consistent.
     func seededForSelfPreview(
         homeCrowd ownerHomeCrowd: HomeCrowdVenueSummary?,
-        openToPreferences ownerPreferences: FanIdentityPreferences
+        openToPreferences ownerPreferences: FanIdentityPreferences,
+        primaryFavoriteTeamID ownerPrimaryFavoriteTeamID: String? = nil,
+        favoriteTeams ownerFavoriteTeams: [FavoriteTeam]? = nil,
+        profileBackgroundKey ownerProfileBackgroundKey: ProfileBackgroundKey? = nil
     ) -> PublicUserProfileData {
         let seededHome = homeCrowd ?? ownerHomeCrowd
+        let seededFavoriteTeams: [FavoriteTeam] = {
+            guard let ownerFavoriteTeams, !ownerFavoriteTeams.isEmpty else { return favoriteTeams }
+            return ownerFavoriteTeams
+        }()
+        let seededPrimaryID = FavoriteTeamsStore.explicitPrimaryTeamID(
+            ownerPrimaryFavoriteTeamID ?? primaryFavoriteTeamID,
+            within: seededFavoriteTeams.map(\.id)
+        )
+        let seededBackground = ownerProfileBackgroundKey ?? profileBackgroundKey
         let ownerOpenTo = PublicProfileOpenToBuilder.items(
             preferences: ownerPreferences,
-            favoriteTeams: favoriteTeams,
+            favoriteTeams: seededFavoriteTeams,
             venueCount: venueCount,
             pickupHostedCount: pickupHostedCount,
             pickupJoinedCount: pickupJoinedCount
         )
         let seededOpenTo = openToItems.count >= ownerOpenTo.count ? openToItems : ownerOpenTo
-        guard seededHome?.venueId != homeCrowd?.venueId || seededOpenTo.count != openToItems.count else {
+        let homeChanged = seededHome?.venueId != homeCrowd?.venueId
+        let openToChanged = seededOpenTo.count != openToItems.count
+        let teamsChanged = seededFavoriteTeams.map(\.id) != favoriteTeams.map(\.id)
+        let primaryChanged = seededPrimaryID != primaryFavoriteTeamID
+        let backgroundChanged = seededBackground != profileBackgroundKey
+        guard homeChanged || openToChanged || teamsChanged || primaryChanged || backgroundChanged else {
             return self
         }
         return PublicUserProfileData(
@@ -82,11 +147,13 @@ struct PublicUserProfileData {
             bio: bio,
             avatarURL: avatarURL,
             avatarThumbnailURL: avatarThumbnailURL,
+            totalXP: totalXP,
             reputation: reputation,
             organizerStats: organizerStats,
-            favoriteTeams: favoriteTeams,
-            primaryFavoriteTeamID: primaryFavoriteTeamID,
+            favoriteTeams: seededFavoriteTeams,
+            primaryFavoriteTeamID: seededPrimaryID,
             nationalTeam: nationalTeam,
+            profileBackgroundKey: seededBackground,
             isBusinessAccount: isBusinessAccount,
             hasResolvedIdentity: hasResolvedIdentity,
             isPubliclyVisible: isPubliclyVisible,
@@ -102,9 +169,11 @@ struct PublicUserProfileData {
             homeCityDisplayLine: homeCityDisplayLine,
             pickupHostedCount: pickupHostedCount,
             pickupJoinedCount: pickupJoinedCount,
+            lastPickupGameCreatedAt: lastPickupGameCreatedAt,
             socialHighlightLabels: socialHighlightLabels,
             personalityTags: personalityTags,
-            sharedTeamNames: sharedTeamNames
+            sharedTeamNames: sharedTeamNames,
+            lastSeenAtRaw: lastSeenAtRaw
         )
     }
 }
@@ -132,7 +201,7 @@ struct PublicProfileMutualFanAvatar: Equatable, Identifiable {
 
 enum PublicUserProfileService {
     private static let profileSelect =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,created_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,home_city,home_region,home_country,show_home_city"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,created_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,home_city,home_region,home_country,show_home_city,profile_background_key"
 
     /// Always returns a displayable profile; optional sections use safe fallbacks.
     /// - Parameter isSelfPreview: When `true` and `userId` matches the authenticated session user,
@@ -258,7 +327,12 @@ enum PublicUserProfileService {
         }
 
         let (fanXP, _) = await loadPublicXP(userId: userId)
-        let organizerStats = await fetchOrganizerStats(userId: userId)
+        let organizerSummary = await fetchOrganizerProfileSummary(userId: userId)
+        let organizerStats = PickupCreatorPublicRatingStats(
+            avgRating: organizerSummary.averageRating ?? 0,
+            ratingCount: organizerSummary.ratingCount
+        )
+        let pickupHosted = organizerSummary.hostedCount
         let favoriteSelection = await fetchPublicFavoriteTeamSelection(userId: userId)
         let favoriteTeams = FavoriteTeamsStore.resolvedTeams(fromIDs: favoriteSelection.teamIDs)
         let preferences = await fetchFanIdentityPreferences(userId: userId) ?? .empty
@@ -266,6 +340,7 @@ enum PublicUserProfileService {
         // Self-preview must use the owner-safe profile pointer path so WYSIWYG
         // matches what other fans see via those RPCs.
         let homeCrowd = await fetchSelfHomeCrowdForPublicProjection(userId: userId)
+        let lastSeenAtRaw = row?.last_seen_at
 
         let built = buildProfileData(
             userId: userId,
@@ -286,7 +361,7 @@ enum PublicUserProfileService {
                 preferences: preferences,
                 favoriteTeams: favoriteTeams,
                 venueCount: 0,
-                pickupHostedCount: 0,
+                pickupHostedCount: pickupHosted,
                 pickupJoinedCount: 0
             ),
             mutualFansCount: 0,
@@ -295,9 +370,11 @@ enum PublicUserProfileService {
             venueCount: 0,
             venueCards: [],
             homeCrowd: homeCrowd,
-            pickupHostedCount: 0,
+            pickupHostedCount: pickupHosted,
             pickupJoinedCount: 0,
-            sharedTeamNames: []
+            lastPickupGameCreatedAt: organizerSummary.lastPickupGameCreatedAt,
+            sharedTeamNames: [],
+            lastSeenAtRaw: lastSeenAtRaw
         )
 
 #if DEBUG
@@ -340,15 +417,15 @@ enum PublicUserProfileService {
     private static func logPublicProfileBlocked(userId: UUID, reason: String) {}
 #endif
 
-    static func userProfileRow(from preview: UserPreview) -> UserProfileRow {
+    static func userProfileRow(from preview: UserPreview, includeAvatars: Bool = true) -> UserProfileRow {
         UserProfileRow(
             id: preview.id,
             email: preview.email,
             display_name: preview.displayName,
             username: preview.username,
             bio: nil,
-            avatar_url: preview.avatarURL,
-            avatar_thumbnail_url: preview.avatarThumbnailURL,
+            avatar_url: includeAvatars ? preview.avatarURL : nil,
+            avatar_thumbnail_url: includeAvatars ? preview.avatarThumbnailURL : nil,
             is_business_account: preview.isBusinessAccount,
             admin_status: "active",
             live_visibility_enabled: true,
@@ -409,6 +486,18 @@ enum PublicUserProfileService {
         let home_region: String?
         let home_country: String?
         let show_home_city: Bool?
+        /// Present after 20260871; nil on older backends triggers optional user_xp fallback.
+        let total_xp: Int?
+        let xp_level: Int?
+        let xp_title: String?
+        /// Present after 20260874; nil on older backends triggers organizer stats fallback RPC.
+        let pickup_games_hosted_count: Int?
+        let pickup_organizer_average_rating: PickupRPCNumericOrString?
+        let pickup_organizer_rating_count: Int?
+        /// Present after 20260875; ISO timestamptz string when hosted games exist.
+        let last_pickup_game_created_at: String?
+        /// Present after 20260885; curated background catalog key.
+        let profile_background_key: String?
 
         struct MutualFanRow: Decodable {
             let user_id: UUID?
@@ -452,6 +541,14 @@ enum PublicUserProfileService {
             home_region = try? c.decode(String.self, forKey: .home_region)
             home_country = try? c.decode(String.self, forKey: .home_country)
             show_home_city = try? c.decode(Bool.self, forKey: .show_home_city)
+            total_xp = try? c.decode(Int.self, forKey: .total_xp)
+            xp_level = try? c.decode(Int.self, forKey: .xp_level)
+            xp_title = try? c.decode(String.self, forKey: .xp_title)
+            pickup_games_hosted_count = try? c.decode(Int.self, forKey: .pickup_games_hosted_count)
+            pickup_organizer_average_rating = try? c.decode(PickupRPCNumericOrString.self, forKey: .pickup_organizer_average_rating)
+            pickup_organizer_rating_count = try? c.decode(Int.self, forKey: .pickup_organizer_rating_count)
+            last_pickup_game_created_at = try? c.decode(String.self, forKey: .last_pickup_game_created_at)
+            profile_background_key = try? c.decode(String.self, forKey: .profile_background_key)
             if c.contains(.home_crowd_venue) {
                 if (try? c.decodeNil(forKey: .home_crowd_venue)) == true {
                     home_crowd_venue = nil
@@ -514,6 +611,14 @@ enum PublicUserProfileService {
             case home_region
             case home_country
             case show_home_city
+            case total_xp
+            case xp_level
+            case xp_title
+            case pickup_games_hosted_count
+            case pickup_organizer_average_rating
+            case pickup_organizer_rating_count
+            case last_pickup_game_created_at
+            case profile_background_key
         }
     }
 
@@ -603,9 +708,21 @@ enum PublicUserProfileService {
             return crowd
         }
 
+        if let crowd = await fetchSupplementalPublicHomeCrowd(userId: userId) {
+            print("[HomeCrowdDebug] legacyHomeCrowd= source=supplemental")
+            return crowd
+        }
+
+        print("[HomeCrowdDebug] legacyHomeCrowd= nil")
+        logRenderedHomeCrowd(nil)
+        return nil
+    }
+
+    /// Dedicated public Home Crowd RPCs / pointer fallbacks when the identity payload omits the venue.
+    private static func fetchSupplementalPublicHomeCrowd(userId: UUID) async -> HomeCrowdVenueSummary? {
         if let dedicated = await HomeCrowdService.fetchPublicHomeCrowdForFan(targetUserId: userId),
            let crowd = resolvePublicHomeCrowd(dedicated) {
-            print("[HomeCrowdDebug] legacyHomeCrowd= source=dedicated_rpc")
+            print("[HomeCrowdDebug] supplementalHomeCrowd= source=dedicated_rpc")
             return crowd
         }
 
@@ -615,7 +732,7 @@ enum PublicUserProfileService {
                 setAt: pointer.home_crowd_set_at,
                 excludeUserId: userId
             ), let crowd = resolvePublicHomeCrowd(summary) {
-                print("[HomeCrowdDebug] legacyHomeCrowd= source=venue_summary_rpc")
+                print("[HomeCrowdDebug] supplementalHomeCrowd= source=venue_summary_rpc")
                 return crowd
             }
 
@@ -623,13 +740,12 @@ enum PublicUserProfileService {
                 venueId: pointer.venue_id,
                 setAt: pointer.home_crowd_set_at
             ), let crowd = resolvePublicHomeCrowd(tableSummary) {
-                print("[HomeCrowdDebug] legacyHomeCrowd= source=venues_table")
+                print("[HomeCrowdDebug] supplementalHomeCrowd= source=venues_table")
                 return crowd
             }
         }
 
-        print("[HomeCrowdDebug] legacyHomeCrowd= nil")
-        logRenderedHomeCrowd(nil)
+        print("[HomeCrowdDebug] supplementalHomeCrowd= nil")
         return nil
     }
 
@@ -729,25 +845,73 @@ enum PublicUserProfileService {
             home_city: rpc.show_home_city == true ? rpc.home_city : nil,
             home_region: rpc.show_home_city == true ? rpc.home_region : nil,
             home_country: rpc.show_home_city == true ? rpc.home_country : nil,
-            show_home_city: rpc.show_home_city
+            show_home_city: rpc.show_home_city,
+            profile_background_key: rpc.profile_background_key
         )
 
-        let organizerStats = await fetchOrganizerStats(userId: userId)
+        let organizerStats: PickupCreatorPublicRatingStats
+        if let count = rpc.pickup_organizer_rating_count {
+            // 20260874 embeds organizer aggregates; prefer them to avoid a second RPC.
+            let avg = rpc.pickup_organizer_average_rating?.doubleValue
+            if count <= 0 {
+                organizerStats = PickupCreatorPublicRatingStats(avgRating: 0, ratingCount: 0)
+            } else {
+                organizerStats = PickupCreatorPublicRatingStats(avgRating: avg ?? 0, ratingCount: count)
+            }
+        } else {
+            organizerStats = await fetchOrganizerStats(userId: userId)
+                ?? PickupCreatorPublicRatingStats(avgRating: 0, ratingCount: 0)
+        }
         let venueCount = max(0, rpc.venue_count ?? 0)
-        let pickupHosted = max(0, rpc.pickup_hosted_count ?? 0)
+        let pickupHosted = max(
+            0,
+            rpc.pickup_games_hosted_count ?? rpc.pickup_hosted_count ?? 0
+        )
         let pickupJoined = max(0, rpc.pickup_joined_count ?? 0)
+        let lastPickupCreated: Date? = {
+            guard let raw = rpc.last_pickup_game_created_at?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { return nil }
+            return PickupGameModels.parseSupabaseTimestamptz(raw)
+        }()
         var preferences = rpc.fan_identity_preferences ?? .empty
-        if preferences.resolvedOpenToItemIDs.isEmpty,
+        let rpcOpenToMissing = rpc.fan_identity_preferences == nil
+        if rpcOpenToMissing || preferences.resolvedOpenToItemIDs.isEmpty,
            let fetched = await fetchFanIdentityPreferences(userId: userId) {
-            preferences = fetched
-            print("[OpenToDebug] publicRpcPreferences= used_profile_fetch ids=\(preferences.resolvedOpenToItemIDs)")
+            // Prefer table fetch when RPC omitted/failed prefs, or when it yields more Open To ids.
+            if rpcOpenToMissing
+                || fetched.resolvedOpenToItemIDs.count >= preferences.resolvedOpenToItemIDs.count {
+                preferences = fetched
+                print("[OpenToDebug] publicRpcPreferences= used_profile_fetch ids=\(preferences.resolvedOpenToItemIDs)")
+            }
         }
         let sharedTeamNames = FavoriteTeamsStore.resolvedTeams(fromIDs: rpc.shared_team_ids ?? [])
             .map { ($0.shortCode?.isEmpty == false) ? $0.shortCode! : $0.name }
+
+        let fanXP: FanXPState
+        if rpc.total_xp != nil || rpc.xp_level != nil || rpc.xp_title != nil {
+            let total = max(0, rpc.total_xp ?? 0)
+            let level = max(1, rpc.xp_level ?? FanXPLevelCalculator.levelForXP(total))
+            let titleRaw = (rpc.xp_title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            fanXP = FanXPState(
+                totalXP: total,
+                level: level,
+                title: titleRaw.isEmpty ? FanXPLevelCalculator.titleForLevel(level) : titleRaw
+            )
+        } else {
+            // Pre-20260871 backends: one user_xp read (same path as legacy fallback).
+            let loaded = await loadPublicXP(userId: userId)
+            fanXP = loaded.0
+        }
+
+        var homeCrowd = resolvePublicHomeCrowd(rpc.home_crowd_venue)
+        if homeCrowd == nil {
+            homeCrowd = await fetchSupplementalPublicHomeCrowd(userId: userId)
+        }
+
         let built = buildProfileData(
             userId: userId,
             row: row,
-            fanXP: FanXPState.rookie,
+            fanXP: fanXP,
             organizerStats: organizerStats,
             favoriteTeams: favoriteTeams,
             primaryFavoriteTeamID: primaryTeamID,
@@ -804,11 +968,13 @@ enum PublicUserProfileService {
                     thumbnailURL: thumb.isEmpty ? nil : thumb
                 )
             },
-            homeCrowd: resolvePublicHomeCrowd(rpc.home_crowd_venue),
+            homeCrowd: homeCrowd,
             homeCityDisplayLine: resolvePublicHomeCityDisplay(from: rpc),
             pickupHostedCount: pickupHosted,
             pickupJoinedCount: pickupJoined,
-            sharedTeamNames: sharedTeamNames
+            lastPickupGameCreatedAt: lastPickupCreated,
+            sharedTeamNames: sharedTeamNames,
+            lastSeenAtRaw: await fetchVisibleActivityLastSeen(userId: userId)
         )
 
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
@@ -839,11 +1005,13 @@ enum PublicUserProfileService {
             bio: nil,
             avatarURL: nil,
             avatarThumbnailURL: nil,
+            totalXP: 0,
             reputation: FanReputationEngine.evaluate(FanReputationSignals(fanXP: .rookie)),
             organizerStats: nil,
             favoriteTeams: [],
             primaryFavoriteTeamID: nil,
             nationalTeam: nil,
+            profileBackgroundKey: .fangeo,
             isBusinessAccount: false,
             hasResolvedIdentity: false,
             isPubliclyVisible: false,
@@ -859,9 +1027,11 @@ enum PublicUserProfileService {
             homeCityDisplayLine: nil,
             pickupHostedCount: 0,
             pickupJoinedCount: 0,
+            lastPickupGameCreatedAt: nil,
             socialHighlightLabels: [],
             personalityTags: [],
-            sharedTeamNames: []
+            sharedTeamNames: [],
+            lastSeenAtRaw: nil
         )
     }
 
@@ -944,6 +1114,7 @@ enum PublicUserProfileService {
         }
 
         let legacyHomeCrowd = await fetchPublicHomeCrowdForLegacyProfile(userId: userId)
+        let lastSeenAtRaw = await fetchVisibleActivityLastSeen(userId: userId)
 
         let built = buildProfileData(
             userId: userId,
@@ -975,7 +1146,8 @@ enum PublicUserProfileService {
             homeCrowd: legacyHomeCrowd,
             pickupHostedCount: pickupHosted,
             pickupJoinedCount: pickupJoined,
-            sharedTeamNames: []
+            sharedTeamNames: [],
+            lastSeenAtRaw: lastSeenAtRaw
         )
 
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
@@ -1149,7 +1321,9 @@ enum PublicUserProfileService {
         homeCityDisplayLine: String? = nil,
         pickupHostedCount: Int,
         pickupJoinedCount: Int,
-        sharedTeamNames: [String]
+        lastPickupGameCreatedAt: Date? = nil,
+        sharedTeamNames: [String],
+        lastSeenAtRaw: String? = nil
     ) -> PublicUserProfileData {
         let emailNorm = OwnerBusinessEmail.normalized(row?.email ?? "")
         let display = (row?.display_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1209,6 +1383,7 @@ enum PublicUserProfileService {
             bio: trimmedBio.isEmpty ? nil : trimmedBio,
             avatarURL: avatarFull.isEmpty ? nil : avatarFull,
             avatarThumbnailURL: avatarThumb.isEmpty ? nil : avatarThumb,
+            totalXP: max(0, fanXP.totalXP),
             reputation: reputation,
             organizerStats: organizerStats,
             favoriteTeams: uniquedTeams,
@@ -1218,6 +1393,7 @@ enum PublicUserProfileService {
                 return raw
             }(),
             nationalTeam: row?.nationalTeamIdentity,
+            profileBackgroundKey: ProfileBackgroundCatalog.resolveKey(row?.profile_background_key),
             isBusinessAccount: isBusinessAccount,
             hasResolvedIdentity: hasResolvedIdentity,
             isPubliclyVisible: isPubliclyVisible,
@@ -1233,6 +1409,7 @@ enum PublicUserProfileService {
             homeCityDisplayLine: homeCityDisplayLine ?? resolvePublicHomeCityDisplay(from: row),
             pickupHostedCount: pickupHostedCount,
             pickupJoinedCount: pickupJoinedCount,
+            lastPickupGameCreatedAt: lastPickupGameCreatedAt,
             socialHighlightLabels: socialHighlights(
                 venueCount: venueCount,
                 pickupHosted: pickupHostedCount,
@@ -1240,8 +1417,29 @@ enum PublicUserProfileService {
                 sharedTeams: sharedTeamsCount
             ),
             personalityTags: [],
-            sharedTeamNames: sharedTeamNames
+            sharedTeamNames: sharedTeamNames,
+            lastSeenAtRaw: lastSeenAtRaw
         )
+    }
+
+    /// Privacy-gated last_seen for public profile badge (companion RPC; nil if unavailable).
+    private static func fetchVisibleActivityLastSeen(userId: UUID) async -> String? {
+        struct Params: Encodable { let p_user_id: UUID }
+        do {
+            let value: String? = try await supabase
+                .rpc("get_visible_activity_last_seen", params: Params(p_user_id: userId))
+                .execute()
+                .value
+            if let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                ActivityStatusDebug.lifecycle("presence record received", details: "source=public_profile_rpc")
+                return value
+            }
+            return nil
+        } catch {
+            // Pre-migration backends: fall back to no badge (do not claim Online).
+            ActivityStatusDebug.lifecycle("statistics request failed", details: "reason=activity_rpc_unavailable")
+            return nil
+        }
     }
 
     /// SwiftUI `ForEach` fatals on duplicate `Identifiable.id` values — mutual avatar RPC can
@@ -1340,5 +1538,47 @@ enum PublicUserProfileService {
         } catch {
             return PickupCreatorPublicRatingStats(avgRating: 0, ratingCount: 0)
         }
+    }
+
+    /// Prefer `pickup_organizer_profile_summary` (hosted + ratings). Falls back to rating-only RPC.
+    private static func fetchOrganizerProfileSummary(userId: UUID) async -> PickupOrganizerSummary {
+        struct Params: Encodable {
+            let p_user_id: UUID
+        }
+        struct Row: Decodable {
+            let pickup_games_hosted_count: Int64?
+            let pickup_organizer_average_rating: PickupRPCNumericOrString?
+            let pickup_organizer_rating_count: Int64?
+            let last_pickup_game_created_at: String?
+        }
+
+        do {
+            let rows: [Row] = try await supabase
+                .rpc("pickup_organizer_profile_summary", params: Params(p_user_id: userId))
+                .execute()
+                .value
+            if let row = rows.first {
+                let count = max(0, Int(row.pickup_organizer_rating_count ?? 0))
+                let avg: Double? = count > 0 ? row.pickup_organizer_average_rating?.doubleValue : nil
+                let lastCreated: Date? = {
+                    guard let raw = row.last_pickup_game_created_at?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !raw.isEmpty else { return nil }
+                    return PickupGameModels.parseSupabaseTimestamptz(raw)
+                }()
+                return PickupOrganizerSummary(
+                    hostedCount: max(0, Int(row.pickup_games_hosted_count ?? 0)),
+                    averageRating: avg,
+                    ratingCount: count,
+                    lastPickupGameCreatedAt: lastCreated
+                )
+            }
+        } catch {
+#if DEBUG
+            print("[PickupOrganizerSummary] public self-preview summary rpc failed: \(error.localizedDescription)")
+#endif
+        }
+
+        let stats = await fetchOrganizerStats(userId: userId)
+        return PickupOrganizerSummary(hostedCount: 0, stats: stats)
     }
 }

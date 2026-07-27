@@ -89,6 +89,12 @@ struct ProfileAvatarView: View {
     let size: CGFloat
     /// Passed to ``MapViewModel/presentPublicProfile(userId:context:)`` debug logs.
     var profileTapContext: String = "profile_avatar"
+    /// Chat inbox fan rows show the compact Facebook-style relative-time pill
+    /// (`Online` / `5m` / `2h` / `1d`) instead of the green online dot. Exactly
+    /// one indicator renders; the pill self-hides for missing/hidden/stale
+    /// `last_seen_at` (UserPreview already nils it for deleted or
+    /// activity-hidden users).
+    var usesCompactActivityPill: Bool = false
 
     var body: some View {
         let avatar = SocialAvatarRenderer.socialAvatarView(for: preview, size: size)
@@ -103,7 +109,13 @@ struct ProfileAvatarView: View {
                     .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
             }
             .overlay(alignment: .bottomTrailing) {
-                if preview.isOnlineNow {
+                if usesCompactActivityPill {
+                    if !preview.isBusinessIdentity {
+                        ActivityStatusCompactPill(lastSeenAtRaw: preview.lastSeenAtRaw)
+                            .fixedSize()
+                            .offset(x: 4, y: 3)
+                    }
+                } else if preview.isOnlineNow {
                     PresenceOnlineBadge(size: max(9, size * 0.22))
                         .offset(x: size * 0.03, y: size * 0.03)
                 }
@@ -230,6 +242,7 @@ struct FriendsTabView: View {
     @State private var showingBlockedUsersSheet = false
     @State private var showingNewMessageSheet = false
     @State private var showingCreateGroupSheet = false
+    @State private var showingRecentlyDeleted = false
     @State private var groupNavigationConversationId: UUID?
     @State private var manualFriendLookupDraft: String = ""
     @State private var friendDirectorySearchText = ""
@@ -238,7 +251,7 @@ struct FriendsTabView: View {
     @State private var filteredFriendsDirectoryItemsSnapshot: [ChatViewModel.FriendDisplay] = []
     /// Fingerprint of inputs to ``rebuildFriendDisplaySnapshots`` (ordering, unread, last message,
     /// presence lastSeen, friendship chips, group membership/avatar keys, search query).
-    @State private var lastFriendDisplaySnapshotFingerprint = ""
+    @State private var lastFriendDisplaySnapshotFingerprint: ChatFriendDisplaySnapshotFingerprint? = nil
     /// Populated after first paint from cached friend presence (see ``refreshFansLiveNowAfterFirstPaint``).
     @State private var fansLiveNowEntries: [ChatFansLiveNowEntry] = []
     /// Programmatic push (in-app DM banner → Chat tab → ``DirectChatView``).
@@ -305,6 +318,7 @@ struct FriendsTabView: View {
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "ChatInbox")
         friendsTabNavigationStack
             .background(chatRootBackground.ignoresSafeArea())
             .sheet(isPresented: $showingAddFriendSheet) {
@@ -355,7 +369,7 @@ struct FriendsTabView: View {
                     chatConversationFriendsSnapshot = []
                     friendsDirectoryItemsSnapshot = []
                     filteredFriendsDirectoryItemsSnapshot = []
-                    lastFriendDisplaySnapshotFingerprint = ""
+                    lastFriendDisplaySnapshotFingerprint = nil
                     fansLiveNowEntries = []
                     rebuildFriendDisplaySnapshots(reason: "chatAuthIdChanged")
                 },
@@ -364,7 +378,7 @@ struct FriendsTabView: View {
                     chatConversationFriendsSnapshot = []
                     friendsDirectoryItemsSnapshot = []
                     filteredFriendsDirectoryItemsSnapshot = []
-                    lastFriendDisplaySnapshotFingerprint = ""
+                    lastFriendDisplaySnapshotFingerprint = nil
                     fansLiveNowEntries = []
                     ChatFansLiveNowSessionCache.clear(authId: nil)
                     rebuildFriendDisplaySnapshots(reason: "mapAuthIdChanged")
@@ -456,6 +470,10 @@ struct FriendsTabView: View {
                         screenTitle: "Support Center"
                     )
                 }
+                .navigationDestination(isPresented: $showingRecentlyDeleted) {
+                    ChatRecentlyDeletedView(chatViewModel: viewModel)
+                        .environmentObject(mapViewModel)
+                }
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar(.hidden, for: .navigationBar)
         }
@@ -475,6 +493,7 @@ struct FriendsTabView: View {
 
     private func handleTabSelectedChange(_ on: Bool) {
         guard on else { return }
+        TabTapPerf.shellVisible(tab: "chat")
         AppPerfDebug.screenLoadStart(tab: "chat", source: "tabSelected")
         UIPerformanceDiagnostics.signpost("DM inbox open", "source=tabSelected")
         applyPendingDiscoverTodayDashboardChatNavIfNeeded()
@@ -510,13 +529,20 @@ struct FriendsTabView: View {
     private func handleAppear() {
 #if DEBUG
         let started = CFAbsoluteTimeGetCurrent()
+        ChatActivationPerf.log("activationStarted cachedContentShown=\(!viewModel.friends.isEmpty) initialLoadDone=\(viewModel.hasCompletedInitialInboxLoad)")
 #endif
+        TabTapPerf.shellVisible(tab: "chat")
         rebuildFriendDisplaySnapshots(reason: "appear")
 #if DEBUG
         let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        ChatActivationPerf.log(
+            "cachedInboxUsable ms=\(String(format: "%.2f", ms)) rows=\(chatConversationFriendsSnapshot.count)"
+        )
         DebugLogGate.tabSwitchPerfVerbose(
             "[TabRenderPerf] tab=chat visible=\(isTabSelected) renderMs=\(String(format: "%.2f", ms))"
         )
+        // The first Chat mount is the one that can stall the tap→frame path; report it explicitly.
+        TabTapPerf.mainActorBusy(ms: ms, source: "chatFirstMountSnapshotRebuild")
 #endif
         if isTabSelected {
             UIPerformanceDiagnostics.signpost("DM inbox open", "source=onAppear")
@@ -549,6 +575,7 @@ struct FriendsTabView: View {
                 viewModel.noteChatTabSurfaceRefreshCompleted()
                 DebugLogGate.tabSwitchPerfVerbose("[TabDeferredRefresh] tab=chat reason=appear finished")
             }
+            TabTapPerf.stableInboxReady(rows: chatConversationFriendsSnapshot.count)
             if isTabSelected {
                 await viewModel.ensureSignedInSocialRealtimeIfNeeded()
             }
@@ -594,7 +621,12 @@ struct FriendsTabView: View {
 #endif
         let friends = viewModel.friends
         let query = friendDirectorySearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let fingerprintStartedAt = CFAbsoluteTimeGetCurrent()
         let fingerprint = friendDisplaySnapshotFingerprint(friends: friends, query: query)
+        ChatActivationPerf.fingerprintBuildMs(
+            (CFAbsoluteTimeGetCurrent() - fingerprintStartedAt) * 1000,
+            rows: friends.count
+        )
         if fingerprint == lastFriendDisplaySnapshotFingerprint,
            !chatConversationFriendsSnapshot.isEmpty || friends.isEmpty {
             DebugLogGate.tabSwitchPerfVerbose(
@@ -630,41 +662,49 @@ struct FriendsTabView: View {
 
     /// Inputs: friend id/order, unread, last message time/body, presence lastSeen, conversation/group
     /// flags, group member avatar keys, friendship chip kind, and directory search query.
+    ///
+    /// Structural equality replaces the previous large interpolated String while encoding
+    /// exactly the same fields — any change that altered the old fingerprint alters this value.
     private func friendDisplaySnapshotFingerprint(
         friends: [ChatViewModel.FriendDisplay],
         query: String
-    ) -> String {
-        let rows = friends.map { item -> String in
-            let chip: String = {
+    ) -> ChatFriendDisplaySnapshotFingerprint {
+        let rows: [ChatFriendDisplaySnapshotFingerprint.Row] = friends.map { item in
+            let chip: ChatFriendDisplaySnapshotFingerprint.ChipKind = {
                 switch viewModel.chipKind(forOtherUserId: item.preview.id) {
-                case .addFriend: return "add"
-                case .pendingOutgoing: return "out"
-                case .pendingIncoming: return "in"
-                case .friends: return "friends"
-                case .declinedOutgoing: return "declined"
+                case .addFriend: return .add
+                case .pendingOutgoing: return .out
+                case .pendingIncoming: return .in
+                case .friends: return .friends
+                case .declinedOutgoing: return .declined
                 }
             }()
-            let groupKey: String = {
-                guard item.isGroupConversation, let conversationId = item.conversationId else { return "-" }
-                let members = (viewModel.groupInboxAvatarMemberIdsByConversationId[conversationId] ?? [])
-                    .map { $0.uuidString.lowercased() }
-                    .joined(separator: ",")
-                return "\(conversationId.uuidString.lowercased()):\(members):\(item.groupMemberCount):\(item.isGroupMuted ? 1 : 0)"
-            }()
-            return [
-                item.id.uuidString.lowercased(),
-                item.preview.id.uuidString.lowercased(),
-                "\(item.unreadCount)",
-                "\(item.lastMessageAt?.timeIntervalSince1970 ?? 0)",
-                item.subtitle ?? "",
-                item.preview.lastSeenAtRaw ?? "",
-                item.isConversationBacked ? "1" : "0",
-                item.inboxKind.rawValue,
-                chip,
-                groupKey
-            ].joined(separator: "|")
-        }.joined(separator: ";")
-        return "q=\(query);rows=\(rows)"
+            let groupMembers: [UUID]
+            let groupConversationId: UUID?
+            if item.isGroupConversation, let conversationId = item.conversationId {
+                groupConversationId = conversationId
+                groupMembers = viewModel.groupInboxAvatarMemberIdsByConversationId[conversationId] ?? []
+            } else {
+                groupConversationId = nil
+                groupMembers = []
+            }
+            return ChatFriendDisplaySnapshotFingerprint.Row(
+                id: item.id,
+                previewId: item.preview.id,
+                unreadCount: item.unreadCount,
+                lastMessageAtEpoch: item.lastMessageAt?.timeIntervalSince1970 ?? 0,
+                subtitle: item.subtitle ?? "",
+                lastSeenAtRaw: item.preview.lastSeenAtRaw ?? "",
+                isConversationBacked: item.isConversationBacked,
+                inboxKind: item.inboxKind.rawValue,
+                chip: chip,
+                groupConversationId: groupConversationId,
+                groupMemberIds: groupMembers,
+                groupMemberCount: item.groupMemberCount,
+                isGroupMuted: item.isGroupMuted
+            )
+        }
+        return ChatFriendDisplaySnapshotFingerprint(query: query, rows: rows)
     }
 
     private func prefetchChatInboxAvatars(reason: String, rows: [ChatViewModel.FriendDisplay]) {
@@ -785,6 +825,19 @@ struct FriendsTabView: View {
             } label: {
                 Text("🚫 Blocked Users")
             }
+
+            Divider()
+
+            Button {
+                showingRecentlyDeleted = true
+            } label: {
+                Label(
+                    L10n.t("chat_recently_deleted_title", languageCode: appLanguageRaw),
+                    systemImage: "trash"
+                )
+            }
+            .accessibilityLabel(L10n.t("chat_recently_deleted_menu_a11y", languageCode: appLanguageRaw))
+            .accessibilityHint(L10n.t("chat_recently_deleted_menu_a11y_hint", languageCode: appLanguageRaw))
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 16, weight: .bold))
@@ -946,7 +999,9 @@ struct FriendsTabView: View {
     }
 
     private var totalRequestRowCount: Int {
-        viewModel.incomingRequests.count + viewModel.outgoingRequests.count
+        viewModel.incomingRequests.count
+            + viewModel.outgoingRequests.count
+            + viewModel.pendingGroupInvitations.count
     }
 
     private var requestsSectionSubtitle: String? {
@@ -1441,7 +1496,10 @@ struct FriendsTabView: View {
                             )
                         }
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        Label(
+                            L10n.t("chat_delete_from_chats", languageCode: appLanguageRaw),
+                            systemImage: "trash"
+                        )
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 5, leading: 16, bottom: 5, trailing: 16))
@@ -1645,7 +1703,9 @@ struct FriendsTabView: View {
 
     private var requestsList: some View {
         Group {
-            if viewModel.incomingRequests.isEmpty && viewModel.outgoingRequests.isEmpty {
+            if viewModel.incomingRequests.isEmpty
+                && viewModel.outgoingRequests.isEmpty
+                && viewModel.pendingGroupInvitations.isEmpty {
                 ContentUnavailableView(
                     "No pending requests",
                     systemImage: "person.2",
@@ -1654,33 +1714,50 @@ struct FriendsTabView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List {
-                    Section {
-                        if !viewModel.incomingRequests.isEmpty {
-                            ForEach(viewModel.incomingRequests) { item in
-                                requestRowIncoming(item)
+                    if !viewModel.pendingGroupInvitations.isEmpty {
+                        Section {
+                            ForEach(viewModel.pendingGroupInvitations) { invitation in
+                                groupInvitationRow(invitation)
                             }
+                        } header: {
+                            chatContentSectionHeader(
+                                title: L10n.t("group_chat_invitations_section", languageCode: appLanguageRaw),
+                                count: viewModel.pendingGroupInvitations.count,
+                                subtitle: nil
+                            )
+                            .padding(.bottom, 4)
                         }
-                        if !viewModel.outgoingRequests.isEmpty {
+                    }
+
+                    if !viewModel.incomingRequests.isEmpty || !viewModel.outgoingRequests.isEmpty {
+                        Section {
                             if !viewModel.incomingRequests.isEmpty {
-                                Text("Sent")
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                    .textCase(nil)
-                                    .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 4, trailing: 16))
-                                    .listRowSeparator(.hidden)
-                                    .listRowBackground(Color.clear)
+                                ForEach(viewModel.incomingRequests) { item in
+                                    requestRowIncoming(item)
+                                }
                             }
-                            ForEach(viewModel.outgoingRequests) { item in
-                                requestRowOutgoing(item)
+                            if !viewModel.outgoingRequests.isEmpty {
+                                if !viewModel.incomingRequests.isEmpty {
+                                    Text("Sent")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                        .textCase(nil)
+                                        .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 4, trailing: 16))
+                                        .listRowSeparator(.hidden)
+                                        .listRowBackground(Color.clear)
+                                }
+                                ForEach(viewModel.outgoingRequests) { item in
+                                    requestRowOutgoing(item)
+                                }
                             }
+                        } header: {
+                            chatContentSectionHeader(
+                                title: "Requests",
+                                count: viewModel.incomingRequests.count + viewModel.outgoingRequests.count,
+                                subtitle: requestsSectionSubtitle
+                            )
+                            .padding(.bottom, 4)
                         }
-                    } header: {
-                        chatContentSectionHeader(
-                            title: "Requests",
-                            count: totalRequestRowCount,
-                            subtitle: requestsSectionSubtitle
-                        )
-                        .padding(.bottom, 4)
                     }
                 }
                 .listStyle(.insetGrouped)
@@ -1785,6 +1862,61 @@ struct FriendsTabView: View {
 #if DEBUG
         print("[FriendsDirectoryDebug] searchQuery=\(query.trimmingCharacters(in: .whitespacesAndNewlines))")
 #endif
+    }
+
+    private func groupInvitationRow(_ invitation: GroupPendingInvitationRow) -> some View {
+        let inviterPreview = viewModel.pendingGroupInvitationPreviews[invitation.inviter_user_id]
+            ?? UserPreview(
+                id: invitation.inviter_user_id,
+                displayName: L10n.t("group_chat_system_member_fallback", languageCode: appLanguageRaw),
+                avatarURL: nil,
+                avatarThumbnailURL: nil
+            )
+        let memberCountText: String? = invitation.member_count.map { count in
+            String(format: L10n.t("group_chat_invitation_member_count", languageCode: appLanguageRaw), count)
+        }
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                ProfileAvatarView(preview: inviterPreview, size: 40)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(invitation.group_title)
+                        .font(.subheadline.weight(.semibold))
+                    Text(
+                        String(
+                            format: L10n.t("group_chat_invitation_invited_you", languageCode: appLanguageRaw),
+                            inviterPreview.displayName
+                        )
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    if let memberCountText {
+                        Text(memberCountText)
+                            .font(.caption2)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 10) {
+                Button(L10n.t("group_chat_invitation_accept", languageCode: appLanguageRaw)) {
+                    Task {
+                        do {
+                            let conversationId = try await viewModel.acceptGroupInvitation(invitation)
+                            selectedSection = .chats
+                            groupNavigationConversationId = conversationId
+                        } catch {
+                            // Server authorization failures clear on next inbox refresh.
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                Button(L10n.t("group_chat_invitation_decline", languageCode: appLanguageRaw)) {
+                    Task { try? await viewModel.declineGroupInvitation(invitation) }
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     private func requestRowIncoming(_ item: ChatViewModel.IncomingRequestDisplay) -> some View {
@@ -2172,7 +2304,13 @@ private struct ChatFriendInboxRow: View {
 
                 Button(action: onOpenConversation) {
                     VStack(alignment: .leading, spacing: 4) {
-                        if item.isGroupConversation, item.groupMemberCount > 0 {
+                        if item.isPickupGameChat {
+                            Text("Pickup game")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(FGColor.accentGreen)
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else if item.isGroupConversation, item.groupMemberCount > 0 {
                             Text(
                                 String(
                                     format: L10n.t("group_chat_member_count_format", languageCode: languageCode),
@@ -2186,6 +2324,13 @@ private struct ChatFriendInboxRow: View {
                         } else if let businessName = item.preview.businessVenueBusinessName,
                            !businessName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             Text(businessName)
+                                .font(.caption)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else if !item.preview.isBusinessIdentity,
+                                  !item.preview.publicHandleLine.isEmpty {
+                            Text(item.preview.publicHandleLine)
                                 .font(.caption)
                                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                                 .lineLimit(1)
@@ -2297,7 +2442,12 @@ private struct ChatFriendInboxRow: View {
             ChatInboxBusinessConversationAvatar(size: businessIconSize)
                 .frame(width: fanAvatarSize, height: fanAvatarSize, alignment: .center)
         } else {
-            ProfileAvatarView(preview: item.preview, size: fanAvatarSize)
+            // Fan counterpart: compact last-active pill replaces the online dot.
+            ProfileAvatarView(
+                preview: item.preview,
+                size: fanAvatarSize,
+                usesCompactActivityPill: true
+            )
         }
     }
 
@@ -2762,6 +2912,10 @@ private struct FriendsTabLifecycleModifier: ViewModifier {
             }
             .onChange(of: viewModel.pendingDmOpenPreview) { _, preview in
                 guard preview != nil else { return }
+                onPendingDmOpen()
+            }
+            .onChange(of: viewModel.pendingGroupOpenConversationId) { _, groupId in
+                guard groupId != nil else { return }
                 onPendingDmOpen()
             }
             .onChange(of: viewModel.requiresSignIn) { _, _ in

@@ -1,9 +1,20 @@
-// Manual test: curl -X POST "$SUPABASE_URL/functions/v1/sync-live-matches" \
-//   -H "Authorization: Bearer $SUPABASE_ANON_KEY" -H "Content-Type: application/json"
+// Privileged live sports cache sync (provider APIs → public.live_matches).
+// Auth: service-role bearer OR x-cron-secret
+//   (SYNC_LIVE_MATCHES_CRON_SECRET / SPORTS_SYNC_CRON_SECRET / PRO_SCORE_PUSH_WORKER_CRON_SECRET).
+// Manual test:
+//   curl -X POST "$SUPABASE_URL/functions/v1/sync-live-matches" \
+//     -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+//     -H "Content-Type: application/json" -d '{}'
 // Deploy: supabase functions deploy sync-live-matches
+// Do NOT invoke from iOS/user JWTs — cron + pro-game-score-alert-worker only.
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2"
+import {
+  authorizeSportsWorkerRequest,
+  readServiceRoleKey,
+  sportsWorkerAuthLog,
+} from "../_shared/sports_worker_auth.ts"
 import { followedCatalogTeamIdsForMatch } from "./favorite-team-live-matcher.ts"
 import {
   applyFifaWorldCupTagging,
@@ -20,10 +31,14 @@ import {
   FORCE_FIFA_WORLD_CUP_FEATURED_SLUG,
 } from "./fifa-world-cup-tagging.ts"
 
+// Local `deno check` has no generated Database schema; untyped client avoids
+// PostgREST `never` row types. Edge deploy type-erases and does not require this.
+type EdgeSupabaseClient = SupabaseClient<any, "public", any>
+
 const THESPORTSDB_V2_BASE = "https://www.thesportsdb.com/api/v2/json"
 const THE_SPORTSDB_V1_FREE_API_KEY = "123"
 
-type MatchStatus = "LIVE" | "HT" | "FT" | "SCHEDULED"
+type MatchStatus = "LIVE" | "HT" | "FT" | "SCHEDULED" | "AET" | "PEN"
 
 type TVBroadcastRow = {
   idEvent: string | null
@@ -244,7 +259,8 @@ type SportsDBCompletedEvent = {
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-cron-secret, x-fangeo-cron-secret",
 }
 
 const FEATURED_PRELOAD_LOOKAHEAD_DAYS = 180
@@ -503,7 +519,7 @@ async function collectForceFeaturedEventMatches(
 }
 
 async function runForceFeaturedEventsRefresh(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
 ): Promise<ForceFeaturedSyncCounts> {
   forceFeaturedSyncLog("started")
 
@@ -630,21 +646,47 @@ async function fetchTheSportsDBEventsNextLeague(
 }
 
 serve(async (req) => {
+  const requestId = req.headers.get("x-request-id") ?? req.headers.get("sb-request-id")
+
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders })
   }
 
+  const auth = authorizeSportsWorkerRequest(req, {
+    cronSecretEnvNames: [
+      "SYNC_LIVE_MATCHES_CRON_SECRET",
+      "SPORTS_SYNC_CRON_SECRET",
+      // Accepted so pro-game-score-alert-worker can keep sending its existing header.
+      "PRO_SCORE_PUSH_WORKER_CRON_SECRET",
+    ],
+  })
+  if (!auth.accepted) {
+    sportsWorkerAuthLog("sync-live-matches", "unauthorized", {
+      reason: auth.reason,
+      requestId,
+    })
+    return json(
+      { success: false, error: "unauthorized" },
+      auth.reason === "method_not_allowed" ? 405 : 401,
+    )
+  }
+  sportsWorkerAuthLog("sync-live-matches", "authorized", {
+    source: auth.source,
+    requestId,
+  })
+
   const supabaseUrl = Deno.env.get("PROJECT_URL") ?? Deno.env.get("SUPABASE_URL")
-  const serviceRoleKey = Deno.env.get("SERVICE_ROLE_KEY") ?? Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")
+  const serviceRoleKey = readServiceRoleKey()
   if (!supabaseUrl || !serviceRoleKey) {
     return json({ success: false, error: "Missing Supabase service env vars" }, 500)
   }
 
   try {
     const requestBody = await req.json().catch(() => ({} as Record<string, unknown>))
+    // Service-role client only after authorization succeeds.
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
-    })
+    }) as EdgeSupabaseClient
 
     const forceFeaturedPreload = requestBody?.forceFeaturedPreload === true
     const forceFeaturedEventsRefresh = requestBody?.forceFeaturedEventsRefresh === true
@@ -948,7 +990,7 @@ async function fetchScheduledFixtureMatches(
 }
 
 async function fetchFeaturedEventFixtureMatches(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   counts: FeaturedPreloadCounts,
   featuredEvents: FeaturedEventRow[],
   options: FeaturedPreloadOptions = { forceFeaturedPreload: false },
@@ -1254,7 +1296,7 @@ async function fetchFeaturedEventEventsDayFallback(
 }
 
 async function fetchLastFeaturedPreloadUpdatedAt(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
 ): Promise<Date | null> {
   const syncKindFilter = FEATURED_PRELOAD_SYNC_KINDS
     .map((kind) => `payload->>fangeo_sync_kind.eq.${kind}`)
@@ -1279,7 +1321,7 @@ async function fetchLastFeaturedPreloadUpdatedAt(
 }
 
 async function fetchActiveUpcomingFeaturedEvents(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   counts: FeaturedPreloadCounts,
 ): Promise<FeaturedEventRow[]> {
   const today = dateOnlyString(new Date())
@@ -1403,7 +1445,7 @@ function dedupeFeaturedMatches(matches: LiveMatchUpsert[]): LiveMatchUpsert[] {
 }
 
 async function fetchRecentlyCompletedMatches(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   completedWindow: MatchWindow,
   counts: CompletedMatchesCounts,
 ): Promise<LiveMatchUpsert[]> {
@@ -1503,7 +1545,7 @@ async function fetchRecentlyCompletedMatches(
 }
 
 async function fetchRecentCompletedProviderCandidates(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   completedWindow: MatchWindow,
   counts: CompletedMatchesCounts,
 ): Promise<Map<string, string>> {
@@ -1517,7 +1559,7 @@ async function fetchRecentCompletedProviderCandidates(
 }
 
 async function fetchRecentCompletedCandidateRows(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   table: "saved_pro_games" | "pro_game_alert_subscriptions",
   completedWindow: MatchWindow,
 ): Promise<RecentCompletedCandidateRow[]> {
@@ -1855,7 +1897,7 @@ function normalizeScheduledFixtureBatch(
 }
 
 async function fetchProtectedMatchIds(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   matchWindow: MatchWindow,
 ): Promise<Set<string>> {
   const { data, error } = await supabase
@@ -1901,7 +1943,7 @@ function mergeLiveAndScheduledMatches(
 }
 
 async function enrichMatchesWithTVBroadcasts(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   matches: LiveMatchUpsert[],
   counts: SyncCounts,
 ): Promise<void> {
@@ -1960,7 +2002,7 @@ async function enrichMatchesWithTVBroadcasts(
 }
 
 async function fetchTVBroadcastCache(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   externalIds: string[],
 ): Promise<Map<string, TVBroadcastCacheRow>> {
   if (externalIds.length === 0) return new Map()
@@ -2085,7 +2127,7 @@ function cleanString(value: unknown): string | null {
 }
 
 async function enrichSavedProGamesWithTimelineEvents(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   savedTimelineCounts: SavedTimelineCounts,
 ): Promise<void> {
   const targets = await fetchSavedProGameTimelineTargets(supabase)
@@ -2274,7 +2316,7 @@ async function enrichSavedProGamesWithTimelineEvents(
 }
 
 async function fetchSavedProGameLiveMatchRow(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   savedGameId: string,
   source?: string | null,
   externalId?: string | null,
@@ -2904,7 +2946,7 @@ function applyTimelineFromFetch(
 }
 
 async function hydrateEmptyCompletedMatchTimelines(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   savedTimelineCounts: SavedTimelineCounts,
 ): Promise<void> {
   const windowStart = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()
@@ -2995,7 +3037,7 @@ async function hydrateEmptyCompletedMatchTimelines(
 }
 
 async function fetchSavedProGameTimelineTargets(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
 ): Promise<SavedProGameTimelineTarget[]> {
   const { data, error } = await supabase
     .from("saved_pro_games")
@@ -3127,7 +3169,7 @@ function timelineScoringMarker(event: TimelineEventRow): string | null {
 }
 
 async function enrichMatchesWithTimelineEvents(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   matches: LiveMatchUpsert[],
   counts: SyncCounts,
 ): Promise<void> {
@@ -3280,7 +3322,7 @@ async function enrichMatchesWithTimelineEvents(
 }
 
 async function fetchTimelineEventCache(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   externalIds: string[],
 ): Promise<Map<string, TimelineEventCacheRow>> {
   if (externalIds.length === 0) return new Map()
@@ -3344,7 +3386,7 @@ function matchHasAnyLookupKey(keys: string[], found: Set<string>): boolean {
 }
 
 async function fetchDistinctSavedProGameKeys(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   keys: string[],
 ): Promise<Set<string>> {
   const found = new Set<string>()
@@ -3366,7 +3408,7 @@ async function fetchDistinctSavedProGameKeys(
 }
 
 async function fetchDistinctProGamePredictionKeys(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   keys: string[],
 ): Promise<Set<string>> {
   const found = new Set<string>()
@@ -3388,7 +3430,7 @@ async function fetchDistinctProGamePredictionKeys(
 }
 
 async function fetchDistinctFavoriteTeamIds(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
 ): Promise<Set<string>> {
   const { data, error } = await supabase
     .from("user_favorite_teams")
@@ -3404,7 +3446,7 @@ async function fetchDistinctFavoriteTeamIds(
 }
 
 async function buildTimelineActiveFollowerIndex(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   liveMatches: LiveMatchUpsert[],
 ): Promise<TimelineActiveFollowerIndex> {
   const byExternalId = new Map<string, TimelineActiveFollowerStatus>()
@@ -3794,7 +3836,7 @@ function normalizeTimelineTeamKey(value: string | null | undefined): string {
 }
 
 async function pruneStaleMatches(
-  supabase: ReturnType<typeof createClient>,
+  supabase: EdgeSupabaseClient,
   matchWindow: MatchWindow,
 ): Promise<number> {
   const { data, error } = await supabase.rpc("prune_live_matches_cache", {

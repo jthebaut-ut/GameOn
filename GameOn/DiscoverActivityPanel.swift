@@ -8,6 +8,8 @@ enum FanGeoDiscoverActivityPanelPreferences {
     private static let guestIntroShownKey = "discoverActivityPanelIntroShown.guest"
     private static let stateKeyPrefix = "discoverActivityPanelState"
     private static let guestStateKey = "discoverActivityPanelState.guest"
+    private static let dragHintShownKeyPrefix = "discoverActivityPanelDragHintShown"
+    private static let guestDragHintShownKey = "discoverActivityPanelDragHintShown.guest"
 
     /// Guest → `discoverActivityPanelIntroShown.guest`; signed-in → `…IntroShown.<uuid>`.
     private static func introKey(for userId: UUID?) -> String {
@@ -27,6 +29,22 @@ enum FanGeoDiscoverActivityPanelPreferences {
     /// Call only after the user collapses, hides, or otherwise explicitly interacts during intro.
     static func markIntroShown(for userId: UUID?) {
         UserDefaults.standard.set(true, forKey: introKey(for: userId))
+    }
+
+    /// Guest → `discoverActivityPanelDragHintShown.guest`; signed-in → `…DragHintShown.<uuid>`.
+    private static func dragHintKey(for userId: UUID?) -> String {
+        guard let userId else { return guestDragHintShownKey }
+        return "\(dragHintShownKeyPrefix).\(userId.uuidString.lowercased())"
+    }
+
+    /// True once the one-time drag-affordance lift has played (or been superseded by interaction).
+    static func hasShownDragHint(for userId: UUID?) -> Bool {
+        UserDefaults.standard.bool(forKey: dragHintKey(for: userId))
+    }
+
+    /// Permanently retires the one-time drag-affordance lift for this user/guest.
+    static func markDragHintShown(for userId: UUID?) {
+        UserDefaults.standard.set(true, forKey: dragHintKey(for: userId))
     }
 
     /// Restores only `hidden` or `compact`. Expanded always restores as compact.
@@ -197,6 +215,10 @@ enum DiscoverActivityPanelPresentationBuilder {
         return formatter
     }()
 
+    /// Cached: this cache-key builder runs on every Discover activation; a per-call
+    /// `ISO8601DateFormatter()` allocation here showed up in the tab-switch path.
+    private static let selectedDayISOFormatter = ISO8601DateFormatter()
+
     static func cacheKey(
         viewModel: MapViewModel,
         favoritesRaw: String,
@@ -209,7 +231,7 @@ enum DiscoverActivityPanelPresentationBuilder {
         }
         let now = Date()
         let calendar = Calendar.current
-        let selectedDay = ISO8601DateFormatter().string(from: calendar.startOfDay(for: viewModel.selectedDate))
+        let selectedDay = selectedDayISOFormatter.string(from: calendar.startOfDay(for: viewModel.selectedDate))
         let localToday = localDayFormatter.string(from: now)
         let pickupSoon = pickupSoonCount(viewModel: viewModel, now: now)
         let venuePlansToday = myVenueGamesTodayCount(viewModel: viewModel, now: now)
@@ -1507,21 +1529,12 @@ struct DiscoverPersonalizedInsightRow: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: FGSpacing.xs) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .top, spacing: FGSpacing.sm) {
-                        nextEventTitleText
-                        nextEventMoreUpcomingCapsule
-                        nextEventChevron
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(alignment: .top, spacing: FGSpacing.sm) {
-                            nextEventTitleText
-                            nextEventChevron
-                        }
-                        nextEventMoreUpcomingCapsule
-                    }
+                HStack(alignment: .top, spacing: FGSpacing.sm) {
+                    nextEventTitleText
+                    nextEventChevron
                 }
+
+                nextEventMoreUpcomingCapsule
 
                 if let relative = insight.relativeCountdownText, !relative.isEmpty {
                     Text(relative)
@@ -1722,6 +1735,11 @@ struct DiscoverActivityPanel: View {
     @State private var handleBreathScale: CGFloat = 1
     @State private var handleBreathOpacity: Double = 0.88
     @State private var handleBreathTask: Task<Void, Never>?
+    /// One-time "you can drag me" lift. Offset only — never rebuilds map or panel content.
+    @State private var dragHintOffset: CGFloat = 0
+    @State private var dragHintTask: Task<Void, Never>?
+    /// Guards against duplicate onAppear scheduling within a single view lifetime.
+    @State private var didAttemptDragHintThisLifetime = false
 
     private var isHidden: Bool { state == .hidden }
     private var isExpanded: Bool { state == .expanded }
@@ -1777,6 +1795,7 @@ struct DiscoverActivityPanel: View {
         .animation(panelAnimation, value: presentation)
         .onAppear {
             startHandleBreathingLoop()
+            runDragHintIfNeeded()
         }
         .onChange(of: handleAttentionToken) { _, token in
             guard token > 0 else { return }
@@ -1794,32 +1813,143 @@ struct DiscoverActivityPanel: View {
             handleBreathTask = nil
             handleEmphasized = false
             resetHandleBreathVisuals()
+            dragHintTask?.cancel()
+            dragHintTask = nil
+        }
+    }
+
+    /// Directional chevron that indicates the *next available action*, not every possible
+    /// direction — matching Apple sheet / Human Interface affordance conventions:
+    /// - `.hidden` (fully collapsed): `chevron.up` → Expand
+    /// - `.compact` (intermediate): `chevron.up.chevron.down` → can expand or collapse
+    /// - `.expanded` (fully expanded): `chevron.down` → Collapse
+    /// Symbol swaps animate with the body's `panelAnimation`.
+    private var grabberChevronSystemName: String {
+        switch state {
+        case .hidden: return "chevron.up"
+        case .compact: return "chevron.up.chevron.down"
+        case .expanded: return "chevron.down"
+        }
+    }
+
+    private var grabberAccessibilityLabelKey: String {
+        switch state {
+        case .hidden: return "discover_panel_grabber_expand_label"
+        case .compact: return "discover_panel_grabber_move_label"
+        case .expanded: return "discover_panel_grabber_collapse_label"
+        }
+    }
+
+    private var grabberChevron: some View {
+        Image(systemName: grabberChevronSystemName)
+            .font(.system(size: 11, weight: .semibold))
+            .foregroundStyle(Color.secondary.opacity(colorScheme == .dark ? 0.85 : 0.55))
+            .contentTransition(.symbolEffect(.replace))
+            .accessibilityHidden(true)
+    }
+
+    /// Chevron + grabber, tappable to toggle compact ↔ expanded. Drag still reaches all three
+    /// detents (including `.hidden`).
+    private var grabberAffordance: some View {
+        Button {
+            handleUserInteracted()
+            setState(isExpanded ? .compact : .expanded, analyticsSource: "tapGrabber")
+        } label: {
+            VStack(spacing: 3) {
+                grabberChevron
+                grabHandleCapsule
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel(L10n.t(grabberAccessibilityLabelKey, languageCode: languageCode))
+        .accessibilityHint(L10n.t("discover_panel_grabber_hint", languageCode: languageCode))
+    }
+
+    /// Wraps the host's `onUserInteracted` and permanently retires the one-time drag hint the
+    /// instant the user drags or taps, so it can never replay on a later launch.
+    private func handleUserInteracted() {
+        cancelDragHint(markShown: true)
+        onUserInteracted()
+    }
+
+    private func cancelDragHint(markShown: Bool) {
+        dragHintTask?.cancel()
+        dragHintTask = nil
+        if dragHintOffset != 0 {
+            withAnimation(panelAnimation) { dragHintOffset = 0 }
+        }
+        if markShown {
+            FanGeoDiscoverActivityPanelPreferences.markDragHintShown(for: accountUserId)
+        }
+    }
+
+    /// One-time, once-per-user gentle lift telling the user the panel is draggable.
+    /// No timer, no loop, no geometry polling, no content rebuild — only the panel offset moves.
+    private func runDragHintIfNeeded() {
+        // A single attempt per view lifetime prevents duplicate onAppear scheduling.
+        guard !didAttemptDragHintThisLifetime else { return }
+        didAttemptDragHintThisLifetime = true
+        // Only in the collapsed, non-intro state; the first-Discover intro is a stronger cue.
+        guard isCompact, !showsIntroInstruction else { return }
+        // Reduce Motion: keep the static chevron + tap behavior, skip the lift entirely.
+        guard !reduceMotion else { return }
+        guard !FanGeoDiscoverActivityPanelPreferences.hasShownDragHint(for: accountUserId) else { return }
+
+        dragHintTask?.cancel()
+        dragHintTask = Task { @MainActor in
+            // Smallest reliable deferral so the lift runs only after first layout.
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard !Task.isCancelled else { return }
+            guard isCompact, !isDraggingHandle else { return }
+            guard !FanGeoDiscoverActivityPanelPreferences.hasShownDragHint(for: accountUserId) else { return }
+            // Retire before animating so it can never replay, even if interrupted mid-lift.
+            FanGeoDiscoverActivityPanelPreferences.markDragHintShown(for: accountUserId)
+#if DEBUG
+            print("[DiscoverActivityPanelPerf] dragHint=lift")
+#endif
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.58)) {
+                dragHintOffset = -20
+            }
+            try? await Task.sleep(nanoseconds: 260_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.74)) {
+                dragHintOffset = 0
+            }
         }
     }
 
     /// Tiny handle only — no card / body that could intercept map touches.
+    /// Shows `chevron.up` because the only available action from fully collapsed is Expand.
+    /// Layout height stays 12 pt; the chevron draws above the grabber without growing the panel.
     private var hiddenHandle: some View {
         Color.clear
             .frame(height: 12)
             .frame(maxWidth: .infinity)
-            .overlay {
+            .overlay(alignment: .bottom) {
                 Button {
-                    onUserInteracted()
+                    handleUserInteracted()
                     setState(.compact, analyticsSource: "tapHiddenHandle")
                 } label: {
-                    grabHandleCapsule
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
+                    VStack(spacing: 3) {
+                        grabberChevron
+                        grabHandleCapsule
+                    }
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .highPriorityGesture(hiddenDragGesture)
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(L10n.t("discover_activity_hidden_a11y", languageCode: languageCode))
-            .accessibilityHint(L10n.t("discover_activity_show_hint", languageCode: languageCode))
+            .accessibilityLabel(L10n.t("discover_panel_grabber_expand_label", languageCode: languageCode))
+            .accessibilityHint(L10n.t("discover_panel_grabber_hint", languageCode: languageCode))
             .accessibilityAddTraits(.isButton)
             .accessibilityAction(named: Text(L10n.t("discover_activity_show_hint", languageCode: languageCode))) {
-                onUserInteracted()
+                handleUserInteracted()
                 setState(.compact, analyticsSource: "a11yShow")
             }
             .dynamicTypeSize(.large)
@@ -1827,7 +1957,7 @@ struct DiscoverActivityPanel: View {
 
     private var visiblePanel: some View {
         VStack(spacing: 0) {
-            grabHandleCapsule
+            grabberAffordance
                 .padding(.top, isExpanded ? 8 : 6)
                 .padding(.bottom, isExpanded ? 6 : 4)
 
@@ -1852,12 +1982,12 @@ struct DiscoverActivityPanel: View {
         .frame(maxWidth: .infinity)
         .frame(minHeight: visiblePanelMinHeight, maxHeight: visiblePanelMaxHeight)
         .fanGeoGlassCard(cornerRadius: isExpanded ? 20 : 28)
-        .offset(y: visibleDragOffset)
+        .offset(y: visibleDragOffset + dragHintOffset)
         .contentShape(Rectangle())
         .highPriorityGesture(visibleDragGesture)
         .onTapGesture {
             guard isCompact else { return }
-            onUserInteracted()
+            handleUserInteracted()
             setState(.expanded, analyticsSource: "tapCompact")
         }
         .accessibilityElement(children: isExpanded ? .contain : .combine)
@@ -1879,11 +2009,11 @@ struct DiscoverActivityPanel: View {
                 languageCode: languageCode
             )
         )) {
-            onUserInteracted()
+            handleUserInteracted()
             setState(isExpanded ? .compact : .expanded, analyticsSource: "a11yToggle")
         }
         .accessibilityAction(named: Text(L10n.t("discover_activity_hide_hint", languageCode: languageCode))) {
-            onUserInteracted()
+            handleUserInteracted()
             setState(.hidden, analyticsSource: "a11yHide")
         }
     }
@@ -1970,7 +2100,7 @@ struct DiscoverActivityPanel: View {
             .onEnded { value in
                 let dy = value.translation.height
                 let predicted = value.predictedEndTranslation.height
-                onUserInteracted()
+                handleUserInteracted()
                 settleVisibleDrag(dy: dy, predicted: predicted)
             }
     }
@@ -1981,7 +2111,7 @@ struct DiscoverActivityPanel: View {
                 let dy = value.translation.height
                 let predicted = value.predictedEndTranslation.height
                 guard dy < -16 || predicted < -28 else { return }
-                onUserInteracted()
+                handleUserInteracted()
                 if dy < -72 || predicted < -110 {
                     setState(.expanded, analyticsSource: "dragHidden")
                 } else {
@@ -2212,7 +2342,7 @@ struct DiscoverActivityPanel: View {
                 if let timely = presentation.timelyInsight {
                     DiscoverPersonalizedInsightRow(insight: timely) {
                         guard timely.isNextEventTappable else { return }
-                        onUserInteracted()
+                        handleUserInteracted()
                         onNextEventTap(timely)
                     }
                     .padding(.top, presentation.favoriteTeamInsight != nil ? FGSpacing.sm : FGSpacing.sm + 2)
@@ -2257,7 +2387,7 @@ struct DiscoverActivityPanel: View {
         }
         if item.isTappable {
             Button {
-                onUserInteracted()
+                handleUserInteracted()
                 if isGuestMode {
                     onGuestCreateAccount()
                 } else {

@@ -9,6 +9,38 @@ struct ScheduleProGameNavIntent: Equatable, Sendable {
     let startTime: Date
 }
 
+/// Authoritative Discover focus for a professional game.
+/// Identity: ``externalGameId`` == ``LiveMatch/id`` == ``VenueEventRow/external_game_id``.
+struct DiscoverFocusedProGame: Equatable, Sendable, Identifiable {
+    var id: String { externalGameId }
+    let externalGameId: String
+    let stableKey: String
+    let displayTitle: String
+    let startTime: Date?
+
+    static func from(match: LiveMatch) -> DiscoverFocusedProGame? {
+        let externalGameId = match.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !externalGameId.isEmpty else { return nil }
+        let title = matchTitle(match)
+        return DiscoverFocusedProGame(
+            externalGameId: externalGameId,
+            stableKey: SavedProGame.stableKey(for: match),
+            displayTitle: title,
+            startTime: match.startTime
+        )
+    }
+
+    private static func matchTitle(_ match: LiveMatch) -> String {
+        let home = match.homeTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        let away = match.awayTeam.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !home.isEmpty, !away.isEmpty {
+            return "\(away) vs \(home)"
+        }
+        let league = match.league.trimmingCharacters(in: .whitespacesAndNewlines)
+        return league.isEmpty ? "Selected game" : league
+    }
+}
+
 extension MapViewModel {
     /// Enqueue Schedule Pro Games navigation for a Discover match-detail CTA.
     @MainActor
@@ -57,13 +89,105 @@ extension MapViewModel {
         return liveMatches.first(where: { SavedProGame.stableKey(for: $0) == key })
     }
 
+    // MARK: - Discover focused pro game
+
+    @MainActor
+    func setDiscoverFocusedProGame(from match: LiveMatch, alignSelectedDate: Bool = true) {
+        guard let focus = DiscoverFocusedProGame.from(match: match) else {
+            clearDiscoverFocusedProGame(reason: "emptyMatchId")
+            return
+        }
+        if alignSelectedDate, let start = focus.startTime {
+            selectedDate = Calendar.current.startOfDay(for: start)
+        }
+        discoverFocusedProGame = focus
+#if DEBUG
+        print(
+            "[DiscoverFocusedProGame] set id=\(focus.externalGameId) title=\(focus.displayTitle)"
+        )
+#endif
+    }
+
+    @MainActor
+    func clearDiscoverFocusedProGame(reason: String = "clear") {
+        guard discoverFocusedProGame != nil else { return }
+        discoverFocusedProGame = nil
+        discoverTopVenuesForFocusedGame = []
+        discoverTopVenuesForFocusedGameState = .idle
+        discoverTopVenuesRefreshTask?.cancel()
+        discoverTopVenuesRefreshTask = nil
+#if DEBUG
+        print("[DiscoverFocusedProGame] cleared reason=\(reason)")
+#endif
+    }
+
+    @MainActor
+    func scheduleDiscoverTopVenuesForFocusedGameRefresh(reason: String) {
+        guard discoverFocusedProGame != nil else {
+            discoverTopVenuesForFocusedGame = []
+            discoverTopVenuesForFocusedGameState = .idle
+            return
+        }
+        discoverTopVenuesRefreshTask?.cancel()
+        discoverTopVenuesRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(nanoseconds: 220_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self.refreshDiscoverTopVenuesForFocusedGame(reason: reason)
+        }
+    }
+
+    @MainActor
+    func refreshDiscoverTopVenuesForFocusedGame(reason: String) async {
+        guard let focus = discoverFocusedProGame else {
+            discoverTopVenuesForFocusedGame = []
+            discoverTopVenuesForFocusedGameState = .idle
+            return
+        }
+        discoverTopVenuesForFocusedGameState = .loading
+        let result = await loadDiscoverWatchSpots(
+            externalGameID: focus.externalGameId,
+            mapBounds: currentMapRegionBounds(),
+            limit: DiscoverGameVenueRanking.topLimit
+        )
+        guard !Task.isCancelled else { return }
+        guard discoverFocusedProGame?.externalGameId == focus.externalGameId else { return }
+        discoverTopVenuesForFocusedGameState = result
+        if case .loaded(let spots) = result {
+            discoverTopVenuesForFocusedGame = spots
+        } else if case .unavailable = result {
+            discoverTopVenuesForFocusedGame = []
+        }
+#if DEBUG
+        print(
+            "[DiscoverTopVenues] reason=\(reason) game=\(focus.externalGameId) state=\(String(describing: result))"
+        )
+#endif
+    }
+
     // MARK: - Discover Watch Spots for a professional game (region-bounded)
 
     struct DiscoverProGameWatchSpot: Identifiable, Equatable {
         let id: UUID
         let bar: BarVenue
+        let venueEventID: UUID?
         let eventTitle: String?
         let distanceFromRegionCenterMiles: Double?
+        let gameSpecificEnergy: Int
+        let goingCount: Int
+        let isLiveNow: Bool
+
+        var energyTier: VenueMapEnergyScore.EnergyTier {
+            VenueMapEnergyScore.tier(for: gameSpecificEnergy)
+        }
+
+        var energyCaption: String {
+            DiscoverGameVenueRanking.tierCaption(forEnergy: gameSpecificEnergy)
+        }
     }
 
     enum DiscoverProGameWatchSpotsLoadState: Equatable {
@@ -75,14 +199,28 @@ extension MapViewModel {
 
     /// Confirmed watch spots hosting this exact pro game inside the active Discover map/search region.
     /// Matching requires ``VenueEventRow/external_game_id`` == ``LiveMatch/id`` (canonical import identity).
-    /// Venue IDs are bounded to bars already in (or intersecting) the provided region — never a global scan.
+    /// Ranked by game-specific ``VenueMapEnergyScore`` (not general venue-day energy).
     @MainActor
     func loadDiscoverWatchSpots(
         for match: LiveMatch,
         mapBounds: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)?,
-        limit: Int = 5
+        limit: Int = DiscoverGameVenueRanking.topLimit
     ) async -> DiscoverProGameWatchSpotsLoadState {
         let externalGameID = match.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return await loadDiscoverWatchSpots(
+            externalGameID: externalGameID,
+            mapBounds: mapBounds,
+            limit: limit
+        )
+    }
+
+    @MainActor
+    func loadDiscoverWatchSpots(
+        externalGameID: String,
+        mapBounds: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)?,
+        limit: Int = DiscoverGameVenueRanking.topLimit
+    ) async -> DiscoverProGameWatchSpotsLoadState {
+        let externalGameID = externalGameID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !externalGameID.isEmpty else {
 #if DEBUG
             print("[DiscoverProGameWatchSpots] skipped reason=emptyMatchId")
@@ -133,14 +271,31 @@ extension MapViewModel {
             }
         }
 
-        var seen = Set<UUID>()
-        var spots: [DiscoverProGameWatchSpot] = []
+        var bestRowByVenue: [UUID: VenueEventRow] = [:]
         for row in matchedRows {
-            guard let venueID = row.venue_id,
-                  seen.insert(venueID).inserted,
-                  let bar = barsByID[venueID] ?? bars.first(where: { $0.id == venueID })
-            else { continue }
+            guard let venueID = row.venue_id else { continue }
+            if let existing = bestRowByVenue[venueID] {
+                let existingScore = gameSpecificEnergy(for: existing)
+                let nextScore = gameSpecificEnergy(for: row)
+                if nextScore.energy > existingScore.energy
+                    || (nextScore.energy == existingScore.energy && nextScore.going > existingScore.going)
+                    || (nextScore.energy == existingScore.energy
+                        && nextScore.going == existingScore.going
+                        && (row.id?.uuidString ?? "") < (existing.id?.uuidString ?? "")) {
+                    bestRowByVenue[venueID] = row
+                }
+            } else {
+                bestRowByVenue[venueID] = row
+            }
+        }
 
+        var candidates: [DiscoverGameVenueRanking.Candidate] = []
+        candidates.reserveCapacity(bestRowByVenue.count)
+        var spotsByID: [UUID: DiscoverProGameWatchSpot] = [:]
+
+        for (venueID, row) in bestRowByVenue {
+            guard let bar = barsByID[venueID] ?? bars.first(where: { $0.id == venueID }) else { continue }
+            let scored = gameSpecificEnergy(for: row)
             let distanceMiles: Double? = {
                 guard let regionCenter else { return nil }
                 let venueLocation = CLLocation(
@@ -150,29 +305,67 @@ extension MapViewModel {
                 return venueLocation.distance(from: regionCenter) / 1609.344
             }()
 
-            spots.append(
-                DiscoverProGameWatchSpot(
-                    id: venueID,
-                    bar: bar,
-                    eventTitle: row.event_title,
-                    distanceFromRegionCenterMiles: distanceMiles
-                )
+            let candidate = DiscoverGameVenueRanking.Candidate(
+                id: venueID,
+                venueName: bar.name,
+                gameSpecificEnergy: scored.energy,
+                goingCount: scored.going,
+                distanceMiles: distanceMiles,
+                isLiveNow: scored.isLive,
+                venueEventID: row.id
             )
-            if spots.count >= limit { break }
+            candidates.append(candidate)
+            spotsByID[venueID] = DiscoverProGameWatchSpot(
+                id: venueID,
+                bar: bar,
+                venueEventID: row.id,
+                eventTitle: row.event_title,
+                distanceFromRegionCenterMiles: distanceMiles,
+                gameSpecificEnergy: scored.energy,
+                goingCount: scored.going,
+                isLiveNow: scored.isLive
+            )
         }
 
-        spots.sort {
-            ($0.distanceFromRegionCenterMiles ?? .greatestFiniteMagnitude)
-                < ($1.distanceFromRegionCenterMiles ?? .greatestFiniteMagnitude)
-        }
-        spots = Array(spots.prefix(limit))
+        let ranked = DiscoverGameVenueRanking.rank(candidates, limit: limit)
+        let spots = ranked.compactMap { spotsByID[$0.id] }
 
 #if DEBUG
         print(
-            "[DiscoverProGameWatchSpots] matchId=\(externalGameID) regionVenues=\(regionVenueIDs.count) spots=\(spots.count)"
+            "[DiscoverProGameWatchSpots] matchId=\(externalGameID) regionVenues=\(regionVenueIDs.count) spots=\(spots.count) rankedBy=gameSpecificEnergy"
         )
 #endif
         return .loaded(spots)
+    }
+
+    /// Game-specific Venue Energy for one venue_events row (never aggregates sibling games).
+    @MainActor
+    func gameSpecificEnergy(for row: VenueEventRow) -> (energy: Int, going: Int, isLive: Bool) {
+        guard let eventID = row.id else {
+            return (0, 0, false)
+        }
+        let going = interestCountForVenueEvent(eventID)
+        let vibes = venueEventVibeCounts[eventID] ?? [:]
+        let commenters = venueEventUniqueCommenterCounts[eventID] ?? 0
+        let isLive = isVenueEventRowLiveNow(row)
+        let energy = DiscoverGameVenueRanking.gameSpecificEnergy(
+            goingCount: going,
+            vibeCounts: vibes,
+            uniqueCommenterCount: commenters,
+            isLiveNow: isLive
+        )
+        return (energy, going, isLive)
+    }
+
+    @MainActor
+    func isVenueEventRowLiveNow(_ row: VenueEventRow) -> Bool {
+        guard let eventID = row.id,
+              let start = FanGeoLiveEnergyTiming.parseScheduledStart(row.scheduled_start_at, eventId: eventID) else {
+            return false
+        }
+        let now = Date()
+        let liveEnd = start.addingTimeInterval(TimeInterval(FanGeoLiveEnergyTiming.liveWindowHours * 3600))
+        return now >= start && now <= liveEnd
     }
 
     @MainActor
@@ -218,9 +411,8 @@ extension MapViewModel {
                 .execute()
                 .value
             for row in rows {
-                if let id = row.id {
-                    byID[id] = row
-                }
+                guard let id = row.id else { continue }
+                byID[id] = row
             }
         }
         return Array(byID.values)

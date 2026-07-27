@@ -22,6 +22,7 @@ extension MapViewModel {
     }
 
     var canFavoriteVenues: Bool { canUseFanSocialFeatures }
+    var canFavoriteProGames: Bool { canUseFanSocialFeatures }
     var canMarkGoing: Bool { canUseFanSocialFeatures }
     var canRateVenues: Bool { canUseFanSocialFeatures }
     var canJoinPickupGames: Bool { canUseFanSocialFeatures }

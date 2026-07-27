@@ -1,6 +1,22 @@
 import SwiftUI
 import Supabase
 
+/// Neutral copy for invite eligibility / authorization failures (never disclose blocks).
+/// Also routes backend age-access denials into the shared age gate (single system).
+@MainActor
+private func groupChatNeutralInviteErrorText(_ error: Error, languageCode: String) -> String {
+    if AgeAccessBackendDenial.handle(error, requestUserId: nil) {
+        return L10n.t("group_chat_invite_unavailable", languageCode: languageCode)
+    }
+    let raw = error.localizedDescription.lowercased()
+    if raw.contains("not eligible")
+        || raw.contains("not authorized")
+        || raw.contains("42501") {
+        return L10n.t("group_chat_invite_unavailable", languageCode: languageCode)
+    }
+    return error.localizedDescription
+}
+
 // MARK: - Create group
 
 struct CreateGroupChatSheet: View {
@@ -15,6 +31,10 @@ struct CreateGroupChatSheet: View {
     @State private var isSubmitting = false
     @State private var errorText: String?
 
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
     private var candidates: [ChatViewModel.FriendDisplay] {
         chatViewModel.friends.filter {
             !$0.isGroupConversation
@@ -22,6 +42,7 @@ struct CreateGroupChatSheet: View {
                 && !$0.preview.isBusinessVenueConversation
                 && !$0.preview.isDeleted
                 && chatViewModel.chipKind(forOtherUserId: $0.preview.id) == .friends
+                && !chatViewModel.isEitherDirectionBlocked(with: $0.preview.id)
         }
     }
 
@@ -43,7 +64,7 @@ struct CreateGroupChatSheet: View {
                 } header: {
                     Text(L10n.t("group_chat_name_section", languageCode: appLanguageRaw))
                 } footer: {
-                    Text(L10n.t("group_chat_create_footer", languageCode: appLanguageRaw))
+                    Text(L10n.t("group_chat_create_invite_footer", languageCode: appLanguageRaw))
                 }
 
                 Section {
@@ -112,7 +133,7 @@ struct CreateGroupChatSheet: View {
             onCreated(id)
             dismiss()
         } catch {
-            errorText = error.localizedDescription
+            errorText = groupChatNeutralInviteErrorText(error, languageCode: languageCode)
         }
         isSubmitting = false
     }
@@ -175,9 +196,12 @@ struct NewMessageFriendPickerSheet: View {
 struct GroupChatView: View {
     let conversationId: UUID
     @ObservedObject var chatViewModel: ChatViewModel
+    /// When set, this thread is presented as a pickup-game chat (header + info gating).
+    var pickupContext: PickupGameChatContext? = nil
     @EnvironmentObject private var mapViewModel: MapViewModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var title: String = L10n.t("group_chat_default_title")
@@ -192,6 +216,9 @@ struct GroupChatView: View {
     @State private var details: [GroupConversationDetailRow] = []
     @State private var memberPreviews: [UUID: UserPreview] = [:]
     @State private var realtimeChannel: RealtimeChannelV2?
+    @State private var realtimeListenTask: Task<Void, Never>?
+    @State private var subscribedConversationId: UUID?
+    @State private var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting
     @State private var seenMessageIds: Set<UUID> = []
     @State private var reportTarget: GroupMessageRow?
     @State private var reportCategory: ModerationReportCategory = .spam
@@ -209,6 +236,10 @@ struct GroupChatView: View {
 
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    private var isPickupGameChat: Bool {
+        pickupContext != nil || details.first?.isPickupGameChat == true
     }
 
     private var viewerIsActiveMember: Bool {
@@ -243,12 +274,31 @@ struct GroupChatView: View {
     }
 
     private var headerSubtitleText: String {
-        GroupChatMemberIdentity.headerSubtitle(
+        if let pickupContext {
+            let subtitle = pickupContext.headerSubtitle
+            if !subtitle.isEmpty { return subtitle }
+        }
+        if isPickupGameChat {
+            let count = details.count
+            if count > 0 {
+                return "\(count) approved · Pickup game"
+            }
+            return "Pickup game"
+        }
+        return GroupChatMemberIdentity.headerSubtitle(
             names: headerPreviewNames,
             totalOtherCount: headerOtherMembers.count,
             isOnlyViewer: details.count == 1 && details.first?.member_user_id == chatViewModel.currentUserAuthId,
             languageCode: languageCode
         )
+    }
+
+    private var displayTitle: String {
+        if let pickupContext {
+            let trimmed = pickupContext.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return title
     }
 
     private var headerAccessibilityLabel: String {
@@ -301,8 +351,8 @@ struct GroupChatView: View {
                         .disabled(isLoadingOlder)
                     }
 
-                    ForEach(messages) { message in
-                        groupBubble(message)
+                    ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
+                        groupBubble(message, showsSenderIdentity: showsSenderIdentity(at: index))
                             .id(message.id)
                     }
                 }
@@ -326,13 +376,19 @@ struct GroupChatView: View {
                     showInfo = true
                 } label: {
                     VStack(spacing: 2) {
-                        Text(title)
+                        Text(displayTitle)
                             .font(.headline.weight(.semibold))
                             .foregroundStyle(FGColor.primaryText(colorScheme))
                             .lineLimit(1)
                             .minimumScaleFactor(0.85)
 
-                        if !details.isEmpty {
+                        if isPickupGameChat {
+                            Text(headerSubtitleText)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                        } else if !details.isEmpty {
                             GroupChatMemberHeaderPreview(
                                 members: Array(headerOtherMembers.prefix(3)),
                                 subtitle: headerSubtitleText,
@@ -341,7 +397,7 @@ struct GroupChatView: View {
                             .frame(maxWidth: 220)
                         }
                     }
-                    .frame(minHeight: details.isEmpty ? 28 : 40)
+                    .frame(minHeight: details.isEmpty && pickupContext == nil ? 28 : 40)
                 }
                 .buttonStyle(.plain)
                 .accessibilityElement(children: .ignore)
@@ -364,6 +420,8 @@ struct GroupChatView: View {
                 details: details,
                 memberPreviews: memberPreviews,
                 chatViewModel: chatViewModel,
+                isPickupGameChat: isPickupGameChat,
+                pickupLocationLabel: pickupContext?.locationLabel,
                 onLeft: {
                     showInfo = false
                     dismiss()
@@ -419,16 +477,31 @@ struct GroupChatView: View {
         }
         .task {
             await load()
-            await subscribe()
+            await subscribeGroupRealtime(reason: "open")
         }
         .onAppear {
             chatViewModel.hidesFloatingTabBarForDirectChat = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: FanProfileChangeCenter.avatarDidChangeNotification)) { notification in
+            guard let change = FanProfileChangeCenter.avatarChange(from: notification) else { return }
+            applyMemberAvatarChange(change)
+        }
         .onDisappear {
             chatViewModel.hidesFloatingTabBarForDirectChat = false
+            Task { await tearDownGroupRealtime(statusAfter: .offline) }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active else { return }
             Task {
-                if let realtimeChannel {
-                    await service.removeRealtimeChannel(realtimeChannel)
+                await tearDownGroupRealtime(statusAfter: .connecting)
+                await subscribeGroupRealtime(reason: "foreground")
+            }
+        }
+        .onChange(of: chatViewModel.currentUserAuthId) { _, newId in
+            Task {
+                await tearDownGroupRealtime(statusAfter: .offline)
+                if newId != nil {
+                    await subscribeGroupRealtime(reason: "accountSwitch")
                 }
             }
         }
@@ -456,6 +529,12 @@ struct GroupChatView: View {
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            ChatRealtimeConnectionStatusView(status: realtimeConnectionStatus)
+                .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
+                .padding(.bottom, FGSpacing.xs)
+                .transition(.opacity)
+                .animation(.easeInOut(duration: 0.18), value: realtimeConnectionStatus)
 
             ChatMessageComposer(
                 draft: $draft,
@@ -552,8 +631,62 @@ struct GroupChatView: View {
         }
     }
 
+    /// Keeps message-row avatars current when a member updates their photo elsewhere in the app.
+    @MainActor
+    private func applyMemberAvatarChange(_ change: FanProfileAvatarChange) {
+        guard let existing = memberPreviews[change.userId] else { return }
+        let nextFull = change.avatarURL.isEmpty ? existing.avatarURL : change.avatarURL
+        let nextThumb = change.avatarThumbnailURL ?? existing.avatarThumbnailURL
+        let updated = existing.replacingAvatars(avatarURL: nextFull, avatarThumbnailURL: nextThumb)
+        guard updated != existing else { return }
+        memberPreviews[change.userId] = updated
+    }
+
+    /// Small circular sender avatar next to incoming group bubbles.
+    private static let groupSenderAvatarSize: CGFloat = 26
+    /// Fixed gutter so grouped follow-up bubbles stay aligned with the first one.
+    private static let groupSenderAvatarColumnWidth: CGFloat = 32
+    /// Trailing breathing room for incoming rows; keeps usable bubble width close to
+    /// the pre-avatar layout instead of stacking a new column on top of the old inset.
+    private static let groupIncomingTrailingInset: CGFloat = 12
+
+    /// True for the first incoming message in a same-sender run (avatar + name row).
+    /// Outgoing and system rows never show sender identity.
+    private func showsSenderIdentity(at index: Int) -> Bool {
+        guard messages.indices.contains(index) else { return false }
+        let message = messages[index]
+        guard !message.isSystemMessage else { return false }
+        guard message.sender_id != chatViewModel.currentUserAuthId else { return false }
+        guard index > 0 else { return true }
+        let previous = messages[index - 1]
+        if previous.isSystemMessage { return true }
+        return previous.sender_id != message.sender_id
+    }
+
     @ViewBuilder
-    private func groupBubble(_ message: GroupMessageRow) -> some View {
+    private func groupSenderAvatarColumn(
+        for message: GroupMessageRow,
+        showsSenderIdentity: Bool
+    ) -> some View {
+        if showsSenderIdentity {
+            ProfileAvatarView(
+                preview: preview(for: message.sender_id),
+                size: Self.groupSenderAvatarSize,
+                profileTapContext: "group_chat_message_avatar"
+            )
+            .frame(width: Self.groupSenderAvatarColumnWidth, alignment: .center)
+        } else {
+            Color.clear
+                .frame(width: Self.groupSenderAvatarColumnWidth, height: 1)
+                .accessibilityHidden(true)
+        }
+    }
+
+    @ViewBuilder
+    private func groupBubble(
+        _ message: GroupMessageRow,
+        showsSenderIdentity: Bool
+    ) -> some View {
         let isMine = message.sender_id == chatViewModel.currentUserAuthId
         if message.isSystemMessage {
             let eventText = GroupSystemEventFormatting.displayText(
@@ -571,10 +704,14 @@ struct GroupChatView: View {
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(eventText)
         } else if let payload = FanProfileShareMessage.decode(from: message.body) {
-            HStack {
-                if isMine { Spacer(minLength: 40) }
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
                 VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
-                    if !isMine {
+                    if !isMine, showsSenderIdentity {
                         Text(senderName(message.sender_id))
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
@@ -588,13 +725,17 @@ struct GroupChatView: View {
                         mapViewModel: mapViewModel
                     )
                 }
-                if !isMine { Spacer(minLength: 40) }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
             }
         } else {
-            HStack {
-                if isMine { Spacer(minLength: 40) }
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
                 VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
-                    if !isMine {
+                    if !isMine, showsSenderIdentity {
                         Text(senderName(message.sender_id))
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
@@ -629,7 +770,7 @@ struct GroupChatView: View {
                             }
                         }
                 }
-                if !isMine { Spacer(minLength: 40) }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
             }
         }
     }
@@ -650,6 +791,8 @@ struct GroupChatView: View {
             canLoadOlder = messages.count >= 50
             if let first = details.first {
                 title = first.title
+            } else if let pickupContext {
+                title = pickupContext.title
             }
             await hydrateMemberPreviews(from: details)
             try await service.markRead(conversationId: conversationId)
@@ -686,22 +829,94 @@ struct GroupChatView: View {
     }
 
     @MainActor
-    private func subscribe() async {
-        let (channel, stream) = service.groupMessagesInsertChannel(conversationId: conversationId)
-        realtimeChannel = channel
-        try? await channel.subscribeWithError()
-        Task {
-            for await action in stream {
-                guard let row = try? action.decodeRecord(as: GroupMessageRow.self, decoder: JSONDecoder()) else {
-                    continue
+    private func tearDownGroupRealtime(statusAfter: ChatRealtimeConnectionStatus) async {
+        realtimeListenTask?.cancel()
+        realtimeListenTask = nil
+        let channel = realtimeChannel
+        realtimeChannel = nil
+        subscribedConversationId = nil
+        realtimeConnectionStatus = statusAfter
+        if let channel {
+            await service.removeRealtimeChannel(channel)
+        }
+    }
+
+    /// Postgres INSERT on `group_messages` (includes system join/leave rows). Edit/delete events are not published.
+    @MainActor
+    private func subscribeGroupRealtime(reason: String) async {
+        // Prevent duplicate live channels when reopen / task re-entry races.
+        if realtimeChannel != nil,
+           subscribedConversationId == conversationId,
+           realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
+            return
+        }
+
+        await tearDownGroupRealtime(statusAfter: .connecting)
+
+        let delaysNs: [UInt64] = [0, 1_000_000_000, 2_000_000_000, 4_000_000_000]
+        var attempt = 0
+        while !Task.isCancelled {
+            realtimeConnectionStatus = attempt == 0 ? .connecting : .reconnecting
+            let (channel, stream) = service.groupMessagesInsertChannel(conversationId: conversationId)
+            realtimeChannel = channel
+            subscribedConversationId = conversationId
+            do {
+                try await channel.subscribeWithError()
+                guard !Task.isCancelled, subscribedConversationId == conversationId else {
+                    if subscribedConversationId == conversationId {
+                        realtimeChannel = nil
+                        subscribedConversationId = nil
+                    }
+                    await service.removeRealtimeChannel(channel)
+                    return
                 }
-                await MainActor.run {
-                    guard seenMessageIds.insert(row.id).inserted else { return }
-                    messages.append(row)
+                realtimeConnectionStatus = .live
+                realtimeListenTask = Task { @MainActor in
+                    for await action in stream {
+                        if Task.isCancelled { break }
+                        guard subscribedConversationId == conversationId else { break }
+                        guard let row = try? action.decodeRecord(as: GroupMessageRow.self, decoder: JSONDecoder()) else {
+                            continue
+                        }
+                        // Defense in depth: hide blocked senders even if Realtime delivers the row.
+                        if row.message_type != "system",
+                           chatViewModel.isEitherDirectionBlocked(with: row.sender_id) {
+                            continue
+                        }
+                        guard seenMessageIds.insert(row.id).inserted else { continue }
+                        messages.append(row)
+                        try? await service.markRead(conversationId: conversationId)
+                    }
+                    if !Task.isCancelled, subscribedConversationId == conversationId {
+                        realtimeConnectionStatus = .reconnecting
+                    }
                 }
-                try? await service.markRead(conversationId: conversationId)
+                return
+            } catch is CancellationError {
+                if subscribedConversationId == conversationId {
+                    realtimeChannel = nil
+                    subscribedConversationId = nil
+                }
+                await service.removeRealtimeChannel(channel)
+                return
+            } catch {
+                if subscribedConversationId == conversationId {
+                    realtimeChannel = nil
+                    subscribedConversationId = nil
+                }
+                await service.removeRealtimeChannel(channel)
+                attempt += 1
+                if attempt >= delaysNs.count {
+                    realtimeConnectionStatus = .reconnecting
+                    return
+                }
+                let delay = delaysNs[attempt]
+                if delay > 0 {
+                    try? await Task.sleep(nanoseconds: delay)
+                }
             }
         }
+        _ = reason
     }
 
     @MainActor
@@ -721,6 +936,7 @@ struct GroupChatView: View {
             }
             await chatViewModel.refreshInboxSummaries()
         } catch {
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
             errorText = error.localizedDescription
         }
         isSending = false
@@ -741,6 +957,7 @@ struct GroupChatView: View {
             }
             await chatViewModel.refreshInboxSummaries()
         } catch {
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
             errorText = error.localizedDescription
         }
         isSending = false
@@ -796,6 +1013,8 @@ struct GroupChatInfoView: View {
     let memberPreviews: [UUID: UserPreview]
     @ObservedObject var chatViewModel: ChatViewModel
     @EnvironmentObject private var mapViewModel: MapViewModel
+    var isPickupGameChat: Bool = false
+    var pickupLocationLabel: String? = nil
     var onLeft: () -> Void
     var onDetailsChanged: (([GroupConversationDetailRow], [UUID: UserPreview]) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
@@ -805,8 +1024,14 @@ struct GroupChatInfoView: View {
     @State private var localDetails: [GroupConversationDetailRow] = []
     @State private var localPreviews: [UUID: UserPreview] = [:]
     @State private var errorText: String?
+    @State private var inviteConfirmationText: String?
     @State private var isMuted = false
+    /// Suppresses mute RPC while applying authoritative server/cached state into the toggle.
+    @State private var isHydratingMuteState = true
+    @State private var isApplyingMuteChange = false
     @State private var showAddMembers = false
+    @State private var pendingInvites: [GroupConversationPendingInviteRow] = []
+    @State private var pendingInvitePreviews: [UUID: UserPreview] = [:]
     @State private var showReportGroup = false
     @State private var reportCategory: GroupConversationReportCategory?
     @State private var reportDetails = ""
@@ -828,6 +1053,10 @@ struct GroupChatInfoView: View {
 
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    private var effectiveIsPickupGameChat: Bool {
+        isPickupGameChat || localDetails.first?.isPickupGameChat == true || details.first?.isPickupGameChat == true
     }
 
     private var title: String {
@@ -854,6 +1083,20 @@ struct GroupChatInfoView: View {
                 Section {
                     Text(title)
                         .font(.headline)
+                    if effectiveIsPickupGameChat {
+                        Text("Private chat for this pickup game")
+                            .font(.caption)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        if let location = pickupLocationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+                           !location.isEmpty {
+                            Text(location)
+                                .font(.caption)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        }
+                        Text("Membership follows approved players for this game.")
+                            .font(.caption)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
                 }
 
                 Section(L10n.t("group_chat_members_section", languageCode: languageCode)) {
@@ -861,23 +1104,68 @@ struct GroupChatInfoView: View {
                         groupMemberRow(member)
                     }
 
-                    if viewerIsAdmin, memberIds.count < 25 {
+                    if viewerIsAdmin, !effectiveIsPickupGameChat, memberIds.count + pendingInvites.count < 25 {
                         Button {
                             showAddMembers = true
                         } label: {
                             Label(
-                                L10n.t("group_chat_add_members", languageCode: languageCode),
+                                L10n.t("group_chat_invite_members", languageCode: languageCode),
                                 systemImage: "person.badge.plus"
                             )
                         }
                     }
                 }
 
-                Section {
-                    Toggle(L10n.t("group_chat_mute", languageCode: languageCode), isOn: $isMuted)
-                        .onChange(of: isMuted) { _, newValue in
-                            Task { try? await service.setMuted(conversationId: conversationId, muted: newValue) }
+                if viewerIsAdmin, !effectiveIsPickupGameChat, !pendingInvites.isEmpty {
+                    Section(L10n.t("group_chat_pending_invitations_section", languageCode: languageCode)) {
+                        ForEach(pendingInvites) { invite in
+                            HStack(spacing: 12) {
+                                ProfileAvatarView(
+                                    preview: pendingInvitePreviews[invite.invitee_user_id]
+                                        ?? UserPreview(id: invite.invitee_user_id, displayName: "Fan", avatarURL: nil, avatarThumbnailURL: nil),
+                                    size: 36
+                                )
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(
+                                        pendingInvitePreviews[invite.invitee_user_id]?.displayName
+                                            ?? L10n.t("group_chat_system_member_fallback", languageCode: languageCode)
+                                    )
+                                    .font(.body.weight(.medium))
+                                    Text(L10n.t("group_chat_invitation_pending_status", languageCode: languageCode))
+                                        .font(.caption)
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                }
+                                Spacer()
+                                Button(L10n.t("Cancel", languageCode: languageCode)) {
+                                    Task { await cancelPendingInvite(invite.invitation_id) }
+                                }
+                                .font(.caption.weight(.semibold))
+                            }
                         }
+                    }
+                }
+
+                if let inviteConfirmationText {
+                    Section {
+                        Text(inviteConfirmationText)
+                            .font(.caption)
+                            .foregroundStyle(FGColor.accentGreen)
+                    }
+                }
+
+                Section {
+                    Toggle(
+                        L10n.t("group_chat_mute", languageCode: languageCode),
+                        isOn: Binding(
+                            get: { isMuted },
+                            set: { newValue in
+                                guard newValue != isMuted else { return }
+                                guard !isHydratingMuteState, !isApplyingMuteChange else { return }
+                                Task { await commitMuteChange(to: newValue) }
+                            }
+                        )
+                    )
+                    .disabled(isHydratingMuteState || isApplyingMuteChange)
 
                     if viewerIsActiveMember {
                         Button {
@@ -897,14 +1185,20 @@ struct GroupChatInfoView: View {
                         )
                     }
 
-                    Button(role: .destructive) {
-                        Task { await leave() }
-                    } label: {
-                        Text(L10n.t("group_chat_leave", languageCode: languageCode))
+                    if !effectiveIsPickupGameChat {
+                        Button(role: .destructive) {
+                            Task { await leave() }
+                        } label: {
+                            Text(L10n.t("group_chat_leave", languageCode: languageCode))
+                        }
+                        .accessibilityLabel(
+                            L10n.t("group_chat_leave", languageCode: languageCode)
+                        )
+                    } else {
+                        Text("To leave this chat, withdraw from the pickup game.")
+                            .font(.caption)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
                     }
-                    .accessibilityLabel(
-                        L10n.t("group_chat_leave", languageCode: languageCode)
-                    )
                 }
 
                 if let errorText {
@@ -924,6 +1218,7 @@ struct GroupChatInfoView: View {
                 GroupChatAddMembersSheet(
                     chatViewModel: chatViewModel,
                     existingMemberIds: memberIds,
+                    pendingInviteeIds: Set(pendingInvites.map(\.invitee_user_id)),
                     onAdd: { ids in
                         Task { await add(ids) }
                     }
@@ -951,18 +1246,67 @@ struct GroupChatInfoView: View {
                 L10n.t("group_chat_report_group_success_title", languageCode: languageCode),
                 isPresented: $showReportSuccessAlert
             ) {
-                Button(L10n.t("group_chat_leave", languageCode: languageCode), role: .destructive) {
-                    Task { await leave() }
+                if !effectiveIsPickupGameChat {
+                    Button(L10n.t("group_chat_leave", languageCode: languageCode), role: .destructive) {
+                        Task { await leave() }
+                    }
                 }
                 Button(L10n.t("done", languageCode: languageCode), role: .cancel) {}
             } message: {
                 Text(L10n.t("group_chat_report_group_success_body", languageCode: languageCode))
             }
             .onAppear {
+                // Seed from parent cache first (patched after successful mute) while fetch runs.
+                isHydratingMuteState = true
                 localDetails = details
                 localPreviews = memberPreviews
                 isMuted = details.first?.viewer_is_muted == true
             }
+            .task(id: conversationId) {
+                await hydrateAuthoritativeMuteState()
+                await refreshPendingInvitesIfAdmin()
+            }
+        }
+    }
+
+    /// Loads persisted mute from the server (or falls back to passed-in details) without firing a mute RPC.
+    @MainActor
+    private func hydrateAuthoritativeMuteState() async {
+        isHydratingMuteState = true
+        defer { isHydratingMuteState = false }
+
+        let fallbackMuted = (localDetails.first ?? details.first)?.viewer_is_muted == true
+        do {
+            let fresh = try await service.fetchDetails(conversationId: conversationId)
+            if !fresh.isEmpty {
+                localDetails = fresh
+                isMuted = fresh.first?.viewer_is_muted == true
+                onDetailsChanged?(localDetails, localPreviews)
+                chatViewModel.patchGroupInboxMuted(conversationId: conversationId, isMuted: isMuted)
+                return
+            }
+        } catch {
+            // Keep UI usable offline / on transient errors using the best local snapshot.
+        }
+        isMuted = fallbackMuted
+    }
+
+    @MainActor
+    private func commitMuteChange(to muted: Bool) async {
+        let previous = isMuted
+        isApplyingMuteChange = true
+        isMuted = muted
+        errorText = nil
+        defer { isApplyingMuteChange = false }
+
+        do {
+            try await service.setMuted(conversationId: conversationId, muted: muted)
+            localDetails = localDetails.map { $0.withViewerMuted(muted) }
+            onDetailsChanged?(localDetails, localPreviews)
+            chatViewModel.patchGroupInboxMuted(conversationId: conversationId, isMuted: muted)
+        } catch {
+            isMuted = previous
+            errorText = error.localizedDescription
         }
     }
 
@@ -1227,7 +1571,7 @@ struct GroupChatInfoView: View {
                         )
                     )
 
-                    if viewerIsAdmin {
+                    if viewerIsAdmin, !effectiveIsPickupGameChat {
                         Button(role: .destructive) {
                             Task { await remove(member.member_user_id) }
                         } label: {
@@ -1326,18 +1670,53 @@ struct GroupChatInfoView: View {
             localPreviews = merged
         }
         onDetailsChanged?(localDetails, localPreviews)
+        await refreshPendingInvitesIfAdmin()
+    }
+
+    @MainActor
+    private func refreshPendingInvitesIfAdmin() async {
+        guard viewerIsAdmin else {
+            pendingInvites = []
+            return
+        }
+        do {
+            let rows = try await service.fetchPendingInvitations(conversationId: conversationId)
+            pendingInvites = rows
+            let ids = Array(Set(rows.map(\.invitee_user_id)))
+            if let fetched = try? await identityService.fetchUserPreviews(for: ids) {
+                pendingInvitePreviews = fetched
+            }
+        } catch {
+            // Older servers without invitation RPCs: leave empty.
+            pendingInvites = []
+        }
+    }
+
+    @MainActor
+    private func cancelPendingInvite(_ invitationId: UUID) async {
+        do {
+            try await service.cancelInvitation(invitationId: invitationId)
+            await refreshPendingInvitesIfAdmin()
+        } catch {
+            errorText = error.localizedDescription
+        }
     }
 
     @MainActor
     private func add(_ ids: [UUID]) async {
         guard !ids.isEmpty else { return }
         do {
-            try await service.addMembers(conversationId: conversationId, memberIds: ids)
+            let invited = try await service.addMembers(conversationId: conversationId, memberIds: ids)
             try await refreshDetailsAndPreviews()
             showAddMembers = false
+            if invited > 0 {
+                inviteConfirmationText = L10n.t("group_chat_invitations_sent", languageCode: languageCode)
+            } else {
+                inviteConfirmationText = nil
+            }
             await chatViewModel.refreshInboxSummaries()
         } catch {
-            errorText = error.localizedDescription
+            errorText = groupChatNeutralInviteErrorText(error, languageCode: languageCode)
         }
     }
 
@@ -1368,6 +1747,7 @@ struct GroupChatInfoView: View {
 private struct GroupChatAddMembersSheet: View {
     @ObservedObject var chatViewModel: ChatViewModel
     let existingMemberIds: Set<UUID>
+    var pendingInviteeIds: Set<UUID> = []
     var onAdd: ([UUID]) -> Void
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -1382,12 +1762,14 @@ private struct GroupChatAddMembersSheet: View {
                 && !$0.preview.isBusinessVenueConversation
                 && !$0.preview.isDeleted
                 && !existingMemberIds.contains($0.preview.id)
+                && !pendingInviteeIds.contains($0.preview.id)
                 && chatViewModel.chipKind(forOtherUserId: $0.preview.id) == .friends
+                && !chatViewModel.isEitherDirectionBlocked(with: $0.preview.id)
         }
     }
 
     private var remainingSlots: Int {
-        max(0, 25 - existingMemberIds.count)
+        max(0, 25 - existingMemberIds.count - pendingInviteeIds.count)
     }
 
     var body: some View {
@@ -1413,14 +1795,14 @@ private struct GroupChatAddMembersSheet: View {
                     .buttonStyle(.plain)
                 }
             }
-            .navigationTitle(L10n.t("group_chat_add_members", languageCode: appLanguageRaw))
+            .navigationTitle(L10n.t("group_chat_invite_members", languageCode: appLanguageRaw))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.t("Cancel", languageCode: appLanguageRaw)) { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(L10n.t("group_chat_add_action", languageCode: appLanguageRaw)) {
+                    Button(L10n.t("group_chat_invite_action", languageCode: appLanguageRaw)) {
                         onAdd(Array(selectedIds))
                     }
                     .disabled(selectedIds.isEmpty)
@@ -1428,7 +1810,7 @@ private struct GroupChatAddMembersSheet: View {
             }
             .overlay {
                 if candidates.isEmpty {
-                    Text(L10n.t("group_chat_no_friends_to_add", languageCode: appLanguageRaw))
+                    Text(L10n.t("group_chat_no_friends_to_invite", languageCode: appLanguageRaw))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .padding()
                 }

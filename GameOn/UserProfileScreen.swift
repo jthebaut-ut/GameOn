@@ -508,7 +508,9 @@ struct UserProfileScreen: View {
 
         if let err = await viewModel.persistUserProfileAvatar(
             fullURL: urls.fullURL,
-            thumbnailURL: urls.thumbnailURL
+            thumbnailURL: urls.thumbnailURL,
+            replacedFullURL: urls.replacedFullURL,
+            replacedThumbnailURL: urls.replacedThumbnailURL
         ) {
             await MainActor.run {
                 localAvatarPreviewImage = nil

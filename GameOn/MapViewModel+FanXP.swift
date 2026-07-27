@@ -12,37 +12,32 @@ extension MapViewModel {
         await MainActor.run { currentUserFanXP = state }
     }
 
-    /// Awards an internal reputation signal via RPC; refreshes profile summary and queues subtle feedback when newly awarded.
+    /// Claims Fan XP for a verified action. Amount and eligibility are enforced by `claim_fan_xp`.
+    /// - Parameters:
+    ///   - source: Canonical source string (`FanXPSource`).
+    ///   - sourceId: Evidence record id (venue, event, pickup game, request, friendship, etc.).
+    ///   - showToast: When true and the caller is the awarded user, show the XP overlay.
+    @discardableResult
     func awardFanXP(
-        userId: UUID,
-        amount: Int,
         source: String,
-        sourceId: UUID? = nil,
-        sourceKey: String = "",
+        sourceId: UUID,
         showToast: Bool = true
-    ) async {
-        guard amount > 0 else { return }
-
+    ) async -> FanXPAwardResult? {
         let previousLevel = await MainActor.run {
-            userId == currentUserAuthId ? currentUserFanXP.level : 0
+            currentUserFanXP.level
         }
 
-        let result = await Self.fanXPService.awardXP(
-            userId: userId,
-            amount: amount,
+        let result = await Self.fanXPService.claimXP(
             source: source,
-            sourceId: sourceId,
-            sourceKey: sourceKey
+            sourceId: sourceId
         )
 
-        guard let result else { return }
+        guard let result else { return nil }
 
         if result.awarded == true {
-            if userId == currentUserAuthId {
-                await refreshProfileXP()
-            }
-            if showToast, userId == currentUserAuthId {
-                let gained = result.xp_gained ?? amount
+            await refreshProfileXP()
+            if showToast {
+                let gained = result.xp_gained ?? FanXPSource.expectedAmount(for: source)
                 let newLevel = await MainActor.run { currentUserFanXP.level }
                 let newTitle = await MainActor.run {
                     FanReputationEngine.evaluate(
@@ -53,16 +48,18 @@ extension MapViewModel {
                 await MainActor.run {
                     if newLevel > previousLevel {
                         fanXPRewardOverlay.enqueueLevelUp(level: newLevel, title: newTitle)
-                    } else {
+                    } else if gained > 0 {
                         fanXPRewardOverlay.enqueueXP(amount: gained, source: source)
                     }
                 }
             }
-        } else if userId == currentUserAuthId, let total = result.total_xp, let level = result.level, let title = result.title {
+        } else if let total = result.total_xp, let level = result.level, let title = result.title {
             await MainActor.run {
                 currentUserFanXP = FanXPState(totalXP: total, level: level, title: title)
             }
         }
+
+        return result
     }
 
     /// Routes legacy reputation feedback through the premium overlay (not ``showSocialActionToast``).

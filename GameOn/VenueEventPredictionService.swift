@@ -394,6 +394,10 @@ final class VenueEventPredictionService {
         summaryCache.removeValue(forKey: eventID)
     }
 
+    func clearAllCachedSummaries() {
+        summaryCache.removeAll(keepingCapacity: false)
+    }
+
     private func currentUserId() async throws -> UUID {
         do {
             let session = try await client.auth.session

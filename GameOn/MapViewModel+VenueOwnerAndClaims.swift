@@ -221,6 +221,13 @@ extension MapViewModel {
         businessHandle: String
     ) async {
         print("[EmailConfirmDebug] signupButtonTapped=true businessAccountOnly=true")
+        guard await requireAgeAccessForSignUp(email: OwnerBusinessEmail.normalized(email)) else {
+            let message = AgeAccessGateService.shared.latestState.isBlockingUnder13
+                ? L10n.t("age_gate_under13_body")
+                : L10n.t("age_gate_confirmation_body")
+            await MainActor.run { venueAuthErrorMessage = message }
+            return
+        }
         await MainActor.run { venueAuthErrorMessage = "" }
 
         let ownerEmail = OwnerBusinessEmail.normalized(email)
@@ -355,6 +362,13 @@ extension MapViewModel {
         recordVenueGuidelinesAcceptance: Bool = false
     ) async {
         print("[EmailConfirmDebug] signupButtonTapped=true")
+        guard await requireAgeAccessForSignUp(email: OwnerBusinessEmail.normalized(email)) else {
+            let message = AgeAccessGateService.shared.latestState.isBlockingUnder13
+                ? L10n.t("age_gate_under13_body")
+                : L10n.t("age_gate_confirmation_body")
+            await MainActor.run { venueAuthErrorMessage = message }
+            return
+        }
 #if DEBUG
         let coverExists = coverPhotoJPEGData.map { !$0.isEmpty } ?? false
         let menuExists = menuPhotoJPEGData.map { !$0.isEmpty } ?? false
@@ -958,6 +972,16 @@ extension MapViewModel {
         draft: PendingBusinessEmailSignupDraft
     ) async -> Bool {
         let ownerEmail = OwnerBusinessEmail.normalized(session.user.email ?? draft.email)
+        guard await requireAgeAccessForSignUp(email: ownerEmail) else {
+            if AgeAccessGateService.shared.latestState.isBlockingUnder13 {
+                await quarantineSessionAfterAgeAccessBlock(reason: "ageAccessBlockedUnder13PendingBusiness")
+            } else {
+                await forceLogout(reason: "ageAccessUnresolvedPendingBusiness", source: "MapViewModel.completePendingBusinessSignupAfterConfirmation")
+            }
+            return false
+        }
+        await claimAgeAccessSignUpOwnership(userId: session.user.id, email: ownerEmail)
+
 #if DEBUG
         print("[PendingBusinessSignupTrace] enter completePendingBusinessSignupAfterConfirmation sessionEmail=\(ownerEmail) authUserId=\(session.user.id.uuidString.lowercased()) draft.emailVerified=\(draft.emailVerified) userEmailConfirmed=\(Self.userEmailConfirmed(session.user))")
 #endif
@@ -1337,13 +1361,25 @@ extension MapViewModel {
     }
 
     // Signs in as venue owner and refreshes claim approval UI via `checkVenueApprovalStatus`.
-    func loginVenueOwner(email: String, password: String) async {
+    func loginVenueOwner(email: String, password: String, loginGeneration: UInt64? = nil) async {
+        let generationOrNil: UInt64? = await MainActor.run {
+            if let loginGeneration { return loginGeneration }
+            return beginSafeLogin(method: .emailPasswordBusiness, source: "loginVenueOwnerLegacy")
+        }
+        guard let generation = generationOrNil else { return }
+
         await MainActor.run { venueAuthErrorMessage = "" }
 
         let ownerEmail = OwnerBusinessEmail.normalized(email)
         guard OwnerBusinessEmail.isValidStrict(ownerEmail) else {
             await MainActor.run {
                 venueAuthErrorMessage = OwnerBusinessEmail.invalidOwnerEmailUserMessage
+                failSafeLogin(
+                    generation: generation,
+                    message: OwnerBusinessEmail.invalidOwnerEmailUserMessage,
+                    accountMode: .business,
+                    failurePhase: "validation"
+                )
             }
             return
         }
@@ -1354,12 +1390,27 @@ extension MapViewModel {
                 password: password
             )
 
+            guard await MainActor.run(body: { isActiveSafeLoginGeneration(generation) }) else {
+                SafeLoginDebug.log("stale previous-session result ignored phase=businessPostSignIn")
+                return
+            }
+
+            await MainActor.run {
+                markSafeLoginPreparingSession(generation: generation)
+            }
+
             guard let session = try? await supabase.auth.session else {
                 await forceLogout(reason: "businessLoginNoSessionAfterSignIn", source: "MapViewModel.loginVenueOwner")
                 await MainActor.run {
                     clearVenueOwnerOwnedBusinessCaches()
                     ownerVenueDatabaseId = nil
                     venueAuthErrorMessage = "Unable to login venue owner."
+                    failSafeLogin(
+                        generation: generation,
+                        message: "Unable to login venue owner.",
+                        accountMode: .business,
+                        failurePhase: "sessionMissing"
+                    )
                 }
                 return
             }
@@ -1372,6 +1423,12 @@ extension MapViewModel {
                     venueAuthErrorMessage = "Please verify your email before signing in."
                     markEmailVerificationPending(email: ownerEmail, kind: .business)
                     print("[EmailVerifyDebug] signInBlockedUnconfirmed=true")
+                    failSafeLogin(
+                        generation: generation,
+                        message: "Please verify your email before signing in.",
+                        accountMode: .business,
+                        failurePhase: "emailUnconfirmed"
+                    )
                 }
                 return
             }
@@ -1383,6 +1440,9 @@ extension MapViewModel {
                 ownerUserId: session.user.id
             ) {
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                await MainActor.run {
+                    clearSafeLoginProgress(generation: generation, reason: "businessBanGate")
+                }
                 return
             }
 
@@ -1391,15 +1451,33 @@ extension MapViewModel {
                 userId: session.user.id,
                 context: "businessLogin"
             ) else {
+                await MainActor.run {
+                    failSafeLogin(
+                        generation: generation,
+                        message: venueAuthErrorMessage,
+                        accountMode: .business,
+                        failurePhase: "businessAccess"
+                    )
+                }
                 return
             }
 
             if await applyVerifiedBusinessSignupSessionIfAllowed(session: session) {
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+                await MainActor.run {
+                    if isVenueOwnerLoggedIn {
+                        completeSafeLoginSuccess(generation: generation, accountKind: "business")
+                    } else {
+                        clearSafeLoginProgress(generation: generation, reason: "verifiedBusinessSignupSession")
+                    }
+                }
                 return
             }
 
             if await resumePendingBusinessSignupAfterOwnerSignInIfNeeded(session: session) {
+                await MainActor.run {
+                    clearSafeLoginProgress(generation: generation, reason: "pendingBusinessSignup")
+                }
                 return
             }
 
@@ -1422,10 +1500,14 @@ extension MapViewModel {
                         sessionEmail: ownerEmailForSetup,
                         source: "loginVenueOwner_pendingVenueSetup"
                     )
+                    await MainActor.run {
+                        clearSafeLoginProgress(generation: generation, reason: "businessLifecycleBlocked")
+                    }
                     return
                 }
                 await MainActor.run {
                     venueAuthErrorMessage = ""
+                    clearSafeLoginProgress(generation: generation, reason: "pendingVenueSetup")
                 }
                 clearExplicitLogoutMarkerAfterManualAuthSucceeded()
                 return
@@ -1450,11 +1532,27 @@ extension MapViewModel {
                 print("[AuthAccountTypeGate] business login blocked fanEmail=\(ownerEmail)")
 #endif
                 await undoPartialSupabaseSessionAfterAccountTypeMismatch()
-                await MainActor.run { venueAuthErrorMessage = Self.businessLoginBlockedBecauseFanMessage }
+                await MainActor.run {
+                    venueAuthErrorMessage = Self.businessLoginBlockedBecauseFanMessage
+                    failSafeLogin(
+                        generation: generation,
+                        message: Self.businessLoginBlockedBecauseFanMessage,
+                        accountMode: .business,
+                        failurePhase: "accountTypeGate"
+                    )
+                }
                 return
             }
 
             guard await claimAccountIdentity(.business, context: "loginVenueOwner") else {
+                await MainActor.run {
+                    failSafeLogin(
+                        generation: generation,
+                        message: venueAuthErrorMessage,
+                        accountMode: .business,
+                        failurePhase: "claimIdentity"
+                    )
+                }
                 return
             }
 
@@ -1463,6 +1561,14 @@ extension MapViewModel {
                 sessionEmail: ownerEmail,
                 source: "loginVenueOwner"
             ) {
+                await MainActor.run {
+                    clearSafeLoginProgress(generation: generation, reason: "businessLifecycleGate")
+                }
+                return
+            }
+
+            guard await MainActor.run(body: { isActiveSafeLoginGeneration(generation) }) else {
+                SafeLoginDebug.log("stale previous-session result ignored phase=businessBeginSession")
                 return
             }
 
@@ -1476,6 +1582,7 @@ extension MapViewModel {
                 venueAuthErrorMessage = ""
                 venueOwnerJustCompletedRegistration = false
                 authSessionState = .signedIn
+                SafeLoginDebug.log("minimum profile/preferences loading started")
 #if DEBUG
                 print("[AuthStateDebug] authStateTransition=businessLogin->signedIn")
 #endif
@@ -1496,31 +1603,55 @@ extension MapViewModel {
 
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
 
-            await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
-            _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "after_business_login_post_refresh")
+            await MainActor.run {
+                completeSafeLoginSuccess(generation: generation, accountKind: "business")
+            }
 
+            // Secondary hydration — venue catalogs and following must not block the authenticated root.
             Task {
+                await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
+                _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "after_business_login_post_refresh")
                 await loadFavoriteVenuesFromSupabase()
                 await refreshFollowingTabDataGlobally()
             }
 
         } catch {
             await MainActor.run {
+                guard isActiveSafeLoginGeneration(generation) else {
+                    SafeLoginDebug.log("stale previous-session result ignored phase=businessCatch")
+                    return
+                }
+                if isVenueOwnerLoggedIn, currentUserAuthId != nil {
+                    SafeLoginDebug.log("stale previous-session result ignored phase=businessCatchAlreadyAuthenticated")
+                    return
+                }
+
                 isVenueOwnerLoggedIn = false
                 clearVenueOwnerOwnedBusinessCaches()
                 ownerVenueDatabaseId = nil
 
                 let message = error.localizedDescription.lowercased()
+                let userMessage: String
 
                 if Self.isUnconfirmedEmailAuthError(error) {
-                    venueAuthErrorMessage = "Please verify your email before signing in."
+                    userMessage = "Please verify your email before signing in."
+                    venueAuthErrorMessage = userMessage
                     markEmailVerificationPending(email: ownerEmail, kind: .business)
                     print("[EmailVerifyDebug] signInBlockedUnconfirmed=true")
                 } else if message.contains("invalid login credentials") {
-                    venueAuthErrorMessage = "Venue owner account not found or incorrect password."
+                    userMessage = "Venue owner account not found or incorrect password."
+                    venueAuthErrorMessage = userMessage
                 } else {
-                    venueAuthErrorMessage = "Unable to login venue owner."
+                    userMessage = "Unable to login venue owner."
+                    venueAuthErrorMessage = userMessage
                 }
+
+                failSafeLogin(
+                    generation: generation,
+                    message: userMessage,
+                    accountMode: .business,
+                    failurePhase: "signInError"
+                )
             }
 
             print("VENUE LOGIN ERROR:", error)
@@ -2233,6 +2364,7 @@ extension MapViewModel {
         legacyOwnerVenuesForEmailFallback = []
         businessDashboardPreloadSnapshot = nil
         businessDashboardPreloadInFlightKey = nil
+        businessDashboardPreloadTask?.cancel()
         businessDashboardPreloadTask = nil
         clearBusinessFavoriteTeamState()
         isVenueOwnerBusinessDataLoading = false
@@ -4618,7 +4750,10 @@ extension MapViewModel {
                 let refreshed = try await supabase.auth.refreshSession()
                 print("[BusinessVenueDeleteDebug] authSessionRefreshAttempted result=success")
                 await applyAuthSession(refreshed)
-                _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "businessVenueDeleteAuthRefresh")
+                _ = await ensureBusinessOwnerSessionFlagsIfPossible(
+                    context: "businessVenueDeleteAuthRefresh",
+                    allowsRecentResultReuse: false
+                )
                 logAuthContext(refreshed)
                 return refreshed
             } catch {
@@ -4632,7 +4767,10 @@ extension MapViewModel {
             let session = try await supabase.auth.session
             guard session.isExpired else {
                 await applyAuthSession(session)
-                _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "businessVenueDeleteAuthActive")
+                _ = await ensureBusinessOwnerSessionFlagsIfPossible(
+                    context: "businessVenueDeleteAuthActive",
+                    allowsRecentResultReuse: false
+                )
                 logAuthContext(session)
                 return session
             }
@@ -5741,25 +5879,44 @@ extension MapViewModel {
     }
 
     func runDeferredBusinessOwnerHydrationAfterLaunch() async {
+        if let existing = deferredBusinessOwnerHydrationTask {
+            StartupPerf.taskCoalesced(name: "businessOwnerHydration")
+            print("[BusinessLaunchPerf] deferredBusinessHydrationCoalesced=true")
+            await existing.value
+            return
+        }
+
         let shouldHydrate = await MainActor.run {
             hasAuthenticatedVenueOwnerSession || isBusinessOwnerSessionRestorePending
         }
         guard shouldHydrate else { return }
 
-        print("[BusinessLaunchPerf] deferredBusinessHydrationStarted=true")
+        let task = Task { [weak self] in
+            guard let self else { return }
+            print("[BusinessLaunchPerf] deferredBusinessHydrationStarted=true")
+            StartupPerf.phase("businessOwnerHydrationStart")
+            let started = Date()
 
-        await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
-        await MainActor.run {
-            if isBusinessOwnerSessionRestorePending, hasAuthenticatedVenueOwnerSession {
-                isBusinessOwnerSessionRestorePending = false
+            await self.refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
+            await MainActor.run {
+                if self.isBusinessOwnerSessionRestorePending, self.hasAuthenticatedVenueOwnerSession {
+                    self.isBusinessOwnerSessionRestorePending = false
 #if DEBUG
-                print("[BusinessSessionRestoreDebug] restoreCompleted=deferredBusinessHydration")
+                    print("[BusinessSessionRestoreDebug] restoreCompleted=deferredBusinessHydration")
 #endif
+                }
+                self.checkVenueApprovalStatus()
             }
-            checkVenueApprovalStatus()
-        }
 
-        print("[BusinessLaunchPerf] deferredBusinessHydrationCompleted=true")
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            print("[BusinessLaunchPerf] deferredBusinessHydrationCompleted=true")
+            StartupPerf.phase("businessOwnerHydrationEnd", ms: ms)
+        }
+        deferredBusinessOwnerHydrationTask = task
+        await task.value
+        if deferredBusinessOwnerHydrationTask == task {
+            deferredBusinessOwnerHydrationTask = nil
+        }
     }
 
     // Loads the latest `venue_claims` row for `venueOwnerEmail` to drive pending/approved UI and prefilled venue fields.

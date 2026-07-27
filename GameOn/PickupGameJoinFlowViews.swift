@@ -35,6 +35,14 @@ struct PickupJoinWithdrawConfirmState: Identifiable {
     }
 }
 
+/// Confirmation for per-user “Clear from Going” on completed Playing pickup cards.
+struct PickupPlayingClearConfirmState: Identifiable {
+    let id = UUID()
+    let pickupGameId: UUID
+    /// True when the participant has not submitted an organizer rating yet.
+    let warnUnrated: Bool
+}
+
 // MARK: - Pickup “started” visuals (shared)
 
 /// Wraps a sport glyph with a small, neutral “Started” tag (not alarming).
@@ -89,6 +97,7 @@ struct DiscoverPickupGameDetailSheet: View {
     @ObservedObject var viewModel: MapViewModel
     let gameId: UUID
 
+    @EnvironmentObject private var chatViewModel: ChatViewModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -96,6 +105,12 @@ struct DiscoverPickupGameDetailSheet: View {
 
     @State private var showJoinComposer = false
     @State private var showInviteComposer = false
+    @State private var showPickupChat = false
+    @State private var pickupChatConversationId: UUID?
+    @State private var pickupChatContext: PickupGameChatContext?
+    @State private var isOpeningPickupChat = false
+    @State private var pickupChatError: String?
+    @State private var showPlayerRoster = false
     @State private var joinError: String?
     @State private var isCancellingRequest = false
     @State private var withdrawConfirm: PickupJoinWithdrawConfirmState?
@@ -143,6 +158,18 @@ struct DiscoverPickupGameDetailSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    if let g = game, !viewModel.isGuestDiscoverMode {
+                        Menu {
+                            ShareLink(item: pickupShareText(for: g)) {
+                                Label("Share", systemImage: "square.and.arrow.up")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("More options")
+                    }
+                }
             }
             .sheet(isPresented: $showJoinComposer) {
                 if let g = game {
@@ -156,6 +183,32 @@ struct DiscoverPickupGameDetailSheet: View {
                     PickupGameInviteFriendsSheet(viewModel: viewModel, game: g)
                 }
             }
+            .sheet(isPresented: $showPickupChat, onDismiss: {
+                pickupChatConversationId = nil
+                pickupChatContext = nil
+            }) {
+                if let conversationId = pickupChatConversationId {
+                    NavigationStack {
+                        GroupChatView(
+                            conversationId: conversationId,
+                            chatViewModel: chatViewModel,
+                            pickupContext: pickupChatContext
+                        )
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Back to game") {
+                                    showPickupChat = false
+                                }
+                            }
+                        }
+                    }
+                    .environmentObject(viewModel)
+                }
+            }
+            .sheet(isPresented: $showPlayerRoster) {
+                PickupGameRosterSheet(viewModel: viewModel, pickupGameId: gameId)
+                    .environmentObject(viewModel)
+            }
             .task(id: gameId) {
                 if viewModel.isGuestDiscoverMode {
                     if let g = viewModel.resolvedPickupGameRow(for: gameId) {
@@ -167,8 +220,14 @@ struct DiscoverPickupGameDetailSheet: View {
                     await viewModel.loadPickupCreatorDisplayNameIfNeeded(creatorUserId: cid)
                 }
                 await viewModel.loadMyLatestJoinRequestForPickupGame(pickupGameId: gameId)
+                await viewModel.loadPickupGameRoster(pickupGameId: gameId, force: true)
                 if let g = viewModel.resolvedPickupGameRow(for: gameId) {
+                    viewModel.ensurePickupCreatorRatingSessionScoped()
                     await viewModel.loadPickupCreatorDisplayNameIfNeeded(creatorUserId: g.creator_user_id)
+                    await viewModel.refreshPickupCreatorRatingUIContext(
+                        pickupGameId: g.id,
+                        creatorUserId: g.creator_user_id
+                    )
                     let now = Date()
                     let creator = viewModel.currentUserAuthId == g.creator_user_id
                     let actions: String
@@ -254,20 +313,25 @@ struct DiscoverPickupGameDetailSheet: View {
 
     @ViewBuilder
     private func detailContent(for g: PickupGameRow) -> some View {
-        let locationLine = [g.address, g.city, g.state]
+        let addressPrimary: String? = {
+            let trimmed = g.address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? nil : trimmed
+        }()
+        let cityStateLine = [g.city, g.state]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .joined(separator: ", ")
         let creatorLabel = viewModel.pickupCreatorDisplayLabel(for: g.creator_user_id)
-        let subtitleLine = "\(g.sport) • \(g.playEnvironmentEnum.shortLabel) • \(g.skillLevelEnum.displayTitle)"
+        let metadataLine = "\(AppSportCatalog.displayLabel(forSportToken: g.sport)) • \(g.playEnvironmentEnum.shortLabel) • \(g.skillLevelEnum.displayTitle)"
         let showStarted = g.hasPickupGameStarted()
 
         ScrollView {
             VStack(alignment: .leading, spacing: FGSpacing.md) {
                 pickupHeroCard(
                     g: g,
-                    locationLine: locationLine,
-                    subtitleLine: subtitleLine,
+                    addressPrimary: addressPrimary,
+                    cityStateLine: cityStateLine,
+                    metadataLine: metadataLine,
                     showStarted: showStarted
                 )
 
@@ -275,29 +339,13 @@ struct DiscoverPickupGameDetailSheet: View {
                     pickupInviteActionRow(for: g)
                 }
 
-                HStack(alignment: .top, spacing: FGSpacing.sm) {
-                    pickupStatCard(
-                        title: "Spots",
-                        value: "\(g.pickupOpenSlotsRemaining) left",
-                        systemImage: "person.3.sequence",
-                        tint: FGColor.accentBlue
-                    )
-                    pickupStatCard(
-                        title: "Players",
-                        value: "\(g.playersNeededClamped) needed",
-                        systemImage: "person.badge.plus",
-                        tint: FGColor.accentGreen
-                    )
-                    pickupStatCard(
-                        title: "Approved",
-                        value: "\(g.approvedJoinCount)",
-                        systemImage: "checkmark.circle.fill",
-                        tint: FGColor.accentYellow
-                    )
-                }
+                pickupChatEntrySection(for: g)
+
+                pickupCapacityCard(for: g)
 
                 LazyVGrid(
                     columns: [GridItem(.flexible(), spacing: FGSpacing.sm), GridItem(.flexible(), spacing: FGSpacing.sm)],
+                    alignment: .leading,
                     spacing: FGSpacing.sm
                 ) {
                     pickupDetailTile(
@@ -311,13 +359,11 @@ struct DiscoverPickupGameDetailSheet: View {
                         systemImage: "dollarsign.circle.fill"
                     )
                     pickupOrganizerDetailTile(g: g, creatorLabel: creatorLabel)
-                        .gridCellColumns(2)
                     pickupDetailTile(
                         title: "Play",
                         value: g.playEnvironmentEnum.displayTitle,
                         systemImage: "sportscourt.fill"
                     )
-                        .gridCellColumns(2)
                 }
 
                 let desc = g.description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -339,9 +385,9 @@ struct DiscoverPickupGameDetailSheet: View {
                     pickupInfoBanner(text: "You’re organizing this game.")
                 }
 
-                // TODO(Organizer Reputation): Bring organizer rating/review presentation back
-                // here when reputation includes average rating, total reviews, reliability
-                // score, organizer badges, and profile reputation display.
+                if !isCreator {
+                    pickupDetailCreatorRatingSection(for: g)
+                }
 
                 joinSection(for: g)
 
@@ -356,6 +402,41 @@ struct DiscoverPickupGameDetailSheet: View {
         }
         .scrollContentBackground(.hidden)
         .fanGeoScreenBackground()
+    }
+
+    private var pickupDisplayLocale: Locale {
+        Locale(identifier: languageCode.replacingOccurrences(of: "-", with: "_"))
+    }
+
+    /// Localized "Mon D, YYYY" for the hero date row (empty when unparsable).
+    private func pickupDateText(for g: PickupGameRow) -> String {
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at) else { return "" }
+        return start.formatted(
+            Date.FormatStyle.dateTime.month(.abbreviated).day().year().locale(pickupDisplayLocale)
+        )
+    }
+
+    /// Localized start–end time range (or single start time) for the hero date row.
+    private func pickupTimeRangeText(for g: PickupGameRow) -> String? {
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at) else { return nil }
+        let timeStyle = Date.FormatStyle.dateTime.hour().minute().locale(pickupDisplayLocale)
+        if let end = PickupGameModels.endDate(for: g), end > start {
+            return "\(start.formatted(timeStyle)) – \(end.formatted(timeStyle))"
+        }
+        return start.formatted(timeStyle)
+    }
+
+    /// Compact duration derived from existing start/end (e.g. "2h", "1h 30m", "45m").
+    private func pickupDurationText(for g: PickupGameRow) -> String? {
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at),
+              let end = PickupGameModels.endDate(for: g), end > start else { return nil }
+        let totalMinutes = Int((end.timeIntervalSince(start) / 60).rounded())
+        guard totalMinutes > 0 else { return nil }
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours > 0 && minutes == 0 { return "\(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 
     private var pickupDetailMainInk: Color {
@@ -388,9 +469,104 @@ struct DiscoverPickupGameDetailSheet: View {
             .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.4), lineWidth: 1)
     }
 
-    private func pickupStatCard(title: String, value: String, systemImage: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 5) {
+    /// One cohesive three-column capacity card (Spots · Players · Playing) with thin separators.
+    /// Spots/Players remain joiner-capacity math; Playing = organizer + approved joiners.
+    private func pickupCapacityCard(for g: PickupGameRow) -> some View {
+        let roster = viewModel.pickupGameRosterByGameId[g.id]
+        let playingCount = roster?.playingTotal
+            ?? PickupGameRosterPresentation.playingDisplayCount(approvedJoinCount: g.approvedJoinCount)
+        let stackMembers = roster?.stackMembers ?? fallbackOrganizerStack(for: g)
+
+        return HStack(alignment: .top, spacing: 0) {
+            pickupCapacityColumn(
+                title: "Spots",
+                value: "\(g.pickupOpenSlotsRemaining) left",
+                secondary: "of \(g.playersNeededClamped)",
+                systemImage: "person.3.sequence",
+                tint: FGColor.accentBlue
+            )
+            pickupCapacityDivider
+            pickupCapacityColumn(
+                title: "Players",
+                value: "\(g.playersNeededClamped) needed",
+                secondary: "to start",
+                systemImage: "person.badge.plus",
+                tint: FGColor.accentGreen
+            )
+            pickupCapacityDivider
+            Button {
+                showPlayerRoster = true
+            } label: {
+                VStack(spacing: 5) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "person.2.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(FGColor.accentYellow)
+                        Text("Playing")
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(pickupDetailSubInk)
+                    }
+                    Text("\(playingCount)")
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                        .foregroundStyle(pickupDetailMainInk)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    if !stackMembers.isEmpty {
+                        PickupPlayingAvatarStack(members: stackMembers, diameter: 20)
+                            .padding(.top, 1)
+                    } else {
+                        Text(playingCount == 1 ? "player" : "players")
+                            .font(FGTypography.caption)
+                            .foregroundStyle(FGColor.mutedText(colorScheme))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, FGSpacing.xs)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Playing, \(playingCount) \(playingCount == 1 ? "player" : "players")")
+            .accessibilityHint("Shows who is playing in this pickup game")
+            .accessibilityAddTraits(.isButton)
+        }
+        .padding(.vertical, FGSpacing.md)
+        .padding(.horizontal, FGSpacing.sm)
+        .frame(maxWidth: .infinity)
+        .background { pickupGlassBackground(cornerRadius: FGRadius.large) }
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
+        .overlay { pickupGlassStroke(cornerRadius: FGRadius.large) }
+    }
+
+    /// Before the roster RPC returns, show at least the organizer avatar from cached creator fields.
+    private func fallbackOrganizerStack(for g: PickupGameRow) -> [PickupGameRosterMember] {
+        let uid = g.creator_user_id
+        let name = viewModel.pickupCreatorDisplayLabel(for: uid)
+        return [
+            PickupGameRosterMember(
+                user_id: uid,
+                request_id: nil,
+                display_name: name,
+                username: nil,
+                avatar_url: viewModel.pickupOrganizerAvatarFullForDetail(userId: uid),
+                avatar_thumbnail_url: viewModel.pickupOrganizerAvatarThumbnailForDetail(userId: uid),
+                role: "organizer",
+                status: nil
+            )
+        ]
+    }
+
+    private func pickupCapacityColumn(
+        title: String,
+        value: String,
+        secondary: String,
+        systemImage: String,
+        tint: Color
+    ) -> some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 4) {
                 Image(systemName: systemImage)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(tint)
@@ -399,17 +575,26 @@ struct DiscoverPickupGameDetailSheet: View {
                     .foregroundStyle(pickupDetailSubInk)
             }
             Text(value)
-                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .font(.system(size: 17, weight: .semibold, design: .rounded))
                 .foregroundStyle(pickupDetailMainInk)
-                .lineLimit(2)
-                .minimumScaleFactor(0.78)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(secondary)
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, FGSpacing.sm + 2)
-        .padding(.vertical, FGSpacing.sm + 2)
-        .background { pickupGlassBackground(cornerRadius: FGRadius.medium) }
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
-        .overlay { pickupGlassStroke(cornerRadius: FGRadius.medium) }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, FGSpacing.xs)
+    }
+
+    private var pickupCapacityDivider: some View {
+        Rectangle()
+            .fill(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.5 : 0.4))
+            .frame(width: 1)
+            .padding(.vertical, 2)
+            .accessibilityHidden(true)
     }
 
     private func pickupDetailTile(title: String, value: String, systemImage: String) -> some View {
@@ -438,130 +623,140 @@ struct DiscoverPickupGameDetailSheet: View {
 
     private func pickupOrganizerDetailTile(g: PickupGameRow, creatorLabel: String?) -> some View {
         let uid = g.creator_user_id
-        let value = creatorLabel ?? "—"
-        let displayForAvatar = creatorLabel ?? ""
-        let cachedEmail = viewModel.pickupOrganizerEmailForDetail(userId: uid)
-        let emailLine = !cachedEmail.isEmpty ? cachedEmail : (g.creator_email ?? "")
+        let displayName = (creatorLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let shownName = displayName.isEmpty ? "—" : displayName
         let thumb = viewModel.pickupOrganizerAvatarThumbnailForDetail(userId: uid)
         let full = viewModel.pickupOrganizerAvatarFullForDetail(userId: uid)
         let token = viewModel.pickupOrganizerAvatarRefreshTokenForDetail(userId: uid)
         let avatarFallback: UserAvatarView.FallbackStyle = colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome
+        let summary = viewModel.pickupOrganizerSummary(for: uid)
+        let summaryInFlight = viewModel.pickupOrganizerSummaryInFlightUserIds.contains(uid)
 
-        return VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.95 : 0.88))
-                        Text("Organizer")
-                            .font(FGTypography.caption.weight(.semibold))
-                            .foregroundStyle(pickupDetailSubInk)
-                    }
-                    Text(value)
-                        .font(FGTypography.metadata.weight(.semibold))
-                        .foregroundStyle(pickupDetailMainInk)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.85)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                PublicProfileAvatarTap(userId: uid, context: "pickup_detail_organizer") {
+        return Button {
+            viewModel.presentPublicProfile(
+                userId: uid,
+                context: "pickup_detail_organizer",
+                isSelfPreview: uid == viewModel.currentUserAuthId
+            )
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 10) {
                     UserAvatarView(
                         avatarThumbnailURL: thumb,
                         avatarURL: full,
                         avatarDisplayRefreshToken: token,
-                        displayName: displayForAvatar,
-                        email: emailLine,
-                        size: 48,
+                        displayName: displayName.isEmpty ? shownName : displayName,
+                        email: "",
+                        size: 40,
                         fallbackStyle: avatarFallback,
                         imagePlaceholderTint: colorScheme == .dark ? .white.opacity(0.75) : nil
                     )
+                    .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L10n.t("Organizer", languageCode: languageCode))
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(pickupDetailSubInk)
+                        Text(shownName)
+                            .font(FGTypography.metadata.weight(.semibold))
+                            .foregroundStyle(pickupDetailMainInk)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .accessibilityHidden(true)
+                }
+                .contentShape(Rectangle())
+
+                if let summary {
+                    pickupOrganizerSummaryLines(summary)
+                } else if summaryInFlight {
+                    // Keep identity visible; omit counts until authoritative summary arrives (no “New organizer” flash).
+                    Color.clear.frame(height: 1)
+                        .accessibilityHidden(true)
                 }
             }
-            // TODO(Organizer Reputation): Restore organizer trust/reputation badge here
-            // when average rating, total reviews, reliability score, organizer badges,
-            // and profile reputation display are implemented.
+            .padding(.horizontal, FGSpacing.sm + 2)
+            .padding(.top, FGSpacing.sm + 2)
+            .padding(.bottom, FGSpacing.md)
+            .background { pickupGlassBackground(cornerRadius: FGRadius.medium) }
+            .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+            .overlay { pickupGlassStroke(cornerRadius: FGRadius.medium) }
+            .contentShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
         }
-        .padding(.horizontal, FGSpacing.sm + 2)
-        .padding(.top, FGSpacing.sm + 2)
-        .padding(.bottom, FGSpacing.md)
-        .background { pickupGlassBackground(cornerRadius: FGRadius.medium) }
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
-        .overlay { pickupGlassStroke(cornerRadius: FGRadius.medium) }
-    }
-
-    /// Full-width pill highlighting organizer trust (detail sheet only; stats from existing cache / RPC loaders).
-    @ViewBuilder
-    private func organizerTrustBadgeShell<Content: View>(@ViewBuilder content: () -> Content) -> some View {
-        content()
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.22 : 0.16))
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(FGColor.accentYellow.opacity(colorScheme == .dark ? 0.52 : 0.4), lineWidth: 1.5)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .buttonStyle(.plain)
+        .accessibilityLabel(pickupOrganizerDetailAccessibilityLabel(displayName: shownName, summary: summary))
+        .accessibilityHint(L10n.t("live_pickup_organizer_a11y_hint", languageCode: languageCode))
     }
 
     @ViewBuilder
-    private func pickupOrganizerTrustBadge(stats: PickupCreatorPublicRatingStats?) -> some View {
-        let starTint = FGColor.accentYellow
-        if let stats {
-            if stats.ratingCount > 0 {
-                let reviewWords = stats.ratingCount == 1 ? "1 review" : "\(stats.ratingCount) reviews"
-                organizerTrustBadgeShell {
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "star.fill")
-                                .font(.title3)
-                                .foregroundStyle(starTint)
-                            Text(String(format: "%.1f", stats.avgRating))
-                                .font(.callout.weight(.bold))
-                                .foregroundStyle(pickupDetailMainInk)
-                        }
-                        Text(reviewWords)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(pickupDetailSubInk)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Organizer rating \(String(format: "%.1f", stats.avgRating)), \(reviewWords)")
-            } else {
-                organizerTrustBadgeShell {
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(alignment: .center, spacing: 8) {
-                            Image(systemName: "star.fill")
-                                .font(.title3)
-                                .foregroundStyle(starTint)
-                            Text("New organizer")
-                                .font(.callout.weight(.bold))
-                                .foregroundStyle(pickupDetailMainInk)
-                        }
-                        Text("No ratings yet")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(pickupDetailSubInk)
-                    }
-                }
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Organizer is a new organizer, no ratings yet")
+    private func pickupOrganizerSummaryLines(_ summary: PickupOrganizerSummary) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(summary.summaryLine(languageCode: languageCode))
+                .font(FGTypography.caption.weight(.medium))
+                .foregroundStyle(pickupDetailSubInk)
+                .lineLimit(2)
+                .minimumScaleFactor(0.85)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let recency = summary.recencyLine(languageCode: languageCode) {
+                Text(recency)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-        } else {
-            organizerTrustBadgeShell {
-                HStack(spacing: 10) {
-                    ProgressView()
-                    Text("Loading organizer trust…")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(pickupDetailSubInk)
-                }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityHidden(true)
+    }
+
+    private func pickupOrganizerDetailAccessibilityLabel(
+        displayName: String,
+        summary: PickupOrganizerSummary?
+    ) -> String {
+        let organizerWord = L10n.t("Organizer", languageCode: languageCode)
+        let identity = "\(organizerWord) \(displayName)"
+        guard let summary else { return identity }
+        let summaryA11y = summary.accessibilityLabel(languageCode: languageCode)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if summaryA11y.isEmpty { return identity }
+        // Drop the leading “Organizer.” title from the summary a11y string when present.
+        let title = L10n.t("pickup_organizer_title", languageCode: languageCode)
+        let trimmedSummary: String = {
+            if summaryA11y.lowercased().hasPrefix(title.lowercased()) {
+                let rest = summaryA11y.dropFirst(title.count).trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+                return rest
             }
-            .accessibilityLabel("Loading organizer trust")
+            return summaryA11y
+        }()
+        return trimmedSummary.isEmpty ? identity : "\(identity). \(trimmedSummary)"
+    }
+
+    @ViewBuilder
+    private func pickupDetailCreatorRatingSection(for g: PickupGameRow) -> some View {
+        let joinStatus = myRequest?.status
+            ?? viewModel.pickupJoinRequestLatestByPickupGameIdForFan[g.id]?.status
+        if viewModel.hasSubmittedPickupCreatorRating(for: g.id) {
+            PickupCreatorRateOrganizerHistoryRow(
+                viewModel: viewModel,
+                game: g,
+                joinStatus: joinStatus ?? "approved"
+            )
+        } else if viewModel.shouldPresentPickupCreatorRatingPrompt(game: g, joinStatus: joinStatus) {
+            PickupCreatorRatingPromptCard(viewModel: viewModel, game: g)
+        } else if viewModel.shouldShowPickupCreatorRateOrganizerAction(game: g, joinStatus: joinStatus) {
+            PickupCreatorRateOrganizerHistoryRow(
+                viewModel: viewModel,
+                game: g,
+                joinStatus: joinStatus
+            )
         }
     }
 
@@ -591,20 +786,38 @@ struct DiscoverPickupGameDetailSheet: View {
         }
     }
 
-    private func pickupHeroCard(g: PickupGameRow, locationLine: String, subtitleLine: String, showStarted: Bool) -> some View {
+    private func pickupHeroCard(
+        g: PickupGameRow,
+        addressPrimary: String?,
+        cityStateLine: String,
+        metadataLine: String,
+        showStarted: Bool
+    ) -> some View {
         let hasUsableMapCoordinate = Self.pickupHasUsableMapCoordinate(g)
+        let dateText = pickupDateText(for: g)
+        let timeRange = pickupTimeRangeText(for: g)
+        let duration = pickupDurationText(for: g)
+        let timeSecondary: String? = {
+            guard let timeRange, !timeRange.isEmpty else { return nil }
+            if let duration, !duration.isEmpty { return "\(timeRange) (\(duration))" }
+            return timeRange
+        }()
+        let locationPrimary = addressPrimary ?? (cityStateLine.isEmpty ? nil : cityStateLine)
+        let locationSecondary = addressPrimary == nil ? nil : (cityStateLine.isEmpty ? nil : cityStateLine)
+        let hasDateRow = !dateText.isEmpty || (timeSecondary != nil)
+        let hasLocationRow = locationPrimary != nil
 
-        return VStack(alignment: .leading, spacing: FGSpacing.sm) {
+        return VStack(alignment: .leading, spacing: FGSpacing.md) {
             Button {
                 showPickupOnDiscoverMap(g)
             } label: {
                 HStack(alignment: .top, spacing: FGSpacing.md) {
                     PickupGameStartedSportGlyphFrame(showStarted: showStarted) {
-                        SportArtworkIconView(sport: g.sport, diameter: 48)
+                        SportArtworkIconView(sport: g.sport, diameter: 52)
                     }
                     .accessibilityHidden(true)
 
-                    VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    VStack(alignment: .leading, spacing: 6) {
                         GameFormatBadgeView(format: g.gameFormat, colorScheme: colorScheme)
                             .accessibilityHidden(true)
 
@@ -612,32 +825,25 @@ struct DiscoverPickupGameDetailSheet: View {
                             .font(FGTypography.sectionTitle)
                             .foregroundStyle(pickupDetailMainInk)
                             .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
 
-                        Text(subtitleLine)
+                        Text(metadataLine)
                             .font(FGTypography.metadata.weight(.medium))
                             .foregroundStyle(pickupDetailSubInk)
                             .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
 
                         if showStarted {
                             PickupGameStartedLineCaption()
                         }
-
-                        if let start = PickupGameModels.parseSupabaseTimestamptz(g.game_start_at) {
-                            Text(g.pickupDateWithCompactTimeRange ?? start.formatted(date: .abbreviated, time: .shortened))
-                                .font(FGTypography.cardTitle.weight(.semibold))
-                                .foregroundStyle(pickupDetailMainInk)
-                                .multilineTextAlignment(.leading)
-                        }
-
-                        if !locationLine.isEmpty {
-                            Text(locationLine)
-                                .font(FGTypography.caption)
-                                .foregroundStyle(pickupDetailSubInk)
-                                .lineLimit(3)
-                                .multilineTextAlignment(.leading)
-                        }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -655,28 +861,104 @@ struct DiscoverPickupGameDetailSheet: View {
             .accessibilityHint(L10n.t("discover_pickup_show_on_map_a11y_hint", languageCode: languageCode))
             .accessibilityAddTraits(.isButton)
 
-            if hasUsableMapCoordinate, let lat = g.latitude, let lon = g.longitude {
-                HStack {
-                    Spacer(minLength: 0)
-                    Button {
-                        if let url = URL(string: "http://maps.apple.com/?ll=\(lat),\(lon)&q=Pickup%20game") {
-                            openURL(url)
-                        }
-                    } label: {
-                        Label("Directions", systemImage: "map")
-                            .font(FGTypography.caption.weight(.semibold))
-                            .labelStyle(.titleAndIcon)
+            if hasDateRow || hasLocationRow {
+                VStack(spacing: 0) {
+                    if hasDateRow {
+                        pickupHeroInfoRow(
+                            systemImage: "calendar",
+                            tint: FGColor.accentBlue,
+                            primary: dateText.isEmpty ? (timeSecondary ?? "") : dateText,
+                            secondary: dateText.isEmpty ? nil : timeSecondary
+                        )
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(FGColor.accentBlue)
-                    .fixedSize()
+                    if hasDateRow && hasLocationRow {
+                        Rectangle()
+                            .fill(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.45 : 0.35))
+                            .frame(height: 1)
+                            .padding(.leading, 48 + FGSpacing.md)
+                            .accessibilityHidden(true)
+                    }
+                    if hasLocationRow, let locationPrimary {
+                        pickupHeroInfoRow(
+                            systemImage: "mappin.and.ellipse",
+                            tint: FGColor.accentGreen,
+                            primary: locationPrimary,
+                            secondary: locationSecondary
+                        )
+                    }
                 }
+                .background {
+                    RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                        .fill(Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.035))
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                        .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.45 : 0.3), lineWidth: 1)
+                }
+                .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+            }
+
+            if hasUsableMapCoordinate, let lat = g.latitude, let lon = g.longitude {
+                Button {
+                    if let url = URL(string: "http://maps.apple.com/?ll=\(lat),\(lon)&q=Pickup%20game") {
+                        openURL(url)
+                    }
+                } label: {
+                    Label("Directions", systemImage: "map")
+                        .font(FGTypography.metadata.weight(.semibold))
+                        .labelStyle(.titleAndIcon)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(FGColor.accentBlue)
+                .controlSize(.large)
             }
         }
         .padding(FGSpacing.lg)
         .background { pickupGlassBackground(cornerRadius: FGRadius.large) }
         .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
         .overlay { pickupGlassStroke(cornerRadius: FGRadius.large) }
+    }
+
+    /// Icon-in-tinted-circle info row for the hero date/time and location surfaces.
+    private func pickupHeroInfoRow(
+        systemImage: String,
+        tint: Color,
+        primary: String,
+        secondary: String?
+    ) -> some View {
+        HStack(alignment: .center, spacing: FGSpacing.md) {
+            ZStack {
+                Circle()
+                    .fill(tint.opacity(colorScheme == .dark ? 0.22 : 0.12))
+                    .frame(width: 36, height: 36)
+                Image(systemName: systemImage)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(tint)
+            }
+            .frame(width: 48, alignment: .center)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(primary)
+                    .font(FGTypography.metadata.weight(.semibold))
+                    .foregroundStyle(pickupDetailMainInk)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let secondary, !secondary.isEmpty {
+                    Text(secondary)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(pickupDetailSubInk)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.trailing, FGSpacing.md)
+        .padding(.vertical, FGSpacing.sm + 2)
+        .accessibilityElement(children: .combine)
     }
 
     private static func pickupHasUsableMapCoordinate(_ g: PickupGameRow) -> Bool {
@@ -725,37 +1007,163 @@ struct DiscoverPickupGameDetailSheet: View {
         }
     }
 
-    private func pickupInviteActionRow(for g: PickupGameRow) -> some View {
-        HStack(spacing: FGSpacing.sm) {
-            ShareLink(item: pickupShareText(for: g)) {
-                Label("Share", systemImage: "square.and.arrow.up")
-                    .font(FGTypography.metadata.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+    private var canAccessPickupGameChat: Bool {
+        PickupGameChatAccessPolicy.canAccess(
+            isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
+            isCreator: isCreator,
+            joinRequestStatus: myRequest?.status
+        )
+    }
+
+    private var showsPickupChatLockedHint: Bool {
+        PickupGameChatAccessPolicy.showsLockedHint(
+            isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
+            isCreator: isCreator,
+            joinRequestStatus: myRequest?.status
+        )
+    }
+
+    @ViewBuilder
+    private func pickupChatEntrySection(for g: PickupGameRow) -> some View {
+        if canAccessPickupGameChat {
+            Button {
+                Task { await openPickupGameChat(for: g) }
+            } label: {
+                pickupTintedActionLabel(
+                    title: isOpeningPickupChat ? "Opening chat…" : "Chat",
+                    systemImage: "bubble.left.and.bubble.right.fill",
+                    tint: FGColor.accentGreen
+                )
             }
-            .buttonStyle(.bordered)
-            .tint(FGColor.accentBlue)
+            .buttonStyle(.plain)
+            .disabled(isOpeningPickupChat)
+            .accessibilityLabel("Open pickup game chat")
+            .accessibilityHint("Opens the private chat for approved players of this pickup game")
+
+            if let pickupChatError, !pickupChatError.isEmpty {
+                Text(pickupChatError)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.dangerRed)
+            }
+        } else if showsPickupChatLockedHint {
+            HStack(spacing: FGSpacing.sm) {
+                Image(systemName: "lock.fill")
+                    .font(.caption.weight(.semibold))
+                Text("Chat available to approved players")
+                    .font(FGTypography.caption.weight(.medium))
+            }
+            .foregroundStyle(pickupDetailSubInk)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, FGSpacing.xs)
+            .accessibilityLabel("Chat available to approved players")
+        }
+    }
+
+    @MainActor
+    private func openPickupGameChat(for g: PickupGameRow) async {
+        guard canAccessPickupGameChat else { return }
+        // Client gate only — server RLS/RPC re-checks authorization.
+        isOpeningPickupChat = true
+        pickupChatError = nil
+        defer { isOpeningPickupChat = false }
+        do {
+            let conversationId = try await GroupChatService().ensurePickupGameConversation(pickupGameId: g.id)
+            pickupChatConversationId = conversationId
+            pickupChatContext = makePickupGameChatContext(for: g)
+            showPickupChat = true
+#if DEBUG
+            print("[PickupGameChat] opened gameId=\(g.id.uuidString.lowercased()) conversationId=\(conversationId.uuidString.lowercased())")
+#endif
+        } catch {
+            pickupChatError = Self.userFacingPickupChatOpenError(error)
+#if DEBUG
+            print("[PickupGameChat] openFailed gameId=\(g.id.uuidString.lowercased()) error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
+    private func makePickupGameChatContext(for g: PickupGameRow) -> PickupGameChatContext {
+        let title = {
+            let raw = g.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !raw.isEmpty { return raw }
+            return AppSportCatalog.displayLabel(forSportToken: g.sport)
+        }()
+        let when: String = {
+            let date = pickupDateText(for: g)
+            let time = pickupTimeRangeText(for: g) ?? ""
+            if date.isEmpty { return time }
+            if time.isEmpty { return date }
+            return "\(date) · \(time)"
+        }()
+        let location: String? = {
+            let parts = [g.address, g.city, g.state]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            return parts.isEmpty ? nil : parts.joined(separator: ", ")
+        }()
+        // Organizer + approved joiners (approved_join_count is joiners only).
+        let approvedCount = max(0, g.approved_join_count ?? 0) + 1
+        return PickupGameChatContext(
+            pickupGameId: g.id,
+            title: title,
+            sportLabel: AppSportCatalog.displayLabel(forSportToken: g.sport),
+            whenLabel: when,
+            locationLabel: location,
+            approvedParticipantCount: approvedCount
+        )
+    }
+
+    private static func userFacingPickupChatOpenError(_ error: Error) -> String {
+        let raw = String(describing: error).lowercased()
+        if raw.contains("not authorized") || raw.contains("42501") {
+            return "Chat is only available to the organizer and approved players."
+        }
+        if raw.contains("age") {
+            return "Chat is unavailable for this account right now."
+        }
+        return "Couldn't open pickup chat. Try again."
+    }
+
+    private func pickupInviteActionRow(for g: PickupGameRow) -> some View {
+        HStack(spacing: FGSpacing.md) {
+            ShareLink(item: pickupShareText(for: g)) {
+                pickupTintedActionLabel(title: "Share", systemImage: "square.and.arrow.up", tint: FGColor.accentBlue)
+            }
+            .buttonStyle(.plain)
 
             Button {
                 showInviteComposer = true
             } label: {
-                Label("Invite friends", systemImage: "person.badge.plus")
-                    .font(FGTypography.metadata.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+                pickupTintedActionLabel(title: "Invite friends", systemImage: "person.badge.plus", tint: Color.orange)
             }
-            .buttonStyle(.bordered)
-            .tint(Color.orange)
+            .buttonStyle(.plain)
         }
-        .padding(FGSpacing.sm)
-        .background { pickupGlassBackground(cornerRadius: FGRadius.medium) }
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
-        .overlay { pickupGlassStroke(cornerRadius: FGRadius.medium) }
+    }
+
+    /// Large equal-width rounded action button used for Share (blue) / Invite friends (orange).
+    private func pickupTintedActionLabel(title: String, systemImage: String, tint: Color) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(FGTypography.metadata.weight(.semibold))
+            .labelStyle(.titleAndIcon)
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .frame(maxWidth: .infinity, minHeight: 30)
+            .padding(.vertical, 12)
+            .background {
+                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    .fill(tint.opacity(colorScheme == .dark ? 0.20 : 0.11))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    .strokeBorder(tint.opacity(colorScheme == .dark ? 0.42 : 0.26), lineWidth: 1)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
     }
 
     private func pickupShareText(for g: PickupGameRow) -> String {
         var lines = ["Join \(g.title) on FanGeo."]
-        if let date = g.pickupDateWithCompactTimeRange {
+        if let date = g.pickupDateWithCompactTimeRange(languageCode: languageCode) {
             lines.append(date)
         }
         let location = [g.address, g.city, g.state]
@@ -796,7 +1204,10 @@ struct DiscoverPickupGameDetailSheet: View {
         } else {
             VStack(alignment: .leading, spacing: FGSpacing.sm) {
                 if let req = myRequest {
-                    labeledRow("Your request", req.statusDisplayTitle)
+                    labeledRow(
+                        "Your request",
+                        req.statusDisplayTitle(languageCode: appLanguageRaw)
+                    )
                     let st = req.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                     if st == "pending" {
                         Button(role: .destructive) {
@@ -869,11 +1280,21 @@ struct DiscoverPickupGameDetailSheet: View {
                         showJoinComposer = true
                     } label: {
                         Text("Request to Join")
-                            .font(FGTypography.metadata.weight(.semibold))
+                            .font(FGTypography.cardTitle.weight(.semibold))
                             .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(FGColor.accentBlue)
+                    .controlSize(.large)
+
+                    Label("You’ll be visible to other players once you join.", systemImage: "lock.fill")
+                        .font(FGTypography.caption)
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 2)
                 } else if myRequest == nil, g.isPickupFullForDiscover {
                     Text("No more players needed.")
                         .font(FGTypography.caption.weight(.semibold))
@@ -913,6 +1334,7 @@ struct PickupGameInviteFriendsSheet: View {
     @EnvironmentObject private var chatViewModel: ChatViewModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     /// Selected invitee profile/auth user IDs only (`UserPreview.id` / search `user_id`). Never conversation IDs.
     @State private var selectedInviteeUserIds: Set<UUID> = []
@@ -1056,7 +1478,7 @@ struct PickupGameInviteFriendsSheet: View {
                     Text("\(AppSportCatalog.displayLabel(forSportToken: game.sport)) · \(game.gameFormat.displayTitle)")
                         .font(FGTypography.caption.weight(.semibold))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    if let dateLine = game.pickupDateWithCompactTimeRange {
+                    if let dateLine = game.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw) {
                         Text(dateLine)
                             .font(FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))

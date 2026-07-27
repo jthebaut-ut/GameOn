@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 struct AppLanguage: Identifiable, Hashable {
     let code: String
@@ -9,15 +10,18 @@ struct AppLanguage: Identifiable, Hashable {
     var id: String { code }
 }
 
-enum LocalizationDiagnostics {
+nonisolated enum LocalizationDiagnostics {
     static let enabled = false
 }
 
-enum L10n {
+/// Stateless localization utility. Kept `nonisolated` so string lookups work from any
+/// context (including nonisolated value types) under the module's `MainActor` default
+/// isolation; the only mutable state is a DEBUG dedup set guarded by a synchronous lock.
+nonisolated enum L10n {
     static let appLanguageKey = "appLanguage"
     static let defaultLanguageCode = "en"
 #if DEBUG
-    private static var missingKeysLogged: Set<String> = []
+    private static let missingKeysLogged = OSAllocatedUnfairLock<Set<String>>(initialState: [])
 #endif
 
     static let supportedLanguages: [AppLanguage] = [
@@ -67,7 +71,8 @@ enum L10n {
 
 #if DEBUG
     static func logMissingKeyOnce(_ key: String, prefix: String = "missingKey") {
-        guard missingKeysLogged.insert("\(prefix):\(key)").inserted else { return }
+        let inserted = missingKeysLogged.withLock { $0.insert("\(prefix):\(key)").inserted }
+        guard inserted else { return }
         print("[LocalizationDebug] \(prefix)=\(key)")
     }
 #endif

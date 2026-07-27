@@ -112,7 +112,10 @@ extension MapViewModel {
     func refreshActiveBusinessBanGateAndRestoreBusinessSessionIfAllowed(reason: String) async -> Bool {
         let isBanned = await refreshActiveBusinessBanGate(checkPath: reason)
         guard !isBanned else { return true }
-        _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "\(reason)_restore_business")
+        _ = await ensureBusinessOwnerSessionFlagsIfPossible(
+            context: "\(reason)_restore_business",
+            allowsRecentResultReuse: false
+        )
         return false
     }
 

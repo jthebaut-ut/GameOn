@@ -1599,28 +1599,46 @@ private struct BusinessDashboardStableRemoteThumb: View {
             }
         }
         .task(id: url?.absoluteString) {
-            let key = url?.absoluteString
-            guard let url else {
+            guard let requestedURL = url else {
                 image = nil
                 loadedURLString = nil
                 return
             }
-            if loadedURLString == key, image != nil {
+            let requestedKey = requestedURL.absoluteString
+            if loadedURLString == requestedKey, image != nil {
                 return
             }
-            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: url) {
-                guard !Task.isCancelled else { return }
-                image = cached
-                loadedURLString = key
+            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL) {
+                guard !Task.isCancelled else {
+                    ImagePerf.waiterCancelled()
+                    return
+                }
+                guard self.url?.absoluteString == requestedKey else {
+                    ImagePerf.staleResultRejected()
+                    return
+                }
+                if image !== cached {
+                    image = cached
+                }
+                loadedURLString = requestedKey
                 return
             }
-            if loadedURLString != key {
+            if loadedURLString != requestedKey {
                 image = nil
             }
-            if let loaded = await DiscoverMapImageCache.shared.image(for: url) {
-                guard !Task.isCancelled else { return }
-                image = loaded
-                loadedURLString = key
+            if let loaded = await DiscoverMapImageCache.shared.image(for: requestedURL) {
+                guard !Task.isCancelled else {
+                    ImagePerf.waiterCancelled()
+                    return
+                }
+                guard self.url?.absoluteString == requestedKey else {
+                    ImagePerf.staleResultRejected()
+                    return
+                }
+                if image !== loaded {
+                    image = loaded
+                }
+                loadedURLString = requestedKey
             }
         }
     }

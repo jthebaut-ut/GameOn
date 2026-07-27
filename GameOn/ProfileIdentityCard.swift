@@ -25,6 +25,26 @@ enum ProfilePhase1PersonalizationCache {
         suggestedFansByAuthId.removeValue(forKey: authId)
     }
 
+    /// Merges a remote/local avatar URL change into cached Suggested Fans rows (viewer caches keyed by auth id).
+    static func applyAvatarChange(_ change: FanProfileAvatarChange) {
+        let target = change.userId
+        let full = change.avatarURL.isEmpty ? nil : change.avatarURL
+        let thumb = change.avatarThumbnailURL
+        for authId in suggestedFansByAuthId.keys {
+            guard var rows = suggestedFansByAuthId[authId] else { continue }
+            var changed = false
+            rows = rows.map { row in
+                guard row.userID == target else { return row }
+                let next = row.replacingAvatars(avatarURL: full ?? row.avatarURL, avatarThumbnailURL: thumb ?? row.avatarThumbnailURL)
+                if next != row { changed = true }
+                return next
+            }
+            if changed {
+                suggestedFansByAuthId[authId] = rows
+            }
+        }
+    }
+
     static func storeIncomingPokes(_ items: [ProfilePokeIncomingItem], for authId: UUID) {
         incomingPokesByAuthId[authId] = items
         incomingPokesLoadedAtByAuthId[authId] = Date()
@@ -81,14 +101,16 @@ private enum ProfileAvatarRefreshToken {
 /// Unified Account-tab “Profile & Identity” card: compact profile, reputation, and favorite teams in one surface.
 struct ProfileIdentityCard: View {
     @ObservedObject var viewModel: MapViewModel
-    @ObservedObject private var fanUpdatesStore: FanUpdatesRealtimeStore
+    /// Intentionally not `@ObservedObject`: FanUpdates realtime maps must not rebuild the whole identity card.
+    /// Comment/reaction totals for reputation use equality-gated `@State` via `onReceive`.
+    private let fanUpdatesStore: FanUpdatesRealtimeStore
     /// When false, Pokes / Suggested Fans loads wait until the Account tab is selected.
     var isAccountTabActive: Bool = true
     @EnvironmentObject private var chatViewModel: ChatViewModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @FocusState private var focusedIdentityField: IdentityField?
+    @FocusState private var focusedIdentityField: EditProfileFocusField?
 
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(FavoriteTeamsStore.appStorageKey) private var favoriteTeamIDsRaw: String = ""
@@ -99,6 +121,11 @@ struct ProfileIdentityCard: View {
     @State private var showIdentityEditor = false
     @State private var showFanIdentityEditor = false
     @State private var showBioEmojiPicker = false
+    @State private var showProfileBackgroundPicker = false
+    @State private var showShareOwnProfileSheet = false
+    @State private var ownShareProfile: PublicUserProfileData?
+    @State private var isLoadingOwnShareProfile = false
+    @State private var ownShareProfileError: String?
     @State private var selectedAvatarItem: PhotosPickerItem?
     @State private var editedDisplayName = ""
     @State private var editedUsername = ""
@@ -108,6 +135,7 @@ struct ProfileIdentityCard: View {
     @State private var editedHomeCountry = ""
     @State private var editedHomeCityDisplay = ""
     @State private var editedShowHomeCity = false
+    @State private var editedProfileBackgroundKey: ProfileBackgroundKey = .fangeo
     @State private var identityMessage = ""
     @State private var handleStatusMessage = ""
     @State private var handleStatusIsPositive = false
@@ -117,6 +145,8 @@ struct ProfileIdentityCard: View {
     @State private var localAvatarPreviewImage: UIImage?
     @State private var incomingPokes: [ProfilePokeIncomingItem] = []
     @State private var incomingPokeTotalCount = 0
+    @State private var locallyLoadedCommentCount = 0
+    @State private var locallyLoadedReactionCount = 0
     @State private var isLoadingIncomingPokes = false
     @State private var isClearingAllPokes = false
     @State private var incomingPokesMessage: String?
@@ -170,9 +200,10 @@ struct ProfileIdentityCard: View {
     private static let profileHeroCameraIconSize: CGFloat = 11.5
     private static let profileHomeCrowdAccent = Color(red: 0.56, green: 0.32, blue: 0.96)
     private static let profileTealAccent = Color(red: 0.08, green: 0.72, blue: 0.74)
-    private static let favoriteTeamsCarouselHeight: CGFloat = 178
+    private static let favoriteTeamsCarouselHeight: CGFloat = FavoriteTeamRichCardStyle.ownProfile.carouselHeight
+    private static let favoriteTeamCardHeight: CGFloat = FavoriteTeamRichCardStyle.ownProfile.height
     private static let favoriteTeamsHomeCrowdBottomSpacing: CGFloat = 8
-    private static let profileMajorSectionSpacing: CGFloat = 26
+    private static let profileMajorSectionSpacing: CGFloat = 22
     private static let sponsoredPlacementRefreshDebounceSeconds: TimeInterval = 0.75
     private static let sponsoredPlacementDebugDateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -192,16 +223,10 @@ struct ProfileIdentityCard: View {
         case utility
     }
 
-    private enum IdentityField: Hashable {
-        case displayName
-        case username
-        case bio
-    }
-
     init(viewModel: MapViewModel, isAccountTabActive: Bool = true) {
         self.isAccountTabActive = isAccountTabActive
         _viewModel = ObservedObject(wrappedValue: viewModel)
-        _fanUpdatesStore = ObservedObject(wrappedValue: viewModel.fanUpdatesStore)
+        self.fanUpdatesStore = viewModel.fanUpdatesStore
     }
 
     private var profilePersonalizationLoadToken: String {
@@ -254,7 +279,7 @@ struct ProfileIdentityCard: View {
     }
 
     private var primaryFavoriteTeamID: String? {
-        FavoriteTeamsStore.normalizedPrimaryTeamID(primaryFavoriteTeamIDRaw, within: selectedTeamIDs)
+        FavoriteTeamsStore.explicitPrimaryTeamID(primaryFavoriteTeamIDRaw, within: selectedTeamIDs)
     }
 
     private var primaryFavoriteTeam: FavoriteTeam? {
@@ -315,50 +340,43 @@ struct ProfileIdentityCard: View {
         ].joined(separator: "|")
     }
 
-    private var profileIdentityStripColumns: [ProfileIdentityStripColumn] {
-        var columns: [ProfileIdentityStripColumn] = []
-        if let identity = viewModel.currentUserNationalTeam {
-            columns.append(
-                ProfileIdentityStripColumn(
-                    id: .nationalTeam,
-                    title: identity.resolvedSupporterLabel(languageCode: appLanguageRaw),
-                    subtitle: NationalTeamCopy.text("world_cup_2026", languageCode: appLanguageRaw),
-                    action: { openNationalTeamPicker() }
-                )
-            )
-        }
-        if let venue = viewModel.currentUserHomeCrowdVenue {
-            let venueName = venue.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !venueName.isEmpty {
-                columns.append(
-                    ProfileIdentityStripColumn(
-                        id: .homeCrowd,
-                        title: L10n.t("home_crowd", languageCode: appLanguageRaw),
-                        subtitle: venueName,
-                        action: { viewModel.focusDiscoverOnHomeCrowdVenue() }
-                    )
-                )
+    private var profileHeroIdentityCards: [ProfileHeroIdentityCardItem] {
+        let locationLine = viewModel.currentUserVisibleHomeCityDisplayLine
+        let locationParts: (String?, String?) = {
+            guard let locationLine, !locationLine.isEmpty else { return (nil, nil) }
+            let parts = locationLine
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            if parts.count >= 2 {
+                let primary = parts.dropLast().joined(separator: ", ")
+                let secondary = String(parts[parts.count - 1])
+                return (primary, secondary)
             }
-        }
-        if let homeCity = viewModel.currentUserVisibleHomeCityDisplayLine {
-            columns.append(
-                ProfileIdentityStripColumn(
-                    id: .homeCity,
-                    title: "Location",
-                    subtitle: homeCity
-                )
-            )
-        }
-        if let fanSince = FanGeoHandleRules.fanSinceMonthYear(from: viewModel.currentUserProfileCreatedAt) {
-            columns.append(
-                ProfileIdentityStripColumn(
-                    id: .fanSince,
-                    title: "Fan Since",
-                    subtitle: fanSince
-                )
-            )
-        }
-        return columns
+            let country = viewModel.currentUserHomeCountry.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (locationLine, country.isEmpty ? nil : country)
+        }()
+        let crowdName = viewModel.currentUserHomeCrowdVenue?.name
+        return ProfileHeroIdentityCardsBuilder.cards(
+            myTeam: primaryFavoriteTeam,
+            homeCrowdName: crowdName,
+            homeCrowdSubtitle: (crowdName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                ? L10n.t("home_crowd", languageCode: appLanguageRaw)
+                : nil,
+            locationPrimary: locationParts.0,
+            locationSecondary: locationParts.1,
+            fanSincePrimary: FanGeoHandleRules.fanSinceMonthYear(from: viewModel.currentUserProfileCreatedAt),
+            fanSinceSecondary: nil,
+            nationalTeam: viewModel.currentUserNationalTeam,
+            languageCode: appLanguageRaw,
+            onMyTeam: { showFavoriteTeamsPicker = true },
+            onHomeCrowd: {
+                if viewModel.currentUserHomeCrowdVenue != nil {
+                    viewModel.focusDiscoverOnHomeCrowdVenue()
+                }
+            },
+            onNationalTeam: { openNationalTeamPicker() }
+        )
     }
 
     private var bioLine: String {
@@ -392,6 +410,34 @@ struct ProfileIdentityCard: View {
         return viewModel.pickupCreatorTrustStats(for: uid)
     }
 
+    private var ownPickupOrganizerSummary: PickupOrganizerSummary {
+        guard let uid = viewModel.currentUserAuthId else { return .empty }
+        if viewModel.myPickupOrganizerSummaryLoadedForUserId == uid {
+            return viewModel.myPickupOrganizerSummary
+        }
+        return PickupOrganizerSummary(
+            hostedCount: viewModel.myPickupGamesForSettings.count
+                + viewModel.myRemovedPickupGamesForSettings.count,
+            stats: currentOrganizerStats,
+            lastPickupGameCreatedAt: {
+                let rows = viewModel.myPickupGamesForSettings + viewModel.myRemovedPickupGamesForSettings
+                return rows.compactMap { row -> Date? in
+                    guard let raw = row.created_at else { return nil }
+                    return PickupGameModels.parseSupabaseTimestamptz(raw)
+                }.max()
+            }()
+        )
+    }
+
+    private func pickupGamesProfileSection(userId: UUID) -> some View {
+        ProfileIdentityPickupGamesSection(
+            viewModel: viewModel,
+            userId: userId,
+            summary: ownPickupOrganizerSummary,
+            languageCode: appLanguageRaw
+        )
+    }
+
     private var localContext: String? {
         FanReputationEngine.localContext(
             latitude: viewModel.currentUserLocation?.latitude,
@@ -399,14 +445,27 @@ struct ProfileIdentityCard: View {
         )
     }
 
-    private var locallyLoadedCommentCount: Int {
-        fanUpdatesStore.venueEventComments.values.reduce(0) { $0 + $1.count }
-    }
-
-    private var locallyLoadedReactionCount: Int {
-        fanUpdatesStore.venueEventVibeCounts.values.reduce(0) { total, counts in
+    private func refreshLocallyLoadedFanUpdateTotals(reason: String) {
+        let nextComments = fanUpdatesStore.venueEventComments.values.reduce(0) { $0 + $1.count }
+        let nextReactions = fanUpdatesStore.venueEventVibeCounts.values.reduce(0) { total, counts in
             total + counts.values.reduce(0, +)
         }
+        let commentsChanged = nextComments != locallyLoadedCommentCount
+        let reactionsChanged = nextReactions != locallyLoadedReactionCount
+        guard commentsChanged || reactionsChanged else {
+            SwiftUIRecompPerf.identicalSnapshotSkipped(
+                source: "profile.fanUpdateTotals.\(reason)",
+                rows: nextComments + nextReactions
+            )
+            return
+        }
+        if commentsChanged { locallyLoadedCommentCount = nextComments }
+        if reactionsChanged { locallyLoadedReactionCount = nextReactions }
+        SwiftUIRecompPerf.immutableSnapshotPublished(
+            source: "profile.fanUpdateTotals.\(reason)",
+            rows: nextComments + nextReactions
+        )
+        SwiftUIRecompPerf.rootInvalidated(screen: "ProfileIdentity", source: "fanUpdateTotals.\(reason)")
     }
 
     private var savedVenueCount: Int {
@@ -415,6 +474,7 @@ struct ProfileIdentityCard: View {
 
     private func loadProfileStatsIfNeeded() async {
         guard isAccountTabActive, let userId = viewModel.currentUserAuthId else { return }
+        guard !viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         let email = await viewModel.strictNormalizedSessionEmailForSocialTables()
             ?? viewModel.currentUserEmail.trimmingCharacters(in: .whitespacesAndNewlines)
         let counts = await ProfileStatsService.shared.loadStats(
@@ -446,6 +506,7 @@ struct ProfileIdentityCard: View {
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "ProfileIdentity")
         if shouldBlockFanIdentityCardForBusiness {
             EmptyView()
                 .onAppear {
@@ -455,47 +516,136 @@ struct ProfileIdentityCard: View {
 #endif
                 }
         } else {
+            // Collapse ProfileIdentityCard.body to AnyView so SettingsScreen / Account
+            // never embeds this card's nested SwiftUI generic metadata.
+            AnyView(
+                profileIdentityCardContent
+                    .onAppear { refreshLocallyLoadedFanUpdateTotals(reason: "appear") }
+                    .onReceive(fanUpdatesStore.$venueEventComments) { _ in
+                        refreshLocallyLoadedFanUpdateTotals(reason: "comments")
+                    }
+                    .onReceive(fanUpdatesStore.$venueEventVibeCounts) { _ in
+                        refreshLocallyLoadedFanUpdateTotals(reason: "vibes")
+                    }
+            )
+        }
+    }
+
+    private var profileIdentityCardContent: some View {
+            // Shallow LazyVStack: every major section is a dedicated leaf + AnyView chrome.
             LazyVStack(alignment: .leading, spacing: Self.profileMajorSectionSpacing) {
                 if shouldShowHandlePromptBanner {
-                    handlePromptBanner
-                        .padding(.horizontal, 16)
+                    AnyView(
+                        handlePromptBanner
+                            .padding(.horizontal, 16)
+                    )
                 }
 
-                profileSectionContainer(.hero) {
-                    heroBlock
-                }
+                AnyView(
+                    ProfileIdentitySectionChrome(
+                        hierarchy: .hero,
+                        accent: nil,
+                        profileBackgroundKey: viewModel.currentUserProfileBackgroundKey
+                    ) {
+                        ProfileIdentityHeroSection(
+                            viewModel: viewModel,
+                            selectedAvatarItem: $selectedAvatarItem,
+                            isUploadingAvatar: isUploadingAvatar,
+                            isSavingIdentity: isSavingIdentity,
+                            localAvatarPreviewImage: localAvatarPreviewImage,
+                            displayName: displayName,
+                            handleLine: handleLine,
+                            bioLine: bioLine,
+                            identityCards: profileHeroIdentityCards,
+                            onEditDisplayName: { presentIdentityEditor(focusedField: .displayName) },
+                            onEditBio: { presentIdentityEditor(focusedField: .bio) },
+                            onEditProfile: { presentIdentityEditor(focusedField: .displayName) },
+                            onShareProfile: { presentShareOwnProfile() }
+                        )
+                    }
+                )
 
                 if profileBelowFoldSectionsReady, canShowOwnerPokesHighlights {
-                    profileSectionContainer(.utility) {
-                        pokesHighlightsSection
+                    AnyView(
+                        ProfileIdentitySectionChrome(hierarchy: .utility, accent: nil) {
+                            AnyView(pokesHighlightsSection)
+                        }
+                    )
+                }
+
+                AnyView(
+                    ProfileIdentitySectionChrome(
+                        hierarchy: .primary,
+                        accent: [FGColor.accentBlue, Self.profileHomeCrowdAccent]
+                    ) {
+                        ProfileIdentityFavoriteTeamsSection(
+                            languageCode: appLanguageRaw,
+                            teamsEmpty: selectedTeams.isEmpty,
+                            onEdit: { showFavoriteTeamsPicker = true },
+                            carouselContent: AnyView(favoriteTeamsCarouselOnly)
+                        )
                     }
-                }
+                )
 
-                profileSectionContainer(.primary, accent: [FGColor.accentBlue, Self.profileHomeCrowdAccent]) {
-                    favoriteTeamsSection
-                }
+                AnyView(
+                    ProfileIdentitySectionChrome(
+                        hierarchy: .secondary,
+                        accent: [Self.profileHomeCrowdAccent]
+                    ) {
+                        ProfileIdentityHomeVenueSection(viewModel: viewModel)
+                    }
+                )
 
-                profileSectionContainer(.secondary, accent: [Self.profileHomeCrowdAccent]) {
-                    homeCrowdSection
-                }
+                AnyView(
+                    ProfileIdentitySectionChrome(
+                        hierarchy: .secondary,
+                        accent: [FGColor.accentBlue]
+                    ) {
+                        ProfileIdentityOpenToSection(
+                            languageCode: appLanguageRaw,
+                            previewItems: FanOpenToCatalog.publicDisplayItems(
+                                from: viewModel.currentUserFanIdentityPreferences.resolvedOpenToItemIDs
+                            ),
+                            onEdit: { showFanIdentityEditor = true },
+                            onQuickRemove: { quickRemoveOpenToItem($0) }
+                        )
+                    }
+                )
 
-                profileSectionContainer(.secondary, accent: [FGColor.accentBlue]) {
-                    openToPreviewSection
+                if let uid = viewModel.currentUserAuthId {
+                    AnyView(
+                        ProfileIdentitySectionChrome(
+                            hierarchy: .secondary,
+                            accent: [FGColor.accentBlue, FGColor.accentGreen]
+                        ) {
+                            pickupGamesProfileSection(userId: uid)
+                        }
+                    )
                 }
 
                 if profileBelowFoldSectionsReady, canShowSuggestedFans {
-                    profileSectionContainer(.secondary, accent: [FGColor.accentBlue, Self.profileTealAccent]) {
-                        suggestedFansSection
-                    }
-                    .id(Self.suggestedFansScrollAnchorID)
+                    AnyView(
+                        ProfileIdentitySectionChrome(
+                            hierarchy: .secondary,
+                            accent: [FGColor.accentBlue, Self.profileTealAccent]
+                        ) {
+                            AnyView(suggestedFansSection)
+                        }
+                        .id(Self.suggestedFansScrollAnchorID)
+                    )
                 }
 
                 if profileBelowFoldSectionsReady, let slot = sponsoredProfileSlotContent {
-                    profileSectionContainer(.secondary, accent: [FGColor.accentGreen]) {
-                        sponsoredProfileSlotView(slot)
-                            .id(slot.stableIdentity)
-                    }
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    AnyView(
+                        ProfileIdentitySectionChrome(
+                            hierarchy: .secondary,
+                            accent: [FGColor.accentGreen]
+                        ) {
+                            sponsoredProfileSlotView(slot)
+                                .id(slot.stableIdentity)
+                        }
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    )
                 }
             }
             .padding(.top, 14)
@@ -560,6 +710,36 @@ struct ProfileIdentityCard: View {
                 identityEditorSheet
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $showShareOwnProfileSheet) {
+                if let ownShareProfile,
+                   ownShareProfile.isPubliclyVisible,
+                   ownShareProfile.isDiscoverableByFans {
+                    ShareFanProfileSheet(profile: ownShareProfile, mapViewModel: viewModel)
+                        .environmentObject(chatViewModel)
+                } else {
+                    NavigationStack {
+                        VStack(spacing: 12) {
+                            Text(ownShareProfileError
+                                 ?? L10n.t("share_profile_unavailable", languageCode: appLanguageRaw))
+                                .font(.body)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .multilineTextAlignment(.center)
+                                .padding()
+                            Spacer()
+                        }
+                        .navigationTitle(L10n.t("share_profile", languageCode: appLanguageRaw))
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button(L10n.t("close", languageCode: appLanguageRaw)) {
+                                    showShareOwnProfileSheet = false
+                                }
+                            }
+                        }
+                    }
+                    .presentationDetents([.medium])
+                }
             }
             .sheet(isPresented: $showFanIdentityEditor) {
                 FanIdentityPreferencesEditorView(viewModel: viewModel)
@@ -744,7 +924,6 @@ struct ProfileIdentityCard: View {
                     editedBio = limited
                 }
             }
-        }
     }
 
     // MARK: - Shell
@@ -1441,9 +1620,11 @@ struct ProfileIdentityCard: View {
     @MainActor
     private func scheduleProfileBelowFoldSectionsIfNeeded() {
         guard isAccountTabActive, !profileBelowFoldSectionsReady else { return }
+        guard !viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         Task { @MainActor in
             await Task.yield()
             guard !Task.isCancelled, isAccountTabActive else { return }
+            guard !viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
             profileBelowFoldSectionsReady = true
             primeSuggestedFansLoadingStateIfNeeded()
 #if DEBUG
@@ -1549,7 +1730,20 @@ struct ProfileIdentityCard: View {
     // MARK: - Suggested fans
 
     private var displayedSuggestedFans: [FriendSuggestionProfile] {
-        Array(suggestedFans.prefix(Self.suggestedFansDisplayLimit))
+        guard let viewerId = viewModel.currentUserAuthId else {
+            return Array(suggestedFans.prefix(Self.suggestedFansDisplayLimit))
+        }
+        // Re-order by score then apply stable 8+2 diversity for the visible 10.
+        // Exact distance is never present on these profiles.
+        let scoreOrdered = suggestedFans.sorted { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.userID.uuidString < rhs.userID.uuidString
+        }
+        return SuggestedFansRanking.applyControlledDiversity(
+            rankedByScoreDescending: scoreOrdered,
+            displayLimit: Self.suggestedFansDisplayLimit,
+            viewerId: viewerId
+        )
     }
 
     private var suggestedFansSection: some View {
@@ -2491,12 +2685,12 @@ struct ProfileIdentityCard: View {
         VStack(alignment: .leading, spacing: 16) {
             headerRow
 
-            if !profileIdentityStripColumns.isEmpty {
-                profileHeroIdentityPanel
+            if !profileHeroIdentityCards.isEmpty {
+                ProfileHeroIdentityCardsRow(cards: profileHeroIdentityCards)
             }
         }
         .padding(.horizontal, 18)
-        .padding(.top, 18)
+        .padding(.top, ProfileHeroMetrics.identityTopInset)
         .padding(.bottom, 18)
     }
 
@@ -2509,11 +2703,11 @@ struct ProfileIdentityCard: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Update profile photo")
 
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 0) {
                 Button {
                     presentIdentityEditor(focusedField: .displayName)
                 } label: {
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(displayName)
                             .font(.system(size: 26, weight: .bold, design: .rounded))
                             .foregroundStyle(FGColor.primaryText(colorScheme))
@@ -2531,10 +2725,21 @@ struct ProfileIdentityCard: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Edit display name and handle")
 
+                // Compact identity stack: handle → XP (~5pt) → bio (~7pt).
+                FanXpSummaryLine(
+                    totalXP: viewModel.currentUserFanXP.totalXP,
+                    languageCode: appLanguageRaw
+                )
+                .padding(.top, 5)
+
                 Button {
                     presentIdentityEditor(focusedField: .bio)
                 } label: {
-                    Text(bioLine.isEmpty ? "Add a short bio so fans know your vibe." : bioLine)
+                    Text(
+                        bioLine.isEmpty
+                            ? L10n.t("profile_bio_placeholder", languageCode: appLanguageRaw)
+                            : bioLine
+                    )
                         .font(.system(size: 14.5, weight: .medium, design: .rounded))
                         .foregroundStyle(bioLine.isEmpty ? FGColor.mutedText(colorScheme) : FGColor.primaryText(colorScheme).opacity(0.88))
                         .lineLimit(3)
@@ -2546,8 +2751,10 @@ struct ProfileIdentityCard: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(bioLine.isEmpty ? "Add bio" : "Edit bio")
+                .padding(.top, 7)
 
                 editProfileHeroButton
+                    .padding(.top, 8)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -2560,8 +2767,9 @@ struct ProfileIdentityCard: View {
             HStack(spacing: 4) {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 9, weight: .bold))
-                Text("Edit Profile")
+                Text(L10n.t("edit_profile_hero_button", languageCode: appLanguageRaw))
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
             }
             .foregroundStyle(FGColor.accentBlue)
             .padding(.horizontal, 8)
@@ -2572,36 +2780,11 @@ struct ProfileIdentityCard: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Edit Profile")
+        .accessibilityLabel(L10n.t("edit_profile", languageCode: appLanguageRaw))
     }
 
     private var profileHeroIdentityPanel: some View {
-        let columns = profileIdentityStripColumns
-        return HStack(alignment: .top, spacing: 0) {
-            ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
-                if index > 0 {
-                    Rectangle()
-                        .fill(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.5 : 0.75))
-                        .frame(width: 1)
-                        .padding(.vertical, 8)
-                }
-
-                profileHeroIdentityColumnView(column)
-                    .frame(maxWidth: .infinity)
-                    .padding(.horizontal, index == 0 || index == columns.count - 1 ? 2 : 6)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 14)
-        .frame(maxWidth: .infinity, alignment: .top)
-        .background {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(profileHeroIdentityPanelFill)
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(profileHeroIdentityPanelBorder, lineWidth: 1)
-        }
+        ProfileHeroIdentityCardsRow(cards: profileHeroIdentityCards)
     }
 
     private var profileHeroIdentityPanelFill: Color {
@@ -2616,7 +2799,7 @@ struct ProfileIdentityCard: View {
             : Color(red: 0.84, green: 0.88, blue: 0.95)
     }
 
-    private func profileHeroIdentityColumnView(_ column: ProfileIdentityStripColumn) -> some View {
+    private func profileHeroIdentityColumnView(_ column: ProfileIdentityHeroStripColumn) -> some View {
         let content = VStack(spacing: 8) {
             profileHeroIdentityIcon(for: column)
 
@@ -2637,6 +2820,8 @@ struct ProfileIdentityCard: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(profileHeroIdentityColumnAccessibilityLabel(column))
 
         return Group {
             if let action = column.action {
@@ -2650,9 +2835,28 @@ struct ProfileIdentityCard: View {
         }
     }
 
-    @ViewBuilder
-    private func profileHeroIdentityIcon(for column: ProfileIdentityStripColumn) -> some View {
+    private func profileHeroIdentityColumnAccessibilityLabel(_ column: ProfileIdentityHeroStripColumn) -> String {
         switch column.id {
+        case .myTeam:
+            let heading = L10n.t("my_team", languageCode: appLanguageRaw)
+            return "\(heading), \(column.title), \(column.subtitle)"
+        case .nationalTeam:
+            let heading = L10n.t("national_team", languageCode: appLanguageRaw)
+            return "\(heading), \(column.title), \(column.subtitle)"
+        case .homeCrowd, .homeCity, .fanSince:
+            return "\(column.title), \(column.subtitle)"
+        }
+    }
+
+    @ViewBuilder
+    private func profileHeroIdentityIcon(for column: ProfileIdentityHeroStripColumn) -> some View {
+        switch column.id {
+        case .myTeam:
+            if let team = column.favoriteTeam {
+                SportsIdentityArtworkView(favoriteTeam: team, diameter: 38)
+            } else {
+                profileHeroIdentitySymbolIcon("trophy.fill", tint: FGColor.accentYellow)
+            }
         case .nationalTeam:
             if let flag = viewModel.currentUserNationalTeam?.flag.trimmingCharacters(in: .whitespacesAndNewlines),
                !flag.isEmpty {
@@ -2776,15 +2980,13 @@ struct ProfileIdentityCard: View {
                 .fill(Color(.secondarySystemGroupedBackground))
                 .frame(width: Self.profileHeroCameraButtonDiameter, height: Self.profileHeroCameraButtonDiameter)
                 .overlay {
-                    if isUploadingAvatar {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(FGColor.accentGreen)
-                    } else {
-                        Image(systemName: "camera.fill")
-                            .font(.system(size: Self.profileHeroCameraIconSize, weight: .bold))
-                            .foregroundStyle(FGColor.accentGreen)
-                    }
+                    // Keep this overlay type shallow — inline ProgressView/Image ConditionalContent
+                    // previously exploded SwiftUI metadata and crashed Profile tab (stack guard).
+                    ProfileHeroAvatarCameraGlyph(
+                        isUploading: isUploadingAvatar,
+                        iconSize: Self.profileHeroCameraIconSize,
+                        tint: FGColor.accentGreen
+                    )
                 }
                 .overlay {
                     Circle()
@@ -2799,142 +3001,114 @@ struct ProfileIdentityCard: View {
     private var identityEditorSheet: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack(alignment: .center, spacing: 12) {
-                        PhotosPicker(selection: $selectedAvatarItem, matching: .images) {
-                            avatarStack
-                        }
-                        .disabled(isUploadingAvatar || isSavingIdentity)
-                        .buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 16) {
+                    EditProfilePhotoHeader(
+                        viewModel: viewModel,
+                        selectedAvatarItem: $selectedAvatarItem,
+                        isUploadingAvatar: isUploadingAvatar,
+                        isSavingIdentity: isSavingIdentity,
+                        localAvatarPreviewImage: localAvatarPreviewImage,
+                        previewDisplayName: editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? displayName
+                            : editedDisplayName.trimmingCharacters(in: .whitespacesAndNewlines),
+                        previewHandleLine: {
+                            let raw = FanGeoHandleRules.normalizeForStorage(editedUsername)
+                            return raw.isEmpty ? "" : "@\(raw)"
+                        }(),
+                        languageCode: appLanguageRaw
+                    )
 
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Edit your profile")
-                                .font(.system(size: 19, weight: .bold, design: .rounded))
-                                .foregroundStyle(FGColor.primaryText(colorScheme))
-                            Text("Your public fan identity")
-                                .font(.system(size: 12, weight: .medium, design: .rounded))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        }
-                    }
-
-                    identityFieldCard(title: "Display name", subtitle: "Shown on your profile and social activity.") {
-                        TextField("Display name", text: $editedDisplayName)
-                            .textInputAutocapitalization(.words)
-                            .disableAutocorrection(true)
-                            .focused($focusedIdentityField, equals: .displayName)
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
-                            .profileIdentityInputStyle(colorScheme: colorScheme)
-                    }
-
-                    identityFieldCard(title: "@handle", subtitle: "Unique FanGeo handle for friend search.") {
-                        HStack(spacing: 4) {
-                            Text("@")
-                                .font(.system(size: 16, weight: .bold, design: .rounded))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            TextField("handle", text: $editedUsername)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .focused($focusedIdentityField, equals: .username)
-                                .font(.system(size: 16, weight: .semibold, design: .rounded))
-                        }
-                        .profileIdentityInputStyle(colorScheme: colorScheme)
-
-                        if !handleStatusMessage.isEmpty {
-                            HandleAvailabilityStatusLabel(
-                                message: handleStatusMessage,
-                                isPositive: handleStatusIsPositive
-                            )
-                        }
-                    }
-
-                    identityFieldCard(title: "Bio", subtitle: "A short line about your fan energy.") {
-                        TextEditor(text: $editedBio)
-                            .focused($focusedIdentityField, equals: .bio)
-                            .font(.system(size: 15, weight: .medium, design: .rounded))
-                            .frame(minHeight: 82)
-                            .scrollContentBackground(.hidden)
-                            .profileIdentityInputStyle(colorScheme: colorScheme)
-                            .overlay(alignment: .topLeading) {
-                                if editedBio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                    Text("Add a short bio")
-                                        .font(.system(size: 15, weight: .medium, design: .rounded))
-                                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.55))
-                                        .padding(.horizontal, 14)
-                                        .padding(.vertical, 12)
-                                        .allowsHitTesting(false)
-                                }
-                            }
-
-                        HStack(spacing: 8) {
-                            Button {
+                    EditProfileSection(title: L10n.t("public_profile", languageCode: appLanguageRaw)) {
+                        EditProfileDisplayNameRow(
+                            displayName: $editedDisplayName,
+                            focusedField: $focusedIdentityField,
+                            languageCode: appLanguageRaw
+                        )
+                        EditProfileRowDivider()
+                        EditProfileHandleRow(
+                            username: $editedUsername,
+                            focusedField: $focusedIdentityField,
+                            handleStatusMessage: handleStatusMessage,
+                            handleStatusIsPositive: handleStatusIsPositive,
+                            languageCode: appLanguageRaw
+                        )
+                        EditProfileRowDivider()
+                        EditProfileBioRow(
+                            bio: $editedBio,
+                            focusedField: $focusedIdentityField,
+                            characterLimit: Self.bioCharacterLimit,
+                            languageCode: appLanguageRaw,
+                            onAddEmoji: {
                                 FGInteractionHaptics.selection()
                                 showBioEmojiPicker = true
-                            } label: {
-                                Image(systemName: "face.smiling")
-                                    .font(.system(size: 16, weight: .semibold))
-                                    .foregroundStyle(FGColor.accentGreen)
-                                    .frame(width: 44, height: 44)
-                                    .contentShape(Rectangle())
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(L10n.t("Add emoji", languageCode: appLanguageRaw))
-
-                            Spacer(minLength: 0)
-
-                            Text("\(editedBio.count)/\(Self.bioCharacterLimit)")
-                                .font(.system(size: 11, weight: .medium, design: .rounded))
-                                .foregroundStyle(
-                                    editedBio.count >= Self.bioCharacterLimit
-                                        ? Color.red.opacity(0.9)
-                                        : FGColor.secondaryText(colorScheme)
-                                )
-                        }
+                        )
                     }
 
-                    identityFieldCard(title: "Home City", subtitle: "Optional. Example: Lehi, Utah") {
-                        ProfileHomeCityAutocompleteField(
+                    EditProfileSection(title: L10n.t("location", languageCode: appLanguageRaw)) {
+                        EditProfileHomeCityRow(
                             city: $editedHomeCity,
                             region: $editedHomeRegion,
                             country: $editedHomeCountry,
-                            displayText: $editedHomeCityDisplay
+                            displayText: $editedHomeCityDisplay,
+                            languageCode: appLanguageRaw
                         )
-
-                        Toggle(isOn: $editedShowHomeCity) {
-                            Text("Show Home City on Profile")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .foregroundStyle(FGColor.primaryText(colorScheme))
-                        }
-                        .tint(FGColor.accentGreen)
-                        .disabled(editedHomeCityDisplay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        EditProfileRowDivider()
+                        EditProfileShowOnProfileRow(
+                            isOn: $editedShowHomeCity,
+                            isDisabled: editedHomeCityDisplay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                            languageCode: appLanguageRaw
+                        )
                     }
 
-                    fanProfileAccountEmailCard
+                    EditProfileSection(title: L10n.t("appearance", languageCode: appLanguageRaw)) {
+                        EditProfileBackgroundRow(
+                            backgroundKey: editedProfileBackgroundKey,
+                            languageCode: appLanguageRaw,
+                            onTap: {
+                                FGInteractionHaptics.selection()
+                                showProfileBackgroundPicker = true
+                            }
+                        )
+                    }
+
+                    EditProfileSection(title: L10n.t("account", languageCode: appLanguageRaw)) {
+                        EditProfileAccountRow(
+                            email: viewModel.currentUserEmail,
+                            languageCode: appLanguageRaw
+                        )
+                    }
 
                     if !identityMessage.isEmpty {
                         Text(identityMessage)
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .font(.footnote.weight(.semibold))
                             .foregroundStyle(
                                 identityMessage.contains("updated") || identityMessage == "Saved."
                                     ? FGColor.accentGreen
-                                    : Color.red
+                                    : FGColor.dangerRed
                             )
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4)
                     }
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 18)
-                .padding(.bottom, 28)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 24)
             }
-            .fanGeoScreenBackground()
-            .navigationTitle("Profile")
+            .scrollDismissesKeyboard(.interactively)
+            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .navigationTitle(L10n.t("Profile", languageCode: appLanguageRaw))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { showIdentityEditor = false }
-                        .disabled(isSavingIdentity || isUploadingAvatar)
+                    Button(L10n.t("close", languageCode: appLanguageRaw)) {
+                        showIdentityEditor = false
+                    }
+                    .disabled(isSavingIdentity || isUploadingAvatar)
+                    .accessibilityLabel("Close profile editor")
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isSavingIdentity ? "Saving..." : "Save") {
+                    Button(isSavingIdentity ? L10n.t("Saving...", languageCode: appLanguageRaw) : L10n.t("done", languageCode: appLanguageRaw)) {
 #if DEBUG
                         print("[FanProfileSave] tap")
                         print("[FanProfileSave] handleState=\(fanProfileSaveHandleStateDebug)")
@@ -2943,8 +3117,9 @@ struct ProfileIdentityCard: View {
                         Task { await saveIdentity() }
                     }
                     // Presentation-load flags are enforced inside `saveIdentity` with a visible message.
-                    // Disabling Save on those flags made taps silently no-op when hydration raced.
+                    // Disabling Done on those flags made taps silently no-op when hydration raced.
                     .disabled(isSavingIdentity || isUploadingAvatar || !identityDraftLooksDirty)
+                    .accessibilityLabel("Save profile changes")
                 }
             }
             .onAppear {
@@ -2958,6 +3133,15 @@ struct ProfileIdentityCard: View {
                     insertBioEmoji(emoji)
                 }
                 .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(isPresented: $showProfileBackgroundPicker) {
+                ProfileBackgroundPickerSheet(
+                    selection: $editedProfileBackgroundKey,
+                    languageCode: appLanguageRaw,
+                    onDismiss: {}
+                )
+                .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
             }
         }
@@ -2978,92 +3162,29 @@ struct ProfileIdentityCard: View {
         }
     }
 
-    private func identityFieldCard<Content: View>(
-        title: String,
-        subtitle: String,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                Text(subtitle)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-            }
-
-            content()
+    private func presentShareOwnProfile() {
+        guard let uid = viewModel.currentUserAuthId else {
+            ownShareProfileError = L10n.t("share_profile_unavailable", languageCode: appLanguageRaw)
+            showShareOwnProfileSheet = true
+            return
         }
-        .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.86 : 0.98))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
+        guard !isLoadingOwnShareProfile else { return }
+        isLoadingOwnShareProfile = true
+        ownShareProfileError = nil
+        Task {
+            let loaded = await PublicUserProfileService.load(userId: uid, isSelfPreview: true)
+            await MainActor.run {
+                isLoadingOwnShareProfile = false
+                ownShareProfile = loaded
+                if !(loaded.isPubliclyVisible && loaded.isDiscoverableByFans) {
+                    ownShareProfileError = L10n.t("share_profile_unavailable", languageCode: appLanguageRaw)
                 }
+                showShareOwnProfileSheet = true
+            }
         }
     }
 
-    /// Read-only account email row (authenticated Supabase user). Presentation only.
-    private var fanProfileAccountEmailCard: some View {
-        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
-        let email = viewModel.currentUserEmail.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayEmail = email.isEmpty ? "—" : email
-        let title = L10n.t("account", languageCode: languageCode)
-        let emailLabel = L10n.t("email_address", languageCode: languageCode)
-        let subtitle = L10n.t("account_email_subtitle", languageCode: languageCode)
-
-        return VStack(alignment: .leading, spacing: 10) {
-            Text(title)
-                .font(.system(size: 12, weight: .bold, design: .rounded))
-                .foregroundStyle(FGColor.primaryText(colorScheme))
-                .accessibilityAddTraits(.isHeader)
-
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "envelope.fill")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .frame(width: 22, height: 22)
-                    .padding(.top, 1)
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(emailLabel)
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-
-                    Text(displayEmail)
-                        .font(.system(size: 15, weight: .medium, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .textSelection(.enabled)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.85)
-
-                    Text(subtitle)
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(emailLabel). \(displayEmail). \(subtitle)")
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.86 : 0.98))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
-                }
-        }
-    }
-
-    private func presentIdentityEditor(focusedField: IdentityField) {
+    private func presentIdentityEditor(focusedField: EditProfileFocusField) {
         if viewModel.hasLoadedUserProfileForPresentation, !viewModel.isUserProfileLoadingForPresentation {
             resetIdentityDraft()
             showIdentityEditor = true
@@ -3100,6 +3221,7 @@ struct ProfileIdentityCard: View {
             country: viewModel.currentUserHomeCountry
         ) ?? viewModel.currentUserHomeCity
         editedShowHomeCity = viewModel.currentUserShowHomeCity
+        editedProfileBackgroundKey = viewModel.currentUserProfileBackgroundKey
         handleStatusMessage = ""
         handleStatusIsPositive = false
     }
@@ -3124,7 +3246,8 @@ struct ProfileIdentityCard: View {
                 country: viewModel.currentUserHomeCountry
             ) ?? viewModel.currentUserHomeCity).trimmingCharacters(in: .whitespacesAndNewlines)
             || editedShowHomeCity != viewModel.currentUserShowHomeCity
-        return nameDirty || handleDirty || bioDirty || cityDirty
+        let backgroundDirty = editedProfileBackgroundKey != viewModel.currentUserProfileBackgroundKey
+        return nameDirty || handleDirty || bioDirty || cityDirty || backgroundDirty
     }
 
 #if DEBUG
@@ -3360,6 +3483,23 @@ struct ProfileIdentityCard: View {
         print("[FanProfileSave] requestSucceeded homeCity")
 #endif
 
+        if let err = await viewModel.saveUserProfileBackgroundKey(editedProfileBackgroundKey) {
+#if DEBUG
+            print("[FanProfileSave] requestFailed=\(err)")
+            print("[FanProfileSave] dismissed=false")
+            print("[FanProfileSave] profileRefreshed=partial_identity_home_city_saved")
+#endif
+            await MainActor.run {
+                identityMessage = err
+                viewModel.showSocialActionToast(err, isError: true)
+            }
+            return
+        }
+
+#if DEBUG
+        print("[FanProfileSave] requestSucceeded profileBackground")
+#endif
+
         await MainActor.run {
             identityMessage = ""
             showIdentityEditor = false
@@ -3404,7 +3544,9 @@ struct ProfileIdentityCard: View {
 
         if let err = await viewModel.persistUserProfileAvatar(
             fullURL: urls.fullURL,
-            thumbnailURL: urls.thumbnailURL
+            thumbnailURL: urls.thumbnailURL,
+            replacedFullURL: urls.replacedFullURL,
+            replacedThumbnailURL: urls.replacedThumbnailURL
         ) {
             await MainActor.run {
                 localAvatarPreviewImage = nil
@@ -3548,9 +3690,22 @@ struct ProfileIdentityCard: View {
 
     // MARK: - Favorite teams
 
+    /// Carousel / empty-state only — header lives in `ProfileIdentityFavoriteTeamsSection`.
+    @ViewBuilder
+    private var favoriteTeamsCarouselOnly: some View {
+        let teams = selectedTeams
+        let primaryID = FavoriteTeamsStore.explicitPrimaryTeamID(primaryFavoriteTeamIDRaw, within: teams.map(\.id))
+        if teams.isEmpty {
+            addTeamSocialCard
+                .frame(height: Self.favoriteTeamsCarouselHeight, alignment: .topLeading)
+        } else {
+            favoriteTeamsCardRow(teams: teams, primaryFavoriteTeamID: primaryID)
+        }
+    }
+
     private var favoriteTeamsSection: some View {
         let teams = selectedTeams
-        let primaryID = FavoriteTeamsStore.normalizedPrimaryTeamID(primaryFavoriteTeamIDRaw, within: teams.map(\.id))
+        let primaryID = FavoriteTeamsStore.explicitPrimaryTeamID(primaryFavoriteTeamIDRaw, within: teams.map(\.id))
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
@@ -3560,7 +3715,11 @@ struct ProfileIdentityCard: View {
                         .foregroundStyle(FGColor.accentBlue)
                         .textCase(.uppercase)
                         .tracking(0.78)
-                    Text(teams.isEmpty ? "Shape your fan identity" : "Show off your fan colors")
+                    Text(
+                        teams.isEmpty
+                            ? L10n.t("profile_shape_fan_identity", languageCode: appLanguageRaw)
+                            : L10n.t("profile_show_off_fan_colors", languageCode: appLanguageRaw)
+                    )
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.82))
                 }
@@ -3619,146 +3778,32 @@ struct ProfileIdentityCard: View {
         let isPrimary = team.id == primaryFavoriteTeamID
         let isAnimatingSelection = animatedTrophyTeamID == team.id
         let isAnimatingDemotion = demotedTrophyTeamID == team.id && !isPrimary
-        let sportAccent = sportAccentColor(for: team.sport.chipTitle)
 
-        return VStack(alignment: .leading, spacing: 10) {
+        return FavoriteTeamRichCard(
+            team: team,
+            isPrimary: isPrimary,
+            style: .ownProfile,
+            languageCode: appLanguageRaw,
+            isAnimatingSelection: isAnimatingSelection,
+            isAnimatingDemotion: isAnimatingDemotion
+        ) {
+            // Single My Team affordance: gold trophy + MY TEAM (selected) or white trophy (others).
             HStack(alignment: .top, spacing: 8) {
-                PremiumTeamIdentityOrb(team: team, diameter: 62)
-                Spacer(minLength: 0)
                 trophyTeamButton(
                     team: team,
                     isPrimary: isPrimary,
                     isAnimatingSelection: isAnimatingSelection
                 )
-
                 removeFavoriteTeamButton(team: team)
             }
-
-            VStack(alignment: .leading, spacing: isPrimary ? 3 : 1) {
-                if isPrimary {
-                    primaryFavoriteTeamCardLabel(team)
-                } else {
-                    Text(team.name)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                        .minimumScaleFactor(0.75)
-                }
-
-                favoriteTeamCardSportBadge(team: team)
-
-                if !isPrimary {
-                    HStack(spacing: 5) {
-                        Image(systemName: "trophy")
-                            .font(.system(size: 10, weight: .heavy))
-                        Text("Make My Team")
-                            .font(.system(size: 10, weight: .heavy, design: .rounded))
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(Color.white.opacity(0.70))
-                    .padding(.top, 6)
-                    .animation(trophyVisualTransitionAnimation, value: isPrimary)
-                }
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(14)
-        .frame(width: 174, height: 148, alignment: .topLeading)
-        .background {
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            team.badgeColor.opacity(0.96),
-                            FGColor.accentBlue.opacity(0.84),
-                            Color(red: 0.09, green: 0.12, blue: 0.18).opacity(0.92)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-                .overlay {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.34),
-                                    Color.white.opacity(0.08)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
-                }
-        }
-        .overlay(alignment: .topLeading) {
-            favoriteTeamSportAccentStripe(color: sportAccent, cornerRadius: 24)
         }
         .overlay {
             if isAnimatingSelection && !reduceMotion {
-                trophySelectionShimmer(cornerRadius: 24)
+                trophySelectionShimmer(cornerRadius: FavoriteTeamRichCardStyle.ownProfile.cornerRadius)
             }
         }
-        .shadow(
-            color: isPrimary
-                ? FGColor.accentYellow.opacity(colorScheme == .dark ? 0.26 : 0.20)
-                : isAnimatingDemotion
-                    ? FGColor.accentYellow.opacity(colorScheme == .dark ? 0.10 : 0.08)
-                : team.badgeColor.opacity(colorScheme == .dark ? 0.18 : 0.16),
-            radius: isPrimary ? 18 : isAnimatingDemotion ? 15 : 14,
-            y: isPrimary ? 9 : 8
-        )
         .animation(trophyVisualTransitionAnimation, value: isPrimary)
         .animation(trophyVisualTransitionAnimation, value: isAnimatingDemotion)
-    }
-
-    private func favoriteTeamSportAccentStripe(color: Color, cornerRadius: CGFloat) -> some View {
-        VStack(spacing: 0) {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            color.opacity(colorScheme == .dark ? 0.62 : 0.50),
-                            color.opacity(colorScheme == .dark ? 0.22 : 0.16),
-                            Color.white.opacity(0.02),
-                            Color.clear
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(height: 3)
-                .shadow(color: color.opacity(colorScheme == .dark ? 0.30 : 0.18), radius: 8, y: 2)
-            Spacer(minLength: 0)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private func primaryFavoriteTeamCardLabel(_ team: FavoriteTeam) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 5) {
-                Image(systemName: "trophy.fill")
-                    .font(.system(size: 10, weight: .heavy))
-                Text(L10n.t("my_team", languageCode: appLanguageRaw))
-                    .font(.system(size: 10.5, weight: .heavy, design: .rounded))
-                    .textCase(.uppercase)
-                    .tracking(0.45)
-            }
-            .foregroundStyle(FGColor.accentYellow)
-
-            Text(team.name)
-                .font(.system(size: 15.5, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-                .lineLimit(2)
-                .truncationMode(.tail)
-                .minimumScaleFactor(0.72)
-                .fixedSize(horizontal: false, vertical: true)
-        }
     }
 
     private func trophyTeamButton(
@@ -3767,16 +3812,18 @@ struct ProfileIdentityCard: View {
         isAnimatingSelection: Bool
     ) -> some View {
         Button {
+            guard !isPrimary else { return }
             promoteTrophyTeam(team)
         } label: {
-            ZStack {
-                Image(systemName: "trophy")
-                    .opacity(isPrimary ? 0 : 1)
-                    .foregroundStyle(Color.white.opacity(0.78))
-                Image(systemName: "trophy.fill")
-                    .opacity(isPrimary ? 1 : 0)
-                    .foregroundStyle(FGColor.accentYellow)
-            }
+            VStack(spacing: 2) {
+                ZStack {
+                    Image(systemName: "trophy")
+                        .opacity(isPrimary ? 0 : 1)
+                        .foregroundStyle(Color.white.opacity(0.92))
+                    Image(systemName: "trophy.fill")
+                        .opacity(isPrimary ? 1 : 0)
+                        .foregroundStyle(FGColor.accentYellow)
+                }
                 .font(.system(size: 14, weight: .heavy))
                 .frame(width: 30, height: 30)
                 .background {
@@ -3792,13 +3839,34 @@ struct ProfileIdentityCard: View {
                 }
                 .shadow(color: isPrimary ? FGColor.accentYellow.opacity(0.45) : .clear, radius: 8, y: 2)
                 .scaleEffect(isAnimatingSelection && !reduceMotion ? 1.13 : 1.0)
-                .contentShape(Circle())
+
+                if isPrimary {
+                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
+                        .font(.system(size: 8.5, weight: .heavy, design: .rounded))
+                        .textCase(.uppercase)
+                        .tracking(0.2)
+                        .foregroundStyle(FGColor.accentYellow)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+            }
+            .frame(minWidth: 44, minHeight: 44, alignment: .top)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(isPrimary)
         .animation(trophyVisualTransitionAnimation, value: isPrimary)
         .animation(trophyPulseAnimation, value: isAnimatingSelection)
-        .accessibilityLabel(isPrimary ? "\(team.name) is My Team" : "Make \(team.name) My Team")
-        .accessibilityHint(isPrimary ? "Only one favorite team can be primary" : "Promotes this favorite team to primary")
+        .accessibilityLabel(
+            isPrimary
+                ? MyTeamDisplayModel(team: team).accessibilityLabel(languageCode: appLanguageRaw)
+                : "\(L10n.t("make_my_team", languageCode: appLanguageRaw)), \(team.name)"
+        )
+        .accessibilityHint(
+            isPrimary
+                ? L10n.t("my_team_only_one_hint", languageCode: appLanguageRaw)
+                : L10n.t("make_my_team_hint", languageCode: appLanguageRaw)
+        )
     }
 
     private func removeFavoriteTeamButton(team: FavoriteTeam) -> some View {
@@ -3974,33 +4042,6 @@ struct ProfileIdentityCard: View {
         .accessibilityHidden(true)
     }
 
-    private func favoriteTeamCardSportBadge(team: FavoriteTeam) -> some View {
-        HStack(spacing: 5) {
-            Text(sportIcon(for: team.sport.chipTitle))
-                .font(.system(size: 13))
-            Text(team.sport.chipTitle)
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .lineLimit(1)
-        }
-        .foregroundStyle(.white.opacity(0.84))
-        .padding(.horizontal, 7)
-        .padding(.vertical, 3)
-        .background {
-            Capsule(style: .continuous)
-                .fill(Color.white.opacity(0.13))
-                .overlay {
-                    Capsule(style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.75)
-                }
-        }
-        .onAppear {
-#if DEBUG
-            print("[FavoriteTeamsDebug] sportIconRendered sport=\(team.sport.chipTitle)")
-            print("[FavoriteTeamsDebug] favoriteTeamCardSportIconVisible=true")
-#endif
-        }
-    }
-
     private var addTeamSocialCard: some View {
         Button {
             showFavoriteTeamsPicker = true
@@ -4027,7 +4068,7 @@ struct ProfileIdentityCard: View {
                 Spacer(minLength: 0)
             }
             .padding(14)
-            .frame(width: 148, height: 148, alignment: .topLeading)
+            .frame(width: 148, height: Self.favoriteTeamCardHeight, alignment: .topLeading)
             .background {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.9))
@@ -6121,17 +6162,22 @@ struct PremiumTeamIdentityOrb: View {
     }
 }
 
-private struct ProfileIdentityStripColumn: Identifiable {
-    enum Kind: String {
-        case nationalTeam
-        case homeCrowd
-        case homeCity
-        case fanSince
-    }
+struct ProfileIdentityOwnPickupOrganizerSection: View {
+    @ObservedObject var viewModel: MapViewModel
+    let userId: UUID
+    let summary: PickupOrganizerSummary
+    var usesExternalChrome: Bool = false
 
-    let id: Kind
-    let title: String
-    let subtitle: String
-    var action: (() -> Void)? = nil
+    var body: some View {
+        PickupOrganizerSummaryCard(
+            userId: userId,
+            summary: summary,
+            compact: true,
+            usesExternalChrome: usesExternalChrome
+        )
+        .task(id: userId) {
+            await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
+        }
+    }
 }
 

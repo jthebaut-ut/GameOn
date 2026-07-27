@@ -13,6 +13,7 @@ struct CalendarScreen: View {
     @Binding var selectedTab: MainTabView.AppTab
     /// False while Calendar is preserved off-screen (defers tab-only pickup refresh at launch).
     var isCalendarTabSelected: Bool = false
+    @EnvironmentObject private var chatViewModel: ChatViewModel
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(LiveLeagueCountryFilterPreference.appStorageKey) private var calendarLeagueCountryFilterRaw: String = ""
     @Environment(\.colorScheme) private var calendarColorScheme
@@ -52,6 +53,12 @@ struct CalendarScreen: View {
     @State private var calendarWatchPartiesDayTransitionActive = false
     @State private var calendarWatchPartiesDayTransitionGeneration: UInt64 = 0
     @State private var calendarWatchPartiesDayTransitionTask: Task<Void, Never>?
+    /// First-open two-phase: chrome paints before the heavy events list / strip inventory work.
+    /// Stays true after the first activation so later visits remain immediate.
+    @State private var calendarHeavyContentReady = false
+    @State private var calendarDateStripInventoryDays: Set<TimeInterval> = []
+    @State private var calendarDateStripInventoryFingerprint = ""
+    @State private var calendarDisplayedEventsIdentity: [UUID] = []
     @FocusState private var isGameSearchFocused: Bool
     @FocusState private var isTeamScheduleSearchFocused: Bool
 
@@ -174,6 +181,7 @@ struct CalendarScreen: View {
             calendarFeaturedEventFilterSlug ?? "",
             calendarLeagueCountryFilterRaw,
             "\(viewModel.liveMatches.count)",
+            "\(viewModel.scheduleLiveMatchesContentRevision)",
             "\(viewModel.activeFeaturedEvents.count)"
         ].joined(separator: "|")
     }
@@ -288,10 +296,12 @@ struct CalendarScreen: View {
 
         if reason == "calendar_tab_filter_change" {
             viewModel.calendarEventsListCache.removeAll()
+            calendarDateStripInventoryFingerprint = ""
             viewModel.loadCalendarTabCalendarDotsAroundMonth(
                 viewModel.calendarTabSelectedDate,
                 reason: reason
             )
+            ensureCalendarDateStripInventoryCache()
         }
 
         if isProGamesSelected {
@@ -305,7 +315,12 @@ struct CalendarScreen: View {
         }
 
         if reason == "calendar_selected_date_change" {
-            refreshCalendarPickupSourcesIfNeeded(forceRefresh: true, reason: reason)
+            // While the date picker sheet is open, date taps only change selection chrome.
+            // Defer selected-day pickup reload until Done so we do not thrash day-scoped map rows
+            // under an open month-dot calendar (legacy path used those rows as orange-dot truth).
+            if !showDatePicker {
+                refreshCalendarPickupSourcesIfNeeded(forceRefresh: true, reason: reason)
+            }
         }
 
         refreshCalendarSegmentBadgeCounts(reason: reason)
@@ -410,6 +425,11 @@ struct CalendarScreen: View {
             calendarProGamesPerf.cachedDisplayedProMatchesKey = key
             calendarProGamesPerf.cachedDisplayedProMatches = cached
             logScheduleTapPerfDisplayedCacheUpdated(count: cached.count, reason: reason)
+            SchedulePerf.dateCache(
+                hit: true,
+                filtered: cached.count,
+                revision: viewModel.scheduleLiveMatchesContentRevision
+            )
 #if DEBUG
             logScheduleDateRefresh(
                 "cacheApplyHit reason=\(reason)",
@@ -427,6 +447,11 @@ struct CalendarScreen: View {
         if calendarProGamesPerf.cachedDisplayedProMatchesKey != key {
             calendarProGamesPerf.cachedDisplayedProMatchesKey = key
             calendarProGamesPerf.cachedDisplayedProMatches = []
+            SchedulePerf.dateCache(
+                hit: false,
+                filtered: 0,
+                revision: viewModel.scheduleLiveMatchesContentRevision
+            )
 #if DEBUG
             logScheduleDateRefresh(
                 "cacheApplyMissClearedDisplay reason=\(reason)",
@@ -442,13 +467,7 @@ struct CalendarScreen: View {
     private func updateCalendarProGamesDisplayCache(reason: String) {
         guard isProGamesSelected, !isCalendarSearchModeActive else { return }
         let key = calendarProGamesDisplayCacheKey()
-        // Only skip when we already painted a non-empty list for this exact key.
-        if calendarProGamesPerf.cachedDisplayedProMatchesKey == key,
-           let existing = calendarProGamesPerf.displayCacheByKey[key],
-           !existing.isEmpty,
-           calendarProGamesPerf.cachedDisplayedProMatches.count == existing.count {
-            return
-        }
+        let started = CFAbsoluteTimeGetCurrent()
         calendarProGamesPerf.displayCacheRebuildInFlight = true
         syncCalendarProGamesStatusIndicator()
         defer {
@@ -456,9 +475,23 @@ struct CalendarScreen: View {
             syncCalendarProGamesStatusIndicator()
         }
         let matches = calendarBaseDisplayedProMatches()
+        let buildMs = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        SchedulePerf.snapshotBuild(
+            ms: buildMs,
+            filtered: matches.count,
+            inventory: viewModel.liveMatches.count,
+            reason: reason
+        )
+        // Full structural equality — same IDs can still change score/status/minute/clock.
+        if calendarProGamesPerf.cachedDisplayedProMatchesKey == key,
+           calendarProGamesPerf.cachedDisplayedProMatches == matches {
+            SchedulePerf.publishSkippedIdentical(rows: matches.count, reason: reason)
+            return
+        }
         storeCalendarProGamesDisplayCacheEntry(key: key, matches: matches)
         calendarProGamesPerf.cachedDisplayedProMatchesKey = key
         calendarProGamesPerf.cachedDisplayedProMatches = matches
+        SchedulePerf.publishApplied(rows: matches.count, reason: reason)
         logScheduleTapPerfDisplayedCacheUpdated(count: matches.count, reason: reason)
 #if DEBUG
         logScheduleDateRefresh(
@@ -473,6 +506,9 @@ struct CalendarScreen: View {
             matches.filter(\.supportsProGamePredictions).count
         )
 #endif
+        if buildMs >= 8 {
+            SchedulePerf.longestMainActorMs(buildMs, label: "proGamesDisplayCache:\(reason)")
+        }
     }
 
     private func scheduleCalendarProGamesStripDateCachePrewarm(reason: String) {
@@ -908,6 +944,7 @@ struct CalendarScreen: View {
     }
 
     var body: some View {
+        let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "Calendar")
         fanCalendarRoot
     }
 
@@ -926,6 +963,12 @@ struct CalendarScreen: View {
             .onChange(of: showDatePicker) { _, isPresented in
                 if isPresented {
                     calendarDatePickerDetent = .large
+                    // Month orange/green dots must come from month availability caches — not
+                    // selected-day ``pickupGamesForDiscoverMap`` rows.
+                    viewModel.loadCalendarTabCalendarDotsAroundMonth(
+                        viewModel.calendarTabSelectedDate,
+                        reason: "calendar_tab_sheet_open"
+                    )
                 }
             }
     }
@@ -933,7 +976,11 @@ struct CalendarScreen: View {
     @ViewBuilder
     private var calendarRootContent: some View {
         if isCalendarTabSelected {
-            fanCalendarContent
+            if calendarHeavyContentReady {
+                fanCalendarContent
+            } else {
+                calendarFirstFrameShell
+            }
         } else {
             calendarOffTabPlaceholder
         }
@@ -944,6 +991,21 @@ struct CalendarScreen: View {
         Color.clear
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityHidden(true)
+    }
+
+    /// One-frame chrome while strip inventory + event list prepare after first selection.
+    private var calendarFirstFrameShell: some View {
+        ZStack {
+            Color(.systemGroupedBackground).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 10) {
+                header
+                gameTypeFilter
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 14)
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var calendarFilterRoot: some View {
@@ -990,12 +1052,17 @@ struct CalendarScreen: View {
             }
             .onChange(of: viewModel.events.count) { _, _ in
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
+                if isCalendarTabSelected { ensureCalendarDateStripInventoryCache() }
+                refreshCalendarDisplayedEventsIdentityIfNeeded()
             }
-            .onChange(of: viewModel.liveMatches.count) { _, _ in
+            .onChange(of: viewModel.scheduleLiveMatchesContentRevision) { _, _ in
                 handleLiveMatchesCountChangedWhileScheduleVisible()
+                if isCalendarTabSelected { ensureCalendarDateStripInventoryCache() }
             }
             .onChange(of: viewModel.pickupGamesForDiscoverMap.count) { _, _ in
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
+                if isCalendarTabSelected { ensureCalendarDateStripInventoryCache() }
+                refreshCalendarDisplayedEventsIdentityIfNeeded()
             }
             .onChange(of: viewModel.venueEventRows.count) { _, _ in
                 refreshCurrentDayCalendarSearchForLoadedDataChange()
@@ -1026,7 +1093,7 @@ struct CalendarScreen: View {
             .onChange(of: viewModel.calendarTabSelectedDate) { _, _ in
                 handleCalendarSelectedDateChange()
             }
-            .onChange(of: displayedEvents.map(\.id)) { _, _ in
+            .onChange(of: calendarDisplayedEventsIdentity) { _, _ in
                 handleCalendarDisplayedEventsIdentityChanged()
             }
             .onChange(of: viewModel.isLoadingEvents) { _, loading in
@@ -1058,6 +1125,7 @@ struct CalendarScreen: View {
         calendarLifecycleRoot
             .sheet(item: $calendarPickupDetailToken) { token in
                 DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                    .environmentObject(chatViewModel)
             }
             .sheet(item: $calendarProGamePredictionSheet) { context in
                 ProGamePredictionSheet(viewModel: viewModel, game: context.game)
@@ -1102,6 +1170,18 @@ struct CalendarScreen: View {
 
             fanCalendarContentStack
         }
+        .onAppear {
+            refreshCalendarDisplayedEventsIdentityIfNeeded()
+        }
+    }
+
+    /// Keeps ``calendarDisplayedEventsIdentity`` in sync without allocating inside `onChange` every body pass.
+    @discardableResult
+    private func refreshCalendarDisplayedEventsIdentityIfNeeded() -> Bool {
+        let next = displayedEvents.map(\.id)
+        guard next != calendarDisplayedEventsIdentity else { return false }
+        calendarDisplayedEventsIdentity = next
+        return true
     }
 
     private var fanCalendarContentStack: some View {
@@ -1141,7 +1221,11 @@ struct CalendarScreen: View {
             events: viewModel.events,
             bars: viewModel.filteredBars,
             useVisibleMapRegionOnly: viewModel.calendarUsesVisibleMapRegionOnly,
-            eventDotDates: viewModel.calendarTabEventDotDatesForPicker(),
+            eventDotDates: viewModel.calendarTabEventDotDatesForPicker(
+                proSportFilter: calendarProGamesSportFilter,
+                proLeagueCountries: selectedCalendarLeagueCountries,
+                proFeaturedEvent: selectedCalendarFeaturedEvent
+            ),
             dotsLoading: viewModel.calendarTabCalendarDotsLoading,
             dotStatusText: nil,
             selectedDate: $viewModel.calendarTabSelectedDate,
@@ -1637,14 +1721,21 @@ struct CalendarScreen: View {
         applyCalendarLeagueCountryFilterFirstUseDefaultIfNeeded()
         refreshCurrentDayCalendarSearchForLoadedDataChange()
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "appearInstant")
+        SchedulePerf.activation(
+            source: "appear",
+            cachedProRows: calendarProGamesPerf.cachedDisplayedProMatches.count,
+            inventoryRows: viewModel.liveMatches.count
+        )
         scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_appear")
         applyPendingScheduleProGameNavIfNeeded()
         guard isCalendarTabSelected else {
 #if DEBUG
             print("[PerfPhase1D] deferredCalendarWork reason=calendarScreenOnAppearPickupRefresh")
 #endif
+            SchedulePerf.preload(action: "skipped", source: "appearOffTab")
             return
         }
+        activateCalendarHeavyContentIfNeeded(source: "appear")
         Task { @MainActor in
             await Task.yield()
             scheduleCalendarProGamesDeferredRefresh(reason: "calendar_tab_appear")
@@ -1656,7 +1747,11 @@ struct CalendarScreen: View {
                     source: "pickupSources",
                     reason: "tabPreloadRecentOrInFlight"
                 )
+                CalendarActivationPerf.warmJoined(source: "appearTabPreload")
                 return
+            }
+            if viewModel.lastCalendarTabPickupSourcesRefreshAt != nil {
+                CalendarActivationPerf.warmJoined(source: "appearExistingPickupCache")
             }
             await viewModel.refreshCalendarTabPickupSources(reason: "calendar_tab_appear")
         }
@@ -1750,7 +1845,9 @@ struct CalendarScreen: View {
             handleCalendarProGamesIndicatorSurfaceHidden(reason: "tabHidden")
             return
         }
+        let firstOpen = !calendarHeavyContentReady
         AppPerfDebug.screenLoadStart(tab: "calendar", source: "tabSelected")
+        CalendarActivationPerf.selected(source: "tabSelected", firstOpen: firstOpen)
         sanitizeBusinessCalendarFilterIfNeeded()
 #if DEBUG
         if isProGamesSelected {
@@ -1758,6 +1855,22 @@ struct CalendarScreen: View {
         }
 #endif
         applyCalendarProGamesDisplayCacheIfAvailable(reason: "tabSelectedInstant")
+        let cachedEventsUsable = !viewModel.calendarEventsListCache.isEmpty
+            || !viewModel.events.isEmpty
+            || !calendarProGamesPerf.cachedDisplayedProMatches.isEmpty
+        let cachedDotsUsable = !viewModel.venueGameCalendarDotDates.isEmpty
+            || !viewModel.pickupGameCalendarDotDates.isEmpty
+            || !viewModel.proGameCalendarDotDates.isEmpty
+        CalendarActivationPerf.shellVisible(
+            cachedDotsUsable: cachedDotsUsable,
+            cachedEventsUsable: cachedEventsUsable
+        )
+        SchedulePerf.activation(
+            source: "tabSelected",
+            cachedProRows: calendarProGamesPerf.cachedDisplayedProMatches.count,
+            inventoryRows: viewModel.liveMatches.count
+        )
+        activateCalendarHeavyContentIfNeeded(source: "tabSelected")
         scheduleCalendarProGamesStripDateCachePrewarm(reason: "calendar_tab_selected")
         scheduleCalendarInteractionDeferredWork(reason: "calendar_tab_selected")
         applyPendingScheduleProGameNavIfNeeded()
@@ -1768,11 +1881,46 @@ struct CalendarScreen: View {
                 refreshCalendarPickupSourcesIfNeeded(reason: "calendar_tab_selected")
                 return
             }
+            SchedulePerf.preload(action: "skipped", source: "tabPreloadRecentOrInFlight")
+            CalendarActivationPerf.warmJoined(source: "tabSelectedTabPreload")
             AppPerfDebug.refreshSkipped(
                 tab: "calendar",
                 source: "pickupSources",
                 reason: "tabPreloadRecentOrInFlight"
             )
+        }
+    }
+
+    /// First selection: paint chrome, then enable the heavy subtree after one yield so the
+    /// selection frame is not blocked by strip inventory + events list construction.
+    private func activateCalendarHeavyContentIfNeeded(source: String) {
+        guard isCalendarTabSelected else { return }
+        if calendarHeavyContentReady {
+            ensureCalendarDateStripInventoryCache()
+            refreshCalendarDisplayedEventsIdentityIfNeeded()
+            CalendarActivationPerf.rootConstructed(firstOpen: false)
+            CalendarActivationPerf.stableReady(firstOpen: false)
+            return
+        }
+        CalendarActivationPerf.shellVisible(
+            cachedDotsUsable: !viewModel.venueGameCalendarDotDates.isEmpty,
+            cachedEventsUsable: !viewModel.events.isEmpty
+        )
+        Task { @MainActor in
+            await Task.yield()
+            guard isCalendarTabSelected, !calendarHeavyContentReady else { return }
+            let started = CFAbsoluteTimeGetCurrent()
+            ensureCalendarDateStripInventoryCache()
+            applyCalendarProGamesDisplayCacheIfAvailable(reason: "heavyContentReady:\(source)")
+            calendarHeavyContentReady = true
+            refreshCalendarDisplayedEventsIdentityIfNeeded()
+            let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+            CalendarActivationPerf.publishMs(ms, reason: "heavyContentReady:\(source)")
+            CalendarActivationPerf.rootConstructed(firstOpen: true)
+            CalendarActivationPerf.stableReady(firstOpen: true)
+            if ms >= 50 {
+                TabTapPerf.mainActorBusy(ms: ms, source: "calendarHeavyContentReady")
+            }
         }
     }
 
@@ -1801,6 +1949,9 @@ struct CalendarScreen: View {
         let previousRendered = calendarProGamesPerf.cachedDisplayedProMatches.count
         beginCalendarWatchPartiesDayTransition(reason: "selectedDateChanged", preserveVisibleCards: true)
         let cacheHit = applyCalendarProGamesDisplayCacheIfAvailable(reason: "selectedDateInstant")
+        calendarDateStripInventoryFingerprint = ""
+        ensureCalendarDateStripInventoryCache()
+        refreshCalendarDisplayedEventsIdentityIfNeeded()
 #if DEBUG
         logScheduleDateRefresh(
             "selectedDateCommitted cacheHit=\(cacheHit)",
@@ -2129,8 +2280,7 @@ struct CalendarScreen: View {
         let calendar = Calendar.current
         let isSelected = calendar.isDate(date, inSameDayAs: viewModel.calendarTabSelectedDate)
         let isToday = calendar.isDateInToday(date)
-        let hasVenueEvents = calendarDateStripHasVenueEvents(on: date)
-        let hasPickupGames = calendarDateStripHasPickupGames(on: date)
+        let stripDots = calendarDateStripDotFlags(on: date)
         return Button {
             handleCalendarDateStripTap(date)
         } label: {
@@ -2146,8 +2296,9 @@ struct CalendarScreen: View {
             .frame(width: 68, height: 52)
             .overlay(alignment: .bottom) {
                 calendarDateStripEventIndicators(
-                    hasVenueEvents: hasVenueEvents,
-                    hasPickupGames: hasPickupGames
+                    hasVenueEvents: stripDots.hasVenueEvents,
+                    hasPickupGames: stripDots.hasPickupGames,
+                    hasProGames: stripDots.hasProGames
                 )
                 .padding(.bottom, 5)
             }
@@ -2169,25 +2320,95 @@ struct CalendarScreen: View {
         .buttonStyle(.plain)
         .accessibilityLabel(calendarDateStripAccessibilityLabel(
             date: date,
-            hasVenueEvents: hasVenueEvents,
-            hasPickupGames: hasPickupGames
+            hasVenueEvents: stripDots.hasVenueEvents,
+            hasPickupGames: stripDots.hasPickupGames,
+            hasProGames: stripDots.hasProGames
         ))
     }
 
-    /// Reuses Calendar-tab venue/pickup day-dot sets already loaded for the month picker — no new queries.
-    private func calendarDateStripHasVenueEvents(on date: Date) -> Bool {
-        let day = Calendar.current.startOfDay(for: date)
-        return viewModel.venueGameCalendarDotDates.contains(day)
+    /// Dots for the date strip must match the active Watch/Play/Pro list inventory only.
+    private func calendarDateStripDotFlags(on date: Date) -> (
+        hasVenueEvents: Bool,
+        hasPickupGames: Bool,
+        hasProGames: Bool
+    ) {
+        let dayKey = Calendar.current.startOfDay(for: date).timeIntervalSince1970
+        let has = calendarDateStripInventoryDays.contains(dayKey)
+        switch effectiveCalendarGameFilter {
+        case .venueGames:
+            return (has, false, false)
+        case .pickupGames:
+            return (false, has, false)
+        case .proGames:
+            return (false, false, has)
+        }
     }
 
+    private func calendarDateStripInventoryFingerprintValue() -> String {
+        let stripKey = calendarDateStripDates
+            .map { String(Int(Calendar.current.startOfDay(for: $0).timeIntervalSince1970)) }
+            .joined(separator: ",")
+        return [
+            effectiveCalendarGameFilter.rawValue,
+            viewModel.selectedSport,
+            calendarProGamesSportFilter,
+            calendarFeaturedEventFilterSlug ?? "",
+            calendarLeagueCountryFilterRaw,
+            "\(viewModel.scheduleDataGeneration)",
+            "\(viewModel.scheduleLiveMatchesContentRevision)",
+            "\(viewModel.events.count)",
+            "\(viewModel.pickupGamesForDiscoverMap.count)",
+            "\(viewModel.liveMatches.count)",
+            stripKey
+        ].joined(separator: "|")
+    }
+
+    @discardableResult
+    private func ensureCalendarDateStripInventoryCache() -> Bool {
+        let fingerprint = calendarDateStripInventoryFingerprintValue()
+        if fingerprint == calendarDateStripInventoryFingerprint {
+            return false
+        }
+        let started = CFAbsoluteTimeGetCurrent()
+        let days = viewModel.calendarTabStripDaysWithListInventory(
+            stripDates: calendarDateStripDates,
+            filter: effectiveCalendarGameFilter,
+            proSportFilter: calendarProGamesSportFilter,
+            proLeagueCountries: selectedCalendarFeaturedEvent == nil ? selectedCalendarLeagueCountries : [],
+            proFeaturedEvent: selectedCalendarFeaturedEvent
+        )
+        calendarDateStripInventoryDays = Set(days.map { Calendar.current.startOfDay(for: $0).timeIntervalSince1970 })
+        calendarDateStripInventoryFingerprint = fingerprint
+        let ms = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        CalendarActivationPerf.stripInventoryBuilt(ms: ms, days: days.count, cacheHit: false)
+        if ms >= 50 {
+            TabTapPerf.mainActorBusy(ms: ms, source: "calendarDateStripInventory")
+        }
+        return true
+    }
+
+    /// Same effective Watch list as ``calendarScreenDisplayedEvents`` for this day (no search).
+    private func calendarDateStripHasVenueEvents(on date: Date) -> Bool {
+        calendarDateStripDotFlags(on: date).hasVenueEvents
+    }
+
+    /// Same effective Play list as ``calendarScreenDisplayedEvents`` for this day (no search).
     private func calendarDateStripHasPickupGames(on date: Date) -> Bool {
-        let day = Calendar.current.startOfDay(for: date)
-        return viewModel.pickupGameCalendarDotDates.contains(day)
+        calendarDateStripDotFlags(on: date).hasPickupGames
+    }
+
+    /// Same effective Pro list as ``calendarBaseDisplayedProMatches`` for this day (no search).
+    private func calendarDateStripHasProGames(on date: Date) -> Bool {
+        calendarDateStripDotFlags(on: date).hasProGames
     }
 
     @ViewBuilder
-    private func calendarDateStripEventIndicators(hasVenueEvents: Bool, hasPickupGames: Bool) -> some View {
-        if hasVenueEvents || hasPickupGames {
+    private func calendarDateStripEventIndicators(
+        hasVenueEvents: Bool,
+        hasPickupGames: Bool,
+        hasProGames: Bool
+    ) -> some View {
+        if hasVenueEvents || hasPickupGames || hasProGames {
             HStack(spacing: 3.5) {
                 if hasVenueEvents {
                     Circle()
@@ -2199,6 +2420,11 @@ struct CalendarScreen: View {
                         .fill(FGColor.accentBlue.opacity(calendarColorScheme == .dark ? 0.92 : 0.88))
                         .frame(width: 4.5, height: 4.5)
                 }
+                if hasProGames {
+                    Circle()
+                        .fill(FGColor.intentProGames.opacity(calendarColorScheme == .dark ? 0.92 : 0.88))
+                        .frame(width: 4.5, height: 4.5)
+                }
             }
             .accessibilityHidden(true)
         }
@@ -2207,11 +2433,13 @@ struct CalendarScreen: View {
     private func calendarDateStripAccessibilityLabel(
         date: Date,
         hasVenueEvents: Bool,
-        hasPickupGames: Bool
+        hasPickupGames: Bool,
+        hasProGames: Bool
     ) -> String {
         var label = calendarDateStripAccessibilityFormatter.string(from: date)
         if hasVenueEvents { label += ", watch parties" }
         if hasPickupGames { label += ", pickup games" }
+        if hasProGames { label += ", pro games" }
         return label
     }
 

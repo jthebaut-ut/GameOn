@@ -99,6 +99,9 @@ struct SettingsVenueAuthSheet: View {
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @State private var authTermsAccepted = false
     @State private var businessAuthEntryMode: BusinessAuthEntryMode = .choice
+#if DEBUG
+    @State private var businessAuthSheetInstanceId = UUID()
+#endif
 
     private var showsBusinessAuthTermsAcceptance: Bool {
         !viewModel.shouldShowPendingBusinessEmailVerificationUI && !viewModel.isVenueOwnerLoggedIn
@@ -220,13 +223,30 @@ struct SettingsVenueAuthSheet: View {
             Color.clear.frame(height: SettingsScrollBottomLayout.sheetScrollComfortInset)
         }
         .background(FGColor.screenGradient(colorScheme).ignoresSafeArea())
+        .overlay {
+            if viewModel.isSafeLoginBlockingUI {
+                SafeLoginProgressOverlay(viewModel: viewModel)
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Close") { dismiss() }
+                    .disabled(viewModel.isSafeLoginInFlight)
             }
         }
+        .interactiveDismissDisabled(viewModel.isSafeLoginInFlight)
         .onAppear {
             resolveInitialBusinessAuthEntryMode()
+#if DEBUG
+            print(
+                "[BusinessLoginFocusDebug] authSheetAppear sheetId=\(businessAuthSheetInstanceId.uuidString) entryMode=\(String(describing: businessAuthEntryMode))"
+            )
+#endif
+        }
+        .onChange(of: viewModel.isVenueOwnerLoggedIn) { _, loggedIn in
+            if loggedIn {
+                venuePassword = ""
+            }
         }
         .onChange(of: viewModel.shouldShowVerifiedPendingBusinessSignInPrompt) { _, show in
             guard show, !viewModel.isVenueOwnerLoggedIn else { return }
@@ -244,9 +264,13 @@ struct SettingsVenueAuthSheet: View {
             showVenueRegisterMode = true
         }
         .onDisappear {
+            // Real sheet dismissal only — do not attach equivalent resets to conditional field children.
             viewModel.venueOwnerJustCompletedRegistration = false
             authTermsAccepted = false
             businessAuthEntryMode = .choice
+#if DEBUG
+            print("[BusinessLoginFocusDebug] authSheetDisappear sheetId=\(businessAuthSheetInstanceId.uuidString)")
+#endif
         }
     }
 

@@ -14,6 +14,58 @@ private func pushTokenDebugLog(_ message: @autoclosure () -> String) {
 private func pushTokenDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
+/// Identity of one push-token registration: a change to any component is genuinely new work.
+nonisolated private struct PushTokenUpsertIdentity: Hashable {
+    let userID: String
+    let token: String
+    let environment: String
+}
+
+/// Single-flight + freshness gate for token upserts.
+///
+/// Launch fans out the same registration from several triggers (app launch, auth id change,
+/// already-authorized permission check, APNs token delivery). They all describe the same row, so
+/// only the first performs the write; the rest observe it or skip while it is still fresh.
+private actor PushTokenUpsertCoalescer {
+    enum Outcome {
+        case performed
+        case coalesced
+        case skippedFresh
+    }
+
+    private var inFlight: [PushTokenUpsertIdentity: Task<Bool, Never>] = [:]
+    private var lastSucceededAt: [PushTokenUpsertIdentity: Date] = [:]
+    private let freshnessWindow: TimeInterval = 60
+
+    func run(
+        identity: PushTokenUpsertIdentity,
+        operation: @escaping @Sendable () async -> Bool
+    ) async -> Outcome {
+        if let existing = inFlight[identity] {
+            _ = await existing.value
+            return .coalesced
+        }
+        if let succeededAt = lastSucceededAt[identity],
+           Date().timeIntervalSince(succeededAt) < freshnessWindow {
+            return .skippedFresh
+        }
+
+        let task = Task { await operation() }
+        inFlight[identity] = task
+        let succeeded = await task.value
+        inFlight[identity] = nil
+        if succeeded {
+            lastSucceededAt[identity] = Date()
+        }
+        return .performed
+    }
+
+    /// Logout/token removal must let the next sign-in write the row again immediately.
+    func invalidateFreshness() {
+        lastSucceededAt.removeAll()
+    }
+}
+
 final class PushNotificationRegistrationService {
     static let shared = PushNotificationRegistrationService()
 
@@ -22,6 +74,7 @@ final class PushNotificationRegistrationService {
 
     /// Skips duplicate foreground lifecycle refresh after launch/foreground already ran this process.
     private var didCompleteLifecyclePushTokenRefresh = false
+    private let upsertCoalescer = PushTokenUpsertCoalescer()
 
     private init() {}
 
@@ -79,20 +132,44 @@ final class PushNotificationRegistrationService {
         let userID = session.user.id
         let environment = Self.resolvedEnvironment()
         UserDefaults.standard.set(environment, forKey: Self.environmentDefaultsKey)
-        let lastSeenAt = SupabaseTimestampParsing.encodeTimestamptz(Date())
 
-        let row = UserPushTokenUpsertRow(
-            user_id: userID.uuidString.lowercased(),
+        let identity = PushTokenUpsertIdentity(
+            userID: userID.uuidString.lowercased(),
             token: token,
-            environment: environment,
+            environment: environment
+        )
+
+        let outcome = await upsertCoalescer.run(identity: identity) {
+            await Self.performTokenUpsert(identity: identity, reason: reason)
+        }
+
+        switch outcome {
+        case .performed:
+            break
+        case .coalesced:
+            pushTokenDebugLog("[PushTokenPerf] duplicateCoalesced=true reason=\(reason)")
+        case .skippedFresh:
+            pushTokenDebugLog("[PushTokenPerf] duplicateSkipped=true reason=\(reason)")
+        }
+    }
+
+    private static func performTokenUpsert(
+        identity: PushTokenUpsertIdentity,
+        reason: String
+    ) async -> Bool {
+        let lastSeenAt = SupabaseTimestampParsing.encodeTimestamptz(Date())
+        let row = UserPushTokenUpsertRow(
+            user_id: identity.userID,
+            token: identity.token,
+            environment: identity.environment,
             last_seen_at: lastSeenAt
         )
 
         do {
             await invalidateMismatchedEnvironmentRows(
                 userID: row.user_id,
-                token: token,
-                storingEnvironment: environment,
+                token: identity.token,
+                storingEnvironment: identity.environment,
                 reason: reason
             )
             try await supabase
@@ -108,23 +185,35 @@ final class PushNotificationRegistrationService {
                     )
                 )
                 .eq("user_id", value: row.user_id)
-                .eq("token", value: token)
-                .eq("environment", value: environment)
+                .eq("token", value: identity.token)
+                .eq("environment", value: identity.environment)
                 .execute()
             pushTokenDebugLog(
                 "[PushTokenDebug] upsertSucceeded userId=\(row.user_id) environment=\(row.environment) " +
-                "tokenPrefix=\(String(token.prefix(12))) reactivated=true reason=\(reason)"
+                "tokenPrefix=\(String(identity.token.prefix(12))) reactivated=true reason=\(reason)"
             )
+            return true
         } catch {
             pushTokenDebugLog("[PushTokenDebug] upsertFailed reason=\(reason) error=\(error.localizedDescription)")
+            return false
         }
     }
 
-    func deleteCurrentTokenForCurrentSession(reason: String) async {
+    func deleteCurrentTokenForCurrentSession(reason: String, knownUserId: UUID? = nil) async {
         didCompleteLifecyclePushTokenRefresh = false
+        await upsertCoalescer.invalidateFreshness()
         guard let token = Self.storedToken, !token.isEmpty else { return }
-        guard let session = try? await supabase.auth.session else { return }
-        let userID = session.user.id
+
+        // Prefer the caller-supplied auth id so logout never blocks on `auth.session`
+        // (token refresh can hang indefinitely on poor networks).
+        let userID: UUID
+        if let knownUserId {
+            userID = knownUserId
+        } else if let session = try? await supabase.auth.session {
+            userID = session.user.id
+        } else {
+            return
+        }
 
         do {
             try await supabase
@@ -197,7 +286,7 @@ final class PushNotificationRegistrationService {
         return String(suffix[valueStart..<valueEnd]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func invalidateMismatchedEnvironmentRows(
+    private static func invalidateMismatchedEnvironmentRows(
         userID: String,
         token: String,
         storingEnvironment: String,
