@@ -379,13 +379,17 @@ nonisolated enum ProGamesFavoriteTeamAutoFollowPreference {
         var id: Int { rawValue }
 
         var title: String {
+            title(languageCode: L10n.defaultLanguageCode)
+        }
+
+        func title(languageCode: String) -> String {
             switch self {
             case .next7:
-                return "Next 7 days"
+                return L10n.t("Next 7 days", languageCode: languageCode)
             case .next30:
-                return "Next 30 days"
+                return L10n.t("Next 30 days", languageCode: languageCode)
             case .next90:
-                return "Next 90 days"
+                return L10n.t("Next 90 days", languageCode: languageCode)
             }
         }
 

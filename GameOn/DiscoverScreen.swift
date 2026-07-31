@@ -1058,7 +1058,8 @@ private struct PickupPlaceClusterSheetView: View {
         if text.contains("soccer") { return "soccerball" }
         if text.contains("basketball") { return "basketball.fill" }
         if text.contains("baseball") || text.contains("softball") { return "baseball.fill" }
-        if text.contains("tennis") || text.contains("pickleball") || text.contains("badminton") { return "figure.tennis" }
+        if text.contains("tennis") || text.contains("pickleball") || text.contains("badminton") || text.contains("padel") { return "figure.tennis" }
+        if text.contains("paragliding") || text.contains("hang_gliding") || text.contains("hang gliding") || text.contains("paramotoring") { return "wind" }
         if text.contains("volleyball") { return "volleyball.fill" }
         if text.contains("dance") || text.contains("breakdance") || text.contains("breaking") || text.contains("ballet") { return "figure.dance" }
         return "sportscourt.fill"
@@ -1309,7 +1310,7 @@ struct DiscoverScreen: View {
     @State private var firstLaunchDetectedLanguageCode = L10n.defaultLanguageCode
     @State private var didPresentStartupGuideThisSession = false
     @State private var pendingDiscoverActivityPanelIntro = false
-    @State private var discoverActivityPanelExpansion: DiscoverActivityPanelState = .compact
+    @State private var discoverActivityPanelExpansion: DiscoverActivityPanelState = .hidden
     @State private var discoverActivityPresentation = DiscoverActivityPanelPresentation.empty
     @State private var discoverActivityPresentationCacheKey: DiscoverActivityPanelPresentationCacheKey?
     @State private var discoverPersonalizedInsightAnalyticsToken: String?
@@ -5103,6 +5104,7 @@ struct DiscoverScreen: View {
         }
         .onMapCameraChange(frequency: .onEnd) { context in
             dismissDiscoverSearchKeyboard()
+            viewModel.noteDiscoverUserCameraInteractionIfStartupPending()
             viewModel.visibleLatitudeDelta = context.region.span.latitudeDelta
             let shouldWriteCameraPosition = viewModel.cameraPosition.region.map { currentRegion in
                 !discoverCameraRegionIsEffectivelyIdentical(currentRegion, context.region)
@@ -6489,6 +6491,7 @@ struct DiscoverScreen: View {
 
     /// True first-Discover introduction for guests and signed-in users (separate persistence keys).
     /// Does **not** mark intro complete until the user explicitly interacts.
+    /// Starts fully collapsed (grabber only) — attention pulse on the handle; no expand→collapse flicker.
     private func presentDiscoverActivityPanelIntroIfNeeded() {
         // Post-signup Welcome dismiss may request intro; clear the flag either way.
         let postSignupPending = pendingDiscoverActivityPanelIntro
@@ -6509,22 +6512,18 @@ struct DiscoverScreen: View {
         discoverActivityPanelUserInteracted = false
         discoverActivityPanelDidRestorePreference = true
         refreshDiscoverActivityCounts(reason: "intro")
-        withAnimation(reduceMotionCompatiblePanelAnimation) {
-            discoverActivityPanelExpansion = .expanded
-        }
-        // Durable preference stays compact/hidden-capable; do not persist expanded across launches.
-        FanGeoDiscoverActivityPanelPreferences.persistState(.compact, for: persistenceUserId)
+        // Keep the panel fully collapsed; user expands via grabber when ready.
+        discoverActivityPanelExpansion = .hidden
+        FanGeoDiscoverActivityPanelPreferences.persistState(.hidden, for: persistenceUserId)
         fireDiscoverActivityHandleAttentionPulse()
-        recordDiscoverActivityPanelShownIfNeeded()
         FanGeoAnalyticsService.record(
-            eventName: "discover_activity_panel_expanded",
+            eventName: "discover_activity_panel_intro_ready",
             sport: nil,
-            metadata: ["source": postSignupPending ? "postSignupIntro" : "firstDiscoverIntro"],
+            metadata: ["source": postSignupPending ? "postSignupIntro" : "firstDiscoverIntro", "state": "hidden"],
             updateLastActive: false
         )
-        scheduleDiscoverActivityPanelAutoCollapse()
 #if DEBUG
-        print("[DiscoverActivityPanel] introPresented persistence=\(persistenceUserId == nil ? "guest" : "signedIn")")
+        print("[DiscoverActivityPanel] introPresented persistence=\(persistenceUserId == nil ? "guest" : "signedIn") state=hidden")
 #endif
     }
 
@@ -8685,7 +8684,8 @@ struct DiscoverScreen: View {
         if text.contains("soccer") { return "soccerball" }
         if text.contains("basketball") { return "basketball.fill" }
         if text.contains("baseball") || text.contains("softball") { return "baseball.fill" }
-        if text.contains("tennis") || text.contains("pickleball") || text.contains("badminton") { return "figure.tennis" }
+        if text.contains("tennis") || text.contains("pickleball") || text.contains("badminton") || text.contains("padel") { return "figure.tennis" }
+        if text.contains("paragliding") || text.contains("hang_gliding") || text.contains("hang gliding") || text.contains("paramotoring") { return "wind" }
         if text.contains("volleyball") { return "volleyball.fill" }
         if text.contains("dance") || text.contains("breakdance") || text.contains("breaking") || text.contains("ballet") { return "figure.dance" }
         return "sportscourt.fill"

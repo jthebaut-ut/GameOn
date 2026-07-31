@@ -2324,6 +2324,7 @@ nonisolated enum LiveLeagueCountryResolver {
             ("Australia", ["nbl1 central", "nbl1 east", "nbl1 north", "nbl1 south", "nbl1 west"]),
             ("United States", ["mls", "major league soccer", "nba", "mlb", "nhl", "nfl", "wnba", "usl"]),
             ("Mexico", ["liga mx"]),
+            ("Canada", ["cfl", "canadian football", "pwhl"]),
             ("England", ["premier league", "english premier league"]),
             ("France", ["ligue 1", "french ligue 1"]),
             ("Spain", ["la liga", "spanish la liga"]),
@@ -2337,16 +2338,33 @@ nonisolated enum LiveLeagueCountryResolver {
         return nil
     }
 
+    /// Canonical English country name used for filtering/persistence (never localized display).
     static func normalizedCountry(_ raw: String?) -> String? {
         let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !value.isEmpty else { return nil }
 
         let lowercased = value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current).lowercased()
         switch lowercased {
-        case "usa", "us", "u.s.", "u.s.a.", "united states of america":
+        case "usa", "us", "u.s.", "u.s.a.", "united states of america", "united states":
             return "United States"
-        case "uk", "eng", "england":
+        case "ca", "can", "canada":
+            return "Canada"
+        case "mx", "mex", "mexico":
+            return "Mexico"
+        case "uk", "eng", "england", "gb", "gbr", "united kingdom", "great britain", "britain":
             return "England"
+        case "fr", "fra", "france":
+            return "France"
+        case "es", "esp", "spain":
+            return "Spain"
+        case "de", "deu", "germany":
+            return "Germany"
+        case "it", "ita", "italy":
+            return "Italy"
+        case "jp", "jpn", "japan":
+            return "Japan"
+        case "au", "aus", "australia":
+            return "Australia"
         default:
             return value
                 .split(separator: " ")
@@ -2368,21 +2386,115 @@ nonisolated enum LiveLeagueCountryResolver {
     }
 }
 
+/// Authoritative Live/Schedule country filter groups. Members are canonical English names.
+nonisolated enum LiveLeagueCountryFilterGroupID: String, CaseIterable, Sendable {
+    case northAmerica
+    case topEurope
+
+    /// North America = United States + Canada + Mexico (single source of truth).
+    var memberCountries: Set<String> {
+        switch self {
+        case .northAmerica:
+            return ["United States", "Canada", "Mexico"]
+        case .topEurope:
+            return ["England", "France", "Spain", "Germany", "Italy"]
+        }
+    }
+}
+
+/// User selection (groups + individual countries) vs effective expanded filter countries.
+nonisolated struct LiveLeagueCountryFilterSelection: Equatable, Sendable {
+    var groups: Set<String>
+    var countries: Set<String>
+
+    static let empty = LiveLeagueCountryFilterSelection(groups: [], countries: [])
+
+    /// Countries used for Live/Schedule matching.
+    var effectiveCountries: Set<String> {
+        var result = Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+        for raw in groups {
+            guard let id = LiveLeagueCountryFilterGroupID(rawValue: raw) else { continue }
+            result.formUnion(id.memberCountries)
+        }
+        return result
+    }
+
+    var isEmpty: Bool { groups.isEmpty && countries.isEmpty }
+
+    /// Individual countries not already represented by a selected group (for UI chips/summaries).
+    var displayCountries: Set<String> {
+        let covered = Set(
+            groups.compactMap { LiveLeagueCountryFilterGroupID(rawValue: $0)?.memberCountries }
+                .flatMap { $0 }
+        )
+        return Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+            .subtracting(covered)
+    }
+
+    func containsCountryInSelectionOrGroup(_ country: String) -> Bool {
+        guard let normalized = LiveLeagueCountryResolver.normalizedCountry(country) else { return false }
+        return effectiveCountries.contains(normalized)
+    }
+}
+
 nonisolated enum LiveLeagueCountryFilterPreference {
     static let appStorageKey = "liveLeagueCountryFilterSelection.v1"
     /// Marks that first-use location default (or an explicit user change) has been applied.
     static let initializedKey = "liveLeagueCountryFilterInitialized.v2"
 
-    static func decode(from raw: String) -> Set<String> {
-        Set(
-            raw.split(separator: "\n")
-                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+    private static let formatVersionMarker = "#v3"
+
+    static func decodeSelection(from raw: String) -> LiveLeagueCountryFilterSelection {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .empty }
+
+        if trimmed.hasPrefix(formatVersionMarker) {
+            var groups: Set<String> = []
+            var countries: Set<String> = []
+            for line in trimmed.split(separator: "\n").dropFirst() {
+                let item = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
+                if item.hasPrefix("G:") {
+                    let id = String(item.dropFirst(2))
+                    if LiveLeagueCountryFilterGroupID(rawValue: id) != nil {
+                        groups.insert(id)
+                    }
+                } else if item.hasPrefix("C:") {
+                    if let normalized = LiveLeagueCountryResolver.normalizedCountry(String(item.dropFirst(2))) {
+                        countries.insert(normalized)
+                    }
+                }
+            }
+            return LiveLeagueCountryFilterSelection(groups: groups, countries: countries)
+        }
+
+        // Legacy flat country list → reconstruct groups only when a full preset is present.
+        let legacy = Set(
+            trimmed.split(separator: "\n")
+                .compactMap { LiveLeagueCountryResolver.normalizedCountry(String($0)) }
         )
+        return migrateLegacyCountrySet(legacy)
     }
 
+    /// Backward-compatible: effective countries for filtering.
+    static func decode(from raw: String) -> Set<String> {
+        decodeSelection(from: raw).effectiveCountries
+    }
+
+    static func encode(_ selection: LiveLeagueCountryFilterSelection) -> String {
+        var lines = [formatVersionMarker]
+        for id in LiveLeagueCountryFilterGroupID.allCases where selection.groups.contains(id.rawValue) {
+            lines.append("G:\(id.rawValue)")
+        }
+        for country in selection.countries.sorted() {
+            lines.append("C:\(country)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Legacy helper — encodes a flat country set as individual countries (no groups).
     static func encode(_ countries: Set<String>) -> String {
-        countries.sorted().joined(separator: "\n")
+        let normalized = Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+        return encode(LiveLeagueCountryFilterSelection(groups: [], countries: normalized))
     }
 
     static var isInitialized: Bool {
@@ -2393,8 +2505,7 @@ nonisolated enum LiveLeagueCountryFilterPreference {
         UserDefaults.standard.set(true, forKey: initializedKey)
     }
 
-    /// First-use only: seed from resolved country when the user has never set an explicit choice.
-    /// Returns a new encoded value when the default should be written; otherwise `nil`.
+    /// First-use only: North America + current country when outside North America.
     static func firstUseDefaultEncodedSelection(
         currentRaw: String,
         resolvedCountry: String?
@@ -2402,22 +2513,38 @@ nonisolated enum LiveLeagueCountryFilterPreference {
         guard !isInitialized else { return nil }
         markInitialized()
 
-        let existing = decode(from: currentRaw)
+        let existing = decodeSelection(from: currentRaw)
         guard existing.isEmpty else { return nil }
-        guard let country = resolvedCountry else { return nil }
 
-        if LiveLeagueCountryFilterPresentation.northAmericaPreset.contains(country) {
-            return encode(LiveLeagueCountryFilterPresentation.northAmericaPreset)
+        var selection = LiveLeagueCountryFilterSelection(
+            groups: [LiveLeagueCountryFilterGroupID.northAmerica.rawValue],
+            countries: []
+        )
+        if let country = LiveLeagueCountryResolver.normalizedCountry(resolvedCountry),
+           !LiveLeagueCountryFilterGroupID.northAmerica.memberCountries.contains(country) {
+            selection.countries.insert(country)
         }
-        return encode([country])
+        return encode(selection)
+    }
+
+    /// Safe migration: only promote a full preset membership to a group selection.
+    private static func migrateLegacyCountrySet(_ countries: Set<String>) -> LiveLeagueCountryFilterSelection {
+        var groups: Set<String> = []
+        var individuals = countries
+        for id in LiveLeagueCountryFilterGroupID.allCases {
+            if id.memberCountries.isSubset(of: countries) {
+                groups.insert(id.rawValue)
+                individuals.subtract(id.memberCountries)
+            }
+        }
+        return LiveLeagueCountryFilterSelection(groups: groups, countries: individuals)
     }
 }
 
-/// Shared Live / Schedule presentation helpers for country filter labels and “Near you” suggestions.
-/// Does not change filter semantics or persistence keys.
+/// Shared Live / Schedule presentation helpers for country filter labels and selection toggles.
 enum LiveLeagueCountryFilterPresentation {
-    nonisolated static let northAmericaPreset: Set<String> = ["United States", "Canada", "Mexico"]
-    nonisolated static let topEuropePreset: Set<String> = ["England", "France", "Spain", "Germany", "Italy"]
+    nonisolated static let northAmericaPreset: Set<String> = LiveLeagueCountryFilterGroupID.northAmerica.memberCountries
+    nonisolated static let topEuropePreset: Set<String> = LiveLeagueCountryFilterGroupID.topEurope.memberCountries
 
     enum PresetSelectionState: Equatable {
         case none
@@ -2426,75 +2553,134 @@ enum LiveLeagueCountryFilterPresentation {
     }
 
     /// Live Now header place presentation (Option 3).
-    /// - `inline`: single country or exact named region → embed in title.
-    /// - `summary`: multi-country compact line → secondary filter line.
     enum LiveHeaderPlaceMode: Equatable {
         case none
         case inline(String)
         case summary(String)
     }
 
-    /// Localized place label for legacy single-line consumers.
-    /// Multi-country selections resolve to the generic “selected countries” phrase.
-    /// Schedule/Live headers use ``liveHeaderPlaceMode(for:languageCode:)`` instead.
-    static func placeLabel(for selected: Set<String>, languageCode: String) -> String? {
-        guard !selected.isEmpty else { return nil }
-        if selected.count == 1, let only = selected.first {
-            return only
-        }
-        if selected == northAmericaPreset {
+    static func localizedCountryDisplayName(_ canonical: String, languageCode: String) -> String {
+        let trimmed = canonical.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return L10n.t(trimmed, languageCode: languageCode)
+    }
+
+    static func localizedGroupDisplayName(_ groupID: LiveLeagueCountryFilterGroupID, languageCode: String) -> String {
+        switch groupID {
+        case .northAmerica:
             return L10n.t("live_region_north_america", languageCode: languageCode)
-        }
-        if selected == topEuropePreset {
+        case .topEurope:
             return L10n.t("live_region_europe", languageCode: languageCode)
         }
+    }
+
+    /// Display labels for the user's selections (groups + uncovered individual countries).
+    static func selectionDisplayLabels(
+        for selection: LiveLeagueCountryFilterSelection,
+        languageCode: String
+    ) -> [String] {
+        var labels: [String] = []
+        for id in LiveLeagueCountryFilterGroupID.allCases where selection.groups.contains(id.rawValue) {
+            labels.append(localizedGroupDisplayName(id, languageCode: languageCode))
+        }
+        for country in selection.displayCountries.sorted() {
+            labels.append(localizedCountryDisplayName(country, languageCode: languageCode))
+        }
+        return labels
+    }
+
+    static func placeLabel(for selection: LiveLeagueCountryFilterSelection, languageCode: String) -> String? {
+        let labels = selectionDisplayLabels(for: selection, languageCode: languageCode)
+        guard !labels.isEmpty else { return nil }
+        if labels.count == 1 { return labels[0] }
         return L10n.t("live_selected_countries", languageCode: languageCode)
     }
 
-    /// Live-only Option 3 place mode: keep elegant single-place titles; use a compact summary for multi-select.
-    static func liveHeaderPlaceMode(for selected: Set<String>, languageCode: String) -> LiveHeaderPlaceMode {
-        guard !selected.isEmpty else { return .none }
-        if selected.count == 1, let only = selected.first {
-            return .inline(only)
-        }
-        if selected == northAmericaPreset {
-            return .inline(L10n.t("live_region_north_america", languageCode: languageCode))
-        }
-        if selected == topEuropePreset {
-            return .inline(L10n.t("live_region_europe", languageCode: languageCode))
-        }
-        return .summary(multiCountrySummaryLine(for: selected, languageCode: languageCode))
+    /// Legacy entry point using effective/flat countries — prefer ``liveHeaderPlaceMode(for:languageCode:)`` with selection.
+    static func placeLabel(for selected: Set<String>, languageCode: String) -> String? {
+        placeLabel(
+            for: LiveLeagueCountryFilterPreference.migrateDisplayFallback(selected),
+            languageCode: languageCode
+        )
     }
 
-    /// Canonical sorted display for multi-country Live filter line.
-    /// 2–3 countries: `A • B • C`. 4+: `First +N more`.
+    static func liveHeaderPlaceMode(
+        for selection: LiveLeagueCountryFilterSelection,
+        languageCode: String
+    ) -> LiveHeaderPlaceMode {
+        let labels = selectionDisplayLabels(for: selection, languageCode: languageCode)
+        guard !labels.isEmpty else { return .none }
+        if labels.count == 1 {
+            return .inline(labels[0])
+        }
+        return .summary(multiCountrySummaryLine(labels: labels, languageCode: languageCode))
+    }
+
+    /// Backward-compatible header mode from a flat country set (treats exact presets as groups).
+    static func liveHeaderPlaceMode(for selected: Set<String>, languageCode: String) -> LiveHeaderPlaceMode {
+        liveHeaderPlaceMode(
+            for: LiveLeagueCountryFilterPreferenceDecodeCompat.selectionForDisplay(from: selected),
+            languageCode: languageCode
+        )
+    }
+
+    static func multiCountrySummaryLine(for selection: LiveLeagueCountryFilterSelection, languageCode: String) -> String {
+        multiCountrySummaryLine(
+            labels: selectionDisplayLabels(for: selection, languageCode: languageCode),
+            languageCode: languageCode
+        )
+    }
+
     static func multiCountrySummaryLine(for selected: Set<String>, languageCode: String) -> String {
-        let ordered = selected.sorted()
-        guard !ordered.isEmpty else { return "" }
-        if ordered.count <= 3 {
-            return ordered.joined(separator: " • ")
+        multiCountrySummaryLine(
+            for: LiveLeagueCountryFilterPreferenceDecodeCompat.selectionForDisplay(from: selected),
+            languageCode: languageCode
+        )
+    }
+
+    private static func multiCountrySummaryLine(labels: [String], languageCode: String) -> String {
+        guard !labels.isEmpty else { return "" }
+        if labels.count <= 3 {
+            return labels.joined(separator: " • ")
         }
         return String(
             format: L10n.t("live_country_summary_plus_more_format", languageCode: languageCode),
             locale: Locale(identifier: languageCode),
-            ordered[0],
-            ordered.count - 1
+            labels[0],
+            labels.count - 1
         )
     }
 
-    /// Spoken accessibility phrase for multi-country selections (no bullet separators).
-    static func multiCountryAccessibilitySummary(for selected: Set<String>, languageCode: String) -> String {
-        let ordered = selected.sorted()
-        guard !ordered.isEmpty else { return "" }
-        if ordered.count <= 3 {
-            return ListFormatter.localizedString(byJoining: ordered)
+    static func multiCountryAccessibilitySummary(for selection: LiveLeagueCountryFilterSelection, languageCode: String) -> String {
+        let labels = selectionDisplayLabels(for: selection, languageCode: languageCode)
+        guard !labels.isEmpty else { return "" }
+        if labels.count <= 3 {
+            return ListFormatter.localizedString(byJoining: labels)
         }
         return String(
             format: L10n.t("live_country_a11y_plus_more_format", languageCode: languageCode),
             locale: Locale(identifier: languageCode),
-            ordered[0],
-            ordered.count - 1
+            labels[0],
+            labels.count - 1
         )
+    }
+
+    static func multiCountryAccessibilitySummary(for selected: Set<String>, languageCode: String) -> String {
+        multiCountryAccessibilitySummary(
+            for: LiveLeagueCountryFilterPreferenceDecodeCompat.selectionForDisplay(from: selected),
+            languageCode: languageCode
+        )
+    }
+
+    static func presetSelectionState(
+        _ groupID: LiveLeagueCountryFilterGroupID,
+        in selection: LiveLeagueCountryFilterSelection
+    ) -> PresetSelectionState {
+        if selection.groups.contains(groupID.rawValue) { return .full }
+        let overlap = selection.countries.intersection(groupID.memberCountries)
+        if overlap.isEmpty { return .none }
+        if overlap == groupID.memberCountries { return .full }
+        return .partial
     }
 
     static func presetSelectionState(_ preset: Set<String>, in selected: Set<String>) -> PresetSelectionState {
@@ -2504,7 +2690,6 @@ enum LiveLeagueCountryFilterPresentation {
         return .partial
     }
 
-    /// Toggle a single country in the canonical selected set (additive multi-select).
     static func toggling(_ country: String, in selected: Set<String>) -> Set<String> {
         var next = selected
         if next.contains(country) {
@@ -2515,7 +2700,50 @@ enum LiveLeagueCountryFilterPresentation {
         return next
     }
 
-    /// Add or remove an entire regional preset without clearing unrelated countries.
+    static func togglingCountry(
+        _ country: String,
+        in selection: LiveLeagueCountryFilterSelection
+    ) -> LiveLeagueCountryFilterSelection {
+        guard let normalized = LiveLeagueCountryResolver.normalizedCountry(country) else { return selection }
+        var next = selection
+        let coveringGroups = LiveLeagueCountryFilterGroupID.allCases.filter {
+            next.groups.contains($0.rawValue) && $0.memberCountries.contains(normalized)
+        }
+        let inIndividuals = next.countries.contains(normalized)
+
+        if inIndividuals && coveringGroups.isEmpty {
+            next.countries.remove(normalized)
+            return next
+        }
+
+        if !coveringGroups.isEmpty {
+            // Deselect a country currently covered by a group without destroying other members.
+            next.countries.remove(normalized)
+            for group in coveringGroups {
+                next.groups.remove(group.rawValue)
+                next.countries.formUnion(group.memberCountries.subtracting([normalized]))
+            }
+            return next
+        }
+
+        next.countries.insert(normalized)
+        return next
+    }
+
+    static func togglingGroup(
+        _ groupID: LiveLeagueCountryFilterGroupID,
+        in selection: LiveLeagueCountryFilterSelection
+    ) -> LiveLeagueCountryFilterSelection {
+        var next = selection
+        if next.groups.contains(groupID.rawValue) {
+            // Removing the group keeps any independently selected member countries.
+            next.groups.remove(groupID.rawValue)
+        } else {
+            next.groups.insert(groupID.rawValue)
+        }
+        return next
+    }
+
     static func togglingPreset(_ preset: Set<String>, in selected: Set<String>) -> Set<String> {
         var next = selected
         if preset.isSubset(of: next) {
@@ -2526,24 +2754,34 @@ enum LiveLeagueCountryFilterPresentation {
         return next
     }
 
-    /// Resolve a country suggestion for the picker without prompting for location or reverse-geocoding.
-    /// Prefer in-memory device country when provided; otherwise profile/home country, then locale region.
+    /// Resolve current country for first-use defaults. Does **not** use hometown/profile.
+    static func resolveCurrentCountryForFilterDefault(
+        locationCountry: String? = nil,
+        localeRegionCode: String? = nil
+    ) -> String? {
+        if let fromLocation = canonicalFilterCountry(locationCountry) {
+            return fromLocation
+        }
+        if let fromLocale = countryName(forRegionCode: localeRegionCode ?? deviceLocaleRegionCode()) {
+            return fromLocale
+        }
+        return nil
+    }
+
+    /// Near-you picker suggestion. Prefer live location country; never hometown.
     static func suggestedNearYouCountry(
         deviceCountryInMemory: String? = nil,
-        homeCountry: String?,
+        homeCountry: String? = nil,
         homeRegion: String? = nil,
         localeRegionCode: String? = nil
     ) -> String? {
         if let fromDevice = canonicalFilterCountry(deviceCountryInMemory) {
             return fromDevice
         }
-        if let fromHome = canonicalFilterCountry(homeCountry) {
-            return fromHome
-        }
-        if let fromRegion = unitedStatesIfUSSubdivision(homeRegion) {
-            return fromRegion
-        }
-        if let fromLocale = countryName(forRegionCode: localeRegionCode) {
+        // Intentionally ignore homeCountry / homeRegion for filter defaults (hometown ≠ current country).
+        _ = homeCountry
+        _ = homeRegion
+        if let fromLocale = countryName(forRegionCode: localeRegionCode ?? deviceLocaleRegionCode()) {
             return fromLocale
         }
         return nil
@@ -2554,16 +2792,29 @@ enum LiveLeagueCountryFilterPresentation {
         return code.isEmpty ? nil : code
     }
 
+    static func countryName(forRegionCode code: String?) -> String? {
+        let trimmed = code?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+        guard !trimmed.isEmpty else { return nil }
+        switch trimmed {
+        case "US", "USA":
+            return "United States"
+        case "CA", "CAN":
+            return "Canada"
+        case "MX", "MEX":
+            return "Mexico"
+        case "GB", "UK":
+            return "England"
+        default:
+            let english = Locale(identifier: "en_US").localizedString(forRegionCode: trimmed)
+            return canonicalFilterCountry(english)
+        }
+    }
+
     private static func canonicalFilterCountry(_ raw: String?) -> String? {
         guard let normalized = LiveLeagueCountryResolver.normalizedCountry(raw) else { return nil }
         if let us = unitedStatesIfUSSubdivision(normalized) {
             return us
         }
-        let lower = normalized.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current).lowercased()
-        if lower == "united kingdom" || lower == "great britain" || lower == "britain" {
-            return "England"
-        }
-        // Prefer catalog / preset names so the suggestion matches the filter list.
         if LiveLeagueCountryResolver.presetCountries.contains(normalized) {
             return normalized
         }
@@ -2571,20 +2822,6 @@ enum LiveLeagueCountryFilterPresentation {
             return normalized
         }
         return nil
-    }
-
-    private static func countryName(forRegionCode code: String?) -> String? {
-        let trimmed = code?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
-        guard !trimmed.isEmpty else { return nil }
-        switch trimmed {
-        case "US", "USA":
-            return "United States"
-        case "GB", "UK":
-            return "England"
-        default:
-            let english = Locale(identifier: "en_US").localizedString(forRegionCode: trimmed)
-            return canonicalFilterCountry(english)
-        }
     }
 
     private static func unitedStatesIfUSSubdivision(_ raw: String?) -> String? {
@@ -2611,6 +2848,19 @@ enum LiveLeagueCountryFilterPresentation {
         "rhode island", "south carolina", "south dakota", "tennessee", "texas", "utah", "vermont",
         "virginia", "washington", "west virginia", "wisconsin", "wyoming", "district of columbia"
     ]
+}
+
+/// Display fallback when only a flat country set is available.
+private enum LiveLeagueCountryFilterPreferenceDecodeCompat {
+    static func selectionForDisplay(from selected: Set<String>) -> LiveLeagueCountryFilterSelection {
+        LiveLeagueCountryFilterPreference.migrateDisplayFallback(selected)
+    }
+}
+
+extension LiveLeagueCountryFilterPreference {
+    fileprivate static func migrateDisplayFallback(_ countries: Set<String>) -> LiveLeagueCountryFilterSelection {
+        migrateLegacyCountrySet(Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) }))
+    }
 }
 
 nonisolated struct FeaturedEvent: Identifiable, Equatable, Codable, Sendable {
@@ -2875,8 +3125,10 @@ nonisolated enum LiveMatchFilters {
 
     static func matchesLeagueCountry(_ match: LiveMatch, selectedCountries: Set<String>) -> Bool {
         guard !selectedCountries.isEmpty else { return true }
-        guard let country = match.leagueCountry else { return false }
-        return selectedCountries.contains(country)
+        guard let raw = match.leagueCountry,
+              let country = LiveLeagueCountryResolver.normalizedCountry(raw) else { return false }
+        let normalizedSelected = Set(selectedCountries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+        return normalizedSelected.contains(country)
     }
 
     static func matchesFeaturedEvent(

@@ -270,15 +270,18 @@ private struct FanGeoAdConsentPrePromptView: View {
     let isPreparingPrivacySettings: Bool
     let onContinue: () -> Void
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(alignment: .leading, spacing: 10) {
-                Text("Help Keep FanGeo Free")
+                Text(L10n.t("Help Keep FanGeo Free", languageCode: languageCode))
                     .font(.system(size: 28, weight: .black, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
-                Text(preConsentBody)
+                Text(L10n.t("ad_consent_pre_prompt_body", languageCode: languageCode))
                     .font(.body.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -288,7 +291,7 @@ private struct FanGeoAdConsentPrePromptView: View {
                 HStack(spacing: 10) {
                     ProgressView()
                         .controlSize(.regular)
-                    Text("Preparing privacy settings…")
+                    Text(L10n.t("Preparing privacy settings…", languageCode: languageCode))
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                 }
@@ -298,7 +301,7 @@ private struct FanGeoAdConsentPrePromptView: View {
             }
 
             Button(action: onContinue) {
-                Text("Continue")
+                Text(L10n.t("Continue", languageCode: languageCode))
                     .font(.headline.weight(.bold))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
@@ -313,17 +316,5 @@ private struct FanGeoAdConsentPrePromptView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .background(FGAdaptiveSurface.sheetRoot.ignoresSafeArea())
-    }
-
-    private var preConsentBody: String {
-        """
-        FanGeo uses advertising to support:
-        • Venue discovery
-        • Pickup games
-        • Community sports places
-        • Fan chat and social features
-
-        You can choose personalized ads, or continue with non-personalized or limited ads where available.
-        """
     }
 }

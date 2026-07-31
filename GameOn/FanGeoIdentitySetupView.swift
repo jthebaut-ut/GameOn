@@ -32,7 +32,7 @@ struct FanGeoIdentitySetupView: View {
     @State private var handleIsConfirmedAvailable = false
     @State private var availabilityTask: Task<Void, Never>?
 
-    private static let defaultFanBio = "I am a FanGeo Fan."
+    private static let defaultFanBio = FanProfileDefaults.canonicalDefaultBio
     private static let displayNameMaxLength = 40
     private static let bioCharacterLimit = 160
 

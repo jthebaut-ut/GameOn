@@ -428,20 +428,35 @@ struct LiveScreen: View {
         }
     }
 
+    private var liveLeagueCountryFilterSelection: LiveLeagueCountryFilterSelection {
+        LiveLeagueCountryFilterPreference.decodeSelection(from: liveLeagueCountryFilterRaw)
+    }
+
     private var selectedLiveLeagueCountries: Set<String> {
-        LiveLeagueCountryFilterPreference.decode(from: liveLeagueCountryFilterRaw)
+        liveLeagueCountryFilterSelection.effectiveCountries
     }
 
     private var liveLeagueCountryFilterCount: Int {
-        selectedLiveLeagueCountries.count
+        let selection = liveLeagueCountryFilterSelection
+        return selection.groups.count + selection.displayCountries.count
     }
 
     private var liveLeagueCountryFilterIsActive: Bool {
-        !selectedLiveLeagueCountries.isEmpty
+        !liveLeagueCountryFilterSelection.isEmpty
     }
 
     private var liveLeagueCountryChipTitle: String {
-        liveLeagueCountryFilterCount == 0 ? "Countries" : "Countries \(liveLeagueCountryFilterCount)"
+        let languageCode = liveNowLanguageCode
+        let count = liveLeagueCountryFilterCount
+        if count == 0 {
+            return L10n.t("Countries", languageCode: languageCode)
+        }
+        let key = count == 1 ? "countries_chip_count_one_format" : "countries_chip_count_other_format"
+        return String(
+            format: L10n.t(key, languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            Int64(count)
+        )
     }
 
     private var liveNowLanguageCode: String {
@@ -450,15 +465,14 @@ struct LiveScreen: View {
 
     private var liveHeaderPlaceMode: LiveLeagueCountryFilterPresentation.LiveHeaderPlaceMode {
         LiveLeagueCountryFilterPresentation.liveHeaderPlaceMode(
-            for: selectedLiveLeagueCountries,
+            for: liveLeagueCountryFilterSelection,
             languageCode: liveNowLanguageCode
         )
     }
 
     private var liveNearYouSuggestedCountry: String? {
         LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
-            homeCountry: viewModel.currentUserHomeCountry,
-            homeRegion: viewModel.currentUserHomeRegion,
+            deviceCountryInMemory: nil,
             localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
         )
     }
@@ -547,7 +561,7 @@ struct LiveScreen: View {
             )
         case .summary:
             let spokenPlaces = LiveLeagueCountryFilterPresentation.multiCountryAccessibilitySummary(
-                for: selectedLiveLeagueCountries,
+                for: liveLeagueCountryFilterSelection,
                 languageCode: languageCode
             )
             return String(
@@ -590,17 +604,52 @@ struct LiveScreen: View {
         LiveLeagueCountryFilterPreference.markInitialized()
     }
 
+    private func updateLiveLeagueCountryFilterSelection(_ selection: LiveLeagueCountryFilterSelection) {
+        liveLeagueCountryFilterRaw = LiveLeagueCountryFilterPreference.encode(selection)
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
     private func applyLiveLeagueCountryFilterFirstUseDefaultIfNeeded() {
-        let resolved = LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
-            homeCountry: viewModel.currentUserHomeCountry,
-            homeRegion: viewModel.currentUserHomeRegion,
-            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
-        )
+        Task { @MainActor in
+            await applyLiveLeagueCountryFilterFirstUseDefaultAsync()
+        }
+    }
+
+    private func applyLiveLeagueCountryFilterFirstUseDefaultAsync() async {
+        guard !LiveLeagueCountryFilterPreference.isInitialized else { return }
+        let existing = LiveLeagueCountryFilterPreference.decodeSelection(from: liveLeagueCountryFilterRaw)
+        guard existing.isEmpty else {
+            LiveLeagueCountryFilterPreference.markInitialized()
+            return
+        }
+
+        let resolved = await resolveLiveFilterCurrentCountry()
         guard let encoded = LiveLeagueCountryFilterPreference.firstUseDefaultEncodedSelection(
             currentRaw: liveLeagueCountryFilterRaw,
             resolvedCountry: resolved
         ) else { return }
         liveLeagueCountryFilterRaw = encoded
+    }
+
+    /// Current country for first-use defaults: GPS reverse-geocode → locale region. Never hometown.
+    private func resolveLiveFilterCurrentCountry() async -> String? {
+        if let coordinate = viewModel.currentUserLocation,
+           let fromLocation = await liveFilterCountryName(from: coordinate) {
+            return fromLocation
+        }
+        if await viewModel.refreshCurrentUserLocationIfAuthorized(timeoutSeconds: 3),
+           let coordinate = viewModel.currentUserLocation,
+           let fromLocation = await liveFilterCountryName(from: coordinate) {
+            return fromLocation
+        }
+        return LiveLeagueCountryFilterPresentation.resolveCurrentCountryForFilterDefault(
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+    }
+
+    private func liveFilterCountryName(from coordinate: CLLocationCoordinate2D) async -> String? {
+        let result = await viewModel.reverseGeocodeBusinessVenueLocation(for: coordinate)
+        return LiveLeagueCountryFilterPresentation.countryName(forRegionCode: result.countryCode)
     }
 
     private func liveMatchesFilteredBySelectedCountries(_ matches: [LiveMatch]) -> [LiveMatch] {
@@ -1046,12 +1095,18 @@ struct LiveScreen: View {
         showFriendsChip: Bool,
         scrollToSection: @escaping (LiveScrollSection) -> Void
     ) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+        let languageCode = liveNowLanguageCode
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 10) {
                 Button {
                     scrollToSection(.liveGames)
                 } label: {
-                    liveSummaryChip(title: "Live now", count: liveNowCount, accent: FGColor.dangerRed, icon: "dot.radiowaves.left.and.right")
+                    liveSummaryChip(
+                        title: L10n.t("Live now", languageCode: languageCode),
+                        count: liveNowCount,
+                        accent: FGColor.dangerRed,
+                        icon: "dot.radiowaves.left.and.right"
+                    )
                 }
                 .buttonStyle(LiveSummaryChipButtonStyle())
 
@@ -1059,7 +1114,12 @@ struct LiveScreen: View {
                     Button {
                         scrollToSection(.today)
                     } label: {
-                        liveSummaryChip(title: "Today", count: todayCount, accent: FGColor.accentGreen, icon: "calendar")
+                        liveSummaryChip(
+                            title: L10n.t("Today", languageCode: languageCode),
+                            count: todayCount,
+                            accent: FGColor.accentGreen,
+                            icon: "calendar"
+                        )
                     }
                     .buttonStyle(LiveSummaryChipButtonStyle())
                 }
@@ -1068,7 +1128,12 @@ struct LiveScreen: View {
                     Button {
                         scrollToSection(.friends)
                     } label: {
-                        liveSummaryChip(title: "Friends", count: friendsCount, accent: FGColor.accentBlue, icon: "person.2.fill")
+                        liveSummaryChip(
+                            title: L10n.t("Friends", languageCode: languageCode),
+                            count: friendsCount,
+                            accent: FGColor.accentBlue,
+                            icon: "person.2.fill"
+                        )
                     }
                     .buttonStyle(LiveSummaryChipButtonStyle())
                 }
@@ -1076,7 +1141,12 @@ struct LiveScreen: View {
                 Button {
                     scrollToSection(.crowdBuilding)
                 } label: {
-                    liveSummaryChip(title: "Crowd", count: crowdCount, accent: liveCrowdSummaryAccent, icon: "flame.fill")
+                    liveSummaryChip(
+                        title: L10n.t("Crowd", languageCode: languageCode),
+                        count: crowdCount,
+                        accent: liveCrowdSummaryAccent,
+                        icon: "flame.fill"
+                    )
                 }
                 .buttonStyle(LiveSummaryChipButtonStyle())
             }
@@ -1087,14 +1157,19 @@ struct LiveScreen: View {
     }
 
     private func liveSummaryChip(title: String, count: Int, accent: Color, icon: String) -> some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: icon)
                 .font(.caption.weight(.bold))
                 .foregroundStyle(accent)
+                .padding(.top, 1)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text("\(count)")
                     .font(.system(size: 17, weight: .bold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
@@ -1457,7 +1532,7 @@ struct LiveScreen: View {
             return "No \(selectedLiveFeaturedEvent.emptyStateTitle) matches scheduled for today."
         }
         if liveLeagueCountryFilterIsActive {
-            return "No live games for selected countries right now"
+            return L10n.t("No live games for selected countries right now", languageCode: liveNowLanguageCode)
         }
         if let liveGamesSportFilter {
             return "No live \(liveGamesSportFilter.filterChipLabel) games right now"
@@ -1470,6 +1545,7 @@ struct LiveScreen: View {
             HStack(spacing: 10) {
                 SportFilterChip(
                     sport: "All",
+                    displayTitle: L10n.t("All", languageCode: liveNowLanguageCode),
                     isSelected: liveGamesSportFilter == nil && selectedLiveFeaturedEvent == nil,
                     preferSystemSymbol: true
                 ) {
@@ -1577,7 +1653,14 @@ struct LiveScreen: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(liveLeagueCountryFilterCount == 0 ? "Countries" : "Countries, \(liveLeagueCountryFilterCount) selected")
+        .accessibilityLabel(liveLeagueCountryFilterCount == 0
+            ? L10n.t("Countries", languageCode: liveNowLanguageCode)
+            : String(
+                format: L10n.t("Countries, %lld selected", languageCode: liveNowLanguageCode),
+                locale: Locale(identifier: liveNowLanguageCode),
+                Int64(liveLeagueCountryFilterCount)
+            )
+        )
     }
 
     private var favoriteTeams: [FavoriteTeam] {
@@ -3753,9 +3836,9 @@ struct LiveScreen: View {
             LiveLeagueCountryFilterSheet(
                 countries: liveLeagueCountryOptions,
                 suggestedNearYouCountry: liveNearYouSuggestedCountry,
-                selectedCountries: Binding(
-                    get: { selectedLiveLeagueCountries },
-                    set: { updateSelectedLiveLeagueCountries($0) }
+                selection: Binding(
+                    get: { liveLeagueCountryFilterSelection },
+                    set: { updateLiveLeagueCountryFilterSelection($0) }
                 )
             )
         case .fanUpdates(let event):
@@ -4096,6 +4179,9 @@ private struct FavoriteTeamsLiveSection: View {
     let onWatchNearby: (LiveScreen.FavoriteTeamLiveItem) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var languageCode: String { L10n.normalizedLanguageCode(appLanguageRaw) }
 
     private var headerAccent: Color {
         Color(red: 0.96, green: 0.78, blue: 0.18)
@@ -4111,10 +4197,10 @@ private struct FavoriteTeamsLiveSection: View {
                 sectionHeaderIcon
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Your Teams Live")
+                    Text(L10n.t("Your Teams Live", languageCode: languageCode))
                         .font(.system(size: 20, weight: .bold, design: .rounded))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
-                    Text("Favorite teams with live, nearby, and social momentum.")
+                    Text(L10n.t("Favorite teams with live, nearby, and social momentum.", languageCode: languageCode))
                         .font(FGTypography.caption)
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .fixedSize(horizontal: false, vertical: true)
@@ -4125,8 +4211,8 @@ private struct FavoriteTeamsLiveSection: View {
             if items.isEmpty {
                 Text(
                     hasFavoriteTeams
-                        ? "No favorite teams live right now"
-                        : "Favorite your teams to personalize Live."
+                        ? L10n.t("No favorite teams live right now", languageCode: languageCode)
+                        : L10n.t("Favorite your teams to personalize Live.", languageCode: languageCode)
                 )
                     .font(FGTypography.caption)
                     .foregroundStyle(FGColor.mutedText(colorScheme))
@@ -4650,7 +4736,7 @@ struct LiveMatchDetailSheet: View {
 private struct LiveLeagueCountryFilterSheet: View {
     let countries: [String]
     let suggestedNearYouCountry: String?
-    @Binding var selectedCountries: Set<String>
+    @Binding var selection: LiveLeagueCountryFilterSelection
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -4663,10 +4749,10 @@ private struct LiveLeagueCountryFilterSheet: View {
             List {
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Live Countries")
+                        Text(L10n.t("Live Countries", languageCode: languageCode))
                             .font(FGTypography.sectionTitle)
                             .foregroundStyle(FGColor.primaryText(colorScheme))
-                        Text("Choose which league countries appear in your Live feed.")
+                        Text(L10n.t("Choose which league countries appear in your Live feed.", languageCode: languageCode))
                             .font(FGTypography.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                     }
@@ -4675,19 +4761,24 @@ private struct LiveLeagueCountryFilterSheet: View {
 
                 if let nearYou = suggestedNearYouCountry {
                     Section {
+                        let nearYouDisplay = LiveLeagueCountryFilterPresentation.localizedCountryDisplayName(
+                            nearYou,
+                            languageCode: languageCode
+                        )
+                        let isSelected = selection.containsCountryInSelectionOrGroup(nearYou)
                         countryRow(
-                            title: nearYou,
+                            title: nearYouDisplay,
                             subtitle: L10n.t("near_you", languageCode: languageCode),
                             flag: CountryFlagHelper.flag(for: nearYou),
-                            isSelected: selectedCountries.contains(nearYou),
+                            isSelected: isSelected,
                             accessibilityLabel: String(
                                 format: L10n.t("near_you_country_a11y_format", languageCode: languageCode),
                                 locale: Locale(identifier: languageCode),
-                                nearYou
+                                nearYouDisplay
                             ),
-                            accessibilityHint: countryToggleHint(isSelected: selectedCountries.contains(nearYou))
+                            accessibilityHint: countryToggleHint(isSelected: isSelected)
                         ) {
-                            applySelection(LiveLeagueCountryFilterPresentation.toggling(nearYou, in: selectedCountries))
+                            applySelection(LiveLeagueCountryFilterPresentation.togglingCountry(nearYou, in: selection))
                         }
                     }
                 }
@@ -4697,47 +4788,58 @@ private struct LiveLeagueCountryFilterSheet: View {
                         title: L10n.t("country_filter_select_all", languageCode: languageCode),
                         accessibilityHint: L10n.t("country_filter_select_all_a11y_hint", languageCode: languageCode)
                     ) {
-                        applySelection(Set(countries))
+                        applySelection(
+                            LiveLeagueCountryFilterSelection(
+                                groups: [],
+                                countries: Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+                            )
+                        )
                     }
                     quickAction(
                         title: L10n.t("country_filter_clear", languageCode: languageCode),
                         accessibilityHint: L10n.t("country_filter_clear_a11y_hint", languageCode: languageCode)
                     ) {
-                        applySelection([])
+                        applySelection(.empty)
                     }
                     presetRow(
                         title: L10n.t("live_region_north_america", languageCode: languageCode),
-                        preset: LiveLeagueCountryFilterPresentation.northAmericaPreset,
+                        groupID: .northAmerica,
                         accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
                     )
                     presetRow(
                         title: L10n.t("country_filter_top_european", languageCode: languageCode),
-                        preset: LiveLeagueCountryFilterPresentation.topEuropePreset,
+                        groupID: .topEurope,
                         accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
                     )
                 }
 
-                Section("Countries") {
+                Section {
                     ForEach(countries, id: \.self) { country in
-                        let isSelected = selectedCountries.contains(country)
+                        let isSelected = selection.containsCountryInSelectionOrGroup(country)
+                        let displayName = LiveLeagueCountryFilterPresentation.localizedCountryDisplayName(
+                            country,
+                            languageCode: languageCode
+                        )
                         countryRow(
-                            title: country,
+                            title: displayName,
                             subtitle: nil,
                             flag: nil,
                             isSelected: isSelected,
-                            accessibilityLabel: country,
+                            accessibilityLabel: displayName,
                             accessibilityHint: countryToggleHint(isSelected: isSelected)
                         ) {
-                            applySelection(LiveLeagueCountryFilterPresentation.toggling(country, in: selectedCountries))
+                            applySelection(LiveLeagueCountryFilterPresentation.togglingCountry(country, in: selection))
                         }
                     }
+                } header: {
+                    Text(L10n.t("Countries", languageCode: languageCode))
                 }
             }
-            .navigationTitle("Live Countries")
+            .navigationTitle(L10n.t("Live Countries", languageCode: languageCode))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
+                    Button(L10n.t("Close", languageCode: languageCode)) {
                         dismiss()
                     }
                     .fontWeight(.semibold)
@@ -4746,8 +4848,8 @@ private struct LiveLeagueCountryFilterSheet: View {
         }
     }
 
-    private func applySelection(_ next: Set<String>) {
-        selectedCountries = next
+    private func applySelection(_ next: LiveLeagueCountryFilterSelection) {
+        selection = next
         LiveLeagueCountryFilterPreference.markInitialized()
     }
 
@@ -4768,10 +4870,14 @@ private struct LiveLeagueCountryFilterSheet: View {
         .accessibilityHint(accessibilityHint)
     }
 
-    private func presetRow(title: String, preset: Set<String>, accessibilityHint: String) -> some View {
-        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(preset, in: selectedCountries)
+    private func presetRow(
+        title: String,
+        groupID: LiveLeagueCountryFilterGroupID,
+        accessibilityHint: String
+    ) -> some View {
+        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(groupID, in: selection)
         return Button {
-            applySelection(LiveLeagueCountryFilterPresentation.togglingPreset(preset, in: selectedCountries))
+            applySelection(LiveLeagueCountryFilterPresentation.togglingGroup(groupID, in: selection))
         } label: {
             HStack(spacing: 12) {
                 Text(title)

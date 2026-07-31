@@ -222,65 +222,105 @@ struct HomeCrowdVenueSummary: Equatable, Codable, Sendable {
 }
 
 enum HomeCrowdSinceFormatter {
-    static func regularSinceLine(from raw: String?) -> String? {
-        guard let raw, let date = SupabaseTimestampParsing.parseTimestamptz(raw) else { return nil }
-        let calendar = Calendar.current
-        let year = calendar.component(.year, from: date)
-        let month = calendar.component(.month, from: date)
-        let monthSymbols = calendar.monthSymbols
-        let monthName = (1...12).contains(month) ? monthSymbols[month - 1] : ""
-        if monthName.isEmpty {
-            return "Regular since \(year)"
-        }
-        return "Regular since \(monthName) \(year)"
+    /// e.g. "Regular since May 2026" — sentence + month/year follow FanGeo app language.
+    static func regularSinceLine(from raw: String?, languageCode: String) -> String? {
+        guard let monthYear = formattedMonthYear(from: raw, languageCode: languageCode) else { return nil }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        return String(
+            format: L10n.t("Regular since %@", languageCode: code),
+            locale: Locale(identifier: code),
+            monthYear
+        )
     }
 
-    static func yourHomeCrowdSinceLine(from raw: String?) -> String? {
-        guard let raw, let date = SupabaseTimestampParsing.parseTimestamptz(raw) else { return nil }
-        let calendar = Calendar.current
-        let year = calendar.component(.year, from: date)
-        let month = calendar.component(.month, from: date)
-        let monthSymbols = calendar.monthSymbols
-        let monthName = (1...12).contains(month) ? monthSymbols[month - 1] : ""
-        if monthName.isEmpty {
-            return "Your home venue since \(year)"
-        }
-        return "Your home venue since \(monthName) \(year)"
+    static func yourHomeCrowdSinceLine(from raw: String?, languageCode: String) -> String? {
+        guard let monthYear = formattedMonthYear(from: raw, languageCode: languageCode) else { return nil }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        return String(
+            format: L10n.t("Your home venue since %@", languageCode: code),
+            locale: Locale(identifier: code),
+            monthYear
+        )
     }
 
-    static func homeCrowdSinceLine(from raw: String?) -> String? {
+    static func homeCrowdSinceLine(from raw: String?, languageCode: String) -> String? {
+        guard let monthYear = formattedMonthYear(from: raw, languageCode: languageCode) else { return nil }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        return String(
+            format: L10n.t("Home venue since %@", languageCode: code),
+            locale: Locale(identifier: code),
+            monthYear
+        )
+    }
+
+    /// Month + year in the active FanGeo language (not device locale alone).
+    private static func formattedMonthYear(from raw: String?, languageCode: String) -> String? {
         guard let raw, let date = SupabaseTimestampParsing.parseTimestamptz(raw) else { return nil }
-        let calendar = Calendar.current
-        let year = calendar.component(.year, from: date)
-        let month = calendar.component(.month, from: date)
-        let monthSymbols = calendar.monthSymbols
-        let monthName = (1...12).contains(month) ? monthSymbols[month - 1] : ""
-        if monthName.isEmpty {
-            return "Home venue since \(year)"
+        let code = L10n.normalizedLanguageCode(languageCode)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: code)
+        // `setLocalizedDateFormatFromTemplate("MMMM yyyy")` expands to standalone `LLLL`
+        // for pl/ru (nominative: maj/май). After Polish "od" / Russian "с" we need the
+        // format-month `MMMM` genitive forms (maja/мая). Other locales keep the template.
+        switch code {
+        case "pl":
+            formatter.dateFormat = "MMMM yyyy"
+        case "ru":
+            formatter.dateFormat = "MMMM yyyy 'г'."
+        default:
+            formatter.setLocalizedDateFormatFromTemplate("MMMM yyyy")
         }
-        return "Home venue since \(monthName) \(year)"
+        let formatted = formatter.string(from: date).trimmingCharacters(in: .whitespacesAndNewlines)
+        return formatted.isEmpty ? nil : formatted
     }
 }
 
 enum HomeCrowdFanCountFormatter {
-    static func publicLine(count: Int) -> String? {
+    static func publicLine(count: Int, languageCode: String) -> String? {
         guard count > 0 else { return nil }
-        if count == 1 { return "1 fan calls this home" }
-        return "\(count) fans call this home"
+        let code = L10n.normalizedLanguageCode(languageCode)
+        let key = count == 1
+            ? "home_crowd_fans_call_home_one_format"
+            : "home_crowd_fans_call_home_other_format"
+        return String(
+            format: L10n.t(key, languageCode: code),
+            locale: Locale(identifier: code),
+            Int64(count)
+        )
     }
 
-    static func localFansLine(count: Int) -> String? {
+    static func localFansLine(count: Int, languageCode: String) -> String? {
         guard count > 0 else { return nil }
-        if count == 1 { return "1 local fan" }
-        return "\(count) local fans"
+        let code = L10n.normalizedLanguageCode(languageCode)
+        let key = count == 1
+            ? "home_crowd_local_fans_one_format"
+            : "home_crowd_local_fans_other_format"
+        return String(
+            format: L10n.t(key, languageCode: code),
+            locale: Locale(identifier: code),
+            Int64(count)
+        )
     }
 
-    static func selfLine(count: Int) -> String? {
+    static func selfLine(count: Int, languageCode: String) -> String? {
         guard count > 0 else { return nil }
-        if count == 1 { return "1 fan calls this home" }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        if count == 1 {
+            return String(
+                format: L10n.t("home_crowd_fans_call_home_one_format", languageCode: code),
+                locale: Locale(identifier: code),
+                Int64(1)
+            )
+        }
         let others = max(0, count - 1)
-        if others == 1 { return "You and 1 fan call this home" }
-        return "You and \(others) fans call this home"
+        let key = others == 1
+            ? "home_crowd_you_and_fan_call_home_one_format"
+            : "home_crowd_you_and_fans_call_home_other_format"
+        return String(
+            format: L10n.t(key, languageCode: code),
+            locale: Locale(identifier: code),
+            Int64(others)
+        )
     }
 }
 

@@ -31,7 +31,7 @@ struct GroupedSportPickerSheet: View {
                             } label: {
                                 HStack(spacing: 14) {
                                     SportArtworkIconView(sport: row.selection, diameter: 40)
-                                    Text(row.label)
+                                    Text(AppSportCatalog.displayLabel(forSportToken: row.selection))
                                         .font(.body.weight(.medium))
                                         .foregroundStyle(FGColor.primaryText(colorScheme))
                                     Spacer(minLength: 0)

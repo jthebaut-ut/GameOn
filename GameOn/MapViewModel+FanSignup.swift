@@ -26,7 +26,7 @@ struct FanSignupSubmitOutcome: Sendable {
 }
 
 extension MapViewModel {
-    static let defaultFanSignupBio = "I am a FanGeo Fan."
+    static let defaultFanSignupBio = FanProfileDefaults.canonicalDefaultBio
 
     /// Marks a newly completed fan signup so Discover can select itself and present the existing Welcome guide once.
     func requestPostSignupDiscoverWelcomeGuide(userId: UUID, source: String) {

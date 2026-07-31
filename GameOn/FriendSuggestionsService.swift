@@ -35,6 +35,8 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
     let score: Double
     let reasonType: String?
     let reasonLabel: String?
+    /// Privacy-gated profile home country (ISO or stored name). Never GPS/current location.
+    let homeCountry: String?
 
     var id: UUID { userID }
 
@@ -56,6 +58,7 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         case score
         case reasonType = "reason_type"
         case reasonLabel = "reason_label"
+        case homeCountry = "home_country"
     }
 
     init(from decoder: Decoder) throws {
@@ -78,6 +81,7 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         score = Self.decodeDoubleIfPresent(from: container, forKey: .score) ?? 0
         reasonType = try container.decodeIfPresent(String.self, forKey: .reasonType)
         reasonLabel = try container.decodeIfPresent(String.self, forKey: .reasonLabel)
+        homeCountry = try container.decodeIfPresent(String.self, forKey: .homeCountry)
     }
 
     init(
@@ -95,7 +99,8 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         mutualFriendAvatars: [FriendSuggestionMutualFanAvatar],
         score: Double,
         reasonType: String?,
-        reasonLabel: String?
+        reasonLabel: String?,
+        homeCountry: String? = nil
     ) {
         self.userID = userID
         self.email = email
@@ -112,6 +117,7 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
         self.score = score
         self.reasonType = reasonType
         self.reasonLabel = reasonLabel
+        self.homeCountry = homeCountry
     }
 
     func replacingAvatars(avatarURL: String?, avatarThumbnailURL: String?) -> FriendSuggestionProfile {
@@ -130,7 +136,29 @@ struct FriendSuggestionProfile: Identifiable, Decodable, Hashable, Sendable {
             mutualFriendAvatars: mutualFriendAvatars,
             score: score,
             reasonType: reasonType,
-            reasonLabel: reasonLabel
+            reasonLabel: reasonLabel,
+            homeCountry: homeCountry
+        )
+    }
+
+    func withHomeCountry(_ homeCountry: String?) -> FriendSuggestionProfile {
+        FriendSuggestionProfile(
+            userID: userID,
+            email: email,
+            displayName: displayName,
+            handle: handle,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            bio: bio,
+            sharedFavoriteTeamsCount: sharedFavoriteTeamsCount,
+            sharedEventInterestCount: sharedEventInterestCount,
+            sharedPickupGameCount: sharedPickupGameCount,
+            mutualFriendCount: mutualFriendCount,
+            mutualFriendAvatars: mutualFriendAvatars,
+            score: score,
+            reasonType: reasonType,
+            reasonLabel: reasonLabel,
+            homeCountry: homeCountry
         )
     }
 
@@ -452,12 +480,56 @@ final class FriendSuggestionsService {
             #endif
 
             // Preserve authoritative server order (already diversity-shaped for the fetch pool).
-            return rows
+            return try await enrichWithHomeCountries(rows)
         } catch {
             #if DEBUG
             print("[FriendSuggestionsService] fetch failed error=\(error.localizedDescription)")
             #endif
             throw error
+        }
+    }
+
+    /// One batch privacy-gated country lookup for the suggestion pool (not N+1).
+    private func enrichWithHomeCountries(_ rows: [FriendSuggestionProfile]) async throws -> [FriendSuggestionProfile] {
+        guard !rows.isEmpty else { return rows }
+
+        struct Params: Encodable {
+            let p_user_ids: [UUID]
+        }
+        struct CountryRow: Decodable {
+            let user_id: UUID
+            let home_country: String?
+        }
+
+        let ids = rows.map(\.userID)
+        do {
+            let countryRows: [CountryRow] = try await client
+                .rpc(
+                    "get_profile_friend_suggestion_home_countries",
+                    params: Params(p_user_ids: ids)
+                )
+                .execute()
+                .value
+
+            var byId: [UUID: String] = [:]
+            for row in countryRows {
+                let trimmed = row.home_country?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !trimmed.isEmpty {
+                    byId[row.user_id] = trimmed
+                }
+            }
+
+            #if DEBUG
+            print("[FriendSuggestionsService] homeCountry enrich matched=\(byId.count) of \(rows.count)")
+            #endif
+
+            return rows.map { $0.withHomeCountry(byId[$0.userID]) }
+        } catch {
+            #if DEBUG
+            print("[FriendSuggestionsService] homeCountry enrich failed error=\(error.localizedDescription)")
+            #endif
+            // Suggestions remain usable without country; do not fail the whole fetch.
+            return rows
         }
     }
 

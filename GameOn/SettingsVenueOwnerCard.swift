@@ -543,7 +543,7 @@ struct SettingsVenueOwnerCard: View {
             BusinessVenueLocationPinPickerView(
                 viewModel: viewModel,
                 initialDraft: signupLocationDraft,
-                fallbackCoordinate: viewModel.currentUserLocation ?? CLLocationCoordinate2D(latitude: 40.3916, longitude: -111.8508),
+                fallbackCoordinate: viewModel.currentUserLocation ?? DiscoverMapRegionDefaults.worldCenter,
                 onCancel: {},
                 onConfirm: applySignupLocationDraft
             )

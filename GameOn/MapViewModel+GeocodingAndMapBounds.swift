@@ -3,6 +3,97 @@ import Foundation
 import MapKit
 import SwiftUI
 
+/// Production Discover map defaults — never Lehi/Utah as a global fallback.
+enum DiscoverMapRegionDefaults {
+    /// Broad neutral world viewport when GPS is unavailable and no safer coarse hint exists.
+    static let worldCenter = CLLocationCoordinate2D(latitude: 20, longitude: 10)
+    static let worldSpan = MKCoordinateSpan(latitudeDelta: 100, longitudeDelta: 160)
+
+    static var worldRegion: MKCoordinateRegion {
+        MKCoordinateRegion(center: worldCenter, span: worldSpan)
+    }
+
+    /// Former production default (Lehi, Utah) — kept only to detect/replace legacy camera state.
+    static let legacyLehiCenter = CLLocationCoordinate2D(latitude: 40.3916, longitude: -111.8508)
+
+    static func isLegacyLehiFallbackCenter(_ coordinate: CLLocationCoordinate2D) -> Bool {
+        abs(coordinate.latitude - legacyLehiCenter.latitude) < 0.05
+            && abs(coordinate.longitude - legacyLehiCenter.longitude) < 0.05
+    }
+
+    /// Coarse country/region center from the device Locale region code (no location permission).
+    /// Unknown codes return nil so callers can fall back to ``worldRegion``.
+    static func coarseRegionForDeviceLocale() -> MKCoordinateRegion? {
+        guard let raw = Locale.current.region?.identifier.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        let code = raw.uppercased()
+        guard let center = approximateCountryCenters[code] else { return nil }
+        return MKCoordinateRegion(
+            center: center,
+            span: MKCoordinateSpan(latitudeDelta: 10, longitudeDelta: 10)
+        )
+    }
+
+    static func distanceMiles(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+        CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude)) / 1609.344
+    }
+
+    /// Approximate geographic centers for common ISO regions (device Locale only — not a GPS substitute).
+    private static let approximateCountryCenters: [String: CLLocationCoordinate2D] = [
+        "US": CLLocationCoordinate2D(latitude: 39.8, longitude: -98.5),
+        "CA": CLLocationCoordinate2D(latitude: 56.1, longitude: -106.3),
+        "MX": CLLocationCoordinate2D(latitude: 23.6, longitude: -102.5),
+        "BR": CLLocationCoordinate2D(latitude: -14.2, longitude: -51.9),
+        "AR": CLLocationCoordinate2D(latitude: -38.4, longitude: -63.6),
+        "GB": CLLocationCoordinate2D(latitude: 54.0, longitude: -2.0),
+        "IE": CLLocationCoordinate2D(latitude: 53.1, longitude: -8.0),
+        "FR": CLLocationCoordinate2D(latitude: 46.2, longitude: 2.2),
+        "DE": CLLocationCoordinate2D(latitude: 51.2, longitude: 10.4),
+        "ES": CLLocationCoordinate2D(latitude: 40.5, longitude: -3.7),
+        "PT": CLLocationCoordinate2D(latitude: 39.4, longitude: -8.2),
+        "IT": CLLocationCoordinate2D(latitude: 41.9, longitude: 12.6),
+        "NL": CLLocationCoordinate2D(latitude: 52.1, longitude: 5.3),
+        "BE": CLLocationCoordinate2D(latitude: 50.5, longitude: 4.5),
+        "CH": CLLocationCoordinate2D(latitude: 46.8, longitude: 8.2),
+        "AT": CLLocationCoordinate2D(latitude: 47.5, longitude: 14.5),
+        "PL": CLLocationCoordinate2D(latitude: 51.9, longitude: 19.1),
+        "SE": CLLocationCoordinate2D(latitude: 60.1, longitude: 18.6),
+        "NO": CLLocationCoordinate2D(latitude: 60.5, longitude: 8.5),
+        "DK": CLLocationCoordinate2D(latitude: 56.3, longitude: 9.5),
+        "FI": CLLocationCoordinate2D(latitude: 61.9, longitude: 25.7),
+        "RU": CLLocationCoordinate2D(latitude: 61.5, longitude: 105.3),
+        "UA": CLLocationCoordinate2D(latitude: 48.4, longitude: 31.2),
+        "TR": CLLocationCoordinate2D(latitude: 39.0, longitude: 35.2),
+        "GR": CLLocationCoordinate2D(latitude: 39.1, longitude: 21.8),
+        "AL": CLLocationCoordinate2D(latitude: 41.2, longitude: 20.2),
+        "AU": CLLocationCoordinate2D(latitude: -25.3, longitude: 133.8),
+        "NZ": CLLocationCoordinate2D(latitude: -40.9, longitude: 174.9),
+        "JP": CLLocationCoordinate2D(latitude: 36.2, longitude: 138.3),
+        "KR": CLLocationCoordinate2D(latitude: 35.9, longitude: 127.8),
+        "CN": CLLocationCoordinate2D(latitude: 35.9, longitude: 104.2),
+        "IN": CLLocationCoordinate2D(latitude: 20.6, longitude: 79.0),
+        "ID": CLLocationCoordinate2D(latitude: -2.5, longitude: 118.0),
+        "TH": CLLocationCoordinate2D(latitude: 15.9, longitude: 100.9),
+        "VN": CLLocationCoordinate2D(latitude: 14.1, longitude: 108.3),
+        "PH": CLLocationCoordinate2D(latitude: 12.9, longitude: 121.8),
+        "SG": CLLocationCoordinate2D(latitude: 1.35, longitude: 103.8),
+        "MY": CLLocationCoordinate2D(latitude: 4.2, longitude: 101.98),
+        "AE": CLLocationCoordinate2D(latitude: 23.4, longitude: 53.8),
+        "SA": CLLocationCoordinate2D(latitude: 23.9, longitude: 45.1),
+        "ZA": CLLocationCoordinate2D(latitude: -30.6, longitude: 25.0),
+        "EG": CLLocationCoordinate2D(latitude: 26.8, longitude: 30.8),
+        "NG": CLLocationCoordinate2D(latitude: 9.1, longitude: 8.7),
+        "KE": CLLocationCoordinate2D(latitude: 0.0, longitude: 37.9),
+        "IL": CLLocationCoordinate2D(latitude: 31.0, longitude: 34.9),
+        "CL": CLLocationCoordinate2D(latitude: -35.7, longitude: -71.5),
+        "CO": CLLocationCoordinate2D(latitude: 4.6, longitude: -74.3),
+        "PE": CLLocationCoordinate2D(latitude: -9.2, longitude: -75.0),
+    ]
+}
+
 private enum DiscoverCitySearchVenueReloadConfig {
     static let radiusMiles = 25.0
 }
@@ -1061,11 +1152,12 @@ extension MapViewModel {
         }
         let spanVal = min(max(visibleLatitudeDelta * 0.35, 0.04), 0.35)
         recordCurrentUserLocation(coordinate)
-        cameraPosition = .region(
+        applyDiscoverCameraRegion(
             MKCoordinateRegion(
                 center: coordinate,
                 span: MKCoordinateSpan(latitudeDelta: spanVal, longitudeDelta: spanVal)
-            )
+            ),
+            programmatic: true
         )
 #if DEBUG
         print("[CurrentLocationButton] centeredMapOnUserLocation")
@@ -1074,6 +1166,37 @@ extension MapViewModel {
     }
 
     private static let startupDiscoverInitialRadiusMiles: Double = 9
+
+    /// Programmatic Discover camera write (startup / my-location / search). Marks the write so
+    /// ``onMapCameraChange`` does not treat it as user intent during startup.
+    func applyDiscoverCameraRegion(_ region: MKCoordinateRegion, programmatic: Bool) {
+        if programmatic {
+            discoverProgrammaticCameraWriteGeneration += 1
+            let generation = discoverProgrammaticCameraWriteGeneration
+            discoverProgrammaticCameraWritePending = true
+            cameraPosition = .region(region)
+            visibleLatitudeDelta = region.span.latitudeDelta
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(750))
+                guard let self else { return }
+                guard self.discoverProgrammaticCameraWriteGeneration == generation else { return }
+                self.discoverProgrammaticCameraWritePending = false
+            }
+        } else {
+            cameraPosition = .region(region)
+            visibleLatitudeDelta = region.span.latitudeDelta
+        }
+    }
+
+    /// Called from Discover when the user pans/zooms. Blocks later startup GPS/locale snaps.
+    func noteDiscoverUserCameraInteractionIfStartupPending() {
+        guard !didFinishStartupDiscoverPrepare else { return }
+        guard !discoverProgrammaticCameraWritePending else { return }
+        discoverStartupCameraOverrideEnabled = false
+#if DEBUG
+        print("[StartupDiscover] userCameraIntent=preserved skippingLaterAutomaticCenter")
+#endif
+    }
 
     /// Startup: optional GPS center + local region, then arms the next ``refreshDiscoverCoreInBackground()`` for DEBUG completion logging. Runs once per launch (see ``didFinishStartupDiscoverPrepare``).
     func prepareInitialDiscoverRegionAndPreload() async {
@@ -1085,6 +1208,14 @@ extension MapViewModel {
 
         let session = DiscoverCurrentLocationFetchSession()
         let result = await session.fetchBestCoordinateOnce(timeoutSeconds: 3)
+
+        guard discoverStartupCameraOverrideEnabled else {
+#if DEBUG
+            print("[StartupDiscover] skippedAutomaticCenter reason=userCameraIntent")
+#endif
+            return
+        }
+
         switch result {
         case .coordinate(let c):
 #if DEBUG
@@ -1093,20 +1224,35 @@ extension MapViewModel {
 #endif
             recordCurrentUserLocation(c)
             let region = Self.discoverStartupMKRegion(center: c, radiusMiles: Self.startupDiscoverInitialRadiusMiles)
-            cameraPosition = .region(region)
+            applyDiscoverCameraRegion(region, programmatic: true)
 #if DEBUG
             print("[StartupMapRegionDebug] initialSpan=\(region.span.latitudeDelta),\(region.span.longitudeDelta)")
             print("[StartupMapRegionDebug] basis=userLocation")
 #endif
         case .unavailable(let reason):
+            if let lastKnown = currentUserLocation {
+                let region = Self.discoverStartupMKRegion(
+                    center: lastKnown,
+                    radiusMiles: Self.startupDiscoverInitialRadiusMiles
+                )
+                applyDiscoverCameraRegion(region, programmatic: true)
 #if DEBUG
-            print("[StartupDiscover] fallbackToDefaultRegion reason=\(reason)")
-            if let region = cameraPosition.region {
-                print("[StartupMapRegionDebug] initialSpan=\(region.span.latitudeDelta),\(region.span.longitudeDelta)")
-            }
-            print("[StartupMapRegionDebug] basis=fallback")
+                print("[StartupDiscover] fallbackToLastKnownSessionLocation reason=\(reason)")
+                print("[StartupMapRegionDebug] basis=lastKnownSessionLocation")
 #endif
-            break
+            } else if let localeRegion = DiscoverMapRegionDefaults.coarseRegionForDeviceLocale() {
+                applyDiscoverCameraRegion(localeRegion, programmatic: true)
+#if DEBUG
+                print("[StartupDiscover] fallbackToDeviceLocaleRegion reason=\(reason)")
+                print("[StartupMapRegionDebug] basis=deviceLocaleRegion")
+#endif
+            } else {
+                applyDiscoverCameraRegion(DiscoverMapRegionDefaults.worldRegion, programmatic: true)
+#if DEBUG
+                print("[StartupDiscover] fallbackToNeutralWorldRegion reason=\(reason)")
+                print("[StartupMapRegionDebug] basis=neutralWorld")
+#endif
+            }
         }
 
 #if DEBUG

@@ -13,7 +13,7 @@ nonisolated enum VenueGameCompetitorDisplay {
         case "soccer", "basketball", "football", "hockey", "baseball", "softball",
              "volleyball", "rugby", "cricket", "lacrosse", "water_polo", "handball":
             return .team
-        case "mma", "ufc", "boxing", "tennis", "pickleball", "table_tennis",
+        case "mma", "ufc", "boxing", "tennis", "pickleball", "padel", "table_tennis",
              "badminton", "racquetball", "squash":
             return .player
         default:
@@ -59,6 +59,8 @@ nonisolated enum VenueGameCompetitorDisplay {
         if lowered.contains("ufc") { return "ufc" }
         if lowered.contains("boxing") { return "boxing" }
         if lowered.contains("pickleball") { return "pickleball" }
+        // Padel must resolve before Tennis so identities never collapse.
+        if lowered.contains("padel") || lowered == "padle" { return "padel" }
         if lowered.contains("table tennis") || lowered.contains("ping pong") { return "table_tennis" }
         if lowered.contains("badminton") { return "badminton" }
         if lowered.contains("racquetball") { return "racquetball" }

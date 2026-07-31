@@ -644,7 +644,7 @@ final class MapViewModel: ObservableObject {
         set { fanUpdatesStore.venueEventCommentLatencyInsertStartTimesByLocalID = newValue }
     }
     @Published var venueEventIDsByKey: [String: UUID] = [:]
-    @Published var visibleLatitudeDelta: Double = 0.55
+    @Published var visibleLatitudeDelta: Double = DiscoverMapRegionDefaults.worldSpan.latitudeDelta
     @Published var userProfilesByEmail: [String: UserProfileRow] = [:]
     @Published var reportedComments: [CommentReportRow] = []
     @Published var reportedCommentDisplays: [ReportedCommentDisplay] = []
@@ -830,12 +830,7 @@ final class MapViewModel: ObservableObject {
             scheduleDiscoverMapRenderSnapshotRebuild(reason: "mapDisplayMode")
         }
     }
-    @Published var cameraPosition: MapCameraPosition = .region(
-        MKCoordinateRegion(
-            center: CLLocationCoordinate2D(latitude: 40.3916, longitude: -111.8508),
-            span: MKCoordinateSpan(latitudeDelta: 0.55, longitudeDelta: 0.55)
-        )
-    )
+    @Published var cameraPosition: MapCameraPosition = .region(DiscoverMapRegionDefaults.worldRegion)
     /// Last known GPS fix for the signed-in user (Discover weather, “my location”, startup centering).
     @Published var currentUserLocation: CLLocationCoordinate2D?
     @Published var calendarSyncMessage: String = ""
@@ -1008,7 +1003,8 @@ final class MapViewModel: ObservableObject {
         return ProfileHomeCityIdentity.displayLine(
             city: currentUserHomeCity,
             region: currentUserHomeRegion,
-            country: currentUserHomeCountry
+            country: currentUserHomeCountry,
+            languageCode: UserDefaults.standard.string(forKey: L10n.appLanguageKey)
         )
     }
 
@@ -1496,8 +1492,14 @@ final class MapViewModel: ObservableObject {
     /// Set when ``renderCachedDiscoverCore()`` (async) applied a disk snapshot this launch; suppresses empty-state loading chrome until fresh fetches finish.
     var discoverSnapshotRestoredThisLaunch = false
 
-    /// Startup Discover: one-shot location + 15 mi region; ``defer`` arms preload completion logging even if the task is cancelled mid-await.
+    /// Startup Discover: one-shot location + local region; ``defer`` arms preload completion logging even if the task is cancelled mid-await.
     var didFinishStartupDiscoverPrepare = false
+    /// When false, startup must not overwrite the camera (user already panned/searched).
+    var discoverStartupCameraOverrideEnabled = true
+    /// Suppresses treating map camera callbacks as user intent after a programmatic write.
+    var discoverProgrammaticCameraWritePending = true
+    /// Bumps on each programmatic camera write so delayed pending-clears stay ordered.
+    var discoverProgrammaticCameraWriteGeneration: UInt64 = 0
     /// When true, the next ``refreshDiscoverCoreInBackground()`` logs ``[StartupDiscover] preloadCompleted`` (DEBUG).
     var startupDiscoverPreloadCompletionLogPending = false
 

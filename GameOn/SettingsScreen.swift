@@ -2502,7 +2502,7 @@ struct SettingsScreen: View {
                 ProfileSettingsRouteButton(route: .appearance, source: "appearance") {
                     settingsRow(
                         title: L10n.t("appearance", languageCode: appLanguageRaw),
-                        subtitle: appearancePreference.displayName,
+                        subtitle: appearancePreference.displayName(languageCode: appLanguageRaw),
                         systemImage: "circle.lefthalf.filled",
                         showsChevron: true
                     )
@@ -2539,17 +2539,45 @@ struct SettingsScreen: View {
 
     private var profileSettingsProGamesPreferencesCard: some View {
         settingsSectionCard {
-            settingsRow(
-                title: "Automatically follow Favorite Teams",
-                subtitle: "Show upcoming \(L10n.t("pro_sports_games", languageCode: appLanguageRaw)) involving your favorite teams in Going.",
-                systemImage: "star.circle.fill",
-                tint: FGColor.accentBlue,
-                showsChevron: false
-            ) {
-                Toggle("Automatically follow games from my Favorite Teams", isOn: favoriteTeamProGameAlertsToggleBinding)
+            HStack(alignment: .top, spacing: FGSpacing.md) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(SettingsPremiumChrome.iconSurface(colorScheme))
+                    Image(systemName: "star.circle.fill")
+                        .font(.system(size: 14, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(FGColor.accentBlue)
+                }
+                .frame(width: SettingsPremiumChrome.rowIconSize, height: SettingsPremiumChrome.rowIconSize)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(L10n.t("Automatically follow Favorite Teams", languageCode: appLanguageRaw))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        L10n.t(
+                            "Show upcoming Pro Games involving your favorite teams in Going.",
+                            languageCode: appLanguageRaw
+                        )
+                    )
+                        .font(.system(size: 12, weight: .regular, design: .rounded))
+                        .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Toggle(
+                    L10n.t("Automatically follow games from my Favorite Teams", languageCode: appLanguageRaw),
+                    isOn: favoriteTeamProGameAlertsToggleBinding
+                )
                     .labelsHidden()
                     .disabled(!viewModel.isAuthenticatedForSocialFeatures)
+                    .padding(.top, 2)
             }
+            .padding(.horizontal, FGSpacing.md)
+            .padding(.vertical, 10)
+            .frame(minHeight: SettingsPremiumChrome.rowMinHeight, alignment: .center)
 
             settingsRowDivider()
 
@@ -2571,7 +2599,7 @@ struct SettingsScreen: View {
     }
 
     private var proGamesFavoriteTeamWindowRow: some View {
-        HStack(alignment: .center, spacing: FGSpacing.md) {
+        HStack(alignment: .top, spacing: FGSpacing.md) {
             ZStack {
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                     .fill(SettingsPremiumChrome.iconSurface(colorScheme))
@@ -2583,27 +2611,32 @@ struct SettingsScreen: View {
             .frame(width: SettingsPremiumChrome.rowIconSize, height: SettingsPremiumChrome.rowIconSize)
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("Favorite Team Game Window")
+                Text(L10n.t("Favorite Team Game Window", languageCode: appLanguageRaw))
                     .font(.system(size: 15, weight: .semibold, design: .rounded))
                     .foregroundStyle(SettingsPremiumChrome.primaryText(colorScheme))
-                Text("How far ahead Going should look for your teams.")
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(L10n.t("How far ahead Going should look for your teams.", languageCode: appLanguageRaw))
                     .font(.system(size: 12, weight: .regular, design: .rounded))
                     .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Picker("Favorite Team Game Window", selection: $proGamesFavoriteTeamWindowDays) {
+            Picker(
+                L10n.t("Favorite Team Game Window", languageCode: appLanguageRaw),
+                selection: $proGamesFavoriteTeamWindowDays
+            ) {
                 ForEach(ProGamesFavoriteTeamAutoFollowPreference.Window.allCases) { window in
-                    Text(window.title).tag(window.rawValue)
+                    Text(window.title(languageCode: appLanguageRaw)).tag(window.rawValue)
                 }
             }
             .labelsHidden()
             .pickerStyle(.menu)
+            .padding(.top, 2)
         }
         .padding(.horizontal, FGSpacing.md)
         .padding(.vertical, 10)
-        .frame(minHeight: SettingsPremiumChrome.rowMinHeight, alignment: .center)
+        .frame(minHeight: SettingsPremiumChrome.rowMinHeight, alignment: .top)
     }
 
     @ViewBuilder

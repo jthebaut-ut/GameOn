@@ -282,6 +282,18 @@ struct EditProfileBioRow: View {
 
     @Environment(\.colorScheme) private var colorScheme
 
+    /// Editor shows localized default bio copy; storage stays canonical English for system defaults.
+    private var editorBio: Binding<String> {
+        Binding(
+            get: { FanProfileDefaults.displayBio(bio, languageCode: languageCode) },
+            set: { bio = FanProfileDefaults.bioForStorage($0) }
+        )
+    }
+
+    private var displayedBioCount: Int {
+        FanProfileDefaults.displayBio(bio, languageCode: languageCode).count
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.t("bio", languageCode: languageCode))
@@ -291,7 +303,7 @@ struct EditProfileBioRow: View {
                 .padding(.top, 11)
 
             ZStack(alignment: .topLeading) {
-                TextEditor(text: $bio)
+                TextEditor(text: editorBio)
                     .font(.body)
                     .focused(focusedField, equals: .bio)
                     .frame(minHeight: 66, maxHeight: 72)
@@ -299,7 +311,9 @@ struct EditProfileBioRow: View {
                     .padding(.horizontal, 10)
                     .autocorrectionDisabled(false)
 
-                if bio.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if FanProfileDefaults.displayBio(bio, languageCode: languageCode)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty {
                     Text(L10n.t("add_a_short_bio", languageCode: languageCode))
                         .font(.body)
                         .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.55))
@@ -322,14 +336,14 @@ struct EditProfileBioRow: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Add emoji to bio")
+                .accessibilityLabel(L10n.t("add_emoji", languageCode: languageCode))
 
                 Spacer(minLength: 0)
 
-                Text("\(bio.count)/\(characterLimit)")
+                Text("\(displayedBioCount)/\(characterLimit)")
                     .font(.footnote.monospacedDigit())
                     .foregroundStyle(
-                        bio.count >= characterLimit
+                        displayedBioCount >= characterLimit
                             ? FGColor.dangerRed
                             : FGColor.secondaryText(colorScheme)
                     )
@@ -364,7 +378,8 @@ struct EditProfileHomeCityRow: View {
                 region: $region,
                 country: $country,
                 displayText: $displayText,
-                usesCompactPillStyle: true
+                usesCompactPillStyle: true,
+                languageCode: languageCode
             )
             .frame(maxWidth: .infinity, alignment: .leading)
         }

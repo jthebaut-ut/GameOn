@@ -19,8 +19,8 @@ struct HomeCrowdProfileCardView: View {
 
     private var subtitleLine: String? {
         guard let summary else { return nil }
-        if let since = HomeCrowdSinceFormatter.regularSinceLine(from: summary.setAtRaw)
-            ?? HomeCrowdSinceFormatter.homeCrowdSinceLine(from: summary.setAtRaw) {
+        if let since = HomeCrowdSinceFormatter.regularSinceLine(from: summary.setAtRaw, languageCode: languageCode)
+            ?? HomeCrowdSinceFormatter.homeCrowdSinceLine(from: summary.setAtRaw, languageCode: languageCode) {
             return since
         }
         if !summary.locationLabel.isEmpty {
@@ -32,9 +32,9 @@ struct HomeCrowdProfileCardView: View {
     private var fanCountLine: String? {
         guard let summary else { return nil }
         if isSelfProfile {
-            return HomeCrowdFanCountFormatter.selfLine(count: summary.fanCount)
+            return HomeCrowdFanCountFormatter.selfLine(count: summary.fanCount, languageCode: languageCode)
         }
-        return HomeCrowdFanCountFormatter.publicLine(count: summary.fanCount)
+        return HomeCrowdFanCountFormatter.publicLine(count: summary.fanCount, languageCode: languageCode)
     }
 
     var body: some View {
@@ -42,7 +42,7 @@ struct HomeCrowdProfileCardView: View {
             if let summary {
                 if isSelfProfile {
                     selfProfilePopulatedBody(summary)
-                        .frame(height: cardHeight)
+                        .frame(minHeight: cardHeight)
                 } else {
                     publicProfilePopulatedBody(summary)
                 }
@@ -80,14 +80,18 @@ struct HomeCrowdProfileCardView: View {
                         Text(subtitleLine)
                             .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if let crowdLine = compactCrowdSubtitle(summary) {
                         Text(crowdLine)
                             .font(.system(size: 10, weight: .medium, design: .rounded))
                             .foregroundStyle(FGColor.mutedText(colorScheme))
-                            .lineLimit(1)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
@@ -129,18 +133,28 @@ struct HomeCrowdProfileCardView: View {
                             .minimumScaleFactor(0.84)
                             .multilineTextAlignment(.leading)
 
-                        if let sinceLine = HomeCrowdSinceFormatter.regularSinceLine(from: summary.setAtRaw) {
+                        if let sinceLine = HomeCrowdSinceFormatter.regularSinceLine(
+                            from: summary.setAtRaw,
+                            languageCode: languageCode
+                        ) {
                             Text(sinceLine)
                                 .font(.system(size: 11, weight: .semibold, design: .rounded))
                                 .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .lineLimit(1)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.85)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        if let localFansLine = HomeCrowdFanCountFormatter.localFansLine(count: summary.fanCount) {
+                        if let localFansLine = HomeCrowdFanCountFormatter.localFansLine(
+                            count: summary.fanCount,
+                            languageCode: languageCode
+                        ) {
                             Text(localFansLine)
                                 .font(.system(size: 10.5, weight: .medium, design: .rounded))
                                 .foregroundStyle(FGColor.mutedText(colorScheme))
-                                .lineLimit(1)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.85)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
 
@@ -160,8 +174,14 @@ struct HomeCrowdProfileCardView: View {
         }
         .buttonStyle(.plain)
         .disabled(onExploreVenue == nil)
-        .accessibilityLabel("Open \(summary.name) venue")
-        .accessibilityHint("Opens this fan's Home Venue in Discover")
+        .accessibilityLabel(
+            String(
+                format: L10n.t("home_crowd_open_venue_a11y_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                summary.name
+            )
+        )
+        .accessibilityHint(L10n.t("home_crowd_open_venue_a11y_hint", languageCode: languageCode))
         .homeCrowdCardChrome(colorScheme: colorScheme, accent: homeCrowdAccent)
     }
 
@@ -195,9 +215,9 @@ struct HomeCrowdProfileCardView: View {
             return fanCountLine
         }
         if isSelfProfile {
-            return "Your match-day crowd"
+            return L10n.t("Your match-day crowd", languageCode: languageCode)
         }
-        return "This fan's home venue"
+        return L10n.t("This fan's home venue", languageCode: languageCode)
     }
 
     private func populatedVenueImageColumn(_ summary: HomeCrowdVenueSummary) -> some View {

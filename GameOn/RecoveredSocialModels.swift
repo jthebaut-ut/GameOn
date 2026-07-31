@@ -513,6 +513,21 @@ struct FriendshipRow: Codable, Hashable, Identifiable {
         )
     }
 
+    func withAcceptedNow(respondedAt: String) -> FriendshipRow {
+        FriendshipRow(
+            id: id,
+            requester_id: requester_id,
+            addressee_id: addressee_id,
+            status: "accepted",
+            responded_at: respondedAt,
+            created_at: created_at,
+            addressee_cleared_at: addressee_cleared_at,
+            requester_cleared_at: requester_cleared_at,
+            requester_entity_type: requester_entity_type,
+            addressee_entity_type: addressee_entity_type
+        )
+    }
+
     func withAddresseeClearedNow(clearedAt: String) -> FriendshipRow {
         FriendshipRow(
             id: id,
@@ -770,21 +785,16 @@ final class FriendshipService {
             .value
     }
 
-    @discardableResult
-    func acceptFriendRequest(requestId: UUID) async throws -> FriendshipRow {
-        struct Patch: Encodable {
-            let status: String
-            let responded_at: String
+    func acceptFriendRequest(requestId: UUID) async throws {
+        struct Params: Encodable {
+            let p_id: UUID
         }
-        let responded = ISO8601DateFormatter().string(from: Date())
-        return try await client
-            .from("friendships")
-            .update(Patch(status: "accepted", responded_at: responded))
-            .eq("id", value: requestId)
-            .select()
-            .single()
+        // SECURITY DEFINER RPC (mirrors decline_friend_request). Do not use
+        // UPDATE…SELECT…single() — PostgREST often returns 0 representation rows
+        // under RLS after a successful accept (PGRST116 / "Cannot coerce…").
+        try await client
+            .rpc("accept_friend_request", params: Params(p_id: requestId))
             .execute()
-            .value
     }
 
     func rejectFriendRequest(requestId: UUID) async throws {

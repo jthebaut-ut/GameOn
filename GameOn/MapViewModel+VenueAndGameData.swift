@@ -36,7 +36,7 @@ private let discoverVenueActiveLegacySafeOrFilter = "admin_status.is.null,admin_
 
 private enum DiscoverVenueFastPinFallback {
     static let radiusMiles = 35.0
-    static let defaultCenter = CLLocationCoordinate2D(latitude: 40.3916, longitude: -111.8508)
+    static let defaultCenter = DiscoverMapRegionDefaults.worldCenter
 }
 
 private enum DiscoverViewportVenueCacheConfig {
@@ -62,14 +62,6 @@ private struct GameonCalendarDotRPCParams: Encodable {
 
 private struct GameonCalendarDotRPCRow: Decodable {
     let event_date: String
-}
-
-/// Broader map bounds when the visible viewport text search returns no rows (Utah / project default area).
-private enum DiscoverVenueSearchFallbackBounds {
-    static let minLat = 36.95
-    static let maxLat = 42.05
-    static let minLon = -114.35
-    static let maxLon = -109.0
 }
 
 // MARK: - Discover disk snapshot (venues + venue_events + merged events for instant map/calendar)
@@ -2859,8 +2851,8 @@ extension MapViewModel {
             .value
     }
 
-    /// Supabase `venues` text search (active only), scoped to map bounds first, then Utah-wide fallback. Omits `venue_events`; games are filled later by the normal Discover pipeline when present.
-    /// - Parameter useViewportTextSearchBounds: When `true`, tries the current map viewport first, then Utah fallback when empty. When `false`, uses Utah-wide bounds only (place-style search not tied to the visible map).
+    /// Supabase `venues` text search (active only), scoped to map bounds first, then a global active-venues fallback. Omits `venue_events`; games are filled later by the normal Discover pipeline when present.
+    /// - Parameter useViewportTextSearchBounds: When `true`, tries the current map viewport first, then global active venues when empty. When `false`, uses global active venues only (place-style search not tied to the visible map).
     func fetchDiscoverVenueSearchBars(query: String, useViewportTextSearchBounds: Bool = true) async -> [BarVenue] {
         let token = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard token.count >= 2 else { return [] }

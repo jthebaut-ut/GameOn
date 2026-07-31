@@ -153,12 +153,7 @@ struct ShareFanProfileSheet: View {
                         .lineLimit(1)
                     if friend.isGroupConversation {
                         if friend.groupMemberCount > 0 {
-                            Text(
-                                String(
-                                    format: L10n.t("group_chat_member_count_format", languageCode: languageCode),
-                                    friend.groupMemberCount
-                                )
-                            )
+                            Text(groupChatLocalizedMemberCount(friend.groupMemberCount, languageCode: languageCode))
                             .font(.system(size: 12, weight: .medium, design: .rounded))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                             .lineLimit(1)

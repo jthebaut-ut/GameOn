@@ -11,10 +11,17 @@ enum FanGeoAppearancePreference: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var displayName: String {
+        displayName(languageCode: nil)
+    }
+
+    func displayName(languageCode: String?) -> String {
         switch self {
-        case .system: return "System Default"
-        case .light: return "Light"
-        case .dark: return "Dark"
+        case .system:
+            return L10n.t("System Default", languageCode: languageCode)
+        case .light:
+            return L10n.t("Light", languageCode: languageCode)
+        case .dark:
+            return L10n.t("Dark", languageCode: languageCode)
         }
     }
 

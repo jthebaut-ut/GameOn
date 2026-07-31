@@ -225,15 +225,15 @@ extension MapViewModel {
         }
 
         private func serverFailureUserMessage(code: String?, detail: String?) -> String {
-            let normalizedCode = code?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() ?? ""
+            _ = code
             let normalizedDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
 
-            if normalizedCode == "42501"
-                || normalizedDetail.contains("fan profile email must match the authenticated user email")
-                || normalizedDetail.contains("fan profile auth user mismatch") {
-                return "Account deletion could not be completed. Please try again or contact FanGeo Support."
+            if normalizedDetail.contains("pickup_request_cancel_forbidden") {
+                return "We couldn’t finish closing your pickup-game activity. Please try again. If the problem continues, contact FanGeo Support."
             }
 
+            // Keep a single safe fallback for remaining execute failures (including
+            // identity-guard / privilege SQLSTATEs). Do not surface SQLSTATE or table names.
             return "Account deletion could not be completed. Please try again or contact FanGeo Support."
         }
     }

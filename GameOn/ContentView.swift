@@ -151,6 +151,7 @@ struct ContentView: View {
             FanProfileAvatarRefreshSelfTests.runAll()
             ChatRealtimeConnectionStatusSelfTests.run()
             LogoutBoundingSelfTests.runAll()
+            ProfileHomeCityIdentitySelfTests.runAll()
             AccountIdentityClassificationSelfTests.runAll()
             PickupGameDiscoverAvailabilitySelfTests.runAll()
             LiveMatchHydrationIndexSelfTests.runAll()
@@ -160,6 +161,8 @@ struct ContentView: View {
             SuggestedFansRankingSelfTests.runAll()
             VenueMapEnergyScoreSelfTests.runAll()
             DiscoverGameVenueRankingSelfTests.runAll()
+            AccountDeletionPickupCleanupSelfTests.runAll()
+            AccountDeletionStorageFinalizeSelfTests.runAll()
             _ = viewModel.runPickupMonthDotSelectionStabilityBoundaryTest()
             #endif
         }

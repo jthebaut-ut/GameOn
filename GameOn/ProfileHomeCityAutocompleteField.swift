@@ -9,6 +9,7 @@ struct ProfileHomeCityAutocompleteField: View {
     @Binding var displayText: String
     /// Compact pill field used inside Edit Profile Location rows.
     var usesCompactPillStyle: Bool = false
+    var languageCode: String = L10n.defaultLanguageCode
 
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var isFocused: Bool
@@ -17,7 +18,10 @@ struct ProfileHomeCityAutocompleteField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: usesCompactPillStyle ? 6 : 8) {
             HStack(spacing: 8) {
-                TextField("Lehi, Utah", text: $displayText)
+                TextField(
+                    L10n.t("Add a city", languageCode: languageCode),
+                    text: $displayText
+                )
                     .textInputAutocapitalization(.words)
                     .disableAutocorrection(true)
                     .focused($isFocused)
@@ -104,7 +108,7 @@ struct ProfileHomeCityAutocompleteField: View {
         do {
             let response = try await search.start()
             guard let item = response.mapItems.first else { return }
-            let parsed = ProfileHomeCityIdentity.parse(mapItem: item)
+            let parsed = ProfileHomeCityIdentity.parse(mapItem: item, languageCode: languageCode)
             await MainActor.run {
                 city = parsed.city
                 region = parsed.region

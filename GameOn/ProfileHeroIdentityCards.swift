@@ -202,14 +202,13 @@ enum ProfileHeroIdentityCardsBuilder {
 
     static func cards(from data: PublicUserProfileData, languageCode: String) -> [ProfileHeroIdentityCardItem] {
         let location = data.homeCityDisplayLine?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let locationParts = Self.splitLocation(location)
         let crowd = data.homeCrowd?.name.trimmingCharacters(in: .whitespacesAndNewlines)
         return cards(
             myTeam: data.explicitPrimaryFavoriteTeam,
             homeCrowdName: crowd,
             homeCrowdSubtitle: nil,
-            locationPrimary: locationParts.primary,
-            locationSecondary: locationParts.secondary,
+            locationPrimary: location,
+            locationSecondary: nil,
             fanSincePrimary: FanGeoHandleRules.fanSinceMonthYear(from: data.profileCreatedAt),
             fanSinceSecondary: nil,
             nationalTeam: data.nationalTeam,
@@ -223,15 +222,6 @@ enum ProfileHeroIdentityCardsBuilder {
         if p.isEmpty { return s }
         if s.isEmpty { return p }
         return "\(p), \(s)"
-    }
-
-    private static func splitLocation(_ line: String?) -> (primary: String?, secondary: String?) {
-        guard let line, !line.isEmpty else { return (nil, nil) }
-        let parts = line.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        if parts.count >= 2 {
-            return (parts.dropLast().joined(separator: ", "), parts.last)
-        }
-        return (line, nil)
     }
 }
 

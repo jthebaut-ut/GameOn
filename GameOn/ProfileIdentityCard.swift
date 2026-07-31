@@ -341,21 +341,8 @@ struct ProfileIdentityCard: View {
     }
 
     private var profileHeroIdentityCards: [ProfileHeroIdentityCardItem] {
+        // Use the shared hometown formatter line as-is (city, region, country).
         let locationLine = viewModel.currentUserVisibleHomeCityDisplayLine
-        let locationParts: (String?, String?) = {
-            guard let locationLine, !locationLine.isEmpty else { return (nil, nil) }
-            let parts = locationLine
-                .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            if parts.count >= 2 {
-                let primary = parts.dropLast().joined(separator: ", ")
-                let secondary = String(parts[parts.count - 1])
-                return (primary, secondary)
-            }
-            let country = viewModel.currentUserHomeCountry.trimmingCharacters(in: .whitespacesAndNewlines)
-            return (locationLine, country.isEmpty ? nil : country)
-        }()
         let crowdName = viewModel.currentUserHomeCrowdVenue?.name
         return ProfileHeroIdentityCardsBuilder.cards(
             myTeam: primaryFavoriteTeam,
@@ -363,8 +350,8 @@ struct ProfileIdentityCard: View {
             homeCrowdSubtitle: (crowdName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? L10n.t("home_crowd", languageCode: appLanguageRaw)
                 : nil,
-            locationPrimary: locationParts.0,
-            locationSecondary: locationParts.1,
+            locationPrimary: locationLine,
+            locationSecondary: nil,
             fanSincePrimary: FanGeoHandleRules.fanSinceMonthYear(from: viewModel.currentUserProfileCreatedAt),
             fanSinceSecondary: nil,
             nationalTeam: viewModel.currentUserNationalTeam,
@@ -380,7 +367,7 @@ struct ProfileIdentityCard: View {
     }
 
     private var bioLine: String {
-        viewModel.currentUserBio.trimmingCharacters(in: .whitespacesAndNewlines)
+        FanProfileDefaults.displayBio(viewModel.currentUserBio, languageCode: appLanguageRaw)
     }
 
     private var fanXP: FanXPState {
@@ -1509,7 +1496,7 @@ struct ProfileIdentityCard: View {
 #endif
                             showClearAllPokesConfirmation = true
                         } label: {
-                            Text(L10n.t("Clear", languageCode: appLanguageRaw))
+                            Text(L10n.t("profile_pokes_clear", languageCode: appLanguageRaw))
                                 .font(.system(size: 13, weight: .bold, design: .rounded))
                         }
                         .disabled(incomingPokes.isEmpty || isLoadingIncomingPokes || isClearingAllPokes)
@@ -3148,14 +3135,14 @@ struct ProfileIdentityCard: View {
     }
 
     private func insertBioEmoji(_ emoji: String) {
-        var draft = editedBio
+        var draft = FanProfileDefaults.displayBio(editedBio, languageCode: appLanguageRaw)
         let inserted = ProfileBioEmojiInsertion.append(
             emoji: emoji,
             to: &draft,
             limit: Self.bioCharacterLimit
         )
         if inserted {
-            editedBio = limitedBio(draft)
+            editedBio = FanProfileDefaults.bioForStorage(limitedBio(draft))
             focusedIdentityField = .bio
         } else {
             FGInteractionHaptics.softImpact()
@@ -3218,7 +3205,8 @@ struct ProfileIdentityCard: View {
         editedHomeCityDisplay = ProfileHomeCityIdentity.displayLine(
             city: viewModel.currentUserHomeCity,
             region: viewModel.currentUserHomeRegion,
-            country: viewModel.currentUserHomeCountry
+            country: viewModel.currentUserHomeCountry,
+            languageCode: appLanguageRaw
         ) ?? viewModel.currentUserHomeCity
         editedShowHomeCity = viewModel.currentUserShowHomeCity
         editedProfileBackgroundKey = viewModel.currentUserProfileBackgroundKey
@@ -3243,7 +3231,8 @@ struct ProfileIdentityCard: View {
             != (ProfileHomeCityIdentity.displayLine(
                 city: viewModel.currentUserHomeCity,
                 region: viewModel.currentUserHomeRegion,
-                country: viewModel.currentUserHomeCountry
+                country: viewModel.currentUserHomeCountry,
+                languageCode: appLanguageRaw
             ) ?? viewModel.currentUserHomeCity).trimmingCharacters(in: .whitespacesAndNewlines)
             || editedShowHomeCity != viewModel.currentUserShowHomeCity
         let backgroundDirty = editedProfileBackgroundKey != viewModel.currentUserProfileBackgroundKey
@@ -3436,7 +3425,7 @@ struct ProfileIdentityCard: View {
         print("[FanProfileSave] requestStarted")
 #endif
 
-        let nextBio = limitedBio(editedBio)
+        let nextBio = FanProfileDefaults.bioForStorage(limitedBio(editedBio))
         if let err = await viewModel.saveUserProfile(
             displayName: nextName,
             avatarURL: viewModel.currentUserAvatarURL,
@@ -3601,9 +3590,15 @@ struct ProfileIdentityCard: View {
                         .foregroundStyle(FGColor.accentBlue)
                         .textCase(.uppercase)
                         .tracking(0.78)
-                    Text(previewItems.isEmpty ? "Tell fans what you're up for" : "What you're open to")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        previewItems.isEmpty
+                            ? L10n.t("Tell fans what you're up for", languageCode: appLanguageRaw)
+                            : L10n.t("What you're open to", languageCode: appLanguageRaw)
+                    )
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.82))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
                 Button {
@@ -4043,7 +4038,12 @@ struct ProfileIdentityCard: View {
     }
 
     private var addTeamSocialCard: some View {
-        Button {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let title = L10n.t("Add a Team", languageCode: languageCode)
+        let subtitle = L10n.t("Add a favorite team", languageCode: languageCode)
+        let cardWidth = FavoriteTeamRichCardStyle.ownProfile.width
+
+        return Button {
             showFavoriteTeamsPicker = true
         } label: {
             VStack(alignment: .leading, spacing: 14) {
@@ -4056,19 +4056,27 @@ struct ProfileIdentityCard: View {
                         .foregroundStyle(FGColor.accentBlue)
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Add Team")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
                         .font(.system(size: 16, weight: .bold, design: .rounded))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
-                    Text("Build your fan profile")
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
+                    Text(subtitle)
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
                 Spacer(minLength: 0)
             }
             .padding(14)
-            .frame(width: 148, height: Self.favoriteTeamCardHeight, alignment: .topLeading)
+            .frame(width: cardWidth, alignment: .topLeading)
+            .frame(minHeight: Self.favoriteTeamCardHeight, alignment: .topLeading)
             .background {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.9))
@@ -4089,7 +4097,7 @@ struct ProfileIdentityCard: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Add favorite team")
+        .accessibilityLabel("\(title). \(subtitle)")
     }
 }
 
@@ -5082,6 +5090,9 @@ struct SuggestedFanCard: View {
         static var nameHeight: CGFloat { CGFloat(nameMaxLines) * nameLineHeight }
         static let accessibilityNameLineHeight: CGFloat = 18
         static var accessibilityNameHeight: CGFloat { CGFloat(nameMaxLines) * accessibilityNameLineHeight }
+        /// Reserved on every card so presence/absence of country never changes outer height.
+        static let countryRowHeight: CGFloat = 14
+        static let accessibilityCountryRowHeight: CGFloat = 16
         static let whyHeaderHeight: CGFloat = 11
         static let whyRowHeight: CGFloat = 12
         static let accessibilityWhyRowHeight: CGFloat = 14
@@ -5094,11 +5105,13 @@ struct SuggestedFanCard: View {
         /// Derived once for standard Dynamic Type.
         static let height: CGFloat = computedHeight(
             nameHeight: nameHeight,
+            countryRowHeight: countryRowHeight,
             whyRowHeight: whyRowHeight
         )
         /// Shared taller height for accessibility text sizes (all cards still equal).
         static let accessibilityHeight: CGFloat = computedHeight(
             nameHeight: accessibilityNameHeight,
+            countryRowHeight: accessibilityCountryRowHeight,
             whyRowHeight: accessibilityWhyRowHeight
         )
 
@@ -5110,13 +5123,19 @@ struct SuggestedFanCard: View {
             whyHeaderHeight + whySectionSpacing + whyExplanationRowsHeight(rowHeight: rowHeight)
         }
 
-        static func computedHeight(nameHeight: CGFloat, whyRowHeight: CGFloat) -> CGFloat {
+        static func computedHeight(
+            nameHeight: CGFloat,
+            countryRowHeight: CGFloat,
+            whyRowHeight: CGFloat
+        ) -> CGFloat {
             let whyBlock = whyBlockHeight(rowHeight: whyRowHeight)
-            // Outer VStack: [avatar+name+why] + spacing + Spacer(0) + spacing + button
+            // Outer VStack: [avatar+name+country+why] + spacing + Spacer(0) + spacing + button
             return cardTopPadding
                 + avatarOuterSize
                 + verticalSpacing
                 + nameHeight
+                + verticalSpacing
+                + countryRowHeight
                 + verticalSpacing
                 + whyBlock
                 + verticalSpacing
@@ -5131,6 +5150,10 @@ struct SuggestedFanCard: View {
 
         static func nameAreaHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
             sizeCategory.isAccessibilityCategory ? accessibilityNameHeight : nameHeight
+        }
+
+        static func countryRowHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
+            sizeCategory.isAccessibilityCategory ? accessibilityCountryRowHeight : countryRowHeight
         }
 
         static func whyRowHeight(for sizeCategory: ContentSizeCategory) -> CGFloat {
@@ -5150,12 +5173,23 @@ struct SuggestedFanCard: View {
         Metrics.nameAreaHeight(for: sizeCategory)
     }
 
+    private var countryRowHeight: CGFloat {
+        Metrics.countryRowHeight(for: sizeCategory)
+    }
+
     private var whyRowHeight: CGFloat {
         Metrics.whyRowHeight(for: sizeCategory)
     }
 
     private var whyBlockHeight: CGFloat {
         Metrics.whyBlockHeight(rowHeight: whyRowHeight)
+    }
+
+    private var displayCountry: (isoCode: String?, flagEmoji: String?, localizedName: String)? {
+        ProfileHomeCityIdentity.displayableHomeCountry(
+            storedCountry: suggestion.homeCountry,
+            languageCode: appLanguageRaw
+        )
     }
 
     var body: some View {
@@ -5172,6 +5206,8 @@ struct SuggestedFanCard: View {
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity)
                         .frame(height: nameAreaHeight, alignment: .top)
+
+                    countryRow
 
                     whySuggestedSection
                 }
@@ -5242,6 +5278,35 @@ struct SuggestedFanCard: View {
         .background(Circle().fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.96)))
     }
 
+    /// Fixed-height country row — empty when no displayable profile country (keeps carousel card sizes equal).
+    private var countryRow: some View {
+        Group {
+            if let displayCountry {
+                HStack(spacing: 3) {
+                    if let flag = displayCountry.flagEmoji {
+                        Text(flag)
+                            .font(.system(size: 10))
+                            .accessibilityHidden(true)
+                    }
+                    Text(displayCountry.localizedName)
+                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .minimumScaleFactor(0.85)
+                }
+                .frame(maxWidth: .infinity)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(displayCountry.localizedName)
+            } else {
+                Color.clear
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: countryRowHeight, alignment: .center)
+    }
+
     /// Fixed-height why block so headings and Add buttons stay aligned across the carousel.
     /// Unused reason rows stay empty (no placeholder bullets); content is top-aligned.
     private var whySuggestedSection: some View {
@@ -5310,6 +5375,9 @@ struct SuggestedFanCard: View {
 
     private var cardAccessibilityLabel: String {
         var parts = [displayName]
+        if let countryName = displayCountry?.localizedName {
+            parts.append(countryName)
+        }
         if !whyExplanations.isEmpty {
             parts.append(whySuggestedAccessibilityLabel)
         }
@@ -5339,6 +5407,8 @@ struct SuggestedFanCard: View {
 
                 Text(state.title)
                     .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
             }
             .foregroundStyle(state.foreground)
             .frame(maxWidth: .infinity)
@@ -5415,9 +5485,10 @@ struct SuggestedFanCard: View {
     }
 
     private var buttonState: ButtonState {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
         if isSending {
             return ButtonState(
-                title: "Adding",
+                title: L10n.t("Adding", languageCode: languageCode),
                 systemImage: nil,
                 isEnabled: false,
                 foreground: FGColor.accentBlue,
@@ -5429,7 +5500,7 @@ struct SuggestedFanCard: View {
         switch chipKind {
         case .addFriend, .declinedOutgoing:
             return ButtonState(
-                title: "Add",
+                title: L10n.t("Add", languageCode: languageCode),
                 systemImage: "person.badge.plus",
                 isEnabled: true,
                 foreground: .white,

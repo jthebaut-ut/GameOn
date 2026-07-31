@@ -1513,7 +1513,8 @@ struct UserProfileRow: Decodable {
         ProfileHomeCityIdentity.displayLine(
             city: home_city,
             region: home_region,
-            country: home_country
+            country: home_country,
+            languageCode: UserDefaults.standard.string(forKey: L10n.appLanguageKey)
         )
     }
 

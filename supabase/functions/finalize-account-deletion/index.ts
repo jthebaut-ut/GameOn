@@ -1,9 +1,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { createClient } from "npm:@supabase/supabase-js@2"
+import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 
 /**
  * Finalizes a fan account soft-deletion job after DB commit:
- * - deletes avatar objects from user-avatars (best-effort)
+ * - deletes avatar objects from user-avatars (best-effort, idempotent)
  * - advances account_deletion_jobs to completed via whitelisted service-role RPC
  *
  * Phase 2 intentionally does NOT call auth.admin.deleteUser or release identities.
@@ -11,6 +11,9 @@ import { createClient } from "npm:@supabase/supabase-js@2"
  * Auth:
  * - Service role bearer (pg_net retry / ops), or
  * - User JWT where sub matches job.subject_user_id (self-service iOS finalize)
+ *
+ * Important: always transition db_committed → storage_pending before mark_completed,
+ * including zero-path jobs. mark_completed requires storage_pending.
  *
  * Deploy: `supabase functions deploy finalize-account-deletion`
  */
@@ -34,6 +37,57 @@ function normalizePaths(paths: unknown): string[] {
   return paths
     .map((value) => (typeof value === "string" ? value.trim() : ""))
     .filter((value) => value.length > 0)
+}
+
+function isMissingObjectError(message: string | undefined): boolean {
+  const normalized = (message ?? "").toLowerCase()
+  return (
+    normalized.includes("not found")
+    || normalized.includes("object not found")
+    || normalized.includes("does not exist")
+    || normalized.includes("no such file")
+    || normalized.includes("404")
+  )
+}
+
+/** Only allow deleting objects under the deletion subject's folder. */
+function pathsOwnedBySubject(paths: string[], subjectUserId: string): {
+  allowed: string[]
+  rejected: string[]
+} {
+  const prefix = `${subjectUserId}/`
+  const allowed: string[] = []
+  const rejected: string[] = []
+  for (const path of paths) {
+    if (path === subjectUserId || path.startsWith(prefix)) {
+      allowed.push(path)
+    } else {
+      rejected.push(path)
+    }
+  }
+  return { allowed, rejected }
+}
+
+async function removeAvatarPath(
+  admin: SupabaseClient,
+  path: string,
+): Promise<{ path: string; ok: boolean; already_missing?: boolean; error?: string; rejected?: boolean }> {
+  try {
+    const { error } = await admin.storage.from(AVATAR_BUCKET).remove([path])
+    if (!error) {
+      return { path, ok: true }
+    }
+    if (isMissingObjectError(error.message)) {
+      return { path, ok: true, already_missing: true }
+    }
+    return { path, ok: false, error: error.message }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (isMissingObjectError(message)) {
+      return { path, ok: true, already_missing: true }
+    }
+    return { path, ok: false, error: message }
+  }
 }
 
 Deno.serve(async (req) => {
@@ -134,10 +188,9 @@ Deno.serve(async (req) => {
     }, 409)
   }
 
-  const paths = normalizePaths(job.avatar_storage_paths)
-  const storageResults: Array<{ path: string; ok: boolean; error?: string }> = []
-
-  if (paths.length > 0) {
+  // Always claim storage_pending before mark_completed (including zero-path jobs).
+  // advance_account_deletion_job rejects mark_completed from db_committed.
+  if (job.status === "db_committed") {
     const { error: pendingError } = await admin.rpc("advance_account_deletion_job", {
       p_job_id: jobId,
       p_action: "mark_storage_pending",
@@ -145,49 +198,85 @@ Deno.serve(async (req) => {
 
     if (pendingError) {
       console.error(`${LOG_PREFIX} mark_storage_pending_failed`, pendingError.message)
-      return json({ ok: false, error: "advance_failed", detail: pendingError.message }, 500)
-    }
-
-    for (const path of paths) {
-      try {
-        const { error } = await admin.storage.from(AVATAR_BUCKET).remove([path])
-        if (error) {
-          storageResults.push({ path, ok: false, error: error.message })
-        } else {
-          storageResults.push({ path, ok: true })
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
-        storageResults.push({ path, ok: false, error: message })
-      }
+      return json({
+        ok: false,
+        error: "advance_failed",
+        detail: pendingError.message,
+        resumable: true,
+      }, 500)
     }
   }
 
-  const allStorageOk = storageResults.every((result) => result.ok)
-  const advanceAction = allStorageOk || paths.length === 0 ? "mark_completed" : "mark_storage_partial"
+  const rawPaths = normalizePaths(job.avatar_storage_paths)
+  const { allowed: paths, rejected } = pathsOwnedBySubject(rawPaths, job.subject_user_id)
+
+  if (rejected.length > 0) {
+    console.error(
+      `${LOG_PREFIX} rejected_foreign_paths job=${jobId} count=${rejected.length}`,
+    )
+  }
+
+  const storageResults: Array<{
+    path: string
+    ok: boolean
+    already_missing?: boolean
+    error?: string
+    rejected?: boolean
+  }> = []
+
+  for (const path of rejected) {
+    storageResults.push({
+      path,
+      ok: false,
+      rejected: true,
+      error: "path_not_owned_by_subject",
+    })
+  }
+
+  for (const path of paths) {
+    storageResults.push(await removeAvatarPath(admin, path))
+  }
+
+  // Foreign paths are never deleted; treat as hard failure so the job stays retryable.
+  const deletableResults = storageResults.filter((result) => !result.rejected)
+  const allStorageOk = rejected.length === 0
+    && deletableResults.every((result) => result.ok)
+  const advanceAction = allStorageOk ? "mark_completed" : "mark_storage_partial"
 
   const { data: advanced, error: advanceError } = await admin.rpc("advance_account_deletion_job", {
     p_job_id: jobId,
     p_action: advanceAction,
     p_error_code: advanceAction === "mark_storage_partial" ? "storage_cleanup_partial" : null,
     p_error_detail: advanceAction === "mark_storage_partial"
-      ? JSON.stringify(storageResults.filter((result) => !result.ok))
+      ? JSON.stringify({
+        attempt_at: new Date().toISOString(),
+        rejected_foreign_paths: rejected,
+        failures: storageResults.filter((result) => !result.ok),
+      })
       : null,
   })
 
   if (advanceError) {
     console.error(`${LOG_PREFIX} advance_failed`, advanceError.message)
-    return json({ ok: false, error: "advance_failed", detail: advanceError.message }, 500)
+    return json({
+      ok: false,
+      error: "advance_failed",
+      detail: advanceError.message,
+      storage_results: storageResults,
+      resumable: true,
+    }, 500)
   }
 
   const advancedRecord = advanced as { status?: string; stage?: string } | null
-  const nextStatus = advancedRecord?.status ?? (allStorageOk || paths.length === 0 ? "completed" : "storage_pending")
-  const nextStage = advancedRecord?.stage ?? (allStorageOk || paths.length === 0 ? "completed" : "storage_cleanup_partial")
+  const nextStatus = advancedRecord?.status ?? (allStorageOk ? "completed" : "storage_pending")
+  const nextStage = advancedRecord?.stage ?? (allStorageOk ? "completed" : "storage_cleanup_partial")
 
-  console.log(`${LOG_PREFIX} completed job=${jobId} storagePaths=${paths.length} allStorageOk=${allStorageOk}`)
+  console.log(
+    `${LOG_PREFIX} done job=${jobId} status=${nextStatus} paths=${paths.length} rejected=${rejected.length} allStorageOk=${allStorageOk}`,
+  )
 
   return json({
-    ok: true,
+    ok: allStorageOk,
     job_id: job.id,
     status: nextStatus,
     stage: nextStage,
@@ -195,5 +284,6 @@ Deno.serve(async (req) => {
     auth_users_deleted: false,
     account_identities_deleted: false,
     email_released: false,
+    resumable: !allStorageOk,
   })
 })

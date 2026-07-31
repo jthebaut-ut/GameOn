@@ -543,7 +543,7 @@ struct FanGeoAnnouncementService {
     func fetchDiscoverBannerCandidates() async -> [FanGeoAnnouncement]? {
         for scope in FetchColumnScope.allCases {
             if let rows = await fetchDiscoverBannerCandidates(columnScope: scope) {
-                return rows
+                return await applyActiveAppLanguageTranslations(to: rows)
             }
         }
         return nil
@@ -629,6 +629,162 @@ struct FanGeoAnnouncementService {
 #endif
             return nil
         }
+    }
+
+    /// Overlay persisted translations for FanGeo's active app language.
+    /// Never translates on-device. Falls back to English source fields when missing.
+    @MainActor
+    private func applyActiveAppLanguageTranslations(
+        to rows: [FanGeoAnnouncement]
+    ) async -> [FanGeoAnnouncement] {
+        let locale = Self.resolveAnnouncementLocale(
+            UserDefaults.standard.string(forKey: L10n.appLanguageKey)
+        )
+        guard locale != L10n.defaultLanguageCode, !rows.isEmpty else {
+            return rows
+        }
+
+        let ids = rows.map { $0.id.uuidString.lowercased() }
+        do {
+            let translations: [FanGeoAnnouncementTranslationRow] = try await supabase
+                .from("announcement_translations")
+                .select(
+                    "announcement_id,locale,title,subtitle,description,cta_label,promo_offer_chip,translation_status"
+                )
+                .in("announcement_id", values: ids)
+                .eq("locale", value: locale)
+                .eq("translation_status", value: "current")
+                .execute()
+                .value
+
+            let byId = Dictionary(
+                uniqueKeysWithValues: translations.compactMap { row -> (UUID, FanGeoAnnouncementTranslationRow)? in
+                    guard let id = UUID(uuidString: row.announcementId) else { return nil }
+                    return (id, row)
+                }
+            )
+
+            return rows.map { row in
+                guard let translation = byId[row.id] else { return row }
+                return row.applyingTranslation(translation)
+            }
+        } catch {
+#if DEBUG
+            print(
+                "[AnnouncementDebug] translationOverlayFailed locale=\(locale) " +
+                "error=\(error.localizedDescription) fallback=englishSource"
+            )
+#endif
+            // Table missing / RLS / network: keep English source copy.
+            return rows
+        }
+    }
+
+    /// Active FanGeo app language → canonical announcement locale.
+    /// Country/GPS must never influence this. Hierarchy: exact → base language → English.
+    private static func resolveAnnouncementLocale(_ raw: String?) -> String {
+        let trimmed = (raw ?? L10n.defaultLanguageCode)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return L10n.defaultLanguageCode
+        }
+
+        if let exact = L10n.supportedLanguages.first(where: {
+            $0.code.caseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
+            return exact.code
+        }
+
+        // fr-FR / es-MX → fr / es when that base language is a FanGeo supported locale.
+        // Script locales like zh-Hans are matched exactly above and are not stripped here.
+        if let dash = trimmed.firstIndex(of: "-") {
+            let base = String(trimmed[..<dash])
+            if let baseMatch = L10n.supportedLanguages.first(where: {
+                $0.code.caseInsensitiveCompare(base) == .orderedSame
+            }) {
+                return baseMatch.code
+            }
+        }
+
+        return L10n.defaultLanguageCode
+    }
+}
+
+private struct FanGeoAnnouncementTranslationRow: Decodable, Sendable {
+    let announcementId: String
+    let locale: String
+    let title: String?
+    let subtitle: String?
+    let description: String?
+    let ctaLabel: String?
+    let promoOfferChip: String?
+    let translationStatus: String?
+
+    enum CodingKeys: String, CodingKey {
+        case announcementId = "announcement_id"
+        case locale
+        case title
+        case subtitle
+        case description
+        case ctaLabel = "cta_label"
+        case promoOfferChip = "promo_offer_chip"
+        case translationStatus = "translation_status"
+    }
+}
+
+extension FanGeoAnnouncement {
+    fileprivate func applyingTranslation(_ translation: FanGeoAnnouncementTranslationRow) -> FanGeoAnnouncement {
+        let localizedTitle = Self.nonEmpty(translation.title) ?? title
+        let localizedSubtitle = Self.optionalNonEmpty(translation.subtitle) ?? subtitle
+        let localizedDescription = Self.optionalNonEmpty(translation.description) ?? announcementDescription
+        let localizedCta = Self.optionalNonEmpty(translation.ctaLabel) ?? ctaLabel
+        let localizedOffer = Self.optionalNonEmpty(translation.promoOfferChip) ?? promoOfferChip
+
+        // Never render blank primary copy if translation somehow emptied required fields.
+        let safeTitle = localizedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? title
+            : localizedTitle
+
+        return FanGeoAnnouncement(
+            id: id,
+            title: safeTitle,
+            subtitle: localizedSubtitle,
+            announcementDescription: localizedDescription,
+            imageURL: imageURL,
+            secondaryImageURL: secondaryImageURL,
+            ctaLabel: localizedCta,
+            ctaAction: ctaAction,
+            audienceFans: audienceFans,
+            audienceBusinesses: audienceBusinesses,
+            displayType: displayType,
+            status: status,
+            startDate: startDate,
+            endDate: endDate,
+            priority: priority,
+            createdAt: createdAt,
+            updatedAt: updatedAt,
+            targetCountry: targetCountry,
+            targetState: targetState,
+            targetCity: targetCity,
+            dismissVersion: dismissVersion,
+            promotionType: promotionType,
+            promotedVenueId: promotedVenueId,
+            targetRadiusMiles: targetRadiusMiles,
+            promoOfferType: promoOfferType,
+            promoOfferChip: localizedOffer,
+            deletedAt: deletedAt
+        )
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func optionalNonEmpty(_ value: String?) -> String? {
+        nonEmpty(value)
     }
 }
 

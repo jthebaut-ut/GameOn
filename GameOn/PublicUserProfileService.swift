@@ -1046,7 +1046,8 @@ enum PublicUserProfileService {
         return ProfileHomeCityIdentity.displayLine(
             city: rpc.home_city,
             region: rpc.home_region,
-            country: rpc.home_country
+            country: rpc.home_country,
+            languageCode: UserDefaults.standard.string(forKey: L10n.appLanguageKey)
         )
     }
 

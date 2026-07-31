@@ -1735,7 +1735,10 @@ struct FollowingScreen: View {
                 if manualSavedProGamesForDisplay.isEmpty {
                     goingRichEmptyCard(
                         title: "📺 \(L10n.t("no_saved_pro_sports_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)))",
-                        description: "Save live or upcoming games to follow them here.",
+                        description: L10n.t(
+                            "Save live or upcoming games to follow them here.",
+                            languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                        ),
                         buttonTitle: L10n.t("browse_pro_sports_games", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
                         buttonAction: openCalendarProGamesFromGoing,
                         buttonAccent: FGColor.intentProGames
@@ -1771,13 +1774,19 @@ struct FollowingScreen: View {
                     )
                 } else if !favoriteTeamProGameAlertsEnabled {
                     goingRichEmptyCard(
-                        title: "Team Alerts are off",
-                        description: "Turn on Team Alerts to get kickoff, score, and final alerts for your favorite teams."
+                        title: L10n.t("Team Alerts are off", languageCode: appLanguageRaw),
+                        description: L10n.t(
+                            "Turn on Team Alerts to get kickoff, score, and final alerts for your favorite teams.",
+                            languageCode: appLanguageRaw
+                        )
                     )
                 } else if favoriteTeamProGamesForDisplay.isEmpty {
                     goingRichEmptyCard(
-                        title: "No upcoming favorite team games",
-                        description: "We'll show games here when your favorite teams have upcoming matches."
+                        title: L10n.t("No upcoming favorite team games", languageCode: appLanguageRaw),
+                        description: L10n.t(
+                            "We'll show games here when your favorite teams have upcoming matches.",
+                            languageCode: appLanguageRaw
+                        )
                     )
                 } else {
                     VStack(spacing: 12) {
@@ -3142,9 +3151,9 @@ struct FollowingScreen: View {
             Text(goingHubActivityText)
                 .font(FGTypography.caption.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(followingColorScheme))
-                .lineLimit(2)
-
-            Spacer(minLength: 0)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             Text("Pickup")
                 .font(.system(size: 10, weight: .bold, design: .rounded))
@@ -3152,6 +3161,7 @@ struct FollowingScreen: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background(Color.orange.opacity(followingColorScheme == .dark ? 0.16 : 0.11), in: Capsule())
+                .layoutPriority(1)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -3165,17 +3175,23 @@ struct FollowingScreen: View {
     }
 
     private var goingHubActivityText: String {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
         if viewModel.pendingPickupGameJoinRequestCount == 1 {
             return "1 player waiting to join."
         }
         if viewModel.pendingPickupGameJoinRequestCount > 1 {
             return "\(viewModel.pendingPickupGameJoinRequestCount) players waiting to join."
         }
-        if viewModel.pickupActivityCount == 1 {
-            return "New activity on a pickup game you joined."
-        }
-        if viewModel.pickupActivityCount > 1 {
-            return "\(viewModel.pickupActivityCount) pickup games have new activity."
+        let pickupActivityCount = viewModel.pickupActivityCount
+        if pickupActivityCount > 0 {
+            let key = pickupActivityCount == 1
+                ? "%lld pickup game has new activity."
+                : "%lld pickup games have new activity."
+            return String(
+                format: L10n.t(key, languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                Int64(pickupActivityCount)
+            )
         }
         return "Pickup activity is waiting in Going."
     }
@@ -5836,6 +5852,7 @@ struct FollowingScreen: View {
                 Text(title)
                     .font(FGTypography.cardTitle.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Text(description)
                     .font(FGTypography.caption)

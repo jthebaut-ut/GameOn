@@ -159,6 +159,10 @@ final class ChatViewModel: ObservableObject {
         }
     }
     @Published var errorMessage: String?
+    /// Localized title for the friend-request error alert (accept / decline / clear).
+    @Published var friendRequestAlertTitle: String?
+    /// Debounce Accept/Decline while a mutation for that friendship id is in flight.
+    @Published private(set) var friendRequestActionInFlightIds: Set<UUID> = []
     /// Shown when swipe-delete (inbox clear) fails; kept separate from ``errorMessage`` so friend-request errors don’t clash.
     @Published var inboxDeleteError: String?
     /// Shown when Friends directory unfriend fails; kept separate from ``errorMessage``.
@@ -464,6 +468,7 @@ final class ChatViewModel: ObservableObject {
         lastCompletedGroupInboxAvatarHydrationKey = nil
         groupInboxAvatarHydrationRefreshToken &+= 1
         errorMessage = nil
+        friendRequestAlertTitle = nil
         inboxDeleteError = nil
         requiresSignIn = signInRequired
         isInboxInitialLoadInFlight = false
@@ -3317,6 +3322,7 @@ final class ChatViewModel: ObservableObject {
         let fullRefreshStartedAt = CFAbsoluteTimeGetCurrent()
         isLoading = true
         errorMessage = nil
+        friendRequestAlertTitle = nil
         defer { isLoading = false }
 
         do {
@@ -3435,15 +3441,68 @@ final class ChatViewModel: ObservableObject {
     }
 
     func accept(_ item: IncomingRequestDisplay) async {
+        let requestId = item.friendship.id
+        guard !friendRequestActionInFlightIds.contains(requestId) else { return }
+        friendRequestActionInFlightIds.insert(requestId)
+        defer { friendRequestActionInFlightIds.remove(requestId) }
+
+        let responded = ISO8601DateFormatter().string(from: Date())
+        let acceptedFriendship = item.friendship.withAcceptedNow(respondedAt: responded)
+        let snapshot = incomingRequests
+        let chipSnapshot = friendshipChipByOtherUserId
+
+        // Optimistic: drop pending request immediately; authoritative refresh follows.
+        incomingRequests.removeAll { $0.id == item.id }
+        pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
+        let rid = item.requester.id
+        var chips = friendshipChipByOtherUserId
+        chips[rid] = .friends
+        friendshipChipByOtherUserId = chips
+
         do {
-            let friendship = try await service.acceptFriendRequest(requestId: item.friendship.id)
+            try await service.acceptFriendRequest(requestId: requestId)
             await refresh()
-            await awardFriendConnectedXP(friendship: friendship)
+            await awardFriendConnectedXP(friendship: acceptedFriendship)
         } catch {
-            if ignoreCancellationIfNeeded(error, context: "friend_request_accept") { return }
+            if ignoreCancellationIfNeeded(error, context: "friend_request_accept") {
+                incomingRequests = snapshot
+                pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
+                friendshipChipByOtherUserId = chipSnapshot
+                return
+            }
+            incomingRequests = snapshot
+            pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
+            friendshipChipByOtherUserId = chipSnapshot
             if AgeAccessBackendDenial.handle(error, requestUserId: nil) { return }
-            errorMessage = error.localizedDescription
+#if DEBUG
+            print("[FriendRequest] accept failed id=\(requestId) error=\(error)")
+#endif
+            presentFriendRequestError(
+                titleKey: "friend_request_accept_failed_title",
+                messageKey: "friend_request_accept_failed_message",
+                underlying: error
+            )
+            await refreshFriendRequestListsOnly()
         }
+    }
+
+    func isFriendRequestActionInFlight(_ friendshipId: UUID) -> Bool {
+        friendRequestActionInFlightIds.contains(friendshipId)
+    }
+
+    private func presentFriendRequestError(
+        titleKey: String,
+        messageKey: String,
+        underlying: Error
+    ) {
+        let languageCode = L10n.normalizedLanguageCode(
+            UserDefaults.standard.string(forKey: L10n.appLanguageKey)
+        )
+        friendRequestAlertTitle = L10n.t(titleKey, languageCode: languageCode)
+        errorMessage = L10n.t(messageKey, languageCode: languageCode)
+#if DEBUG
+        print("[FriendRequest] userAlert titleKey=\(titleKey) underlying=\(underlying.localizedDescription)")
+#endif
     }
 
     private func awardFriendConnectedXP(friendship: FriendshipRow) async {
@@ -3456,6 +3515,11 @@ final class ChatViewModel: ObservableObject {
     }
 
     func reject(_ item: IncomingRequestDisplay) async {
+        let requestId = item.friendship.id
+        guard !friendRequestActionInFlightIds.contains(requestId) else { return }
+        friendRequestActionInFlightIds.insert(requestId)
+        defer { friendRequestActionInFlightIds.remove(requestId) }
+
         let responded = ISO8601DateFormatter().string(from: Date())
         let optimistic = item.friendship.withDeclinedNow(respondedAt: responded)
         let snapshot = incomingRequests
@@ -3472,7 +3536,7 @@ final class ChatViewModel: ObservableObject {
             friendshipChipByOtherUserId = m
         }
         do {
-            try await service.rejectFriendRequest(requestId: item.friendship.id)
+            try await service.rejectFriendRequest(requestId: requestId)
             await refreshFriendRequestListsOnly()
         } catch {
             if ignoreCancellationIfNeeded(error, context: "friend_request_reject") {
@@ -3483,7 +3547,14 @@ final class ChatViewModel: ObservableObject {
             incomingRequests = snapshot
             pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
             if AgeAccessBackendDenial.handle(error, requestUserId: nil) { return }
-            errorMessage = error.localizedDescription
+#if DEBUG
+            print("[FriendRequest] decline failed id=\(requestId) error=\(error)")
+#endif
+            presentFriendRequestError(
+                titleKey: "friend_request_decline_failed_title",
+                messageKey: "friend_request_decline_failed_message",
+                underlying: error
+            )
             await refreshFriendRequestListsOnly()
         }
     }
@@ -3508,7 +3579,11 @@ final class ChatViewModel: ObservableObject {
             DebugLogGate.debug("[FriendRequest] clear failed id=\(item.id) error=\(error)")
             incomingRequests = snapshot
             pendingBadgeCount = incomingRequests.filter { $0.friendship.isPendingStatus }.count
-            errorMessage = error.localizedDescription
+            presentFriendRequestError(
+                titleKey: "friend_request_update_failed_title",
+                messageKey: "friend_request_update_failed_message",
+                underlying: error
+            )
         }
     }
 
@@ -3529,7 +3604,11 @@ final class ChatViewModel: ObservableObject {
             }
             DebugLogGate.debug("[FriendRequest] clear failed id=\(item.id) error=\(error)")
             outgoingRequests = snapshot
-            errorMessage = error.localizedDescription
+            presentFriendRequestError(
+                titleKey: "friend_request_update_failed_title",
+                messageKey: "friend_request_update_failed_message",
+                underlying: error
+            )
         }
     }
 
@@ -3569,7 +3648,11 @@ final class ChatViewModel: ObservableObject {
             DebugLogGate.debug("[FriendRequest] outgoing cancel failed id=\(item.id) error=\(error)")
             outgoingRequests = snapshotOut
             friendshipChipByOtherUserId = snapshotChips
-            errorMessage = error.localizedDescription
+            presentFriendRequestError(
+                titleKey: "friend_request_update_failed_title",
+                messageKey: "friend_request_update_failed_message",
+                underlying: error
+            )
             await refreshFriendRequestListsOnly()
         }
     }
@@ -3620,7 +3703,11 @@ final class ChatViewModel: ObservableObject {
             print("[FriendRequestDebug] cancelFailed peer=\(peerId.uuidString.lowercased()) error=\(error.localizedDescription)")
 #endif
             friendshipChipByOtherUserId = snapshotChips
-            errorMessage = error.localizedDescription
+            presentFriendRequestError(
+                titleKey: "friend_request_update_failed_title",
+                messageKey: "friend_request_update_failed_message",
+                underlying: error
+            )
             await refreshFriendRequestListsOnly()
         }
     }

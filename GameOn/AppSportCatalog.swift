@@ -34,6 +34,9 @@ public nonisolated enum AppSportCatalog {
             Category(id: "action", title: "Action", rows: [
                 ("Climbing", "Climbing"),
                 ("Skateboarding", "Skateboarding"),
+                ("Paragliding", "paragliding"),
+                ("Hang Gliding", "hang_gliding"),
+                ("Paramotoring", "paramotoring"),
                 ("Boxing", "Boxing"),
                 ("MMA / UFC", "UFC"),
                 ("Wrestling", "Wrestling"),
@@ -51,6 +54,7 @@ public nonisolated enum AppSportCatalog {
                 ("Esports", "Esports"),
                 ("Ping Pong", "Ping Pong"),
                 ("Pickleball", "Pickleball"),
+                ("Padel", "padel"),
             ]),
             Category(id: "water_winter", title: "Water/Winter", rows: [
                 ("Swimming", "Swimming"),
@@ -137,6 +141,15 @@ public nonisolated enum AppSportCatalog {
                 return ["breakdance", "breaking", "urban dance", "dance"]
             case "ballet":
                 return ["performing arts", "classical ballet", "dance"]
+            case "paragliding":
+                return ["parapente", "paraglider", "para gliding"]
+            case "hang_gliding", "hang gliding":
+                return ["deltaplane", "hanggliding", "hang glider", "hang-gliding"]
+            case "paramotoring":
+                return ["paramoteur", "powered paragliding", "paramotor"]
+            case "padel":
+                // Typo / FR-identical display alias only — never a canonical stored ID.
+                return ["padle"]
             default:
                 return []
             }
@@ -184,6 +197,7 @@ public nonisolated enum AppSportCatalog {
     public static var formPickerSportsOrdered: [String] { sportsExcludingAll }
 
     /// Friendly label for a stored sport token, e.g. `NBA` -> `Basketball`.
+    /// Uses ``L10n`` so catalog English labels resolve to the active app language (e.g. Parapente).
     public static func displayLabel(forSportToken token: String) -> String {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -193,17 +207,17 @@ public nonisolated enum AppSportCatalog {
                 $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
                     || $0.label.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
             }) {
-                return row.label
+                return L10n.t(row.label)
             }
         }
 
         if let pair = discoverMapDefaultPopularPairs.first(where: {
             $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
         }) {
-            return pair.display
+            return L10n.t(pair.display)
         }
 
-        return trimmed
+        return L10n.t(trimmed)
     }
 
     /// Compact Discover toolbar: stored selection token + chip label (see ``DiscoverSportFilterRowLayout``).

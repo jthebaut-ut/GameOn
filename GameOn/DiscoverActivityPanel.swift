@@ -47,14 +47,35 @@ enum FanGeoDiscoverActivityPanelPreferences {
         UserDefaults.standard.set(true, forKey: dragHintKey(for: userId))
     }
 
-    /// Restores only `hidden` or `compact`. Expanded always restores as compact.
+    private static let defaultHiddenMigrationKeyPrefix = "discoverActivityPanelDefaultHidden.v1"
+    private static let guestDefaultHiddenMigrationKey = "discoverActivityPanelDefaultHidden.v1.guest"
+
+    private static func defaultHiddenMigrationKey(for userId: UUID?) -> String {
+        guard let userId else { return guestDefaultHiddenMigrationKey }
+        return "\(defaultHiddenMigrationKeyPrefix).\(userId.uuidString.lowercased())"
+    }
+
+    /// Prior releases persisted `.compact` for everyone via first-Discover intro. Reset once so the
+    /// new fully-collapsed default applies; afterward, honor the user’s durable preference.
+    private static func migrateDefaultCollapsedIfNeeded(for userId: UUID?) {
+        let key = defaultHiddenMigrationKey(for: userId)
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        UserDefaults.standard.set(true, forKey: key)
+        UserDefaults.standard.removeObject(forKey: stateKey(for: userId))
+    }
+
+    /// Restores durable preference. Missing preference defaults to fully collapsed (`.hidden`).
+    /// In-session expansion is held by DiscoverScreen `@State` across tab switches.
     static func restoredState(for userId: UUID?) -> DiscoverActivityPanelState {
+        migrateDefaultCollapsedIfNeeded(for: userId)
         let raw = UserDefaults.standard.string(forKey: stateKey(for: userId)) ?? ""
         switch raw {
         case DiscoverActivityPanelState.hidden.persistenceRawValue:
             return .hidden
-        default:
+        case DiscoverActivityPanelState.compact.persistenceRawValue:
             return .compact
+        default:
+            return .hidden
         }
     }
 

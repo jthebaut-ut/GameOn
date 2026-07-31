@@ -1,5 +1,17 @@
 import Foundation
 
+/// Localized "N member(s)" for group chat surfaces (inbox rows, invitations, share pickers).
+func groupChatLocalizedMemberCount(_ count: Int, languageCode: String) -> String {
+    let key = count == 1
+        ? "group_chat_member_count_one_format"
+        : "group_chat_member_count_other_format"
+    return String(
+        format: L10n.t(key, languageCode: languageCode),
+        locale: Locale(identifier: L10n.normalizedLanguageCode(languageCode)),
+        Int64(count)
+    )
+}
+
 enum ChatInboxConversationKind: String, Hashable, Sendable {
     case direct
     case business

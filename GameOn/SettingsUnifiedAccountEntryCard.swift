@@ -135,11 +135,17 @@ struct SettingsUnifiedAccountEntryCard: View {
             }
 
             VStack(spacing: FGSpacing.sm) {
-                FGPrimaryButton(title: "Sign In", systemImage: "person.fill") {
+                FGPrimaryButton(
+                    title: L10n.t("Sign In", languageCode: languageCode),
+                    systemImage: "person.fill"
+                ) {
                     onSignIn()
                 }
 
-                FGSecondaryButton(title: "Create Account", systemImage: "person.badge.plus") {
+                FGSecondaryButton(
+                    title: L10n.t("Create Account", languageCode: languageCode),
+                    systemImage: "person.badge.plus"
+                ) {
                     onCreateAccount()
                 }
             }

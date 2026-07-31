@@ -998,9 +998,15 @@ struct ProfileIdentityOpenToSection: View {
                         .foregroundStyle(FGColor.accentBlue)
                         .textCase(.uppercase)
                         .tracking(0.78)
-                    Text(previewItems.isEmpty ? "Tell fans what you're up for" : "What you're open to")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        previewItems.isEmpty
+                            ? L10n.t("Tell fans what you're up for", languageCode: languageCode)
+                            : L10n.t("What you're open to", languageCode: languageCode)
+                    )
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.82))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
                 Button(action: onEdit) {

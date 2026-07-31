@@ -1873,7 +1873,7 @@ struct FriendsTabView: View {
                 avatarThumbnailURL: nil
             )
         let memberCountText: String? = invitation.member_count.map { count in
-            String(format: L10n.t("group_chat_invitation_member_count", languageCode: appLanguageRaw), count)
+            groupChatLocalizedMemberCount(count, languageCode: appLanguageRaw)
         }
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
@@ -1948,10 +1948,13 @@ struct FriendsTabView: View {
                 .tint(.orange)
             } else {
                 HStack(spacing: 10) {
+                    let busy = viewModel.isFriendRequestActionInFlight(item.friendship.id)
                     Button("Accept") { Task { await viewModel.accept(item) } }
                         .buttonStyle(.borderedProminent)
+                        .disabled(busy)
                     Button("Decline") { Task { await viewModel.reject(item) } }
                         .buttonStyle(.bordered)
+                        .disabled(busy)
                 }
             }
         }
@@ -2311,12 +2314,7 @@ private struct ChatFriendInboxRow: View {
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         } else if item.isGroupConversation, item.groupMemberCount > 0 {
-                            Text(
-                                String(
-                                    format: L10n.t("group_chat_member_count_format", languageCode: languageCode),
-                                    item.groupMemberCount
-                                )
-                            )
+                            Text(groupChatLocalizedMemberCount(item.groupMemberCount, languageCode: languageCode))
                                 .font(.caption)
                                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                                 .lineLimit(1)
@@ -2706,11 +2704,21 @@ private struct FriendDirectoryCard: View, Equatable {
 
 private struct ChatErrorAlertsModifier: ViewModifier {
     @ObservedObject var viewModel: ChatViewModel
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var friendRequestErrorAlertBinding: Binding<Bool> {
         Binding(
             get: { viewModel.errorMessage != nil },
-            set: { if !$0 { viewModel.errorMessage = nil } }
+            set: {
+                if !$0 {
+                    viewModel.errorMessage = nil
+                    viewModel.friendRequestAlertTitle = nil
+                }
+            }
         )
     }
 
@@ -2731,11 +2739,13 @@ private struct ChatErrorAlertsModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
             .alert(
-                "Couldn’t update friend request",
+                viewModel.friendRequestAlertTitle
+                    ?? L10n.t("friend_request_update_failed_title", languageCode: languageCode),
                 isPresented: friendRequestErrorAlertBinding
             ) {
-                Button("OK", role: .cancel) {
+                Button(L10n.t("OK", languageCode: languageCode), role: .cancel) {
                     viewModel.errorMessage = nil
+                    viewModel.friendRequestAlertTitle = nil
                 }
             } message: {
                 Text(viewModel.errorMessage ?? "")
@@ -3097,6 +3107,7 @@ private struct AddFriendGlassSheet: View {
     @ObservedObject var viewModel: ChatViewModel
     let onClose: () -> Void
 
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @State private var inlineError: String?
     @State private var inlineWarning: String?
     @State private var successMessage: String?
@@ -3107,6 +3118,10 @@ private struct AddFriendGlassSheet: View {
     @State private var venuePickerOptions: [BusinessVenueMessageTarget] = []
     @State private var selectedDetent: PresentationDetent = .medium
 
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
     private var normalizedDraft: String {
         FriendshipService.normalizedFriendLookupQuery(lookupDraft)
     }
@@ -3116,8 +3131,14 @@ private struct AddFriendGlassSheet: View {
     }
 
     private var primaryActionTitle: String {
-        guard let target = selectedTarget else { return "Send" }
-        return target.entityType == .business ? "Message" : "Send"
+        // Always resolve through L10n (including disabled/"Send" with no selection).
+        // Plain String titles skip SwiftUI LocalizedStringKey lookup.
+        guard let target = selectedTarget else {
+            return L10n.t("Send", languageCode: languageCode)
+        }
+        return target.entityType == .business
+            ? L10n.t("Message", languageCode: languageCode)
+            : L10n.t("Send", languageCode: languageCode)
     }
 
     var body: some View {
@@ -3128,7 +3149,10 @@ private struct AddFriendGlassSheet: View {
                 Text("Search fans or businesses")
                     .font(.subheadline.weight(.semibold))
 
-                TextField("Search by @handle, name, or email", text: $lookupDraft)
+                TextField(
+                    L10n.t("Search by @handle, name, or email", languageCode: languageCode),
+                    text: $lookupDraft
+                )
                     .textFieldStyle(.plain)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -3311,6 +3335,8 @@ private struct AddFriendGlassSheet: View {
             .font(.headline.weight(.semibold))
             .foregroundStyle(canPerformPrimaryAction ? Color.accentColor : Color.secondary)
             .disabled(!canPerformPrimaryAction)
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
             .frame(minWidth: 68, alignment: .trailing)
         }
         .padding(.horizontal, 18)

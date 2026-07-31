@@ -788,6 +788,14 @@ private struct PickupBulkImportPreviewRowView: View {
             return "🏓"
         case "badminton":
             return "🏸"
+        case "padel":
+            return "🎾"
+        case "paragliding":
+            return "🪂"
+        case "hang gliding", "hang_gliding":
+            return "🪁"
+        case "paramotoring":
+            return "🛩️"
         case "tennis":
             return "🎾"
         case "baseball":

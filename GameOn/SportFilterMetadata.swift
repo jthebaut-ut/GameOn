@@ -61,6 +61,14 @@ nonisolated enum SportFilterCatalog {
             return ChipVisual(emoji: "🏃", systemImage: "figure.run", accent: Color(red: 0.22, green: 0.62, blue: 0.42))
         case "pickleball":
             return ChipVisual(emoji: "🏓", systemImage: "figure.tennis", accent: Color(red: 0.35, green: 0.72, blue: 0.38))
+        case "padel":
+            return ChipVisual(emoji: "🎾", systemImage: "figure.tennis", accent: Color(red: 0.12, green: 0.62, blue: 0.58))
+        case "paragliding":
+            return ChipVisual(emoji: "🪂", systemImage: "wind", accent: Color(red: 0.28, green: 0.58, blue: 0.92))
+        case "hanggliding":
+            return ChipVisual(emoji: "🪁", systemImage: "airplane", accent: Color(red: 0.42, green: 0.48, blue: 0.78))
+        case "paramotoring":
+            return ChipVisual(emoji: "🛩️", systemImage: "fan.fill", accent: Color(red: 0.55, green: 0.38, blue: 0.72))
         case "lacrosse":
             return ChipVisual(emoji: "🥍", systemImage: "sportscourt.fill", accent: Color(red: 0.28, green: 0.52, blue: 0.38))
         case "trackfield":
@@ -146,6 +154,8 @@ nonisolated enum SportFilterCatalog {
         if normalized.contains("boxing") { return "boxing" }
         if normalized.contains("badminton") || normalized.contains("shuttlecock") { return "badminton" }
         if normalized.contains("table tennis") || normalized.contains("tabletennis") { return "pingpong" }
+        // Padel must resolve before Tennis so identities never collapse (e.g. "padel tennis").
+        if normalized.contains("padel") || normalized == "padle" { return "padel" }
         if normalized.contains("tennis") { return "tennis" }
         if normalized.contains("golf") { return "golf" }
         if normalized.contains("motocross") { return "motocross" }
@@ -174,6 +184,23 @@ nonisolated enum SportFilterCatalog {
         }
         if normalized.contains("running") || normalized.contains("marathon") { return "running" }
         if normalized.contains("pickleball") { return "pickleball" }
+        if normalized.contains("paragliding")
+            || normalized.contains("parapente")
+            || normalized.contains("paraglider") {
+            return "paragliding"
+        }
+        if normalized.contains("hang gliding")
+            || normalized.contains("hanggliding")
+            || normalized.contains("hang glider")
+            || normalized.contains("deltaplane") {
+            return "hanggliding"
+        }
+        if normalized.contains("paramotoring")
+            || normalized.contains("paramoteur")
+            || normalized.contains("paramotor")
+            || normalized.contains("powered paragliding") {
+            return "paramotoring"
+        }
         if normalized.contains("lacrosse") { return "lacrosse" }
         if normalized.contains("track field") || normalized.contains("track and field") || normalized.contains("athletics") { return "trackfield" }
         if normalized.contains("climbing") || normalized.contains("bouldering") { return "climbing" }
@@ -223,6 +250,10 @@ nonisolated enum SportFilterCatalog {
         case "baseball": return ["baseball", "mlb"]
         case "hockey": return ["hockey", "nhl", "ice hockey"]
         case "tennis": return ["tennis"]
+        case "padel": return ["padel", "padle"]
+        case "paragliding": return ["paragliding", "parapente", "paraglider", "para gliding"]
+        case "hanggliding": return ["hang gliding", "hang_gliding", "hanggliding", "hang glider", "deltaplane", "hang-gliding"]
+        case "paramotoring": return ["paramotoring", "paramoteur", "paramotor", "powered paragliding"]
         case "badminton": return ["badminton", "shuttlecock"]
         case "golf": return ["golf"]
         case "volleyball": return ["volleyball"]

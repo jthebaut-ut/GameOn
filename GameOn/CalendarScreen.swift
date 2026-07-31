@@ -1,3 +1,4 @@
+import CoreLocation
 import SwiftUI
 
 struct CalendarScreen: View {
@@ -881,20 +882,35 @@ struct CalendarScreen: View {
         )
     }
 
+    private var calendarLeagueCountryFilterSelection: LiveLeagueCountryFilterSelection {
+        LiveLeagueCountryFilterPreference.decodeSelection(from: calendarLeagueCountryFilterRaw)
+    }
+
     private var selectedCalendarLeagueCountries: Set<String> {
-        LiveLeagueCountryFilterPreference.decode(from: calendarLeagueCountryFilterRaw)
+        calendarLeagueCountryFilterSelection.effectiveCountries
     }
 
     private var calendarLeagueCountryFilterCount: Int {
-        selectedCalendarLeagueCountries.count
+        let selection = calendarLeagueCountryFilterSelection
+        return selection.groups.count + selection.displayCountries.count
     }
 
     private var calendarLeagueCountryFilterIsActive: Bool {
-        !selectedCalendarLeagueCountries.isEmpty
+        !calendarLeagueCountryFilterSelection.isEmpty
     }
 
     private var calendarLeagueCountryChipTitle: String {
-        calendarLeagueCountryFilterCount == 0 ? "Countries" : "Countries \(calendarLeagueCountryFilterCount)"
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let count = calendarLeagueCountryFilterCount
+        if count == 0 {
+            return L10n.t("Countries", languageCode: languageCode)
+        }
+        let key = count == 1 ? "countries_chip_count_one_format" : "countries_chip_count_other_format"
+        return String(
+            format: L10n.t(key, languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            Int64(count)
+        )
     }
 
     private var calendarLeagueCountryOptions: [String] {
@@ -1035,9 +1051,9 @@ struct CalendarScreen: View {
                 CalendarLeagueCountryFilterSheet(
                     countries: calendarLeagueCountryOptions,
                     suggestedNearYouCountry: calendarNearYouSuggestedCountry,
-                    selectedCountries: Binding(
-                        get: { selectedCalendarLeagueCountries },
-                        set: { updateSelectedCalendarLeagueCountries($0) }
+                    selection: Binding(
+                        get: { calendarLeagueCountryFilterSelection },
+                        set: { updateCalendarLeagueCountryFilterSelection($0) }
                     )
                 )
             }
@@ -2285,7 +2301,7 @@ struct CalendarScreen: View {
             handleCalendarDateStripTap(date)
         } label: {
             VStack(spacing: 4) {
-                Text(isToday ? "Today" : calendarDateStripWeekdayFormatter.string(from: date))
+                Text(isToday ? L10n.t("Today", languageCode: appLanguageRaw) : calendarDateStripWeekdayFormatter.string(from: date))
                     .font(.caption.weight(.heavy))
                     .lineLimit(1)
                 Text(calendarDateStripDayFormatter.string(from: date))
@@ -2565,7 +2581,7 @@ struct CalendarScreen: View {
     private var calendarScheduleHeaderPlaceMode: LiveLeagueCountryFilterPresentation.LiveHeaderPlaceMode {
         guard isProGamesSelected else { return .none }
         return LiveLeagueCountryFilterPresentation.liveHeaderPlaceMode(
-            for: selectedCalendarLeagueCountries,
+            for: calendarLeagueCountryFilterSelection,
             languageCode: calendarScheduleLanguageCode
         )
     }
@@ -2580,8 +2596,6 @@ struct CalendarScreen: View {
 
     private var calendarNearYouSuggestedCountry: String? {
         LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
-            homeCountry: viewModel.currentUserHomeCountry,
-            homeRegion: viewModel.currentUserHomeRegion,
             localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
         )
     }
@@ -2747,13 +2761,8 @@ struct CalendarScreen: View {
     }
 
     private var calendarProGamesEmptyStateMessage: String {
-        if selectedCalendarFeaturedEvent != nil {
-            return "📅 No games found for this date.\nTry another date."
-        }
-        if calendarLeagueCountryFilterIsActive {
-            return "📅 No games found for this date.\nTry another date."
-        }
-        return "📅 No games found for this date.\nTry another date."
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return "📅 \(L10n.t("No games found for this date.", languageCode: languageCode))\n\(L10n.t("Try another date.", languageCode: languageCode))"
     }
 
     private var calendarEventsEmptyStateMessage: String {
@@ -2856,12 +2865,26 @@ struct CalendarScreen: View {
         LiveLeagueCountryFilterPreference.markInitialized()
     }
 
+    private func updateCalendarLeagueCountryFilterSelection(_ selection: LiveLeagueCountryFilterSelection) {
+        calendarLeagueCountryFilterRaw = LiveLeagueCountryFilterPreference.encode(selection)
+        LiveLeagueCountryFilterPreference.markInitialized()
+    }
+
     private func applyCalendarLeagueCountryFilterFirstUseDefaultIfNeeded() {
-        let resolved = LiveLeagueCountryFilterPresentation.suggestedNearYouCountry(
-            homeCountry: viewModel.currentUserHomeCountry,
-            homeRegion: viewModel.currentUserHomeRegion,
-            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
-        )
+        Task { @MainActor in
+            await applyCalendarLeagueCountryFilterFirstUseDefaultAsync()
+        }
+    }
+
+    private func applyCalendarLeagueCountryFilterFirstUseDefaultAsync() async {
+        guard !LiveLeagueCountryFilterPreference.isInitialized else { return }
+        let existing = LiveLeagueCountryFilterPreference.decodeSelection(from: calendarLeagueCountryFilterRaw)
+        guard existing.isEmpty else {
+            LiveLeagueCountryFilterPreference.markInitialized()
+            return
+        }
+
+        let resolved = await resolveCalendarFilterCurrentCountry()
         guard let encoded = LiveLeagueCountryFilterPreference.firstUseDefaultEncodedSelection(
             currentRaw: calendarLeagueCountryFilterRaw,
             resolvedCountry: resolved
@@ -2869,12 +2892,35 @@ struct CalendarScreen: View {
         calendarLeagueCountryFilterRaw = encoded
     }
 
+    private func resolveCalendarFilterCurrentCountry() async -> String? {
+        if let coordinate = viewModel.currentUserLocation,
+           let fromLocation = await calendarFilterCountryName(from: coordinate) {
+            return fromLocation
+        }
+        if await viewModel.refreshCurrentUserLocationIfAuthorized(timeoutSeconds: 3),
+           let coordinate = viewModel.currentUserLocation,
+           let fromLocation = await calendarFilterCountryName(from: coordinate) {
+            return fromLocation
+        }
+        return LiveLeagueCountryFilterPresentation.resolveCurrentCountryForFilterDefault(
+            localeRegionCode: LiveLeagueCountryFilterPresentation.deviceLocaleRegionCode()
+        )
+    }
+
+    private func calendarFilterCountryName(from coordinate: CLLocationCoordinate2D) async -> String? {
+        let result = await viewModel.reverseGeocodeBusinessVenueLocation(for: coordinate)
+        return LiveLeagueCountryFilterPresentation.countryName(forRegionCode: result.countryCode)
+    }
+
     private var gameSearchBar: some View {
         HStack {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
 
-            TextField("Search teams, leagues, or games…", text: $gameSearchText)
+            TextField(
+                L10n.t("Search teams, leagues, or games…", languageCode: appLanguageRaw),
+                text: $gameSearchText
+            )
                 .textInputAutocapitalization(.words)
                 .font(.subheadline)
                 .focused($isGameSearchFocused)
@@ -3239,7 +3285,14 @@ struct CalendarScreen: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(calendarLeagueCountryFilterCount == 0 ? "Countries" : "Countries, \(calendarLeagueCountryFilterCount) selected")
+        .accessibilityLabel(calendarLeagueCountryFilterCount == 0
+            ? L10n.t("Countries", languageCode: appLanguageRaw)
+            : String(
+                format: L10n.t("Countries, %lld selected", languageCode: appLanguageRaw),
+                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                Int64(calendarLeagueCountryFilterCount)
+            )
+        )
     }
 
     private var sportFilterBar: some View {
@@ -3252,9 +3305,16 @@ struct CalendarScreen: View {
     }
 
     private func proGamesSportChip(selection: String, displayTitle: String? = nil) -> some View {
-        SportFilterChip(
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let resolvedTitle: String? = {
+            if selection == "All" {
+                return L10n.t("All", languageCode: languageCode)
+            }
+            return displayTitle
+        }()
+        return SportFilterChip(
             sport: selection,
-            displayTitle: displayTitle,
+            displayTitle: resolvedTitle,
             isSelected: selectedCalendarFeaturedEvent == nil && DiscoverSportFilterRowLayout.selectionTokensMatch(calendarProGamesSportFilter, selection),
             isCompact: true
         ) {
@@ -4810,21 +4870,21 @@ struct CalendarScreen: View {
 
     private var calendarDateStripWeekdayFormatter: DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.locale = Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw))
         formatter.dateFormat = "EEE"
         return formatter
     }
 
     private var calendarDateStripDayFormatter: DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.locale = Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw))
         formatter.dateFormat = "MMM d"
         return formatter
     }
 
     private var calendarDateStripAccessibilityFormatter: DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.locale = Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw))
         formatter.dateStyle = .full
         formatter.timeStyle = .none
         return formatter
@@ -5056,7 +5116,7 @@ private struct CalendarSearchSuggestion: Identifiable {
 private struct CalendarLeagueCountryFilterSheet: View {
     let countries: [String]
     let suggestedNearYouCountry: String?
-    @Binding var selectedCountries: Set<String>
+    @Binding var selection: LiveLeagueCountryFilterSelection
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -5069,7 +5129,7 @@ private struct CalendarLeagueCountryFilterSheet: View {
             List {
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Calendar Countries")
+                        Text(L10n.t("Calendar Countries", languageCode: languageCode))
                             .font(FGTypography.sectionTitle)
                             .foregroundStyle(FGColor.primaryText(colorScheme))
                         Text(L10n.t("pro_sports_country_filter_subtitle", languageCode: languageCode))
@@ -5081,19 +5141,24 @@ private struct CalendarLeagueCountryFilterSheet: View {
 
                 if let nearYou = suggestedNearYouCountry {
                     Section {
+                        let nearYouDisplay = LiveLeagueCountryFilterPresentation.localizedCountryDisplayName(
+                            nearYou,
+                            languageCode: languageCode
+                        )
+                        let isSelected = selection.containsCountryInSelectionOrGroup(nearYou)
                         countryRow(
-                            title: nearYou,
+                            title: nearYouDisplay,
                             subtitle: L10n.t("near_you", languageCode: languageCode),
                             flag: CountryFlagHelper.flag(for: nearYou),
-                            isSelected: selectedCountries.contains(nearYou),
+                            isSelected: isSelected,
                             accessibilityLabel: String(
                                 format: L10n.t("near_you_country_a11y_format", languageCode: languageCode),
                                 locale: Locale(identifier: languageCode),
-                                nearYou
+                                nearYouDisplay
                             ),
-                            accessibilityHint: countryToggleHint(isSelected: selectedCountries.contains(nearYou))
+                            accessibilityHint: countryToggleHint(isSelected: isSelected)
                         ) {
-                            applySelection(LiveLeagueCountryFilterPresentation.toggling(nearYou, in: selectedCountries))
+                            applySelection(LiveLeagueCountryFilterPresentation.togglingCountry(nearYou, in: selection))
                         }
                     }
                 }
@@ -5103,47 +5168,58 @@ private struct CalendarLeagueCountryFilterSheet: View {
                         title: L10n.t("country_filter_select_all", languageCode: languageCode),
                         accessibilityHint: L10n.t("country_filter_select_all_a11y_hint", languageCode: languageCode)
                     ) {
-                        applySelection(Set(countries))
+                        applySelection(
+                            LiveLeagueCountryFilterSelection(
+                                groups: [],
+                                countries: Set(countries.compactMap { LiveLeagueCountryResolver.normalizedCountry($0) })
+                            )
+                        )
                     }
                     quickAction(
                         title: L10n.t("country_filter_clear", languageCode: languageCode),
                         accessibilityHint: L10n.t("country_filter_clear_a11y_hint", languageCode: languageCode)
                     ) {
-                        applySelection([])
+                        applySelection(.empty)
                     }
                     presetRow(
                         title: L10n.t("live_region_north_america", languageCode: languageCode),
-                        preset: LiveLeagueCountryFilterPresentation.northAmericaPreset,
+                        groupID: .northAmerica,
                         accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
                     )
                     presetRow(
                         title: L10n.t("country_filter_top_european", languageCode: languageCode),
-                        preset: LiveLeagueCountryFilterPresentation.topEuropePreset,
+                        groupID: .topEurope,
                         accessibilityHint: L10n.t("country_filter_preset_a11y_hint", languageCode: languageCode)
                     )
                 }
 
-                Section("Countries") {
+                Section {
                     ForEach(countries, id: \.self) { country in
-                        let isSelected = selectedCountries.contains(country)
+                        let isSelected = selection.containsCountryInSelectionOrGroup(country)
+                        let displayName = LiveLeagueCountryFilterPresentation.localizedCountryDisplayName(
+                            country,
+                            languageCode: languageCode
+                        )
                         countryRow(
-                            title: country,
+                            title: displayName,
                             subtitle: nil,
                             flag: nil,
                             isSelected: isSelected,
-                            accessibilityLabel: country,
+                            accessibilityLabel: displayName,
                             accessibilityHint: countryToggleHint(isSelected: isSelected)
                         ) {
-                            applySelection(LiveLeagueCountryFilterPresentation.toggling(country, in: selectedCountries))
+                            applySelection(LiveLeagueCountryFilterPresentation.togglingCountry(country, in: selection))
                         }
                     }
+                } header: {
+                    Text(L10n.t("Countries", languageCode: languageCode))
                 }
             }
-            .navigationTitle("Calendar Countries")
+            .navigationTitle(L10n.t("Calendar Countries", languageCode: languageCode))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
+                    Button(L10n.t("Close", languageCode: languageCode)) {
                         dismiss()
                     }
                     .fontWeight(.semibold)
@@ -5152,8 +5228,8 @@ private struct CalendarLeagueCountryFilterSheet: View {
         }
     }
 
-    private func applySelection(_ next: Set<String>) {
-        selectedCountries = next
+    private func applySelection(_ next: LiveLeagueCountryFilterSelection) {
+        selection = next
         LiveLeagueCountryFilterPreference.markInitialized()
     }
 
@@ -5174,10 +5250,14 @@ private struct CalendarLeagueCountryFilterSheet: View {
         .accessibilityHint(accessibilityHint)
     }
 
-    private func presetRow(title: String, preset: Set<String>, accessibilityHint: String) -> some View {
-        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(preset, in: selectedCountries)
+    private func presetRow(
+        title: String,
+        groupID: LiveLeagueCountryFilterGroupID,
+        accessibilityHint: String
+    ) -> some View {
+        let state = LiveLeagueCountryFilterPresentation.presetSelectionState(groupID, in: selection)
         return Button {
-            applySelection(LiveLeagueCountryFilterPresentation.togglingPreset(preset, in: selectedCountries))
+            applySelection(LiveLeagueCountryFilterPresentation.togglingGroup(groupID, in: selection))
         } label: {
             HStack(spacing: 12) {
                 Text(title)
@@ -5272,6 +5352,7 @@ private struct CalendarLeagueCountryFilterSheet: View {
         }
     }
 }
+
 
 private struct CalendarVenueEventPresentation {
     let venueDisplayName: String?
