@@ -1,5 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
+import { authorizeExactServiceRoleBearer } from "../_shared/service_role_auth.ts"
 
 /**
  * Finalizes a business account deletion job after DB commit.
@@ -20,8 +21,8 @@ import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
  * - ready statuses are auth_delete_pending|storage_pending only (NOT soft db_committed);
  *   soft→permanent promotion (20260902) bumps off db_committed before Auth
  *
- * Auth: service_role bearer only (pg_net queue / ops).
- * Accepts legacy service_role JWT (Vault) or exact match on SUPABASE_SERVICE_ROLE_KEY (sb_secret_*).
+ * Auth: exact SUPABASE_SERVICE_ROLE_KEY / SERVICE_ROLE_KEY bearer only (pg_net / ops).
+ * Does NOT accept decoded JWT role claims without exact key match.
  *
  * Deploy: `supabase functions deploy finalize-business-account-deletion`
  * (after applying migrations through 20260902).
@@ -115,45 +116,6 @@ function bearerCredentialFormat(token: string): "empty" | "jwt" | "secret" | "un
   if (token.split(".").length === 3) return "jwt"
   if (token.startsWith("sb_secret_")) return "secret"
   return "unknown"
-}
-
-function decodeJwtPayload(token: string): Record<string, unknown> | null {
-  const parts = token.split(".")
-  if (parts.length !== 3) return null
-
-  try {
-    const base64Url = parts[1]
-    const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/")
-    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4)
-    const jsonText = atob(padded)
-    const payload = JSON.parse(jsonText) as Record<string, unknown>
-    return payload && typeof payload === "object" ? payload : null
-  } catch {
-    return null
-  }
-}
-
-function isLegacyServiceRoleJwt(token: string): boolean {
-  const payload = decodeJwtPayload(token)
-  if (!payload) return false
-  return String(payload.role ?? "") === "service_role"
-}
-
-function resolveAuthorizedServiceRoleCredential(
-  bearerToken: string,
-  platformServiceRoleKey: string,
-): string | null {
-  if (!bearerToken) return null
-
-  if (platformServiceRoleKey && bearerToken === platformServiceRoleKey) {
-    return bearerToken
-  }
-
-  if (isLegacyServiceRoleJwt(bearerToken)) {
-    return bearerToken
-  }
-
-  return null
 }
 
 async function cleanupVenuePhotos(
@@ -433,18 +395,19 @@ Deno.serve(async (req) => {
 
   const authorizationHeader = req.headers.get("Authorization")
   const bearerToken = authorizationHeader?.replace(/^Bearer\s+/i, "").trim() ?? ""
-  const adminCredential = resolveAuthorizedServiceRoleCredential(bearerToken, serviceRoleKey)
+  const authResult = authorizeExactServiceRoleBearer(req)
 
-  if (!adminCredential) {
+  if (!authResult.accepted) {
     const bearerFingerprint = await sha256Fingerprint(bearerToken)
     const expectedFingerprint = await sha256Fingerprint(serviceRoleKey)
     console.error(
-      `${LOG_PREFIX} auth_mismatch authorization_present=${Boolean(authorizationHeader)} bearer_len=${bearerToken.length} expected_len=${serviceRoleKey.length} bearer_fp=${bearerFingerprint} expected_fp=${expectedFingerprint} bearer_format=${bearerCredentialFormat(bearerToken)} platform_key_format=${bearerCredentialFormat(serviceRoleKey)}`,
+      `${LOG_PREFIX} auth_mismatch reason=${authResult.reason} authorization_present=${Boolean(authorizationHeader)} bearer_len=${bearerToken.length} expected_len=${serviceRoleKey.length} bearer_fp=${bearerFingerprint} expected_fp=${expectedFingerprint} bearer_format=${bearerCredentialFormat(bearerToken)} platform_key_format=${bearerCredentialFormat(serviceRoleKey)}`,
     )
     return json({ ok: false, error: "unauthorized" }, 401)
   }
 
-  const admin = createClient(supabaseUrl, adminCredential, {
+  // Always use the platform env key — never a client-supplied credential string.
+  const admin = createClient(supabaseUrl, serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
   })
 
@@ -530,9 +493,10 @@ Deno.serve(async (req) => {
   // Permanent path: Auth delete only at auth_delete_pending (DB stages already
   // committed). storage_pending retries may re-check Auth idempotently below.
   if (isPermanent && (job.status === "auth_delete_pending" || (job.status === "storage_pending" && job.stage !== "auth_deleted"))) {
+    // Subject must come from the job row — never from client payload.
     const authResult = await deleteAuthUserIfNeeded(
       admin,
-      job.subject_user_id ?? payload.subject_user_id,
+      job.subject_user_id,
     )
 
     if (!authResult.deleted) {

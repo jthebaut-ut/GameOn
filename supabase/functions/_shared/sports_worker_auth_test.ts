@@ -14,6 +14,8 @@ import {
   secretsEqual,
 } from "./sports_worker_auth.ts"
 
+const LEGACY_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.legacy.sig"
+
 Deno.test("secretsEqual accepts identical strings", () => {
   assertEquals(secretsEqual("abc", "abc"), true)
 })
@@ -27,6 +29,9 @@ Deno.test("secretsEqual rejects mismatched values and lengths", () => {
 Deno.test("authorizeSportsWorkerRequest rejects missing auth", () => {
   Deno.env.delete("SERVICE_ROLE_KEY")
   Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY")
+  Deno.env.delete("fangeo_service_role_key")
+  Deno.env.delete("SUPABASE_SECRET_KEYS")
+  Deno.env.delete("SUPABASE_SECRET_KEY")
   Deno.env.delete("SYNC_LIVE_MATCHES_CRON_SECRET")
   const req = new Request("https://example.test/sync", { method: "POST" })
   const result = authorizeSportsWorkerRequest(req, {
@@ -39,11 +44,13 @@ Deno.test("authorizeSportsWorkerRequest rejects missing auth", () => {
 })
 
 Deno.test("authorizeSportsWorkerRequest accepts service role bearer", () => {
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "srv-role-test-key")
+  Deno.env.delete("SERVICE_ROLE_KEY")
+  Deno.env.delete("fangeo_service_role_key")
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", LEGACY_JWT)
   Deno.env.delete("SYNC_LIVE_MATCHES_CRON_SECRET")
   const req = new Request("https://example.test/sync", {
     method: "POST",
-    headers: { Authorization: "Bearer srv-role-test-key" },
+    headers: { Authorization: `Bearer ${LEGACY_JWT}` },
   })
   const result = authorizeSportsWorkerRequest(req, {
     cronSecretEnvNames: ["SYNC_LIVE_MATCHES_CRON_SECRET"],
@@ -55,7 +62,9 @@ Deno.test("authorizeSportsWorkerRequest accepts service role bearer", () => {
 })
 
 Deno.test("authorizeSportsWorkerRequest rejects anon/user-like bearer", () => {
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "srv-role-test-key")
+  Deno.env.delete("SERVICE_ROLE_KEY")
+  Deno.env.delete("fangeo_service_role_key")
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", LEGACY_JWT)
   const req = new Request("https://example.test/sync", {
     method: "POST",
     headers: { Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.user" },
@@ -70,7 +79,9 @@ Deno.test("authorizeSportsWorkerRequest rejects anon/user-like bearer", () => {
 })
 
 Deno.test("authorizeSportsWorkerRequest accepts cron secret header", () => {
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "srv-role-test-key")
+  Deno.env.delete("SERVICE_ROLE_KEY")
+  Deno.env.delete("fangeo_service_role_key")
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", LEGACY_JWT)
   Deno.env.set("SYNC_LIVE_MATCHES_CRON_SECRET", "cron-test-secret")
   const req = new Request("https://example.test/sync", {
     method: "POST",
@@ -86,7 +97,9 @@ Deno.test("authorizeSportsWorkerRequest accepts cron secret header", () => {
 })
 
 Deno.test("authorizeSportsWorkerRequest rejects wrong cron secret", () => {
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "srv-role-test-key")
+  Deno.env.delete("SERVICE_ROLE_KEY")
+  Deno.env.delete("fangeo_service_role_key")
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", LEGACY_JWT)
   Deno.env.set("SYNC_LIVE_MATCHES_CRON_SECRET", "cron-test-secret")
   const req = new Request("https://example.test/sync", {
     method: "POST",

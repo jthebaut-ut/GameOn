@@ -95,6 +95,39 @@ export function htmlResponse(html: string, status = 200): Response {
   })
 }
 
+/** Read-only confirmation — GET never mutates; admin must POST to confirm. */
+export function pageConfirmAction(opts: {
+  action: "approve" | "reject"
+  venueName: string
+  claimId: string
+  token: string
+}): string {
+  const venue = escapeHtml(opts.venueName)
+  const cid = escapeHtml(opts.claimId)
+  const token = escapeHtml(opts.token)
+  const action = opts.action
+  const isApprove = action === "approve"
+  const title = isApprove ? "Confirm venue approval" : "Confirm rejection"
+  const heading = isApprove ? "Approve this venue claim?" : "Reject this location request?"
+  const buttonLabel = isApprove ? "Confirm approve" : "Confirm reject"
+  const accent = isApprove ? "#15803d" : "#b91c1c"
+  const buttonBg = isApprove ? "#16a34a" : "#dc2626"
+  const inner = `<div class="card">
+  <div class="brand">FanGeo</div>
+  <h1 style="color:${accent}">${escapeHtml(heading)}</h1>
+  <p class="meta"><strong>Venue</strong><br/>${venue}</p>
+  <p class="meta"><strong>Claim ID</strong><br/><span style="font-size:13px;word-break:break-all">${cid}</span></p>
+  <p class="msg">Opening this link does <strong>not</strong> change the claim. Confirm below to ${isApprove ? "approve" : "reject"}.</p>
+  <form method="POST" action="">
+    <input type="hidden" name="token" value="${token}"/>
+    <input type="hidden" name="action" value="${escapeHtml(action)}"/>
+    <button type="submit" style="margin-top:8px;width:100%;border:0;border-radius:10px;padding:12px 16px;font-size:15px;font-weight:700;color:#fff;background:${buttonBg};cursor:pointer">${escapeHtml(buttonLabel)}</button>
+  </form>
+  <p class="fine">If you did not intend to review this claim, close this tab.</p>
+</div>`
+  return wrapPage(inner, buttonBg, title)
+}
+
 export function pageApproved(opts: {
   venueName: string
   claimId: string

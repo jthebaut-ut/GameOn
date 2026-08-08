@@ -1,17 +1,16 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
-import { handleVenueClaimAdminGet } from "../_shared/venue_claim_admin_handler.ts"
+import { handleVenueClaimAdminRequest } from "../_shared/venue_claim_admin_handler.ts"
 
 /**
- * Browser GET (email link): reject a pending `venue_claims` row.
- *
- * Query: `token` — HS256 JWT signed with `ADMIN_VENUE_CLAIM_LINK_SECRET`.
- * Payload must include `claim_id` (uuid) and `action`: `"reject"`.
+ * Admin venue-claim reject:
+ * - GET ?token=… → read-only confirmation (no DB mutation; prefetch-safe)
+ * - POST token (+ action) → reject pending claim
  *
  * Deploy: `supabase functions deploy venue-claim-reject`
  */
 
 Deno.serve(async (req) => {
-  const response = await handleVenueClaimAdminGet(req, "reject")
+  const response = await handleVenueClaimAdminRequest(req, "reject")
 
   const priorType = (response.headers.get("Content-Type") ?? "").toLowerCase()
   if (priorType.includes("application/json")) {

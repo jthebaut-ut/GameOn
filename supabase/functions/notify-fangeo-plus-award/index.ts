@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { secretsEqual } from "../_shared/sports_worker_auth.ts"
 
 /**
  * Sends one FanGeo+ award/extension APNs alert after admin_set_user_fangeo_plus.
@@ -32,15 +33,15 @@ function authorizeInvocation(
 ): { accepted: true; source: string } | { accepted: false; reason: string } {
   const authHeader = req.headers.get("Authorization")
   const bearerToken = authHeader?.replace(/^Bearer\s+/i, "").trim() ?? ""
-  if (bearerToken && bearerToken === serviceRoleKey) {
+  if (bearerToken && serviceRoleKey && secretsEqual(bearerToken, serviceRoleKey)) {
     return { accepted: true, source: "service_role_bearer" }
   }
 
-  const cronSecret = Deno.env.get("FANGEO_PLUS_AWARD_PUSH_CRON_SECRET")?.trim()
-    ?? Deno.env.get("FANGEO_ANNOUNCEMENT_PUSH_CRON_SECRET")?.trim()
+  // Dedicated secret only — do not fall back to announcement or other workers.
+  const cronSecret = Deno.env.get("FANGEO_PLUS_AWARD_PUSH_CRON_SECRET")?.trim() ?? ""
   const requestCronSecret = req.headers.get("x-cron-secret")?.trim()
     ?? req.headers.get("x-fangeo-cron-secret")?.trim()
-  if (cronSecret && requestCronSecret === cronSecret) {
+  if (cronSecret && requestCronSecret && secretsEqual(requestCronSecret, cronSecret)) {
     return { accepted: true, source: "cron_secret" }
   }
 

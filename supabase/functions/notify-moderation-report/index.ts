@@ -18,8 +18,10 @@ import { createClient } from "npm:@supabase/supabase-js@2"
  * - Service-role bearer (preferred async pg_net queue for group_conversation / group_message)
  *
  * Conversation-report emails read the bounded `conversation_reports.message_snapshot`
- * from the database (never full DM history). Group conversation emails load title/member
- * snapshots only. Group message emails include the stored message_text_snapshot only.
+ * from the database only when `admin_review_consent_granted === true` (never from client
+ * payload, never full DM history). Group conversation emails load title/member
+ * snapshots only. Group / DM message emails prefer stored `message_text_snapshot` from
+ * `group_message_reports` / `message_reports` over client payload.
  */
 
 type ReportType = "user" | "conversation" | "message" | "group_conversation" | "group_message"
@@ -38,6 +40,7 @@ interface Payload {
   message_text_snapshot?: string | null
   review_window_start?: string | null
   review_window_end?: string | null
+  /** @deprecated Ignored for evidence. Conversation body comes only from DB when consent is granted. */
   conversation_message_snapshot?: ConversationMessageSnapshot[] | null
   group_title?: string | null
   member_count?: number | null
@@ -346,6 +349,58 @@ async function loadGroupMessageReport(
   return data as GroupMessageReportRow | null
 }
 
+interface MessageReportRow {
+  id: string
+  reporter_user_id: string
+  reported_user_id: string
+  message_id: string
+  message_text_snapshot: string | null
+  category: string | null
+  details: string | null
+  created_at: string | null
+}
+
+/** Prefer DB snapshot for DM message reports when report_id or message_id is known. */
+async function loadMessageReportSnapshot(
+  admin: ReturnType<typeof createClient>,
+  opts: { reportId?: string | null; messageId?: string | null; reporterUserId: string },
+): Promise<MessageReportRow | null> {
+  const reportId = (opts.reportId ?? "").trim()
+  const messageId = (opts.messageId ?? "").trim()
+
+  if (reportId) {
+    const { data, error } = await admin
+      .from("message_reports")
+      .select("id,reporter_user_id,reported_user_id,message_id,message_text_snapshot,category,details,created_at")
+      .eq("id", reportId)
+      .eq("reporter_user_id", opts.reporterUserId)
+      .maybeSingle()
+    if (error) {
+      console.error("notify-moderation-report: message_reports load by id failed", error.message)
+      return null
+    }
+    if (data) return data as MessageReportRow
+  }
+
+  if (messageId) {
+    const { data, error } = await admin
+      .from("message_reports")
+      .select("id,reporter_user_id,reported_user_id,message_id,message_text_snapshot,category,details,created_at")
+      .eq("message_id", messageId)
+      .eq("reporter_user_id", opts.reporterUserId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (error) {
+      console.error("notify-moderation-report: message_reports load by message_id failed", error.message)
+      return null
+    }
+    if (data) return data as MessageReportRow
+  }
+
+  return null
+}
+
 async function markGroupConversationReportNotified(
   admin: ReturnType<typeof createClient>,
   reportId: string,
@@ -552,7 +607,9 @@ Deno.serve(async (req) => {
   let detailsForEmail = detailsLine
   let reportedUserIdForEmail = (payload.reported_user_id ?? "").trim()
   let messageIdForEmail = (payload.message_id ?? "").trim()
-  let messageSnapshotForEmail = (payload.message_text_snapshot ?? "").trim()
+  /** Message body for email: prefer DB row; empty means omit / unavailable (never forge from client for group). */
+  let messageSnapshotForEmail = ""
+  let messageSnapshotFromDb = false
   let reporterUserIdForEmail = userId
 
   if (reportType === "group_conversation") {
@@ -630,7 +687,9 @@ Deno.serve(async (req) => {
     reportedUserIdForEmail = groupMessageReport.reported_user_id
     messageIdForEmail = groupMessageReport.message_id
     groupConversationId = groupMessageReport.conversation_id || groupConversationId
-    messageSnapshotForEmail = (groupMessageReport.message_text_snapshot ?? messageSnapshotForEmail).trim()
+    // Never use client payload.message_text_snapshot for group messages.
+    messageSnapshotForEmail = (groupMessageReport.message_text_snapshot ?? "").trim()
+    messageSnapshotFromDb = true
     categoryForEmail = (groupMessageReport.category || categoryForEmail).trim() || "other"
     createdAtForEmail = (groupMessageReport.created_at || createdAtForEmail).trim()
     const dbDetails = (groupMessageReport.details ?? "").trim()
@@ -644,6 +703,41 @@ Deno.serve(async (req) => {
     groupTitle = ((conversation as { title?: string } | null)?.title ?? groupTitle).trim() || "Group"
   }
 
+  if (reportType === "message" && userId) {
+    if (admin) {
+      const dmReport = await loadMessageReportSnapshot(admin, {
+        reportId: reportIdNormalized,
+        messageId: messageIdForEmail || (payload.message_id ?? "").trim(),
+        reporterUserId: userId,
+      })
+      if (dmReport) {
+        reportedUserIdForEmail = dmReport.reported_user_id || reportedUserIdForEmail
+        messageIdForEmail = dmReport.message_id || messageIdForEmail
+        messageSnapshotForEmail = (dmReport.message_text_snapshot ?? "").trim()
+        messageSnapshotFromDb = true
+        if ((dmReport.category ?? "").trim()) {
+          categoryForEmail = (dmReport.category ?? "").trim()
+        }
+        if ((dmReport.created_at ?? "").trim()) {
+          createdAtForEmail = (dmReport.created_at ?? "").trim()
+        }
+        const dbDetails = (dmReport.details ?? "").trim()
+        if (dbDetails.length > 0) detailsForEmail = dbDetails
+      } else {
+        // DM message reports historically may lack report_id; fall back to payload only when DB row missing.
+        messageSnapshotForEmail = (payload.message_text_snapshot ?? "").trim()
+        messageSnapshotFromDb = false
+        console.warn(
+          `notify-moderation-report: message_reports row missing for reporter=${userId} — using payload snapshot only as last resort`,
+        )
+      }
+    } else {
+      messageSnapshotForEmail = (payload.message_text_snapshot ?? "").trim()
+      messageSnapshotFromDb = false
+      console.warn("notify-moderation-report: SUPABASE_SERVICE_ROLE_KEY unset — using payload message snapshot as last resort")
+    }
+  }
+
   if (!categoryForEmail && reportType !== "group_conversation" && reportType !== "group_message") {
     return new Response(JSON.stringify({ error: "missing_fields" }), {
       status: 400,
@@ -654,10 +748,24 @@ Deno.serve(async (req) => {
   const reporterEmailDisplay = reporterEmail.length > 0 ? reporterEmail : reporterEmailLine
 
   let snapshotSection = ""
-  if (reportType === "message" || reportType === "group_message") {
-    const snap = truncateSnapshot(messageSnapshotForEmail || (payload.message_text_snapshot ?? "").trim())
-    const snapDisplay = snap.length > 0 ? snap : "(empty message)"
-    snapshotSection = `<p style="margin:8px 0"><strong>Message text (snapshot):</strong><br/><span style="white-space:pre-wrap">${escapeHtml(snapDisplay)}</span></p>`
+  if (reportType === "group_message") {
+    if (messageSnapshotFromDb && messageSnapshotForEmail.length > 0) {
+      const snap = truncateSnapshot(messageSnapshotForEmail)
+      snapshotSection =
+        `<p style="margin:8px 0"><strong>Message text (snapshot):</strong><br/><span style="white-space:pre-wrap">${escapeHtml(snap)}</span></p>`
+    } else {
+      snapshotSection =
+        `<p style="margin:8px 0;font-size:13px;color:#64748b"><strong>Message text (snapshot):</strong> Evidence unavailable (no stored snapshot on the report row).</p>`
+    }
+  } else if (reportType === "message") {
+    if (messageSnapshotForEmail.length > 0) {
+      const snap = truncateSnapshot(messageSnapshotForEmail)
+      snapshotSection =
+        `<p style="margin:8px 0"><strong>Message text (snapshot):</strong><br/><span style="white-space:pre-wrap">${escapeHtml(snap)}</span></p>`
+    } else {
+      snapshotSection =
+        `<p style="margin:8px 0;font-size:13px;color:#64748b"><strong>Message text (snapshot):</strong> Evidence unavailable.</p>`
+    }
   }
 
   const convLine = groupConversationId || payload.conversation_id?.trim()
@@ -685,88 +793,115 @@ Deno.serve(async (req) => {
     let snapshotMessages: ConversationMessageSnapshot[] = []
     let reporterUserId = userId
     let reportedUserId = reportedUserIdForEmail
-    const payloadSnapshot = filterSnapshotToReviewWindow(
-      normalizeSnapshotMessages(payload.conversation_message_snapshot),
-      windowStart,
-      windowEnd,
-    )
+    let consentGranted = false
+    let evidenceUnavailableReason = "missing_report_row"
 
     console.log(`[PrivateReportEmail] report_id=${reportId || "(missing)"}`)
     console.log(`[PrivateReportEmail] report_type=${reportType}`)
-    console.log(`[PrivateReportEmail] payload_snapshot_count=${payloadSnapshot.length}`)
+    // Never use payload.conversation_message_snapshot as evidence.
+    console.log(`[PrivateReportEmail] payload_snapshot_ignored=true`)
 
     if (admin && reportId) {
       const reportRow = await loadConversationReportSnapshotWithRetry(admin, reportId, userId)
       if (reportRow) {
         windowStart = (reportRow.review_window_start ?? windowStart).trim()
         windowEnd = (reportRow.review_window_end ?? windowEnd).trim()
+        reporterUserId = reportRow.reporter_user_id
+        reportedUserId = reportRow.reported_user_id
+        reportedUserIdForEmail = reportedUserId
+        categoryForEmail = (reportRow.category || categoryForEmail).trim() || categoryForEmail
+        createdAtForEmail = (reportRow.created_at || createdAtForEmail).trim()
+        const dbDetails = (reportRow.details ?? "").trim()
+        if (dbDetails.length > 0) detailsForEmail = dbDetails
+        groupConversationId = reportRow.conversation_id || groupConversationId
+
         if (reportRow.admin_review_consent_granted !== true) {
+          consentGranted = false
+          evidenceUnavailableReason = "consent_not_granted"
+          snapshotMessages = []
           console.error(
-            `[PrivateReportEmail] consent_not_granted report_id=${reportId} — using payload snapshot only`,
+            `[PrivateReportEmail] consent_not_granted report_id=${reportId} — omitting conversation body`,
           )
-          snapshotMessages = payloadSnapshot
         } else {
-          reporterUserId = reportRow.reporter_user_id
-          reportedUserId = reportRow.reported_user_id
+          consentGranted = true
           const rawSnapshot = normalizeSnapshotMessages(reportRow.message_snapshot)
           const dbInWindow = filterSnapshotToReviewWindow(rawSnapshot, windowStart, windowEnd)
-          snapshotMessages = dbInWindow.length > 0 ? dbInWindow : payloadSnapshot
-          if (dbInWindow.length === 0 && payloadSnapshot.length > 0) {
+          snapshotMessages = dbInWindow
+          if (dbInWindow.length === 0) {
+            evidenceUnavailableReason = "empty_db_snapshot"
             console.log(
-              `[PrivateReportEmail] db_snapshot_empty_using_payload report_id=${reportId}`,
+              `[PrivateReportEmail] db_snapshot_empty report_id=${reportId} — omitting conversation body`,
             )
           }
         }
       } else {
+        evidenceUnavailableReason = "missing_report_row"
         console.error(
-          `notify-moderation-report: missing conversation_reports row report_id=${reportId} reporter=${userId} — using payload snapshot`,
+          `notify-moderation-report: missing conversation_reports row report_id=${reportId} reporter=${userId} — omitting conversation body`,
         )
-        snapshotMessages = payloadSnapshot
+        snapshotMessages = []
       }
     } else {
       if (!serviceRoleKey) {
-        console.error("notify-moderation-report: SUPABASE_SERVICE_ROLE_KEY unset — using payload snapshot only")
+        console.error("notify-moderation-report: SUPABASE_SERVICE_ROLE_KEY unset — omitting conversation body")
+        evidenceUnavailableReason = "service_role_missing"
+      } else {
+        evidenceUnavailableReason = "report_id_required"
       }
-      snapshotMessages = payloadSnapshot
+      snapshotMessages = []
     }
 
     console.log(`[PrivateReportEmail] snapshot_count=${snapshotMessages.length}`)
+    console.log(`[PrivateReportEmail] consent_granted=${consentGranted}`)
     console.log(`[PrivateReportEmail] window_start=${windowStart || "(empty)"}`)
     console.log(`[PrivateReportEmail] window_end=${windowEnd || "(empty)"}`)
-
-    const nameIds = [
-      reporterUserId,
-      reportedUserId,
-      ...snapshotMessages.map((m) => (m.sender_id ?? "").trim()).filter(Boolean),
-    ]
-    const nameByUserId = admin ? await fetchDisplayNames(admin, nameIds) : new Map<string, string>()
-
-    const rendered = renderApprovedConversationSnapshot(
-      snapshotMessages,
-      reporterUserId,
-      reportedUserId,
-      nameByUserId,
-    )
-    const bounded = rendered.length > MAX_CONVERSATION_CONTEXT_LEN
-      ? `${rendered.slice(0, MAX_CONVERSATION_CONTEXT_LEN)}… [truncated]`
-      : rendered
 
     const windowFromDisplay = formatDisplayTimestamp(windowStart)
     const windowToDisplay = formatDisplayTimestamp(windowEnd)
 
-    conversationContextSection =
-      `<p style="margin:18px 0 6px;font-size:14px"><strong>Conversation review window:</strong></p>` +
-      `<p style="margin:0 0 4px;font-size:14px">From: ${escapeHtml(windowFromDisplay)}</p>` +
-      `<p style="margin:0 0 10px;font-size:14px">To: ${escapeHtml(windowToDisplay)}</p>` +
-      `<p style="margin:0 0 8px;font-size:13px;color:#475569">Only messages included in the user-approved review window are shown.</p>` +
-      `<p style="margin:14px 0 8px;font-size:14px"><strong>Approved conversation snapshot:</strong></p>` +
-      `<p style="margin:0;font-size:13px;white-space:pre-wrap;background:#f8fafc;padding:12px 14px;border-radius:10px;border:1px solid #e2e8f0;font-family:ui-monospace,monospace">${
-        escapeHtml(bounded)
-      }</p>`
+    if (consentGranted && snapshotMessages.length > 0) {
+      const nameIds = [
+        reporterUserId,
+        reportedUserId,
+        ...snapshotMessages.map((m) => (m.sender_id ?? "").trim()).filter(Boolean),
+      ]
+      const nameByUserId = admin ? await fetchDisplayNames(admin, nameIds) : new Map<string, string>()
 
-    console.log(
-      `[PrivateReportEmail] email_includes_conversation_section=true snapshot_rendered=${snapshotMessages.length > 0}`,
-    )
+      const rendered = renderApprovedConversationSnapshot(
+        snapshotMessages,
+        reporterUserId,
+        reportedUserId,
+        nameByUserId,
+      )
+      const bounded = rendered.length > MAX_CONVERSATION_CONTEXT_LEN
+        ? `${rendered.slice(0, MAX_CONVERSATION_CONTEXT_LEN)}… [truncated]`
+        : rendered
+
+      conversationContextSection =
+        `<p style="margin:18px 0 6px;font-size:14px"><strong>Conversation review window:</strong></p>` +
+        `<p style="margin:0 0 4px;font-size:14px">From: ${escapeHtml(windowFromDisplay)}</p>` +
+        `<p style="margin:0 0 10px;font-size:14px">To: ${escapeHtml(windowToDisplay)}</p>` +
+        `<p style="margin:0 0 8px;font-size:13px;color:#475569">Only messages included in the user-approved review window are shown.</p>` +
+        `<p style="margin:14px 0 8px;font-size:14px"><strong>Approved conversation snapshot:</strong></p>` +
+        `<p style="margin:0;font-size:13px;white-space:pre-wrap;background:#f8fafc;padding:12px 14px;border-radius:10px;border:1px solid #e2e8f0;font-family:ui-monospace,monospace">${
+          escapeHtml(bounded)
+        }</p>`
+
+      console.log(
+        `[PrivateReportEmail] email_includes_conversation_section=true snapshot_rendered=true`,
+      )
+    } else {
+      conversationContextSection =
+        `<p style="margin:18px 0 6px;font-size:14px"><strong>Conversation review window:</strong></p>` +
+        `<p style="margin:0 0 4px;font-size:14px">From: ${escapeHtml(windowFromDisplay)}</p>` +
+        `<p style="margin:0 0 10px;font-size:14px">To: ${escapeHtml(windowToDisplay)}</p>` +
+        `<p style="margin:14px 0 8px;font-size:14px"><strong>Approved conversation snapshot:</strong></p>` +
+        `<p style="margin:0;font-size:13px;color:#64748b;background:#f8fafc;padding:12px 14px;border-radius:10px;border:1px solid #e2e8f0">Evidence unavailable (${escapeHtml(evidenceUnavailableReason)}). Conversation body was not included.</p>`
+
+      console.log(
+        `[PrivateReportEmail] email_includes_conversation_section=true snapshot_rendered=false reason=${evidenceUnavailableReason}`,
+      )
+    }
   } else {
     console.log(
       `[PrivateReportEmail] email_includes_conversation_section=false reason=report_type_${reportType}`,

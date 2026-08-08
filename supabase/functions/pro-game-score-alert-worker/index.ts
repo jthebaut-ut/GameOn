@@ -456,10 +456,8 @@ async function refreshLiveMatchCache(supabaseUrl: string, serviceRoleKey: string
     apikey: serviceRoleKey,
     "content-type": "application/json",
   }
-  const cronSecret = Deno.env.get("PRO_SCORE_PUSH_WORKER_CRON_SECRET")?.trim()
-  if (cronSecret) {
-    headers["x-cron-secret"] = cronSecret
-  }
+  // Auth to sync-live-matches is service-role bearer only — do not forward
+  // PRO_SCORE_PUSH_WORKER_CRON_SECRET (dedicated to this worker).
 
   const response = await fetch(url, {
     method: "POST",
@@ -1581,8 +1579,16 @@ async function sendToUserTokens(
   alert: PushAlertContent,
   counts: WorkerCounts,
 ): Promise<number> {
+  // Defensive dedupe by token+environment within one send batch.
+  const seen = new Set<string>()
+  const deduped = tokens.filter((token) => {
+    const key = `${token.environment}:${token.token}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
   let sent = 0
-  for (const token of tokens) {
+  for (const token of deduped) {
     const result = await apns.send(token, alert)
     if (result.ok) {
       sent += 1

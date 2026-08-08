@@ -1,12 +1,14 @@
 /**
- * Shared GET handler for venue-claim approve/reject Edge Functions.
+ * Shared admin handler for venue-claim approve/reject Edge Functions.
  *
- * Token verification is isolated here — swap only this module if your signing algorithm differs.
+ * Security model (prefetch-safe):
+ * - GET: verify token, show read-only confirmation page — NO database mutation
+ * - POST: verify token + action + claim_id, then mutate (approve/reject)
  *
  * Env:
  * - SUPABASE_URL
- * - SUPABASE_SERVICE_ROLE_KEY — updates venue_claims (admin link must not rely on end-user JWT)
- * - ADMIN_VENUE_CLAIM_LINK_SECRET — HS256 secret for ?token= JWT (payload: claim_id, action)
+ * - SUPABASE_SERVICE_ROLE_KEY
+ * - ADMIN_VENUE_CLAIM_LINK_SECRET — HS256 secret for admin link JWT
  */
 import { createClient } from "npm:@supabase/supabase-js@2"
 import { jwtVerify } from "npm:jose@5"
@@ -19,6 +21,7 @@ import {
   htmlResponse,
   pageAlreadyProcessed,
   pageApproved,
+  pageConfirmAction,
   pageExpiredOrInvalid,
   pageExpiredToken,
   pageInvalidToken,
@@ -73,7 +76,7 @@ function isJwtExpiredError(e: unknown): boolean {
 async function verifyAdminActionToken(
   token: string,
   expectedAction: AdminRouteAction,
-): Promise<{ claim_id: string }> {
+): Promise<{ claim_id: string; jti: string | null }> {
   const secret = Deno.env.get("ADMIN_VENUE_CLAIM_LINK_SECRET")?.trim()
   if (!secret) {
     console.error("venue_claim_admin: missing ADMIN_VENUE_CLAIM_LINK_SECRET")
@@ -85,54 +88,25 @@ async function verifyAdminActionToken(
 
   const claim_id = typeof payload.claim_id === "string" ? payload.claim_id.trim() : ""
   const action = typeof payload.action === "string" ? payload.action.trim().toLowerCase() : ""
+  const jti = typeof payload.jti === "string" ? payload.jti.trim() : null
 
   if (!isUuid(claim_id)) throw new Error("bad_payload")
   if (action !== expectedAction) throw new Error("action_mismatch")
 
-  return { claim_id }
+  return { claim_id, jti }
 }
 
-export async function handleVenueClaimAdminGet(
-  req: Request,
-  routeAction: AdminRouteAction,
-): Promise<Response> {
-  if (req.method !== "GET") {
-    return new Response(JSON.stringify({ error: "method_not_allowed" }), {
-      status: 405,
-      headers: { "Content-Type": "application/json" },
-    })
-  }
-
-  const url = new URL(req.url)
-  const token = url.searchParams.get("token")?.trim() ?? ""
-
-  if (!token) {
-    return htmlResponse(pageInvalidToken(), 400)
-  }
-
-  let claimId: string
-  try {
-    ;({ claim_id: claimId } = await verifyAdminActionToken(token, routeAction))
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    if (msg === "misconfigured") {
-      return htmlResponse(pageExpiredOrInvalid(), 500)
-    }
-    if (isJwtExpiredError(e)) {
-      return htmlResponse(pageExpiredToken(), 401)
-    }
-    return htmlResponse(pageInvalidToken(), 401)
-  }
-
+async function loadClaim(
+  claimId: string,
+): Promise<{ claim: VenueClaimRecord | null; errorPage: Response | null }> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
   if (!supabaseUrl || !serviceKey) {
     console.error("venue_claim_admin: missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
-    return htmlResponse(pageExpiredOrInvalid(), 500)
+    return { claim: null, errorPage: htmlResponse(pageExpiredOrInvalid(), 500) }
   }
 
   const supabase = createClient(supabaseUrl, serviceKey)
-
   const { data: claimRaw, error: selErr } = await supabase
     .from("venue_claims")
     .select("*")
@@ -141,65 +115,63 @@ export async function handleVenueClaimAdminGet(
 
   if (selErr) {
     console.error("venue_claim_admin: select error", selErr)
-    return htmlResponse(pageExpiredOrInvalid(), 500)
+    return { claim: null, errorPage: htmlResponse(pageExpiredOrInvalid(), 500) }
   }
 
-  const claim = claimRaw as VenueClaimRecord | null
-  if (!claim) {
-    return htmlResponse(pageExpiredOrInvalid(), 404)
-  }
+  return { claim: claimRaw as VenueClaimRecord | null, errorPage: null }
+}
+
+async function performReject(claim: VenueClaimRecord, claimId: string): Promise<Response> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+  const supabase = createClient(supabaseUrl, serviceKey)
 
   const venueName = (claim.venue_name ?? "").trim() || "Unknown venue"
   const cid = claim.id
   const ts = formatTimestamp()
 
-  if (routeAction === "reject") {
-    if (isRejectedStatus(claim.approval_status)) {
-      return htmlResponse(
-        pageRejected({ venueName, claimId: cid, timestamp: ts }),
-        200,
-      )
-    }
-    if (isApprovedStatus(claim.approval_status)) {
-      return htmlResponse(
-        pageAlreadyProcessed({
-          venueName,
-          claimId: cid,
-          statusLabel: "approved",
-        }),
-        200,
-      )
-    }
-    if (!isPendingStatus(claim.approval_status)) {
-      return htmlResponse(
-        pageAlreadyProcessed({
-          venueName,
-          claimId: cid,
-          statusLabel: statusLabel(claim.approval_status),
-        }),
-        200,
-      )
-    }
-
-    const { error: upErr } = await supabase
-      .from("venue_claims")
-      .update({ approval_status: "rejected", rejection_acknowledged_at: null })
-      .eq("id", claimId)
-
-    if (upErr) {
-      console.error("venue_claim_admin: reject update error", upErr)
-      return htmlResponse(pageExpiredOrInvalid(), 500)
-    }
-
+  if (isRejectedStatus(claim.approval_status)) {
+    return htmlResponse(pageRejected({ venueName, claimId: cid, timestamp: ts }), 200)
+  }
+  if (isApprovedStatus(claim.approval_status)) {
     return htmlResponse(
-      pageRejected({ venueName, claimId: cid, timestamp: ts }),
+      pageAlreadyProcessed({ venueName, claimId: cid, statusLabel: "approved" }),
+      200,
+    )
+  }
+  if (!isPendingStatus(claim.approval_status)) {
+    return htmlResponse(
+      pageAlreadyProcessed({
+        venueName,
+        claimId: cid,
+        statusLabel: statusLabel(claim.approval_status),
+      }),
       200,
     )
   }
 
-  // approve — never show success until `ensureVenueForApprovedClaim` completes and DB verifies
-  // `venue_claims.venue_id` + `public.venues` row (do not short-circuit on approval_status alone).
-  console.log("[ClaimApprove] handler entered")
+  const { error: upErr } = await supabase
+    .from("venue_claims")
+    .update({ approval_status: "rejected", rejection_acknowledged_at: null })
+    .eq("id", claimId)
+    .eq("approval_status", claim.approval_status)
+
+  if (upErr) {
+    console.error("venue_claim_admin: reject update error", upErr)
+    return htmlResponse(pageExpiredOrInvalid(), 500)
+  }
+
+  return htmlResponse(pageRejected({ venueName, claimId: cid, timestamp: ts }), 200)
+}
+
+async function performApprove(claim: VenueClaimRecord, claimId: string): Promise<Response> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? ""
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
+  const supabase = createClient(supabaseUrl, serviceKey)
+
+  const venueName = (claim.venue_name ?? "").trim() || "Unknown venue"
+  const cid = claim.id
+  const ts = formatTimestamp()
 
   if (!isPendingStatus(claim.approval_status) && !isApprovedStatus(claim.approval_status)) {
     return htmlResponse(
@@ -212,19 +184,11 @@ export async function handleVenueClaimAdminGet(
     )
   }
 
-  console.log("[ClaimApprove] calling ensureVenueForApprovedClaim")
   let outcome: { venueName: string; claimId: string; venueId: string }
   try {
     outcome = await ensureVenueForApprovedClaim(supabase, claim)
   } catch (e) {
     if (e instanceof ClaimApproveError) {
-      console.error(
-        "[ClaimApprove] ensureVenueForApprovedClaim threw",
-        "code=",
-        e.code,
-        "detail=",
-        e.detail ?? "(none)",
-      )
       return htmlResponse(
         pageVenueApprovalFailed({
           claimId: cid,
@@ -235,8 +199,6 @@ export async function handleVenueClaimAdminGet(
       )
     }
     const msg = e instanceof Error ? e.message : String(e)
-    const stack = e instanceof Error ? e.stack : undefined
-    console.error("[ClaimApprove] ensureVenueForApprovedClaim unexpected error", msg, stack)
     return htmlResponse(
       pageVenueApprovalFailed({
         claimId: cid,
@@ -246,9 +208,6 @@ export async function handleVenueClaimAdminGet(
       500,
     )
   }
-
-  console.log(`[ClaimApprove] ensure complete venue_id=${outcome.venueId}`)
-  console.log("[ClaimApprove] returning pageApproved (DB linkage verified)")
 
   const ownerEmail = (claim.owner_email ?? "").trim()
   const businessIdRaw = claim.business_id != null ? String(claim.business_id).trim() : ""
@@ -277,4 +236,137 @@ export async function handleVenueClaimAdminGet(
     }),
     200,
   )
+}
+
+async function resolveToken(
+  token: string,
+  routeAction: AdminRouteAction,
+): Promise<{ claimId: string } | Response> {
+  if (!token) {
+    return htmlResponse(pageInvalidToken(), 400)
+  }
+  try {
+    const { claim_id } = await verifyAdminActionToken(token, routeAction)
+    return { claimId: claim_id }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg === "misconfigured") {
+      return htmlResponse(pageExpiredOrInvalid(), 500)
+    }
+    if (isJwtExpiredError(e)) {
+      return htmlResponse(pageExpiredToken(), 401)
+    }
+    return htmlResponse(pageInvalidToken(), 401)
+  }
+}
+
+/**
+ * GET — read-only confirmation (no mutation).
+ * POST — perform approve/reject after explicit admin confirm.
+ */
+export async function handleVenueClaimAdminRequest(
+  req: Request,
+  routeAction: AdminRouteAction,
+): Promise<Response> {
+  if (req.method !== "GET" && req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "method_not_allowed" }), {
+      status: 405,
+      headers: { "Content-Type": "application/json" },
+    })
+  }
+
+  let token = ""
+  if (req.method === "GET") {
+    token = new URL(req.url).searchParams.get("token")?.trim() ?? ""
+  } else {
+    const contentType = (req.headers.get("Content-Type") ?? "").toLowerCase()
+    if (contentType.includes("application/x-www-form-urlencoded") || contentType.includes("multipart/form-data")) {
+      const form = await req.formData()
+      token = String(form.get("token") ?? "").trim()
+      const formAction = String(form.get("action") ?? "").trim().toLowerCase()
+      if (formAction && formAction !== routeAction) {
+        return htmlResponse(pageInvalidToken(), 400)
+      }
+    } else {
+      try {
+        const body = await req.json() as { token?: string; action?: string }
+        token = (body.token ?? "").trim()
+        const bodyAction = (body.action ?? "").trim().toLowerCase()
+        if (bodyAction && bodyAction !== routeAction) {
+          return htmlResponse(pageInvalidToken(), 400)
+        }
+      } catch {
+        return htmlResponse(pageInvalidToken(), 400)
+      }
+    }
+  }
+
+  const resolved = await resolveToken(token, routeAction)
+  if (resolved instanceof Response) return resolved
+  const { claimId } = resolved
+
+  const { claim, errorPage } = await loadClaim(claimId)
+  if (errorPage) return errorPage
+  if (!claim) {
+    return htmlResponse(pageExpiredOrInvalid(), 404)
+  }
+
+  const venueName = (claim.venue_name ?? "").trim() || "Unknown venue"
+
+  // GET: never mutate — confirmation only (blocks email prefetch CSRF).
+  if (req.method === "GET") {
+    if (routeAction === "reject" && isRejectedStatus(claim.approval_status)) {
+      return htmlResponse(
+        pageRejected({ venueName, claimId: claim.id, timestamp: formatTimestamp() }),
+        200,
+      )
+    }
+    if (routeAction === "approve" && isApprovedStatus(claim.approval_status) && claim.venue_id) {
+      return htmlResponse(
+        pageAlreadyProcessed({
+          venueName,
+          claimId: claim.id,
+          statusLabel: "approved",
+        }),
+        200,
+      )
+    }
+    if (
+      !isPendingStatus(claim.approval_status) &&
+      !(routeAction === "approve" && isApprovedStatus(claim.approval_status))
+    ) {
+      return htmlResponse(
+        pageAlreadyProcessed({
+          venueName,
+          claimId: claim.id,
+          statusLabel: statusLabel(claim.approval_status),
+        }),
+        200,
+      )
+    }
+
+    return htmlResponse(
+      pageConfirmAction({
+        action: routeAction,
+        venueName,
+        claimId: claim.id,
+        token,
+      }),
+      200,
+    )
+  }
+
+  // POST: mutate
+  if (routeAction === "reject") {
+    return await performReject(claim, claimId)
+  }
+  return await performApprove(claim, claimId)
+}
+
+/** @deprecated Use handleVenueClaimAdminRequest — GET no longer mutates. */
+export async function handleVenueClaimAdminGet(
+  req: Request,
+  routeAction: AdminRouteAction,
+): Promise<Response> {
+  return handleVenueClaimAdminRequest(req, routeAction)
 }

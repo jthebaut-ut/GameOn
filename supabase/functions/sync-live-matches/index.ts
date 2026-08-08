@@ -591,6 +591,12 @@ async function runForceFeaturedEventsRefresh(
   omitEmptyTimelineFieldsForUpsert(deduped)
 
   if (deduped.length > 0) {
+    for (const match of deduped) {
+      const payload = (match.payload && typeof match.payload === "object")
+        ? match.payload as Record<string, unknown>
+        : null
+      maybeLogMlbProviderStatusDebug("upsert_featured", payload, match, match.match_status)
+    }
     const { error } = await supabase
       .from("live_matches")
       .upsert(deduped, { onConflict: "id" })
@@ -656,8 +662,8 @@ serve(async (req) => {
     cronSecretEnvNames: [
       "SYNC_LIVE_MATCHES_CRON_SECRET",
       "SPORTS_SYNC_CRON_SECRET",
-      // Accepted so pro-game-score-alert-worker can keep sending its existing header.
-      "PRO_SCORE_PUSH_WORKER_CRON_SECRET",
+      // PRO_SCORE_PUSH_WORKER_CRON_SECRET intentionally NOT accepted here —
+      // score worker must use service_role or call sync with SYNC_LIVE secret.
     ],
   })
   if (!auth.accepted) {
@@ -857,6 +863,12 @@ serve(async (req) => {
     const scheduledUpsertIds = new Set(scheduledOnlyMatches.map((match) => match.id))
 
     if (matchesToUpsert.length > 0) {
+      for (const match of matchesToUpsert) {
+        const payload = (match.payload && typeof match.payload === "object")
+          ? match.payload as Record<string, unknown>
+          : null
+        maybeLogMlbProviderStatusDebug("upsert", payload, match, match.match_status)
+      }
       const { error } = await supabase
         .from("live_matches")
         .upsert(matchesToUpsert, { onConflict: "id" })
@@ -1723,8 +1735,9 @@ function normalizeSportsDBV2Livescore(event: Record<string, unknown>): LiveMatch
 
   const rawStatus = event?.strStatus ?? event?.strProgress
   const minute = numberOrNull(event?.strProgress) ?? minuteFromProgress(event?.strProgress)
+  const matchStatus = normalizeSportsDBStatus(rawStatus)
 
-  return {
+  const match: LiveMatchUpsert = {
     id: `thesportsdb:${externalId}`,
     source: "thesportsdb",
     external_id: externalId,
@@ -1733,7 +1746,7 @@ function normalizeSportsDBV2Livescore(event: Record<string, unknown>): LiveMatch
     away_team: away,
     score_home: numberOrZero(event?.intHomeScore),
     score_away: numberOrZero(event?.intAwayScore),
-    match_status: normalizeSportsDBStatus(rawStatus),
+    match_status: matchStatus,
     minute,
     league: resolveSportsDBLeagueLabel(event),
     start_time: timestamp,
@@ -1744,6 +1757,8 @@ function normalizeSportsDBV2Livescore(event: Record<string, unknown>): LiveMatch
     timeline_updated_at: null,
     featured_event_slug: null,
   }
+  maybeLogMlbProviderStatusDebug("normalize_v2", event, match, matchStatus)
+  return match
 }
 
 async function fetchTheSportsDBV1Matches(
@@ -1793,8 +1808,9 @@ function normalizeSportsDBEvent(event: Record<string, any>, fallbackLeague: stri
 
   const rawStatus = event?.strStatus ?? event?.strProgress
   const minute = numberOrNull(event?.intRound) ?? minuteFromProgress(event?.strProgress)
+  const matchStatus = normalizeSportsDBStatus(rawStatus)
 
-  return {
+  const match: LiveMatchUpsert = {
     id: `thesportsdb:${externalId}`,
     source: "thesportsdb",
     external_id: externalId,
@@ -1803,7 +1819,7 @@ function normalizeSportsDBEvent(event: Record<string, any>, fallbackLeague: stri
     away_team: away,
     score_home: numberOrZero(event?.intHomeScore),
     score_away: numberOrZero(event?.intAwayScore),
-    match_status: normalizeSportsDBStatus(rawStatus),
+    match_status: matchStatus,
     minute,
     league: resolveSportsDBLeagueLabel(event, fallbackLeague),
     start_time: timestamp,
@@ -1814,6 +1830,8 @@ function normalizeSportsDBEvent(event: Record<string, any>, fallbackLeague: stri
     timeline_updated_at: null,
     featured_event_slug: null,
   }
+  maybeLogMlbProviderStatusDebug("normalize_v1", event, match, matchStatus)
+  return match
 }
 
 function normalizeSportsDBScheduledFixture(
@@ -3976,15 +3994,129 @@ function isWithinMatchWindow(rawStart: string, matchWindow: MatchWindow): boolea
   return Number.isFinite(start.getTime()) && start >= matchWindow.start && start <= matchWindow.end
 }
 
+function isBaseballInningProgressStatus(compact: string): boolean {
+  const s = String(compact ?? "").replace(/\s+/g, " ").trim().toUpperCase()
+  if (!s) return false
+
+  // TheSportsDB compact inning codes: IN1…IN99 (e.g. production strStatus=IN9).
+  if (/^IN[0-9]{1,2}$/.test(s)) return true
+
+  // Extra innings (not "Final/10" — those are handled as FT before this runs).
+  if (/\bEXTRA\s+INNINGS?\b/.test(s)) return true
+
+  // "INNING 6" / "6TH INNING" / "6 INNING"
+  if (/\bINNING\s+\d{1,2}\b/.test(s)) return true
+  if (/\b\d{1,2}(?:ST|ND|RD|TH)?\s+INNING\b/.test(s)) return true
+
+  // TOP/BOT/BOTTOM/MID/MIDDLE + optional "OF THE" + inning number
+  // Examples: "TOP 7", "BOT 5", "BOTTOM 9", "BOTTOM OF THE 5TH", "MID 8", "MIDDLE 6TH"
+  if (
+    /\b(?:TOP|BOT|BOTTOM|MID|MIDDLE)\s+(?:OF\s+(?:THE\s+)?)?\d{1,2}(?:ST|ND|RD|TH)?\b/
+      .test(s)
+  ) {
+    return true
+  }
+
+  // "END 5" / "END OF THE 7TH" = inning transition (bare "END"/"ENDED" stay final upstream)
+  if (/\bEND\s+(?:OF\s+(?:THE\s+)?)?\d{1,2}(?:ST|ND|RD|TH)?\b/.test(s)) {
+    return true
+  }
+
+  return false
+}
+
+/** DEBUG-only: MLB rows that look live by score or start+10m — no status mapping changes. */
+function shouldAuditMlbProviderStatus(
+  sport: string,
+  league: string,
+  scoreHome: number,
+  scoreAway: number,
+  startTime: string,
+): boolean {
+  const sportKey = sport.trim().toUpperCase()
+  const leagueKey = league.trim().toUpperCase()
+  const isMlb =
+    sportKey === "MLB" ||
+    leagueKey === "MLB" ||
+    sportKey.includes("BASEBALL") ||
+    leagueKey.includes("BASEBALL")
+  if (!isMlb) return false
+  if (scoreHome > 0 || scoreAway > 0) return true
+  const startMs = Date.parse(startTime)
+  if (!Number.isFinite(startMs)) return false
+  return Date.now() > startMs + 10 * 60 * 1000
+}
+
+function debugScalar(value: unknown): string {
+  if (value === null) return "null"
+  if (value === undefined) return "undefined"
+  if (typeof value === "string") return value.length === 0 ? '""' : value
+  return String(value)
+}
+
+function maybeLogMlbProviderStatusDebug(
+  phase: string,
+  event: Record<string, unknown> | null,
+  match: Pick<
+    LiveMatchUpsert,
+    | "external_id"
+    | "sport"
+    | "league"
+    | "score_home"
+    | "score_away"
+    | "start_time"
+    | "match_status"
+    | "home_team"
+    | "away_team"
+  >,
+  normalizedStatus: MatchStatus,
+): void {
+  if (
+    !shouldAuditMlbProviderStatus(
+      match.sport,
+      match.league,
+      match.score_home,
+      match.score_away,
+      match.start_time,
+    )
+  ) {
+    return
+  }
+
+  const idEvent = debugScalar(event?.idEvent ?? match.external_id)
+  const strStatus = debugScalar(event?.strStatus)
+  const strProgress = debugScalar(event?.strProgress)
+  const strPostponed = debugScalar(event?.strPostponed)
+  const intHomeScore = debugScalar(event?.intHomeScore ?? match.score_home)
+  const intAwayScore = debugScalar(event?.intAwayScore ?? match.score_away)
+
+  // Cap identical lines within a warm isolate (cron can re-sync often).
+  const dedupeKey =
+    `${phase}|${idEvent}|${strStatus}|${strProgress}|${normalizedStatus}|${match.match_status}`
+  if (mlbStatusDebugLoggedKeys.has(dedupeKey)) return
+  mlbStatusDebugLoggedKeys.add(dedupeKey)
+
+  console.log(
+    `[MLBStatusDebug] phase=${phase} idEvent=${idEvent} ` +
+      `strStatus=${strStatus} strProgress=${strProgress} strPostponed=${strPostponed} ` +
+      `intHomeScore=${intHomeScore} intAwayScore=${intAwayScore} ` +
+      `normalized=${normalizedStatus} match_status=${match.match_status} ` +
+      `teams=${match.away_team}@${match.home_team}`,
+  )
+}
+
+const mlbStatusDebugLoggedKeys = new Set<string>()
+
 function normalizeSportsDBStatus(raw: unknown): MatchStatus {
   const status = String(raw ?? "").trim().toUpperCase()
-  const compact = status.replace(/[_-]+/g, " ")
+  const compact = status.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim()
   if (compact.includes("HALF") || compact === "HT") return "HT"
   if (
     status === "FT" ||
     status === "AET" ||
     status === "AP" ||
     status === "AW" ||
+    compact === "END" ||
     compact.includes("FT") ||
     compact.includes("FINAL") ||
     compact.includes("FINISHED") ||
@@ -3998,6 +4130,24 @@ function normalizeSportsDBStatus(raw: unknown): MatchStatus {
     compact.includes("AFTER PEN") ||
     compact.includes("PENALTIES FINISHED")
   ) return "FT"
+
+  // Explicit non-live states before any "STARTED"/progress heuristics.
+  if (
+    compact === "NS" ||
+    compact.includes("NOT STARTED") ||
+    compact.includes("PRE GAME") ||
+    compact.includes("PREGAME") ||
+    compact.includes("WARMUP") ||
+    compact.includes("SCHED") ||
+    compact.includes("POSTPON") ||
+    compact.includes("DELAY") ||
+    compact.includes("CANCEL")
+  ) {
+    return "SCHEDULED"
+  }
+
+  if (isBaseballInningProgressStatus(compact)) return "LIVE"
+
   if (["1H", "2H", "ET", "BT", "P", "OT", "Q1", "Q2", "Q3", "Q4", "LIVE"].includes(status)) return "LIVE"
   if (
     compact.includes("LIVE") ||
@@ -4015,7 +4165,6 @@ function normalizeSportsDBStatus(raw: unknown): MatchStatus {
   ) {
     return "LIVE"
   }
-  if (compact === "NS" || compact.includes("SCHED") || compact.includes("NOT STARTED")) return "SCHEDULED"
   return "SCHEDULED"
 }
 

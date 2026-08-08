@@ -1,12 +1,13 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { secretsEqual } from "../_shared/sports_worker_auth.ts"
 
 /**
  * Sends one Business Pro award/extension APNs alert after an individual admin grant.
  *
  * Invoked asynchronously via pg_net (service role).
- * Secrets: APNS_*, optional BUSINESS_PRO_AWARD_PUSH_CRON_SECRET
+ * Secrets: APNS_*, BUSINESS_PRO_AWARD_PUSH_CRON_SECRET (dedicated — no shared fallbacks)
  * Deploy: `supabase functions deploy notify-business-pro-award`
  */
 
@@ -35,16 +36,14 @@ function authorizeInvocation(
 ): { accepted: true; source: string } | { accepted: false; reason: string } {
   const authHeader = req.headers.get("Authorization")
   const bearerToken = authHeader?.replace(/^Bearer\s+/i, "").trim() ?? ""
-  if (bearerToken && bearerToken === serviceRoleKey) {
+  if (bearerToken && serviceRoleKey && secretsEqual(bearerToken, serviceRoleKey)) {
     return { accepted: true, source: "service_role_bearer" }
   }
 
-  const cronSecret = Deno.env.get("BUSINESS_PRO_AWARD_PUSH_CRON_SECRET")?.trim()
-    ?? Deno.env.get("FANGEO_PLUS_AWARD_PUSH_CRON_SECRET")?.trim()
-    ?? Deno.env.get("FANGEO_ANNOUNCEMENT_PUSH_CRON_SECRET")?.trim()
+  const cronSecret = Deno.env.get("BUSINESS_PRO_AWARD_PUSH_CRON_SECRET")?.trim() ?? ""
   const requestCronSecret = req.headers.get("x-cron-secret")?.trim()
     ?? req.headers.get("x-fangeo-cron-secret")?.trim()
-  if (cronSecret && requestCronSecret === cronSecret) {
+  if (cronSecret && requestCronSecret && secretsEqual(requestCronSecret, cronSecret)) {
     return { accepted: true, source: "cron_secret" }
   }
 
