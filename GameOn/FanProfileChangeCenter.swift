@@ -29,11 +29,41 @@ enum FanProfileChangeCenter {
 
     static func postAvatarChange(_ change: FanProfileAvatarChange) {
         guard !change.avatarURL.isEmpty || !(change.avatarThumbnailURL ?? "").isEmpty else { return }
+        PublicUserProfileProcessCache.invalidate(userId: change.userId, reason: "avatarPosted")
         NotificationCenter.default.post(
             name: avatarDidChangeNotification,
             object: nil,
             userInfo: [changeUserInfoKey: change]
         )
+    }
+
+    /// Drop decoded images for superseded avatar URLs so list rows never keep showing the old photo.
+    static func invalidateCachedAvatarImages(
+        previousAvatarURL: String?,
+        previousThumbnailURL: String?,
+        nextAvatarURL: String,
+        nextThumbnailURL: String?
+    ) {
+        let nextFull = ImageDisplayURL.canonicalStorageURLString(nextAvatarURL)
+        let nextThumb = ImageDisplayURL.canonicalStorageURLString(nextThumbnailURL)
+        var candidates: [String] = []
+        let prevFull = ImageDisplayURL.canonicalStorageURLString(previousAvatarURL)
+        let prevThumb = ImageDisplayURL.canonicalStorageURLString(previousThumbnailURL)
+        if !prevFull.isEmpty, prevFull != nextFull, prevFull != nextThumb {
+            candidates.append(prevFull)
+        }
+        if !prevThumb.isEmpty, prevThumb != nextFull, prevThumb != nextThumb {
+            candidates.append(prevThumb)
+        }
+        if let list = ImageDisplayURL.forList(thumbnail: previousThumbnailURL, full: previousAvatarURL),
+           list != ImageDisplayURL.forList(thumbnail: nextThumbnailURL, full: nextAvatarURL) {
+            candidates.append(list)
+        }
+        let urls = candidates.compactMap { URL(string: $0) }
+        guard !urls.isEmpty else { return }
+        Task {
+            await DiscoverMapImageCache.shared.invalidate(urls: urls)
+        }
     }
 
     static func avatarChange(from notification: Notification) -> FanProfileAvatarChange? {

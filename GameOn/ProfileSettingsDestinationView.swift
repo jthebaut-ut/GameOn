@@ -151,18 +151,22 @@ struct ProfileSettingsDestinationView: View {
             )
 
         case .communityGuidelines:
-            SettingsLegalDocumentSheet(
-                document: .communityGuidelines,
-                embedsInNavigationStack: false,
-                showsCloseButton: false
-            )
+            SettingsTrustSafetyInfoView(topic: .communityGuidelines)
 
         case .trustSafety:
-            SettingsLegalDocumentSheet(
-                document: .safetyReporting,
-                embedsInNavigationStack: false,
-                showsCloseButton: false
-            )
+            SettingsTrustSafetyHubView()
+
+        case .chatSecurity:
+            SettingsTrustSafetyInfoView(topic: .chatSecurity)
+
+        case .reportingModeration:
+            SettingsTrustSafetyInfoView(topic: .reportingModeration)
+
+        case .blockingUsersInfo:
+            SettingsTrustSafetyInfoView(topic: .blockingUsers)
+
+        case .privacyLocationSharing:
+            SettingsTrustSafetyInfoView(topic: .privacyLocationSharing)
 
         case .privacyPolicy:
             SettingsLegalDocumentSheet(

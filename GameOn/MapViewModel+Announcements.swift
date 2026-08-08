@@ -188,6 +188,17 @@ extension MapViewModel {
         clearFocusedDiscoverAnnouncement(reason: "discoverTabHidden")
     }
 
+    /// Publishes any Discover map snapshot that was built while the tab was offscreen.
+    @MainActor
+    func noteDiscoverTabBecameVisibleForMapSnapshot() {
+        guard discoverMapRenderSnapshotNeedsPublishWhenVisible else { return }
+        discoverMapRenderSnapshotNeedsPublishWhenVisible = false
+        flushDiscoverMapRenderSnapshotRebuild(reason: "discoverTabBecameVisible")
+#if DEBUG
+        print("[DiscoverMapSnapshotDebug] publishResumed reason=discoverTabBecameVisible")
+#endif
+    }
+
     @MainActor
     private func clearFocusedDiscoverAnnouncement(reason: String) {
         guard focusedDiscoverAnnouncementId != nil else { return }

@@ -263,7 +263,10 @@ private struct SettingsPickupGamesEmptyStateCard: View {
 
 enum SettingsPickupMyGameListCardDisplayStyle: Equatable {
     case settingsFull
+    /// Going → Hosting list cards.
     case followingCompact
+    /// Going → Hosting pickup detail sheet (organizer).
+    case hostingDetail
 }
 
 struct GameFormatBadgeView: View {
@@ -346,6 +349,8 @@ private struct PickupOrganizerParticipantSummaryView: View {
     var languageCode: String = L10n.defaultLanguageCode
     var onParticipantTapped: (UUID) -> Void
     var onViewAllPlayers: (() -> Void)? = nil
+    /// When false, omit the per-row Approved badge (e.g. Going → Hosting shows it in the card header).
+    var showsParticipantStatusBadge: Bool = true
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .body) private var avatarDiameter: CGFloat = 34
@@ -445,7 +450,7 @@ private struct PickupOrganizerParticipantSummaryView: View {
             onParticipantTapped(userId)
         } label: {
             Group {
-                if stackStatusUnderName {
+                if showsParticipantStatusBadge, stackStatusUnderName {
                     HStack(alignment: .center, spacing: 10) {
                         avatarView(
                             thumb: thumb,
@@ -480,8 +485,10 @@ private struct PickupOrganizerParticipantSummaryView: View {
                             .lineLimit(1)
                             .layoutPriority(1)
                         Spacer(minLength: 4)
-                        statusBadge(title: statusTitle)
-                            .layoutPriority(0)
+                        if showsParticipantStatusBadge {
+                            statusBadge(title: statusTitle)
+                                .layoutPriority(0)
+                        }
                     }
                 }
             }
@@ -561,6 +568,7 @@ struct SettingsPickupMyGameListCard: View {
     var onOpenDetails: (() -> Void)? = nil
     var onInvite: (() -> Void)? = nil
     var onOpenMap: (() -> Void)? = nil
+    var onShare: (() -> Void)? = nil
 
     @State private var rosterActionUserId: UUID?
     @State private var showRosterPlayerActions: Bool = false
@@ -577,6 +585,10 @@ struct SettingsPickupMyGameListCard: View {
         displayStyle == .followingCompact
     }
 
+    private var isHostingDetail: Bool {
+        displayStyle == .hostingDetail
+    }
+
     private var status: SettingsPickupGameListCardStatus {
         Self.computeStatus(row: row, pendingJoinCount: pendingJoinCount, now: now)
     }
@@ -587,6 +599,32 @@ struct SettingsPickupMyGameListCard: View {
 
     private var usesExpiredArchivedStyle: Bool {
         isFollowingCompact && isExpiredClearing
+    }
+
+    private var hostingAutoClearInFlight: Bool {
+        (isFollowingCompact || isHostingDetail) && viewModel.pickupHostingAutoClearInFlightIds.contains(row.id)
+    }
+
+    private var hostingAutoClearFailed: Bool {
+        (isFollowingCompact || isHostingDetail) && viewModel.pickupHostingAutoClearFailedIds.contains(row.id)
+    }
+
+    /// Going Hosting: treat past-deadline as clearing until removed or failure fallback.
+    private var hostingAutoClearStatusActive: Bool {
+        (isFollowingCompact || isHostingDetail)
+            && isExpiredClearing
+            && !hostingAutoClearFailed
+    }
+
+    /// Header Approved chip for Going Hosting list + organizer detail sheet.
+    private var showsHeaderApprovedBadge: Bool {
+        (isFollowingCompact || isHostingDetail) && !usesExpiredArchivedStyle && displayedJoinedPlayerCount > 0
+    }
+
+    private var metaSectionSpacing: CGFloat {
+        if isFollowingCompact { return 8 }
+        if isHostingDetail { return 14 }
+        return 10
     }
 
     private var cardTextOpacity: Double {
@@ -683,6 +721,14 @@ struct SettingsPickupMyGameListCard: View {
         return "\(base) · \(spotPhrase)"
     }
 
+    private var showsFollowingCompactHeaderShare: Bool {
+        isFollowingCompact && !usesExpiredArchivedStyle && row.isEligibleForInAppShare()
+    }
+
+    private var followingCompactShareIconColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.78) : Color.secondary
+    }
+
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: isFollowingCompact ? 16 : 24, style: .continuous)
         VStack(alignment: .leading, spacing: 0) {
@@ -721,6 +767,10 @@ struct SettingsPickupMyGameListCard: View {
                             )
                             .fixedSize(horizontal: true, vertical: false)
                             .accessibilityLabel(status.pillTitle(languageCode: languageCode))
+
+                        if showsHeaderApprovedBadge {
+                            followingCompactHeaderApprovedBadge
+                        }
                     }
 
                     if !isFollowingCompact {
@@ -755,10 +805,15 @@ struct SettingsPickupMyGameListCard: View {
                         .accessibilityLabel("\(pendingJoinCount) players waiting. Tap to review.")
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if showsFollowingCompactHeaderShare {
+                    followingCompactHeaderShareControl
+                }
             }
             .padding(.bottom, 4)
 
-            VStack(alignment: .leading, spacing: isFollowingCompact ? 8 : 10) {
+            VStack(alignment: .leading, spacing: metaSectionSpacing) {
                 if let dateTimeLine {
                     SettingsPickupCardMetaRow(
                         systemImage: "calendar",
@@ -812,7 +867,8 @@ struct SettingsPickupMyGameListCard: View {
                             } else {
                                 onManageRequests()
                             }
-                        }
+                        },
+                        showsParticipantStatusBadge: !(isFollowingCompact || isHostingDetail)
                     )
                     .opacity(cardTextOpacity)
                 }
@@ -835,7 +891,7 @@ struct SettingsPickupMyGameListCard: View {
                         .opacity(cardTextOpacity)
                 }
             }
-            .padding(.top, 6)
+            .padding(.top, isHostingDetail ? 10 : 6)
             .contentShape(Rectangle())
             .onTapGesture { handleCardMapTap() }
 
@@ -878,48 +934,73 @@ struct SettingsPickupMyGameListCard: View {
                     .padding(.top, pendingJoinCount > 0 && !isFollowingCompact ? 8 : 0)
                 }
 
-                HStack(spacing: 10) {
-                    if !usesExpiredArchivedStyle, let onInvite {
-                        Button(action: onInvite) {
-                            Label("Invite", systemImage: "person.badge.plus")
-                                .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
+                if isFollowingCompact {
+                    followingCompactHostingActionRows
+                } else if isHostingDetail {
+                    hostingDetailActionRows
+                } else {
+                    // Settings list: keep existing single-row management actions.
+                    HStack(spacing: 10) {
+                        if !usesExpiredArchivedStyle, row.isEligibleForInAppShare() {
+                            if let onShare {
+                                Button(action: onShare) {
+                                    Label(L10n.t("Share", languageCode: languageCode), systemImage: "square.and.arrow.up")
+                                        .font(.subheadline.weight(.semibold))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.8)
+                                        .pickupCardActionButtonFrame()
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(FGColor.accentBlue)
+                                .accessibilityLabel(L10n.t("share_pickup_a11y_label", languageCode: languageCode))
+                                .accessibilityHint(L10n.t("share_pickup_a11y_hint", languageCode: languageCode))
+                            } else {
+                                PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
+                                    Label(L10n.t("Share", languageCode: languageCode), systemImage: "square.and.arrow.up")
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(FGColor.accentBlue)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.8)
+                                        .multilineTextAlignment(.center)
+                                        .pickupCardOutlinedActionChrome(tint: FGColor.accentBlue)
+                                }
+                            }
                         }
-                        .buttonStyle(.bordered)
-                        .tint(Color.orange)
-                    }
 
-                    if !(isFollowingCompact && isExpiredClearing) {
+                        if !usesExpiredArchivedStyle, let onInvite {
+                            Button(action: onInvite) {
+                                Label("Invite", systemImage: "person.badge.plus")
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.8)
+                                    .pickupCardActionButtonFrame()
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(Color.orange)
+                        }
+
                         Button(action: onEdit) {
                             Label(gameStarted ? "Manage" : "Edit", systemImage: "pencil")
                                 .font(.subheadline.weight(.semibold))
-                                .frame(maxWidth: .infinity)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                                .pickupCardActionButtonFrame()
                         }
                         .buttonStyle(.bordered)
                         .tint(FGColor.accentBlue)
-                    }
 
-                    Button(role: .destructive, action: onDelete) {
-                        Label(isFollowingCompact && isExpiredClearing ? "Clear expired" : "Cancel game", systemImage: "trash")
-                            .font(.subheadline.weight(.semibold))
-                            .frame(maxWidth: .infinity)
+                        Button(role: .destructive, action: onDelete) {
+                            Label("Cancel game", systemImage: "trash")
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                                .pickupCardActionButtonFrame()
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
-                }
-
-                if isFollowingCompact, !isExpiredClearing, let onOpenDetails {
-                    Button(action: onOpenDetails) {
-                        Label(
-                            L10n.t("pickup_details_cleanup", languageCode: languageCode),
-                            systemImage: "ellipsis.circle"
-                        )
-                            .font(.subheadline.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
                 }
             }
-            .padding(.top, isFollowingCompact ? 10 : 14)
+            .padding(.top, isFollowingCompact ? 8 : (isHostingDetail ? 16 : 14))
 
             if !isFollowingCompact {
                 Divider()
@@ -930,21 +1011,33 @@ struct SettingsPickupMyGameListCard: View {
                     row: row,
                     now: now,
                     languageCode: languageCode,
-                    isFooterStyle: true
+                    isFooterStyle: true,
+                    isClearing: hostingAutoClearInFlight || hostingAutoClearStatusActive,
+                    clearFailed: hostingAutoClearFailed
                 )
             } else {
                 let snap = SettingsPickupCleanupDisplay.snapshot(
                     row: row,
                     now: now,
-                    languageCode: languageCode
+                    languageCode: languageCode,
+                    isClearing: hostingAutoClearInFlight || hostingAutoClearStatusActive,
+                    clearFailed: hostingAutoClearFailed
                 )
                 HStack(alignment: .center, spacing: 6) {
                     Image(systemName: snap.symbolName)
                         .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .foregroundStyle(
+                            hostingAutoClearFailed
+                                ? Color.orange.opacity(colorScheme == .dark ? 0.95 : 0.9)
+                                : FGColor.secondaryText(colorScheme)
+                        )
                     Text(snap.label)
                         .font(FGTypography.metadata)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .foregroundStyle(
+                            hostingAutoClearFailed
+                                ? Color.orange.opacity(colorScheme == .dark ? 0.95 : 0.9)
+                                : FGColor.secondaryText(colorScheme)
+                        )
                 }
                 .padding(.top, 4)
             }
@@ -984,6 +1077,222 @@ struct SettingsPickupMyGameListCard: View {
     private func handleCardMapTap() {
         guard isFollowingCompact, !usesExpiredArchivedStyle else { return }
         onOpenMap?()
+    }
+
+    /// Organizer detail sheet actions (Share is in the navigation toolbar):
+    /// Row 1: Invite | Edit (equal width)
+    /// Row 2: Cancel game (full width, destructive)
+    @ViewBuilder
+    private var hostingDetailActionRows: some View {
+        let rowSpacing: CGFloat = 8
+        VStack(spacing: rowSpacing) {
+            HStack(spacing: rowSpacing) {
+                if let onInvite {
+                    Button(action: onInvite) {
+                        followingCompactHostingActionLabel(
+                            title: "Invite",
+                            systemImage: "person.badge.plus",
+                            foreground: Color.orange.opacity(colorScheme == .dark ? 0.95 : 0.90)
+                        )
+                        .pickupCardTintedActionChrome(tint: Color.orange, colorScheme: colorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                }
+
+                Button(action: onEdit) {
+                    followingCompactHostingActionLabel(
+                        title: gameStarted ? "Manage" : "Edit",
+                        systemImage: "pencil",
+                        foreground: FGColor.accentBlue
+                    )
+                    .pickupCardTintedActionChrome(tint: FGColor.accentBlue, colorScheme: colorScheme)
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
+            }
+
+            Button(role: .destructive, action: onDelete) {
+                followingCompactHostingActionLabel(
+                    title: "Cancel game",
+                    systemImage: "trash",
+                    foreground: Color.red.opacity(colorScheme == .dark ? 0.95 : 0.88)
+                )
+                .pickupCardTintedActionChrome(tint: Color.red, colorScheme: colorScheme)
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Going → Hosting compact actions:
+    /// Row 1: Invite | Edit | Cancel game (equal width)
+    /// Row 2: Details & cleanup (full width)
+    /// Past deadline: auto-clear in progress, or Clear expired only after failure.
+    /// Share lives in the card header (icon only).
+    @ViewBuilder
+    private var followingCompactHostingActionRows: some View {
+        let rowSpacing: CGFloat = 8
+        VStack(spacing: rowSpacing) {
+            if isExpiredClearing {
+                if hostingAutoClearFailed {
+                    Button(role: .destructive, action: onDelete) {
+                        followingCompactHostingActionLabel(
+                            title: "Clear expired",
+                            systemImage: "trash",
+                            foreground: Color.red.opacity(colorScheme == .dark ? 0.95 : 0.88)
+                        )
+                        .pickupCardTintedActionChrome(tint: Color.red, colorScheme: colorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .disabled(hostingAutoClearInFlight)
+                } else {
+                    followingCompactHostingActionLabel(
+                        title: L10n.t("pickup_auto_clearing_now", languageCode: languageCode),
+                        systemImage: "arrow.triangle.2.circlepath",
+                        foreground: FGColor.secondaryText(colorScheme)
+                    )
+                    .pickupCardTintedActionChrome(tint: FGColor.mutedText(colorScheme), colorScheme: colorScheme)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityLabel(L10n.t("pickup_auto_clearing_now", languageCode: languageCode))
+                }
+            } else {
+                HStack(spacing: rowSpacing) {
+                    if let onInvite {
+                        Button(action: onInvite) {
+                            followingCompactHostingActionLabel(
+                                title: "Invite",
+                                systemImage: "person.badge.plus",
+                                foreground: Color.orange.opacity(colorScheme == .dark ? 0.95 : 0.90)
+                            )
+                            .pickupCardTintedActionChrome(tint: Color.orange, colorScheme: colorScheme)
+                        }
+                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity)
+                        .layoutPriority(1)
+                    }
+
+                    Button(action: onEdit) {
+                        followingCompactHostingActionLabel(
+                            title: gameStarted ? "Manage" : "Edit",
+                            systemImage: "pencil",
+                            foreground: FGColor.accentBlue
+                        )
+                        .pickupCardTintedActionChrome(tint: FGColor.accentBlue, colorScheme: colorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .layoutPriority(1)
+
+                    Button(role: .destructive, action: onDelete) {
+                        followingCompactHostingActionLabel(
+                            title: "Cancel game",
+                            systemImage: "trash",
+                            foreground: Color.red.opacity(colorScheme == .dark ? 0.95 : 0.88)
+                        )
+                        .pickupCardTintedActionChrome(tint: Color.red, colorScheme: colorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .layoutPriority(1)
+                }
+
+                if let onOpenDetails {
+                    Button(action: onOpenDetails) {
+                        followingCompactHostingActionLabel(
+                            title: L10n.t("pickup_details_cleanup", languageCode: languageCode),
+                            systemImage: "ellipsis.circle",
+                            foreground: FGColor.accentBlue
+                        )
+                        .pickupCardTintedActionChrome(tint: FGColor.accentBlue, colorScheme: colorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                }
+            }
+        }
+    }
+
+    private var followingCompactHeaderApprovedBadge: some View {
+        let title = L10n.t("pickup_host_participant_status_approved", languageCode: languageCode)
+        return Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(FGColor.accentGreen)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(
+                FGColor.accentGreen.opacity(colorScheme == .dark ? 0.2 : 0.12),
+                in: Capsule(style: .continuous)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.35 : 0.22), lineWidth: 1)
+            )
+            .fixedSize(horizontal: true, vertical: false)
+            .accessibilityLabel(title)
+    }
+
+    /// Compact icon Share — matches Discover pickup preview trailing control (38pt material, 44pt hit).
+    @ViewBuilder
+    private var followingCompactHeaderShareControl: some View {
+        Group {
+            if let onShare {
+                Button(action: onShare) {
+                    followingCompactHeaderShareIcon
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("share_pickup_a11y_label", languageCode: languageCode))
+                .accessibilityHint(L10n.t("share_pickup_a11y_hint", languageCode: languageCode))
+            } else {
+                PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
+                    followingCompactHeaderShareIcon
+                }
+                .fixedSize()
+            }
+        }
+    }
+
+    private var followingCompactHeaderShareIcon: some View {
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 38, height: 38)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(followingCompactShareIconColor)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+    }
+
+    /// Compact single-line action label that scales before truncating (avoids "Cancel g…").
+    private func followingCompactHostingActionLabel(
+        title: String,
+        systemImage: String,
+        foreground: Color
+    ) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .imageScale(.medium)
+            Text(title)
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
+                .allowsTightening(true)
+                .multilineTextAlignment(.center)
+        }
+        .foregroundStyle(foreground)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -1440,60 +1749,40 @@ private enum SettingsPickupCleanupDisplay {
     }
 
     static func cleanupDeadline(for row: PickupGameRow) -> Date? {
-        row.pickupHistoryClientCleanupDeadline()
+        PickupHostingAutoClear.deadline(for: row)
     }
 
-    static func snapshot(row: PickupGameRow, now: Date, languageCode: String) -> Snapshot {
+    static func snapshot(
+        row: PickupGameRow,
+        now: Date,
+        languageCode: String,
+        isClearing: Bool = false,
+        clearFailed: Bool = false
+    ) -> Snapshot {
+        let label = PickupHostingAutoClear.statusLabel(
+            row: row,
+            now: now,
+            languageCode: languageCode,
+            isClearing: isClearing,
+            clearFailed: clearFailed
+        )
+        if clearFailed {
+            return Snapshot(label: label, symbolName: "exclamationmark.triangle", tone: .amber)
+        }
+        if isClearing {
+            return Snapshot(label: label, symbolName: "arrow.triangle.2.circlepath", tone: .amber)
+        }
         guard let deadline = cleanupDeadline(for: row) else {
-            return Snapshot(
-                label: String(
-                    format: L10n.t("pickup_auto_clears_after_start_format", languageCode: languageCode),
-                    12
-                ),
-                symbolName: "clock.arrow.circlepath",
-                tone: .normal
-            )
+            return Snapshot(label: label, symbolName: "clock.arrow.circlepath", tone: .normal)
         }
-        guard let gameStart = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else {
-            if now >= deadline {
-                return Snapshot(label: "Past auto-clear time", symbolName: "clock", tone: .normal)
-            }
-            let remaining = deadline.timeIntervalSince(now)
-            if remaining < 3600 {
-                let minutes = max(1, Int(ceil(remaining / 60)))
-                return Snapshot(label: "Clears in \(minutes)m", symbolName: "timer", tone: .amber)
-            }
-            let totalSeconds = Int(remaining)
-            let hours = totalSeconds / 3600
-            let minutes = (totalSeconds % 3600) / 60
-            return Snapshot(label: "Clears in \(hours)h \(minutes)m", symbolName: "timer", tone: .normal)
+        if let gameStart = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at), now < gameStart {
+            return Snapshot(label: label, symbolName: "clock.arrow.circlepath", tone: .normal)
         }
-
-        if now >= deadline {
-            return Snapshot(label: "Past auto-clear time", symbolName: "clock", tone: .normal)
-        }
-
-        if now < gameStart {
-            return Snapshot(
-                label: String(
-                    format: L10n.t("pickup_auto_clears_after_start_format", languageCode: languageCode),
-                    12
-                ),
-                symbolName: "clock.arrow.circlepath",
-                tone: .normal
-            )
-        }
-
         let remaining = deadline.timeIntervalSince(now)
         if remaining < 3600 {
-            let minutes = max(1, Int(ceil(remaining / 60)))
-            return Snapshot(label: "Clears in \(minutes)m", symbolName: "timer", tone: .amber)
+            return Snapshot(label: label, symbolName: "timer", tone: .amber)
         }
-
-        let totalSeconds = Int(remaining)
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
-        return Snapshot(label: "Clears in \(hours)h \(minutes)m", symbolName: "timer", tone: .normal)
+        return Snapshot(label: label, symbolName: "timer", tone: .normal)
     }
 }
 
@@ -1503,13 +1792,17 @@ private struct SettingsPickupCleanupCountdownRow: View {
     let languageCode: String
     /// Footer uses smaller type and neutral gray until amber/red.
     var isFooterStyle: Bool = false
+    var isClearing: Bool = false
+    var clearFailed: Bool = false
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let snap = SettingsPickupCleanupDisplay.snapshot(
             row: row,
             now: now,
-            languageCode: languageCode
+            languageCode: languageCode,
+            isClearing: isClearing,
+            clearFailed: clearFailed
         )
         let iconSize: CGFloat = isFooterStyle ? 11 : 13
         let spacing: CGFloat = isFooterStyle ? 5 : 6
@@ -1831,6 +2124,7 @@ struct SettingsPickupGameFormView: View {
     @State private var showPickupTimeConflictConfirmation = false
     @State private var creationTab: PickupGameCreationTab = .manual
     @State private var gameFormat: GameType = .pickup
+    @State private var pollCreatePermission: PickupPollCreatePermission = .organizerOnly
 
     private var organizerPostStartLockedRow: PickupGameRow? {
         if case .edit(let row) = mode, row.hasPickupGameStarted(), isCurrentUserCreator(of: row) {
@@ -2326,6 +2620,7 @@ struct SettingsPickupGameFormView: View {
 
                     if !isOrganizerPostStartManage {
                         pickupFormHowYouPlaySection
+                        pickupFormPollPermissionsSection
                         pickupFormWhereSection
                         pickupFormDetailsSection
                     } else {
@@ -2727,6 +3022,38 @@ struct SettingsPickupGameFormView: View {
         }
         .onChange(of: participantPreference) { _, newValue in
             applySuggestedAgeRange(for: newValue)
+        }
+    }
+
+    private var pickupFormPollPermissionsSection: some View {
+        PickupFormSectionCard(title: L10n.t("pickup_poll_permissions_section", languageCode: languageCode)) {
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityAddTraits(.isHeader)
+
+                GameOnSegmentedControl(
+                    tabs: PickupPollCreatePermission.allCases.map { option in
+                        GameOnSegmentedTab(
+                            id: option,
+                            title: option.title(languageCode: languageCode),
+                            tint: FGColor.intentPlay
+                        )
+                    },
+                    selection: $pollCreatePermission,
+                    accent: FGColor.intentPlay,
+                    titleMinimumScaleFactor: 0.78
+                )
+                .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+
+                Text(L10n.t("pickup_poll_permissions_footer", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(FGSpacing.md)
         }
     }
 
@@ -3171,6 +3498,7 @@ struct SettingsPickupGameFormView: View {
             playersNeeded = 1
             useMaxPlayers = false
             maxPlayers = 10
+            pollCreatePermission = .organizerOnly
             coordinatesLockedFromMap = false
             mapPinnedCoordinate = nil
             addressPreviewCoordinate = nil
@@ -3229,6 +3557,7 @@ struct SettingsPickupGameFormView: View {
                 useMaxPlayers = false
                 maxPlayers = Swift.max(row.playersNeededClamped, 2)
             }
+            pollCreatePermission = row.pollCreatePermission
             if let latitude = row.latitude,
                let longitude = row.longitude {
                 let savedCoordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
@@ -3612,7 +3941,8 @@ struct SettingsPickupGameFormView: View {
                     isFree: isFree,
                     entryFeeAmount: feeParsed,
                     maxPlayers: maxP,
-                    gameFormat: gameFormat
+                    gameFormat: gameFormat,
+                    pollCreatePermission: pollCreatePermission
                 )
                 onCreated?(created)
                 if appliedPickupPlacePrefill != nil {
@@ -3645,7 +3975,8 @@ struct SettingsPickupGameFormView: View {
                     entry_fee_amount: feeParsed,
                     max_players: maxP,
                     cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
-                    remove_after_at: removeISO
+                    remove_after_at: removeISO,
+                    poll_create_permission: pollCreatePermission.rawValue
                 )
                 try await viewModel.updatePickupGame(id: row.id, full: patch)
             }

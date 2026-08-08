@@ -45,10 +45,17 @@ enum FanGeoDirectionsActions {
         UIPasteboard.general.string = trimmed
     }
 
-    static func hasUsableCoordinate(latitude: Double?, longitude: Double?) -> Bool {
+    /// Pure numeric validation — safe off the MainActor (used by structured-message decode).
+    nonisolated static func hasUsableCoordinate(latitude: Double?, longitude: Double?) -> Bool {
         guard let latitude, let longitude else { return false }
         guard latitude.isFinite, longitude.isFinite else { return false }
         guard abs(latitude) <= 90, abs(longitude) <= 180 else { return false }
         return !(latitude == 0 && longitude == 0)
+    }
+
+    /// True when the Google Maps app URL scheme can be opened on this device.
+    static var isGoogleMapsInstalled: Bool {
+        guard let url = URL(string: "comgooglemaps://") else { return false }
+        return UIApplication.shared.canOpenURL(url)
     }
 }

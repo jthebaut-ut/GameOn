@@ -139,23 +139,45 @@ struct ContentView: View {
             FanGeoAnalyticsService.recordAppOpen()
             ProGameNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             PickupCreatorRatingNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            PickupGameChangeNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             SupportReplyNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             FanGeoPlusAwardNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
             BusinessProAwardNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            DirectMessageNotificationDeepLinkBridge.shared.bind(chatViewModel: chatViewModel)
+            FriendRequestNotificationDeepLinkBridge.shared.bind(chatViewModel: chatViewModel)
+            ChatMessageNotificationDeepLinkBridge.shared.bind(chatViewModel: chatViewModel)
+            PokeNotificationDeepLinkBridge.shared.bind(viewModel: viewModel)
+            if !shouldShowSplash && !bootstrapCoordinator.isBootstrapping {
+                viewModel.allowPokeNotificationDeepLinkDelivery(reason: "contentAppearReady")
+            }
             #if DEBUG
             print("[LaunchPathDebug] ContentViewMounted=true")
             print("[LaunchPathDebug] isBootstrapping=\(bootstrapCoordinator.isBootstrapping)")
             print("[LaunchPathDebug] splashMinDurationActive=\(!debugSplashMinimumElapsed)")
+            if !DirectChatInvestigation.quietConsole {
             AgeAccessGateSelfTests.runAll()
             FanProfileAvatarRefreshSelfTests.runAll()
             ChatRealtimeConnectionStatusSelfTests.run()
+            ChatLocationShareSelfTests.runAll()
+            ChatReplySelfTests.runAll()
+            PickupGamePollSelfTests.runAll()
             LogoutBoundingSelfTests.runAll()
             ProfileHomeCityIdentitySelfTests.runAll()
             AccountIdentityClassificationSelfTests.runAll()
             PickupGameDiscoverAvailabilitySelfTests.runAll()
             LiveMatchHydrationIndexSelfTests.runAll()
+            LiveMatchPlayedLocationPresentationSelfTests.runAll()
+            MatchStatusNormalizationSelfTests.runAll()
+            DirectMessagePushPreviewSelfTests.runAll()
+            FriendRequestPushSelfTests.runAll()
+            ChatMessagePushSelfTests.runAll()
+            PokePushSelfTests.runAll()
+            PushDeepLinkRoutingSelfTests.runAll()
+            PushTokenOwnershipSelfTests.runAll()
+            FavoritePlayerTeamMatchingSelfTests.runAll()
             PickupGameChatAccessSelfTests.runAll()
+            PickupGameMeaningfulChangeSelfTests.runAll()
             PickupGameRosterSelfTests.runAll()
             AgeStartupUnificationSelfTests.runAll()
             SuggestedFansRankingSelfTests.runAll()
@@ -163,7 +185,9 @@ struct ContentView: View {
             DiscoverGameVenueRankingSelfTests.runAll()
             AccountDeletionPickupCleanupSelfTests.runAll()
             AccountDeletionStorageFinalizeSelfTests.runAll()
+            AppSportCatalogSelfTests.runAll()
             _ = viewModel.runPickupMonthDotSelectionStabilityBoundaryTest()
+            }
             #endif
         }
         .task(id: existingUserAgeAccessTaskID) {
@@ -186,8 +210,14 @@ struct ContentView: View {
                 // bindAuthenticatedUser already fails closed unless THIS UUID was
                 // server-confirmed eligible in this session.
                 ageAccessGate.bindAuthenticatedUser(next, reason: previous == nil ? .login : .accountSwitch)
+                if !shouldShowSplash && !bootstrapCoordinator.isBootstrapping {
+                    viewModel.allowPokeNotificationDeepLinkDelivery(reason: "authChangedReady")
+                } else {
+                    viewModel.deliverPendingPokeNotificationDeepLinkIfReady(reason: "authChanged")
+                }
             } else if !isAuthenticatedForAgeAccess {
                 ageAccessGate.handleLogoutOrAccountSwitch()
+                viewModel.clearPendingPokeNotificationDeepLink()
             } else {
                 ageAccessGate.failClosedPendingAuthenticatedResolution()
             }
@@ -199,11 +229,29 @@ struct ContentView: View {
         }
         .onChange(of: shouldShowSplash) { _, isShowingSplash in
             guard !isShowingSplash else { return }
+#if DEBUG
+            if chatViewModel.hasPendingChatPushDeepLinkRoute {
+                PushDeepLinkLog.waiting(reason: "splash")
+            }
+#endif
             presentQueuedSupportDeepLinkIfReady()
+            chatViewModel.deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "splashDismissed")
+            chatViewModel.deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "splashDismissed")
+            chatViewModel.deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "splashDismissed")
+            viewModel.allowPokeNotificationDeepLinkDelivery(reason: "splashDismissed")
         }
         .onChange(of: bootstrapCoordinator.isBootstrapping) { _, isBootstrapping in
             guard !isBootstrapping else { return }
+#if DEBUG
+            if chatViewModel.hasPendingChatPushDeepLinkRoute {
+                PushDeepLinkLog.waiting(reason: "bootstrap")
+            }
+#endif
             presentQueuedSupportDeepLinkIfReady()
+            chatViewModel.deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "bootstrapComplete")
+            chatViewModel.deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "bootstrapComplete")
+            chatViewModel.deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "bootstrapComplete")
+            viewModel.allowPokeNotificationDeepLinkDelivery(reason: "bootstrapComplete")
         }
         .sheet(item: $supportNotificationPresentation, onDismiss: {
 #if DEBUG

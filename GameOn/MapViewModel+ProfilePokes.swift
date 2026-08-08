@@ -134,6 +134,12 @@ extension MapViewModel {
         latestTrackedIncomingPokeAt = nil
     }
 
+    /// Bypass freshness coalesce when a poke push arrives while the app is foregrounded.
+    func refreshUnseenPokesBadgeForPushNotification() {
+        lastUnseenPokesBadgeRefreshAt = nil
+        Task { await refreshUnseenPokesBadgeIfNeeded() }
+    }
+
     private static func latestPokeDate(from items: [ProfilePokeIncomingItem]) -> Date? {
         items.compactMap { FanPropsRelativeTime.parse($0.createdAt) }.max()
     }

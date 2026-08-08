@@ -76,28 +76,6 @@ extension SettingsScreen {
                 .accessibilityLabel(L10n.t("settings_visit_fangeo_website", languageCode: appLanguageRaw))
                 .accessibilityValue("www.fangeosports.com")
                 .accessibilityHint(L10n.t("settings_visit_fangeo_website_hint", languageCode: appLanguageRaw))
-
-                settingsRowDivider()
-
-                ProfileSettingsRouteButton(route: .communityGuidelines, source: "communityGuidelines") {
-                    settingsRow(
-                        title: L10n.t("community_guidelines", languageCode: appLanguageRaw),
-                        subtitle: SettingsLegalDocumentKind.communityGuidelines.rowSubtitle,
-                        systemImage: SettingsLegalDocumentKind.communityGuidelines.systemImage,
-                        showsChevron: true
-                    )
-                }
-
-                settingsRowDivider()
-
-                ProfileSettingsRouteButton(route: .trustSafety, source: "trustSafety") {
-                    settingsRow(
-                        title: SettingsLegalDocumentKind.safetyReporting.title,
-                        subtitle: SettingsLegalDocumentKind.safetyReporting.rowSubtitle,
-                        systemImage: SettingsLegalDocumentKind.safetyReporting.systemImage,
-                        showsChevron: true
-                    )
-                }
             }
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 16, trailing: 16))
             .listRowBackground(Color.clear)

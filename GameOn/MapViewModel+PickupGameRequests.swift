@@ -1480,6 +1480,46 @@ extension MapViewModel {
         mergePickupInsertedLocally(row)
     }
 
+    /// Opens pickup detail from a chat share card. Detail sheet loads/fetches the row if needed.
+    func presentSharedPickupGameDetail(gameId: UUID) {
+        pendingSharedPickupGameDetailToken = PickupDetailNavigationToken(id: gameId)
+#if DEBUG
+        print("[PickupShareDebug] presentDetail gameId=\(gameId.uuidString.lowercased())")
+#endif
+    }
+
+    func clearSharedPickupGameDetailPresentation() {
+        pendingSharedPickupGameDetailToken = nil
+    }
+
+    /// Ensures a shared pickup id is in local caches when RLS allows reading it.
+    /// Writes only to ``pickupGamesFollowingTabCache`` — never into hosted Settings lists.
+    @discardableResult
+    func loadPickupGameRowForDetailIfNeeded(id: UUID) async -> PickupGameRow? {
+        if let existing = resolvedPickupGameRow(for: id) {
+            return existing
+        }
+        do {
+            let rows: [PickupGameRow] = try await supabase
+                .from("pickup_games")
+                .select(pickupGamesSelectColumns)
+                .eq("id", value: id.uuidString.lowercased())
+                .limit(1)
+                .execute()
+                .value
+            guard let row = rows.first else { return nil }
+            await MainActor.run {
+                pickupGamesFollowingTabCache[row.id] = row
+            }
+            return row
+        } catch {
+#if DEBUG
+            print("[PickupShareDebug] loadDetailFailed gameId=\(id.uuidString.lowercased()) error=\(error)")
+#endif
+            return nil
+        }
+    }
+
     // MARK: - Organizer pending join requests (Account tab badge)
 
     /// Counts `pickup_game_requests` in `pending` status for active pickup games created by the current fan user.
@@ -2170,6 +2210,21 @@ extension MapViewModel {
 
     func pickupGameCalendarAddressLine(_ game: PickupGameRow) -> String {
         locationLineForFollowingPickupCard(game: game)
+    }
+
+    /// Multi-line address for Apple Calendar Location (presentation). Uses the shared builder.
+    func pickupGameAppleCalendarLocation(_ game: PickupGameRow) -> String {
+        let built = PickupGameAppleCalendarLocation.build(from: game)
+        let display = built.displayAddress
+        if !display.isEmpty { return display }
+        return locationLineForFollowingPickupCard(game: game)
+    }
+
+    /// Short place label for Apple Calendar Notes (not the full street address).
+    func pickupGameAppleCalendarVenueLabel(_ game: PickupGameRow) -> String {
+        let label = PickupGameAppleCalendarLocation.build(from: game).notesVenueLabel
+        if !label.isEmpty { return label }
+        return locationLineForFollowingPickupCard(game: game)
     }
 
     func pickupGameCalendarDateTimeLine(_ game: PickupGameRow) -> String {

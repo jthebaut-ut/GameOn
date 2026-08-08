@@ -1,6 +1,8 @@
 import Foundation
 import Supabase
 
+private let pickupFollowingSeenActivitySignaturesKeyPrefix = "gameon.following.pickupSeenActivitySignatures."
+
 // MARK: - Following → Games to Play (activity, refresh cadence, requester realtime)
 
 extension MapViewModel {
@@ -19,28 +21,69 @@ extension MapViewModel {
         Task { await stopFollowingPickupRealtime() }
     }
 
-    /// Call when user opens **Games to Play** segment (Following).
+    /// Call when user opens **Play → Playing** and authoritative join cards are present (or load finished).
+    /// Persists per-game acknowledgements so reviewed activity does not return after relaunch.
     func acknowledgePickupFollowingGamesToPlayActivity() {
-        pickupFollowingUnreadActivityGameIds.removeAll()
-        var nextSeen: [UUID: String] = [:]
+        guard currentUserAuthId != nil else { return }
+        // Nothing presented yet — never false-ack unread activity against an empty/error list.
+        guard !myPickupGameJoinRequestCards.isEmpty else { return }
+        guard pickupFollowingActivityPrimed else { return }
+
+        var nextSeen = hydratedPickupFollowingSeenActivitySignatures()
+        var acknowledged: Set<UUID> = []
         var seenGame: Set<UUID> = []
         for c in myPickupGameJoinRequestCards {
             guard !seenGame.contains(c.pickupGameId) else { continue }
             seenGame.insert(c.pickupGameId)
             guard let g = pickupGamesFollowingTabCache[c.pickupGameId] else { continue }
             let join = lastKnownJoinStatus[c.pickupGameId] ?? Self.joinStatusTokenFromPill(c.pill)
-            nextSeen[c.pickupGameId] = Self.pickupFollowingActivitySignature(
+            let sig = Self.pickupFollowingActivitySignature(
                 game: g,
                 joinStatus: join,
                 spotsSummary: c.spotsRemainingSummary
             )
+            nextSeen[c.pickupGameId] = sig
+            acknowledged.insert(c.pickupGameId)
         }
+        guard !acknowledged.isEmpty else { return }
+
+        // Persist before mutating published unread so overlapping refreshes observe the new acks.
+        persistPickupFollowingSeenActivitySignatures(nextSeen)
         pickupFollowingSeenActivitySignatureByGameId = nextSeen
-        hasUnreadPickupActivity = false
-        pickupActivityCount = 0
+
+        let loadedIds = Set(myPickupGameJoinRequestCards.map(\.pickupGameId))
+        // Drop orphans that can no longer be reviewed; keep only still-loaded unread.
+        pickupFollowingUnreadActivityGameIds.formIntersection(loadedIds)
+        pickupFollowingUnreadActivityGameIds.subtract(acknowledged)
+        pickupActivityCount = pickupFollowingUnreadActivityGameIds.count
+        hasUnreadPickupActivity = pickupActivityCount > 0
 #if DEBUG
-        print("[PickupFollowingActivity] acknowledged gamesToPlay unreadCleared=true")
+        print("[PickupFollowingActivity] acknowledged gamesToPlay acked=\(acknowledged.count) unread=\(pickupActivityCount)")
 #endif
+    }
+
+    /// Acknowledge a single pickup game after the user opens its details (or equivalent review).
+    func acknowledgePickupFollowingActivity(for pickupGameId: UUID) {
+        guard currentUserAuthId != nil else { return }
+        guard let g = pickupGamesFollowingTabCache[pickupGameId]
+                ?? resolvedPickupGameRow(for: pickupGameId) else { return }
+        let card = myPickupGameJoinRequestCards.first(where: { $0.pickupGameId == pickupGameId })
+        let join = lastKnownJoinStatus[pickupGameId]
+            ?? card.map { Self.joinStatusTokenFromPill($0.pill) }
+            ?? "unknown"
+        let sig = Self.pickupFollowingActivitySignature(
+            game: g,
+            joinStatus: join,
+            spotsSummary: card?.spotsRemainingSummary
+        )
+        var nextSeen = hydratedPickupFollowingSeenActivitySignatures()
+        // Always acknowledge the latest loaded row signature for this game.
+        nextSeen[pickupGameId] = sig
+        persistPickupFollowingSeenActivitySignatures(nextSeen)
+        pickupFollowingSeenActivitySignatureByGameId = nextSeen
+        pickupFollowingUnreadActivityGameIds.remove(pickupGameId)
+        pickupActivityCount = pickupFollowingUnreadActivityGameIds.count
+        hasUnreadPickupActivity = pickupActivityCount > 0
     }
 
     func pickupFollowingCaptureActivityBaseline() -> [UUID: String] {
@@ -76,24 +119,35 @@ extension MapViewModel {
             firstCardByGame[c.pickupGameId] = c
         }
 
+        var seen = hydratedPickupFollowingSeenActivitySignatures()
+
         if !wasPrimed {
             pickupFollowingActivityPrimed = true
-            var seed: [UUID: String] = [:]
-            for (_, c) in firstCardByGame {
-                guard let g = gameById[c.pickupGameId] else { continue }
-                let join = statusByGameId[c.pickupGameId] ?? Self.joinStatusTokenFromPill(c.pill)
-                seed[c.pickupGameId] = Self.pickupFollowingActivitySignature(
+            var unread: Set<UUID> = []
+            for (gid, c) in firstCardByGame {
+                guard let g = gameById[gid] else { continue }
+                let join = statusByGameId[gid] ?? Self.joinStatusTokenFromPill(c.pill)
+                let currentSig = Self.pickupFollowingActivitySignature(
                     game: g,
                     joinStatus: join,
                     spotsSummary: c.spotsRemainingSummary
                 )
+                if let prev = seen[gid] {
+                    if prev != currentSig {
+                        unread.insert(gid)
+                    }
+                } else {
+                    // First observation of this game: seed as seen (no historical unread).
+                    seen[gid] = currentSig
+                }
             }
-            pickupFollowingSeenActivitySignatureByGameId = seed
-            pickupFollowingUnreadActivityGameIds.removeAll()
-            hasUnreadPickupActivity = false
-            pickupActivityCount = 0
+            persistPickupFollowingSeenActivitySignatures(seen)
+            pickupFollowingSeenActivitySignatureByGameId = seen
+            pickupFollowingUnreadActivityGameIds = unread
+            pickupActivityCount = unread.count
+            hasUnreadPickupActivity = pickupActivityCount > 0
 #if DEBUG
-            print("[PickupFollowingActivity] first_load seedGames=\(seed.count)")
+            print("[PickupFollowingActivity] first_load seedGames=\(seen.count) unread=\(pickupActivityCount)")
 #endif
             return
         }
@@ -113,19 +167,36 @@ extension MapViewModel {
             changed.insert(gid)
         }
 
+        var unread = pickupFollowingUnreadActivityGameIds
         for gid in changed {
             guard let c = firstCardByGame[gid], let g = gameById[gid] else {
-                pickupFollowingUnreadActivityGameIds.insert(gid)
+                // Game dropped from the list — do not keep a sticky unread orphan.
+                unread.remove(gid)
                 continue
             }
             let join = statusByGameId[gid] ?? Self.joinStatusTokenFromPill(c.pill)
             let currentSig = Self.pickupFollowingActivitySignature(game: g, joinStatus: join, spotsSummary: c.spotsRemainingSummary)
-            let seen = pickupFollowingSeenActivitySignatureByGameId[gid]
-            if seen != currentSig {
-                pickupFollowingUnreadActivityGameIds.insert(gid)
+            let acknowledged = seen[gid]
+            if acknowledged != currentSig {
+                unread.insert(gid)
+            } else {
+                unread.remove(gid)
             }
         }
-        pickupActivityCount = pickupFollowingUnreadActivityGameIds.count
+
+        // Reconcile loaded cards that did not appear in `changed` (e.g. ack raced a refresh).
+        for (gid, c) in firstCardByGame where !changed.contains(gid) {
+            guard let g = gameById[gid] else { continue }
+            let join = statusByGameId[gid] ?? Self.joinStatusTokenFromPill(c.pill)
+            let currentSig = Self.pickupFollowingActivitySignature(game: g, joinStatus: join, spotsSummary: c.spotsRemainingSummary)
+            if seen[gid] == currentSig {
+                unread.remove(gid)
+            }
+        }
+
+        pickupFollowingSeenActivitySignatureByGameId = seen
+        pickupFollowingUnreadActivityGameIds = unread
+        pickupActivityCount = unread.count
         hasUnreadPickupActivity = pickupActivityCount > 0
 #if DEBUG
         print("[PickupFollowingActivity] changed=\(changed.count) unread=\(pickupActivityCount)")
@@ -148,16 +219,19 @@ extension MapViewModel {
 #if DEBUG
         print("[PickupJoinRefresh] manual card gameId=\(pickupGameId.uuidString.lowercased())")
 #endif
-        pickupFollowingUnreadActivityGameIds.remove(pickupGameId)
         if let game = pickupGamesFollowingTabCache[pickupGameId],
            let card = myPickupGameJoinRequestCards.first(where: { $0.pickupGameId == pickupGameId }) {
             let join = lastKnownJoinStatus[pickupGameId] ?? Self.joinStatusTokenFromPill(card.pill)
-            pickupFollowingSeenActivitySignatureByGameId[pickupGameId] = Self.pickupFollowingActivitySignature(
+            var nextSeen = hydratedPickupFollowingSeenActivitySignatures()
+            nextSeen[pickupGameId] = Self.pickupFollowingActivitySignature(
                 game: game,
                 joinStatus: join,
                 spotsSummary: card.spotsRemainingSummary
             )
+            persistPickupFollowingSeenActivitySignatures(nextSeen)
+            pickupFollowingSeenActivitySignatureByGameId = nextSeen
         }
+        pickupFollowingUnreadActivityGameIds.remove(pickupGameId)
         pickupFollowingCardRefreshSpinGameId = pickupGameId
         await loadMyPickupGameJoinRequestsForFollowing(
             forceRefresh: true,
@@ -289,6 +363,56 @@ extension MapViewModel {
         }
     }
 
+    // MARK: - Persisted acknowledgement
+
+    private func hydratedPickupFollowingSeenActivitySignatures() -> [UUID: String] {
+        if !pickupFollowingSeenActivitySignatureByGameId.isEmpty {
+            return pickupFollowingSeenActivitySignatureByGameId
+        }
+        guard let uid = currentUserAuthId else { return [:] }
+        let persisted = Self.readPickupFollowingSeenActivitySignatures(userId: uid)
+        if !persisted.isEmpty {
+            pickupFollowingSeenActivitySignatureByGameId = persisted
+        }
+        return persisted
+    }
+
+    private func persistPickupFollowingSeenActivitySignatures(_ map: [UUID: String]) {
+        guard let uid = currentUserAuthId else { return }
+        Self.writePickupFollowingSeenActivitySignatures(userId: uid, signatures: map)
+    }
+
+    private static func readPickupFollowingSeenActivitySignatures(userId: UUID) -> [UUID: String] {
+        let key = pickupFollowingSeenActivitySignaturesKeyPrefix + userId.uuidString.lowercased()
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let raw = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        var out: [UUID: String] = [:]
+        out.reserveCapacity(raw.count)
+        for (idRaw, sig) in raw {
+            guard let id = UUID(uuidString: idRaw), !sig.isEmpty else { continue }
+            out[id] = sig
+        }
+        return out
+    }
+
+    private static func writePickupFollowingSeenActivitySignatures(userId: UUID, signatures: [UUID: String]) {
+        let key = pickupFollowingSeenActivitySignaturesKeyPrefix + userId.uuidString.lowercased()
+        let capped = signatures
+            .sorted { $0.key.uuidString < $1.key.uuidString }
+            .prefix(240)
+        var raw: [String: String] = [:]
+        raw.reserveCapacity(capped.count)
+        for (id, sig) in capped {
+            guard !sig.isEmpty else { continue }
+            raw[id.uuidString.lowercased()] = sig
+        }
+        if let data = try? JSONEncoder().encode(raw) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
     // MARK: - Signatures
 
     static func joinStatusTokenFromPill(_ pill: PickupFollowingJoinRequestPillKind) -> String {
@@ -309,6 +433,8 @@ extension MapViewModel {
     ) -> String {
         let spotsKey = spotsSummary ?? ""
         let appr = game.approved_join_count ?? -1
-        return "\(joinStatus)|\(game.status)|\(game.title)|\(appr)|\(spotsKey)|\(game.game_start_at)|\(game.is_visible)|\(game.players_needed)"
+        // Meaningful fragment includes location identity so place-only edits mark new activity.
+        let meaningful = PickupGameMeaningfulChange.activitySignatureFragment(for: game)
+        return "\(joinStatus)|\(appr)|\(spotsKey)|\(meaningful)"
     }
 }

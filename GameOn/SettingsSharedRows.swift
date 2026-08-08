@@ -5,7 +5,7 @@ import SwiftUI
 /// Scroll tail insets for the Account tab and settings-presented sheets.
 /// `floatingTabBarStackHeight` must stay aligned with ``MainTabView/floatingTabBarStackHeight``.
 enum SettingsScrollBottomLayout {
-    static let floatingTabBarStackHeight: CGFloat = 78
+    static let floatingTabBarStackHeight: CGFloat = 108
     static let breathingRoomBelowLastCard: CGFloat = 72
     static var accountTabScrollBottomInset: CGFloat {
         floatingTabBarStackHeight + breathingRoomBelowLastCard

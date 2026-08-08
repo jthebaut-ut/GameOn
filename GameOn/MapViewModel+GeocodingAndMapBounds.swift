@@ -3,8 +3,32 @@ import Foundation
 import MapKit
 import SwiftUI
 
+/// Why the Discover startup camera currently points where it does.
+/// Broad provisional bases (device region / world) are for presentation only — not giant data fetches.
+enum DiscoverStartupCameraBasis: String, Equatable {
+    case gps
+    case lastKnownLocation
+    case userInteraction
+    case deviceRegion
+    case world
+
+    /// Trusted local / explicit bases may load geographic content when the viewport span is bounded.
+    var isTrustedForGeographicFetch: Bool {
+        switch self {
+        case .gps, .lastKnownLocation, .userInteraction:
+            return true
+        case .deviceRegion, .world:
+            return false
+        }
+    }
+}
+
 /// Production Discover map defaults — never Lehi/Utah as a global fallback.
 enum DiscoverMapRegionDefaults {
+    /// Spans above this (degrees) are too broad for Phase‑1 venue/pickup network loads.
+    /// Matches the existing `latSpan > 8` heavy-query threshold in venue fetch.
+    static let geographicFetchMaxSpanDegrees: Double = 8
+
     /// Broad neutral world viewport when GPS is unavailable and no safer coarse hint exists.
     static let worldCenter = CLLocationCoordinate2D(latitude: 20, longitude: 10)
     static let worldSpan = MKCoordinateSpan(latitudeDelta: 100, longitudeDelta: 160)
@@ -176,6 +200,47 @@ enum DiscoverVenueClusterTuning {
     }
 }
 
+/// Watches for a late When-In-Use grant after startup timed out while authorization was still `.notDetermined`.
+private final class DiscoverStartupLocationAuthObserver: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private let onAuthorized: () -> Void
+    private var hasFired = false
+
+    init(onAuthorized: @escaping () -> Void) {
+        self.onAuthorized = onAuthorized
+        super.init()
+    }
+
+    func start() {
+        manager.delegate = self
+        let status = manager.authorizationStatus
+        if status == .authorizedWhenInUse || status == .authorizedAlways {
+            fireIfNeeded()
+        }
+    }
+
+    func stop() {
+        manager.delegate = nil
+    }
+
+    private func fireIfNeeded() {
+        guard !hasFired else { return }
+        hasFired = true
+        onAuthorized()
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            fireIfNeeded()
+        case .denied, .restricted:
+            fireIfNeeded() // handler no-ops GPS center; clears awaiting flag
+        default:
+            break
+        }
+    }
+}
+
 /// One-shot Core Location fetch for the Discover map “current location” control (no Utah/Lehi fallback).
 private final class DiscoverCurrentLocationFetchSession: NSObject, CLLocationManagerDelegate {
     private let manager = CLLocationManager()
@@ -208,7 +273,13 @@ private final class DiscoverCurrentLocationFetchSession: NSObject, CLLocationMan
 
             timeoutTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(timeoutSeconds))
-                self?.finishUnavailable(reason: "timeout")
+                guard let self else { return }
+                let auth = self.manager.authorizationStatus
+                if auth == .notDetermined {
+                    self.finishUnavailable(reason: "timeoutWhileNotDetermined")
+                } else {
+                    self.finishUnavailable(reason: "timeout")
+                }
             }
         }
     }
@@ -1190,15 +1261,55 @@ extension MapViewModel {
 
     /// Called from Discover when the user pans/zooms. Blocks later startup GPS/locale snaps.
     func noteDiscoverUserCameraInteractionIfStartupPending() {
-        guard !didFinishStartupDiscoverPrepare else { return }
         guard !discoverProgrammaticCameraWritePending else { return }
+        // Any explicit pan/zoom on a provisional broad camera becomes a trusted user viewport.
+        if !discoverStartupCameraBasis.isTrustedForGeographicFetch {
+            discoverStartupCameraOverrideEnabled = false
+            discoverStartupCameraBasis = .userInteraction
+#if DEBUG
+            print("[StartupDiscover] userCameraIntent=preserved skippingLaterAutomaticCenter")
+            print("[StartupMapRegionDebug] basis=userInteraction")
+#endif
+            return
+        }
+        let shouldPreserve =
+            !didFinishStartupDiscoverPrepare
+            || startupAwaitingLateLocationAuthorization
+        guard shouldPreserve else { return }
         discoverStartupCameraOverrideEnabled = false
+        discoverStartupCameraBasis = .userInteraction
 #if DEBUG
         print("[StartupDiscover] userCameraIntent=preserved skippingLaterAutomaticCenter")
+        print("[StartupMapRegionDebug] basis=userInteraction")
 #endif
     }
 
-    /// Startup: optional GPS center + local region, then arms the next ``refreshDiscoverCoreInBackground()`` for DEBUG completion logging. Runs once per launch (see ``didFinishStartupDiscoverPrepare``).
+    /// Whether the current camera span is narrow enough for a normal Discover geographic network load.
+    func discoverGeographicNetworkFetchAllowed() -> Bool {
+        guard let bounds = currentMapRegionBounds() else {
+#if DEBUG
+            print("[StartupDiscover] broadFetchSkipped reason=noCameraBounds basis=\(discoverStartupCameraBasis.rawValue)")
+#endif
+            return false
+        }
+        let latSpan = bounds.maxLat - bounds.minLat
+        let lonSpan = bounds.maxLon - bounds.minLon
+        if latSpan > DiscoverMapRegionDefaults.geographicFetchMaxSpanDegrees
+            || lonSpan > DiscoverMapRegionDefaults.geographicFetchMaxSpanDegrees {
+#if DEBUG
+            print(
+                "[StartupDiscover] broadFetchSkipped reason=viewportTooBroad "
+                    + "latSpan=\(String(format: "%.2f", latSpan)) lonSpan=\(String(format: "%.2f", lonSpan)) "
+                    + "basis=\(discoverStartupCameraBasis.rawValue) maxSpan=\(DiscoverMapRegionDefaults.geographicFetchMaxSpanDegrees)"
+            )
+#endif
+            return false
+        }
+        return true
+    }
+
+    /// Startup: optional GPS center + local region. Does not itself fetch venues.
+    /// Runs once per launch for the initial attempt; late permission grant may refine via ``handleLateStartupLocationAuthorizationGranted()``.
     func prepareInitialDiscoverRegionAndPreload() async {
         guard !didFinishStartupDiscoverPrepare else { return }
         defer {
@@ -1210,8 +1321,10 @@ extension MapViewModel {
         let result = await session.fetchBestCoordinateOnce(timeoutSeconds: 3)
 
         guard discoverStartupCameraOverrideEnabled else {
+            discoverStartupCameraBasis = .userInteraction
 #if DEBUG
             print("[StartupDiscover] skippedAutomaticCenter reason=userCameraIntent")
+            print("[StartupMapRegionDebug] basis=userInteraction")
 #endif
             return
         }
@@ -1225,39 +1338,122 @@ extension MapViewModel {
             recordCurrentUserLocation(c)
             let region = Self.discoverStartupMKRegion(center: c, radiusMiles: Self.startupDiscoverInitialRadiusMiles)
             applyDiscoverCameraRegion(region, programmatic: true)
+            discoverStartupCameraBasis = .gps
 #if DEBUG
             print("[StartupMapRegionDebug] initialSpan=\(region.span.latitudeDelta),\(region.span.longitudeDelta)")
-            print("[StartupMapRegionDebug] basis=userLocation")
+            print("[StartupMapRegionDebug] basis=gps")
 #endif
         case .unavailable(let reason):
-            if let lastKnown = currentUserLocation {
-                let region = Self.discoverStartupMKRegion(
-                    center: lastKnown,
-                    radiusMiles: Self.startupDiscoverInitialRadiusMiles
-                )
-                applyDiscoverCameraRegion(region, programmatic: true)
+            if reason == "timeoutWhileNotDetermined" {
+                startupAwaitingLateLocationAuthorization = true
+                applyProvisionalStartupCameraFallback(reason: reason)
+                startLateStartupLocationAuthorizationObserverIfNeeded()
 #if DEBUG
-                print("[StartupDiscover] fallbackToLastKnownSessionLocation reason=\(reason)")
-                print("[StartupMapRegionDebug] basis=lastKnownSessionLocation")
-#endif
-            } else if let localeRegion = DiscoverMapRegionDefaults.coarseRegionForDeviceLocale() {
-                applyDiscoverCameraRegion(localeRegion, programmatic: true)
-#if DEBUG
-                print("[StartupDiscover] fallbackToDeviceLocaleRegion reason=\(reason)")
-                print("[StartupMapRegionDebug] basis=deviceLocaleRegion")
+                print("[StartupDiscover] awaitingLateAuthorization=true")
 #endif
             } else {
-                applyDiscoverCameraRegion(DiscoverMapRegionDefaults.worldRegion, programmatic: true)
-#if DEBUG
-                print("[StartupDiscover] fallbackToNeutralWorldRegion reason=\(reason)")
-                print("[StartupMapRegionDebug] basis=neutralWorld")
-#endif
+                applyProvisionalStartupCameraFallback(reason: reason)
             }
         }
 
 #if DEBUG
-        print("[StartupDiscover] preloadStarted")
+        print("[StartupDiscover] preloadStarted basis=\(discoverStartupCameraBasis.rawValue)")
 #endif
+    }
+
+    private func applyProvisionalStartupCameraFallback(reason: String) {
+        if let lastKnown = currentUserLocation {
+            let region = Self.discoverStartupMKRegion(
+                center: lastKnown,
+                radiusMiles: Self.startupDiscoverInitialRadiusMiles
+            )
+            applyDiscoverCameraRegion(region, programmatic: true)
+            discoverStartupCameraBasis = .lastKnownLocation
+#if DEBUG
+            print("[StartupDiscover] fallbackToLastKnownSessionLocation reason=\(reason)")
+            print("[StartupMapRegionDebug] basis=lastKnownLocation")
+#endif
+        } else if let localeRegion = DiscoverMapRegionDefaults.coarseRegionForDeviceLocale() {
+            applyDiscoverCameraRegion(localeRegion, programmatic: true)
+            discoverStartupCameraBasis = .deviceRegion
+#if DEBUG
+            print("[StartupDiscover] fallbackToDeviceLocaleRegion reason=\(reason)")
+            print("[StartupMapRegionDebug] basis=deviceRegion")
+#endif
+        } else {
+            applyDiscoverCameraRegion(DiscoverMapRegionDefaults.worldRegion, programmatic: true)
+            discoverStartupCameraBasis = .world
+#if DEBUG
+            print("[StartupDiscover] fallbackToNeutralWorldRegion reason=\(reason)")
+            print("[StartupMapRegionDebug] basis=world")
+#endif
+        }
+    }
+
+    /// After a permission dialog was still pending when the startup location timeout fired.
+    func handleLateStartupLocationAuthorizationGranted() async {
+        guard startupAwaitingLateLocationAuthorization else { return }
+        guard discoverStartupCameraOverrideEnabled else {
+            startupAwaitingLateLocationAuthorization = false
+            stopLateStartupLocationAuthorizationObserver()
+#if DEBUG
+            print("[StartupDiscover] lateGPSSkipped reason=userCameraIntent")
+#endif
+            return
+        }
+
+        let status = CLLocationManager().authorizationStatus
+        guard status == .authorizedWhenInUse || status == .authorizedAlways else {
+            if status == .denied || status == .restricted {
+                startupAwaitingLateLocationAuthorization = false
+                stopLateStartupLocationAuthorizationObserver()
+#if DEBUG
+                print("[StartupDiscover] lateAuthorizationDenied")
+#endif
+            }
+            return
+        }
+
+        let session = DiscoverCurrentLocationFetchSession()
+        let result = await session.fetchBestCoordinateOnce(timeoutSeconds: 8)
+        guard case .coordinate(let c) = result else { return }
+        guard discoverStartupCameraOverrideEnabled else {
+            startupAwaitingLateLocationAuthorization = false
+            stopLateStartupLocationAuthorizationObserver()
+            return
+        }
+
+        recordCurrentUserLocation(c)
+        let region = Self.discoverStartupMKRegion(center: c, radiusMiles: Self.startupDiscoverInitialRadiusMiles)
+        applyDiscoverCameraRegion(region, programmatic: true)
+        discoverStartupCameraBasis = .gps
+        startupAwaitingLateLocationAuthorization = false
+        stopLateStartupLocationAuthorizationObserver()
+#if DEBUG
+        print("[StartupDiscover] lateGPSApplied lat=\(c.latitude) lon=\(c.longitude)")
+        print("[StartupMapRegionDebug] basis=gps")
+#endif
+        applyPendingDiscoverCoreSnapshotIfGeographicallyRelevant()
+        await refreshDiscoverCoreInBackground(forceVenueRefresh: true)
+    }
+
+    private func startLateStartupLocationAuthorizationObserverIfNeeded() {
+        guard lateStartupLocationAuthObserver == nil else { return }
+        let observer = DiscoverStartupLocationAuthObserver { [weak self] in
+            Task { @MainActor in
+                await self?.handleLateStartupLocationAuthorizationGranted()
+            }
+        }
+        lateStartupLocationAuthObserver = observer
+        observer.start()
+#if DEBUG
+        print("[StartupDiscover] lateAuthorizationObserverStarted=true")
+#endif
+    }
+
+    private func stopLateStartupLocationAuthorizationObserver() {
+        (lateStartupLocationAuthObserver as? DiscoverStartupLocationAuthObserver)?.stop()
+        lateStartupLocationAuthObserver = nil
     }
 
     private static func discoverStartupMKRegion(center: CLLocationCoordinate2D, radiusMiles: Double) -> MKCoordinateRegion {

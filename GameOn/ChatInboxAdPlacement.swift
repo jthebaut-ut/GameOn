@@ -32,6 +32,13 @@ enum ChatInboxAdPlacement {
     /// Dedicated AdMob in-flight slot id (separate from venue comment ad slots 0/1).
     static let nativeAdSlotIndex = 2
 
+    /// Cached placement for an identical conversation-id fingerprint.
+    private static var cachedFingerprint: String?
+    private static var cachedItems: [ChatInboxListItem]?
+#if DEBUG
+    private static var lastLoggedFingerprint: String?
+#endif
+
     static var debugOverrideEnabled: Bool {
 #if DEBUG
         true
@@ -59,13 +66,38 @@ enum ChatInboxAdPlacement {
         }
     }
 
+    /// Conversation-id fingerprint — ignores presence/unread/last-message churn.
+    static func fingerprint(for friends: [ChatViewModel.FriendDisplay]) -> String {
+        friends.map { item in
+            let cid = item.conversationId?.uuidString.lowercased() ?? "nil"
+            return "\(item.inboxKind.rawValue):\(item.id.uuidString.lowercased()):\(cid)"
+        }
+        .joined(separator: "|")
+    }
+
     static func listItems(for friends: [ChatViewModel.FriendDisplay]) -> [ChatInboxListItem] {
-        guard FanGeoAdPolicy.shouldInsertAdsInFeeds() else {
+        listItems(for: friends, insertAds: true)
+    }
+
+    /// When ``insertAds`` is false (DM/group route covering inbox), return conversations only
+    /// and skip placement work. Otherwise reuse cached placement for an identical fingerprint.
+    static func listItems(
+        for friends: [ChatViewModel.FriendDisplay],
+        insertAds: Bool
+    ) -> [ChatInboxListItem] {
+        guard insertAds, FanGeoAdPolicy.shouldInsertAdsInFeeds() else {
             return friends.map { .conversation($0) }
+        }
+        let fp = fingerprint(for: friends)
+        if fp == cachedFingerprint, let cachedItems {
+            return cachedItems
         }
         let slots = nativeAdSlots(for: friends.count)
         guard !slots.isEmpty else {
-            return friends.map { .conversation($0) }
+            let items = friends.map { ChatInboxListItem.conversation($0) }
+            cachedFingerprint = fp
+            cachedItems = items
+            return items
         }
         let slotsByPosition = Dictionary(uniqueKeysWithValues: slots.map {
             ($0.insertedAfterConversationPosition, $0)
@@ -80,6 +112,18 @@ enum ChatInboxAdPlacement {
                 items.append(.nativeAd(slot))
             }
         }
+        cachedFingerprint = fp
+        cachedItems = items
         return items
     }
+
+#if DEBUG
+    /// Returns true once per meaningful fingerprint change (for ad diagnostics).
+    static func shouldLogDiagnostics(for friends: [ChatViewModel.FriendDisplay]) -> Bool {
+        let fp = fingerprint(for: friends)
+        guard fp != lastLoggedFingerprint else { return false }
+        lastLoggedFingerprint = fp
+        return true
+    }
+#endif
 }

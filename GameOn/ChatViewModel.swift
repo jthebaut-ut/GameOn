@@ -149,6 +149,21 @@ final class ChatViewModel: ObservableObject {
             mainTabState.setPendingDmOpenPreview(pendingDmOpenPreview)
         }
     }
+    /// Cold-start / background APNs DM tap waiting for auth + Chat shell readiness.
+    @Published private(set) var pendingDirectMessageNotificationDeepLink: DirectMessageNotificationDeepLinkRequest?
+    /// Cold-start / background APNs friend-request tap waiting for auth + Chat shell readiness.
+    @Published private(set) var pendingFriendRequestNotificationDeepLink: FriendRequestNotificationDeepLinkRequest?
+    /// Cold-start / background APNs unified chat_message tap waiting for auth + Chat shell readiness.
+    @Published private(set) var pendingChatMessageNotificationDeepLink: ChatMessageNotificationDeepLinkRequest?
+    /// When true, ``MainTabView`` selects Chat and ``FriendsTabView`` selects Requests.
+    @Published var pendingOpenFriendRequestsSection: Bool = false {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "deepLink")
+            mainTabState.setPendingOpenFriendRequestsSection(pendingOpenFriendRequestsSection)
+        }
+    }
+    /// Optional message id to scroll/highlight after opening a DM or group from global search.
+    @Published var pendingOpenHighlightMessageId: UUID?
     /// Newly created venue-scoped DM threads that should show the one-time intro banner.
     @Published private(set) var pendingVenueChatIntroConversationIds: Set<UUID> = []
     /// Lightweight in-app banner for an incoming DM while the thread is not open (local only).
@@ -205,19 +220,17 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var blockedUserPreviews: [UserPreview] = []
     private let moderation = ModerationService()
 
-    /// When true, ``MainTabView`` hides the floating tab bar so ``DirectChatView`` composer stays visible.
-    @Published var hidesFloatingTabBarForDirectChat: Bool = false {
-        didSet {
-            MainTabObservationPerf.chatPublished(category: "navigationChrome")
-            mainTabState.setHidesFloatingTabBarForDirectChat(hidesFloatingTabBarForDirectChat)
-#if DEBUG
-            if oldValue != hidesFloatingTabBarForDirectChat {
-                print("[DirectChatNav] activeChanged \(hidesFloatingTabBarForDirectChat) reason=hidesFloatingTabBarForDirectChat")
-            }
-#endif
-        }
+    /// When true, Chat has a DM/group conversation route. ``MainTabView`` hides the floating
+    /// tab bar only while Chat is also the selected tab (`hidesFloatingTabBarForActiveChatConversation`).
+    /// Source of truth lives in ``ChatMainTabState``; destinations must not write this.
+    /// Kept as a non-publishing mirror for call sites that still read the name.
+    var hidesFloatingTabBarForDirectChat: Bool {
+        get { mainTabState.hidesFloatingTabBarForDirectChat }
+        set { mainTabState.setHidesFloatingTabBarForDirectChat(newValue) }
     }
     @Published private(set) var activeVisibleConversationId: UUID?
+    /// Typed foreground chat identity (`direct` / `group`) — UUIDs can overlap across tables.
+    @Published private(set) var activeVisibleChatKind: String?
     @Published private(set) var directChatReadVisibilityVersion: Int = 0
 
     @Published private(set) var addFriendSearchResults: [AddFriendSearchTarget] = []
@@ -423,6 +436,9 @@ final class ChatViewModel: ObservableObject {
         print("[ChatAuthGate] hasUserProfile=\(hasUserProfile)")
         print("[ChatAuthGate] reasonBlocked=none")
 #endif
+        deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "auth:\(source)")
+        deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "auth:\(source)")
+        deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "auth:\(source)")
     }
 
     private func ignoreCancellationIfNeeded(_ error: Error, context: String) -> Bool {
@@ -449,6 +465,11 @@ final class ChatViewModel: ObservableObject {
             nextAuthId: newAuthId,
             requiresSignIn: newAuthId == nil
         )
+        if newAuthId != nil {
+            deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
+            deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
+            deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
+        }
     }
 
     private func resetPrivateChatState(reason: String, nextAuthId: UUID?, requiresSignIn signInRequired: Bool) {
@@ -494,7 +515,7 @@ final class ChatViewModel: ObservableObject {
         }
         serverExcludedInboxConversationIds = []
         serverInboxExclusionsAvailable = false
-        hidesFloatingTabBarForDirectChat = false
+        mainTabState.setHidesFloatingTabBarForDirectChat(false)
         blockedUserIds = []
         usersWhoBlockedMeIds = []
         blockedUserPreviews = []
@@ -502,8 +523,17 @@ final class ChatViewModel: ObservableObject {
         addFriendSearchIsLoading = false
         pendingDmOpenPreview = nil
         pendingGroupOpenConversationId = nil
+        pendingOpenHighlightMessageId = nil
+        // Preserve APNs deep-links across login restore; clear only on sign-out.
+        if nextAuthId == nil {
+            pendingDirectMessageNotificationDeepLink = nil
+            pendingFriendRequestNotificationDeepLink = nil
+            pendingChatMessageNotificationDeepLink = nil
+            pendingOpenFriendRequestsSection = false
+        }
         dmInAppNotification = nil
         activeVisibleConversationId = nil
+        activeVisibleChatKind = nil
         chatTabVisibleForDirectReadState = false
         privateChatUnlockedForDirectReadState = false
         inboxUnreadDebounceTask?.cancel()
@@ -885,6 +915,20 @@ final class ChatViewModel: ObservableObject {
             )
         }
 
+        // Invalidate superseded decoded images before publishing new URLs (versioned paths).
+        if let existing = friends.first(where: { !$0.isGroupConversation && $0.preview.id == userId })?.preview
+            ?? incomingRequests.first(where: { $0.requester.id == userId })?.requester
+            ?? outgoingRequests.first(where: { $0.addressee.id == userId })?.addressee
+            ?? groupMemberPreviewByUserId[userId],
+           previewNeedsUpdate(existing) {
+            FanProfileChangeCenter.invalidateCachedAvatarImages(
+                previousAvatarURL: existing.avatarURL,
+                previousThumbnailURL: existing.avatarThumbnailURL,
+                nextAvatarURL: change.avatarURL,
+                nextThumbnailURL: change.avatarThumbnailURL
+            )
+        }
+
         var friendsChanged = false
         let nextFriends = friends.map { display -> FriendDisplay in
             if display.isGroupConversation {
@@ -1150,31 +1194,102 @@ final class ChatViewModel: ObservableObject {
     @discardableResult
     func setActiveVisibleConversationIdIfAllowed(_ conversationId: UUID?, reason: String) -> Bool {
         guard let conversationId else {
+#if DEBUG
+            DirectChatInvestigation.trace(
+                source: "setActiveVisibleConversationIdIfAllowed",
+                property: "activeVisibleConversationId"
+            )
+#endif
             clearActiveVisibleConversationId(reason: "\(reason):missing_conversation")
             return false
         }
         guard chatTabVisibleForDirectReadState && privateChatUnlockedForDirectReadState else {
+#if DEBUG
+            DirectChatInvestigation.trace(
+                source: "setActiveVisibleConversationIdIfAllowed",
+                property: "activeVisibleConversationId"
+            )
+#endif
             clearActiveVisibleConversationId(reason: reason)
             return false
         }
-        activeVisibleConversationId = conversationId
 #if DEBUG
-        print("[DMActiveVisibilityDebug] setActiveVisibleConversationId=\(conversationId.uuidString.lowercased())")
+        DirectChatInvestigation.trace(
+            source: "setActiveVisibleConversationIdIfAllowed",
+            property: "activeVisibleConversationId"
+        )
+#endif
+        activeVisibleConversationId = conversationId
+        activeVisibleChatKind = "direct"
+#if DEBUG
+        print("[DMActiveVisibilityDebug] setActiveVisibleConversationId reason=\(reason)")
 #endif
         return true
     }
 
     func clearActiveVisibleConversationId(reason: String) {
-        guard activeVisibleConversationId != nil else {
+        guard activeVisibleConversationId != nil || activeVisibleChatKind != nil else {
 #if DEBUG
-            print("[DMActiveVisibilityDebug] clearActiveVisibleConversationId reason=\(reason)")
+            if !DirectChatInvestigation.quietConsole {
+                print("[DMActiveVisibilityDebug] clearActiveVisibleConversationId reason=\(reason) noop")
+            }
 #endif
             return
         }
-        activeVisibleConversationId = nil
 #if DEBUG
+        DirectChatInvestigation.trace(
+            source: "clearActiveVisibleConversationId",
+            property: "activeVisibleConversationId"
+        )
         print("[DMActiveVisibilityDebug] clearActiveVisibleConversationId reason=\(reason)")
 #endif
+        activeVisibleConversationId = nil
+        activeVisibleChatKind = nil
+    }
+
+    /// Group / pickup thread visibility for foreground push suppression.
+    func setActiveVisibleGroupConversationId(_ conversationId: UUID?, reason: String) {
+        guard let conversationId else {
+            if activeVisibleChatKind == "group" {
+                activeVisibleConversationId = nil
+                activeVisibleChatKind = nil
+            }
+            return
+        }
+        guard chatTabVisibleForDirectReadState && privateChatUnlockedForDirectReadState else {
+            if activeVisibleChatKind == "group" {
+                activeVisibleConversationId = nil
+                activeVisibleChatKind = nil
+            }
+            return
+        }
+        activeVisibleConversationId = conversationId
+        activeVisibleChatKind = "group"
+#if DEBUG
+        print("[ChatActiveVisibilityDebug] setActiveVisibleGroupConversationId reason=\(reason)")
+#endif
+    }
+
+    func clearActiveVisibleGroupConversationId(reason: String) {
+        guard activeVisibleChatKind == "group" else { return }
+        activeVisibleConversationId = nil
+        activeVisibleChatKind = nil
+#if DEBUG
+        print("[ChatActiveVisibilityDebug] clearActiveVisibleGroupConversationId reason=\(reason)")
+#endif
+    }
+
+    func isUserViewingChatConversation(chatType: String, conversationId: UUID) -> Bool {
+        guard activeVisibleConversationId == conversationId else { return false }
+        let normalized = chatType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "group", "pickup":
+            return activeVisibleChatKind == "group"
+        case "direct", "venue":
+            return activeVisibleChatKind == "direct" || activeVisibleChatKind == nil
+        default:
+            return activeVisibleChatKind == normalized
+        }
     }
 
     func canMarkActiveDirectThreadRead(conversationId: UUID?, reason: String) -> Bool {
@@ -1204,16 +1319,334 @@ final class ChatViewModel: ObservableObject {
         pendingDmOpenPreview = note.senderPreview
     }
 
-    /// Background reconcile only (no blocking UI); caller already applied local inbox/unread patches.
-    func scheduleLightweightInboxReconcile(delayNanoseconds: UInt64 = 900_000_000) {
-        inboxMissingPeerReconcileTask?.cancel()
-        inboxMissingPeerReconcileTask = Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: delayNanoseconds)
-            } catch { return }
-            guard let self, !Task.isCancelled else { return }
-            await self.refreshInboxSummaries()
+    /// True when any chat push deep-link is waiting for Chat tab / subsection / conversation open.
+    var hasPendingChatPushDeepLinkRoute: Bool {
+        pendingDirectMessageNotificationDeepLink != nil
+            || pendingChatMessageNotificationDeepLink != nil
+            || pendingFriendRequestNotificationDeepLink != nil
+            || pendingDmOpenPreview != nil
+            || pendingGroupOpenConversationId != nil
+            || pendingOpenFriendRequestsSection
+    }
+
+    /// Remote APNs DM tap: open Chat tab + exact conversation (waits for auth when needed).
+    func enqueueDirectMessageNotificationDeepLink(_ request: DirectMessageNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "direct", conversation: request.conversationID)
+        print(
+            "[DMPushRoute] enqueue conversationId=\(request.conversationID.uuidString.lowercased()) " +
+            "senderId=\(request.senderID.uuidString.lowercased())"
+        )
+#endif
+        // Newer tap wins; supersede group/friend-request UI pending so DM is not starved.
+        pendingChatMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingGroupOpenConversationId = nil
+        pendingOpenFriendRequestsSection = false
+        pendingDirectMessageNotificationDeepLink = request
+        deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "enqueue")
+    }
+
+    func deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: String) {
+        guard let request = pendingDirectMessageNotificationDeepLink else { return }
+        guard currentUserAuthId != nil else {
+#if DEBUG
+            PushDeepLinkLog.waiting(reason: "auth")
+            print("[DMPushRoute] defer until auth reason=\(reason)")
+#endif
+            return
         }
+        // Never open a DM as the sender's own identity on the recipient device.
+        if currentUserAuthId == request.senderID {
+#if DEBUG
+            print("[DMPushRoute] ignore: current user is sender")
+#endif
+            pendingDirectMessageNotificationDeepLink = nil
+            return
+        }
+
+        // Validate membership before surfacing UI route (wrong-account / stale token safety).
+        let requestID = request.id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.pendingDirectMessageNotificationDeepLink?.id == requestID else { return }
+            let allowed = await self.currentUserParticipatesInDirectConversation(request.conversationID)
+            guard self.pendingDirectMessageNotificationDeepLink?.id == requestID else { return }
+            guard allowed else {
+#if DEBUG
+                PushDeepLinkLog.failed(reason: "not_dm_participant")
+                print("[DMPushRoute] reject not participant conversationId=\(request.conversationID.uuidString.lowercased())")
+#endif
+                self.pendingDirectMessageNotificationDeepLink = nil
+                self.pendingDmOpenPreview = nil
+                self.pendingOpenHighlightMessageId = nil
+                return
+            }
+
+            if let messageId = request.messageID {
+                self.pendingOpenHighlightMessageId = messageId
+            }
+
+            let preview = UserPreview(
+                id: request.senderID,
+                displayName: request.senderDisplayName,
+                avatarURL: nil,
+                dmConversationId: request.conversationID,
+                businessVenueId: request.venueID,
+                businessVenueBusinessId: request.businessID,
+                venueScopedThread: request.venueID != nil
+            )
+            if self.pendingDmOpenPreview?.dmConversationId != request.conversationID
+                || self.pendingDmOpenPreview?.id != request.senderID {
+#if DEBUG
+                PushDeepLinkLog.queued(type: "direct", conversation: request.conversationID)
+                print(
+                    "[DMPushRoute] deliver pendingDmOpenPreview conversationId=\(request.conversationID.uuidString.lowercased()) reason=\(reason)"
+                )
+#endif
+                self.pendingDmOpenPreview = preview
+            }
+        }
+    }
+
+    /// Call only after Chat UI has accepted the DM navigation route (or determined it is invalid).
+    func acknowledgeDirectMessagePushDeepLinkOpened(conversationId: UUID) {
+        if pendingDirectMessageNotificationDeepLink?.conversationID == conversationId {
+            pendingDirectMessageNotificationDeepLink = nil
+        }
+        if pendingDmOpenPreview?.dmConversationId == conversationId {
+            pendingDmOpenPreview = nil
+        }
+#if DEBUG
+        PushDeepLinkLog.completed(conversation: conversationId, kind: "direct")
+#endif
+    }
+
+    /// Remote APNs friend-request tap: open Chat → Requests after auth is ready.
+    func enqueueFriendRequestNotificationDeepLink(_ request: FriendRequestNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "friend_request", conversation: nil)
+        print(
+            "[FriendRequestPushRoute] enqueue requestId=\(request.requestID?.uuidString.lowercased() ?? "nil") " +
+            "requesterId=\(request.requesterID?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
+        // Friend-request taps must not be overridden by a stale DM/group open.
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingChatMessageNotificationDeepLink = nil
+        pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
+        pendingFriendRequestNotificationDeepLink = request
+        deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "enqueue")
+    }
+
+    func deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: String) {
+        guard let request = pendingFriendRequestNotificationDeepLink else { return }
+        guard currentUserAuthId != nil else {
+#if DEBUG
+            PushDeepLinkLog.waiting(reason: "auth")
+            print("[FriendRequestPushRoute] defer until auth reason=\(reason)")
+#endif
+            return
+        }
+        // Never open Requests as the requester on their own device.
+        if let requesterID = request.requesterID, currentUserAuthId == requesterID {
+#if DEBUG
+            print("[FriendRequestPushRoute] ignore: current user is requester")
+#endif
+            pendingFriendRequestNotificationDeepLink = nil
+            return
+        }
+
+        // Keep APNs request until FriendsTab selects Requests.
+        if !pendingOpenFriendRequestsSection {
+#if DEBUG
+            PushDeepLinkLog.queued(type: "friend_request", conversation: nil)
+            print("[FriendRequestPushRoute] deliver pendingOpenFriendRequestsSection reason=\(reason)")
+#endif
+            pendingOpenFriendRequestsSection = true
+        }
+        requestBadgeRecalculation(reason: "friendRequestPushDeepLink", includeInboxSummaries: false)
+        Task { [weak self] in
+            await self?.refreshFriendRequestListsOnly()
+        }
+    }
+
+    func acknowledgeFriendRequestPushDeepLinkOpened() {
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingOpenFriendRequestsSection = false
+#if DEBUG
+        PushDeepLinkLog.completed(conversation: nil, kind: "friend_request")
+#endif
+    }
+
+    /// Remote APNs unified chat_message tap: open Chat → exact DM or group/pickup conversation.
+    func enqueueChatMessageNotificationDeepLink(_ request: ChatMessageNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: request.chatType, conversation: request.conversationID)
+        print(
+            "[ChatPushRoute] enqueue chatType=\(request.chatType) " +
+            "conversationId=\(request.conversationID.uuidString.lowercased())"
+        )
+#endif
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingOpenFriendRequestsSection = false
+        pendingChatMessageNotificationDeepLink = request
+        deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "enqueue")
+    }
+
+    func deliverPendingChatMessageNotificationDeepLinkIfReady(reason: String) {
+        guard let request = pendingChatMessageNotificationDeepLink else { return }
+        guard currentUserAuthId != nil else {
+#if DEBUG
+            PushDeepLinkLog.waiting(reason: "auth")
+            print("[ChatPushRoute] defer until auth reason=\(reason)")
+#endif
+            return
+        }
+        if let senderID = request.senderID, currentUserAuthId == senderID {
+#if DEBUG
+            print("[ChatPushRoute] ignore: current user is sender")
+#endif
+            pendingChatMessageNotificationDeepLink = nil
+            return
+        }
+
+        let requestID = request.id
+        let chatType = request.chatType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard self.pendingChatMessageNotificationDeepLink?.id == requestID else { return }
+
+            let allowed: Bool
+            switch chatType {
+            case "group", "pickup":
+                allowed = await self.currentUserParticipatesInGroupConversation(request.conversationID)
+            default:
+                allowed = await self.currentUserParticipatesInDirectConversation(request.conversationID)
+            }
+            guard self.pendingChatMessageNotificationDeepLink?.id == requestID else { return }
+            guard allowed else {
+#if DEBUG
+                PushDeepLinkLog.failed(reason: "not_chat_participant")
+                print(
+                    "[ChatPushRoute] reject not participant chatType=\(chatType) " +
+                    "conversationId=\(request.conversationID.uuidString.lowercased())"
+                )
+#endif
+                self.pendingChatMessageNotificationDeepLink = nil
+                self.pendingGroupOpenConversationId = nil
+                self.pendingDmOpenPreview = nil
+                self.pendingOpenHighlightMessageId = nil
+                return
+            }
+
+            if let messageId = request.messageID {
+                self.pendingOpenHighlightMessageId = messageId
+            }
+
+            switch chatType {
+            case "group", "pickup":
+                if self.pendingGroupOpenConversationId != request.conversationID {
+#if DEBUG
+                    PushDeepLinkLog.queued(type: chatType, conversation: request.conversationID)
+                    print(
+                        "[ChatPushRoute] deliver pendingGroupOpenConversationId " +
+                        "conversationId=\(request.conversationID.uuidString.lowercased()) reason=\(reason)"
+                    )
+#endif
+                    self.pendingDmOpenPreview = nil
+                    self.pendingGroupOpenConversationId = request.conversationID
+                }
+            default:
+                let senderID = request.senderID ?? UUID()
+                let isVenue = chatType == "venue" || request.venueID != nil || request.businessID != nil
+                let preview = UserPreview(
+                    id: senderID,
+                    displayName: request.senderDisplayName,
+                    avatarURL: nil,
+                    dmConversationId: request.conversationID,
+                    businessVenueId: request.venueID,
+                    businessVenueBusinessId: request.businessID,
+                    businessVenueBusinessName: isVenue ? request.conversationTitle : nil,
+                    venueScopedThread: isVenue
+                )
+                if self.pendingDmOpenPreview?.dmConversationId != request.conversationID {
+#if DEBUG
+                    PushDeepLinkLog.queued(type: isVenue ? "venue" : "direct", conversation: request.conversationID)
+                    print(
+                        "[ChatPushRoute] deliver pendingDmOpenPreview " +
+                        "conversationId=\(request.conversationID.uuidString.lowercased()) reason=\(reason)"
+                    )
+#endif
+                    self.pendingGroupOpenConversationId = nil
+                    self.pendingDmOpenPreview = preview
+                }
+            }
+        }
+    }
+
+    /// RLS-backed membership check: row visible ⇒ current user is a DM participant.
+    func currentUserParticipatesInDirectConversation(_ conversationId: UUID) async -> Bool {
+        struct Row: Decodable { let id: UUID }
+        do {
+            let rows: [Row] = try await supabase
+                .from("direct_conversations")
+                .select("id")
+                .eq("id", value: conversationId.uuidString.lowercased())
+                .limit(1)
+                .execute()
+                .value
+            return !rows.isEmpty
+        } catch {
+#if DEBUG
+            print("[PushDeepLink] dm_participant_check_failed error=\(error.localizedDescription)")
+#endif
+            return false
+        }
+    }
+
+    /// Active group/pickup membership for the signed-in user.
+    func currentUserParticipatesInGroupConversation(_ conversationId: UUID) async -> Bool {
+        guard let me = currentUserAuthId else { return false }
+        struct Row: Decodable { let conversation_id: UUID }
+        do {
+            let rows: [Row] = try await supabase
+                .from("group_conversation_members")
+                .select("conversation_id")
+                .eq("conversation_id", value: conversationId.uuidString.lowercased())
+                .eq("user_id", value: me.uuidString.lowercased())
+                .is("left_at", value: nil)
+                .limit(1)
+                .execute()
+                .value
+            return !rows.isEmpty
+        } catch {
+#if DEBUG
+            print("[PushDeepLink] group_participant_check_failed error=\(error.localizedDescription)")
+#endif
+            return false
+        }
+    }
+
+    func acknowledgeGroupPushDeepLinkOpened(conversationId: UUID) {
+        if pendingChatMessageNotificationDeepLink?.conversationID == conversationId {
+            pendingChatMessageNotificationDeepLink = nil
+        }
+        if pendingGroupOpenConversationId == conversationId {
+            pendingGroupOpenConversationId = nil
+        }
+#if DEBUG
+        PushDeepLinkLog.completed(conversation: conversationId, kind: "group")
+#endif
+    }
+
+    func acknowledgeChatMessageDirectPushDeepLinkOpened(conversationId: UUID) {
+        if pendingChatMessageNotificationDeepLink?.conversationID == conversationId {
+            pendingChatMessageNotificationDeepLink = nil
+        }
+        acknowledgeDirectMessagePushDeepLinkOpened(conversationId: conversationId)
     }
 
     func requestBadgeRecalculation(
@@ -1522,7 +1955,6 @@ final class ChatViewModel: ObservableObject {
                 print("[UnreadStateDebug] incomingInsert source=missingLocalRow action=serverRecountAndInboxReconcile")
 #endif
                 scheduleDebouncedUnreadDirectMessageRPCRefresh()
-                scheduleLightweightInboxReconcile(delayNanoseconds: 600_000_000)
             }
         }
     }
@@ -1565,7 +1997,15 @@ final class ChatViewModel: ObservableObject {
         let senderPreview = previewFromFriendRow
             ?? deletedUserPreview(userId: row.sender_id)
         let trimmed = row.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        let previewSource = FanProfileShareMessage.inboxPreview(from: trimmed) ?? trimmed
+        let previewSource = FanProfileShareMessage.inboxPreview(from: trimmed)
+            ?? PickupGameShareMessage.inboxPreview(from: trimmed)
+            ?? ProGameShareMessage.inboxPreview(from: trimmed)
+            ?? VenueShareMessage.inboxPreview(from: trimmed)
+            ?? ChatLocationShareMessage.inboxPreview(from: trimmed)
+            ?? ChatLiveLocationShareMessage.inboxPreview(from: trimmed)
+            ?? ChatOnMyWayMessage.inboxPreview(from: trimmed)
+            ?? PickupGamePollMessage.inboxPreview(from: trimmed)
+            ?? trimmed
         let snippet = previewSource.isEmpty ? "New message" : String(previewSource.prefix(120))
         dmInAppNotification = DmInAppNotificationPayload(
             id: row.id,
@@ -1604,6 +2044,7 @@ final class ChatViewModel: ObservableObject {
         let old = friends[idx]
         guard old.unreadCount > 0 else {
             if scheduleBadgeRecalculation {
+                // Unread already zero locally — badge-only refresh, not a full inbox rebuild.
                 requestBadgeRecalculation(reason: "marked_read_no_local_unread", includeInboxSummaries: true)
             }
             return
@@ -1638,6 +2079,7 @@ final class ChatViewModel: ObservableObject {
 #endif
         Task { await setUnreadDirectMessageCountAndSyncAppIcon(totalUnread, source: "local_mark_read") }
         if scheduleBadgeRecalculation {
+            // Prefer badge-only; missing-row path above still requests full summaries.
             requestBadgeRecalculation(reason: "marked_read", includeInboxSummaries: true)
         }
     }
@@ -1682,7 +2124,8 @@ final class ChatViewModel: ObservableObject {
             conversationId: conversationId,
             scheduleBadgeRecalculation: false
         )
-        requestBadgeRecalculation(reason: "thread_mark_read_\(reason)", includeInboxSummaries: true)
+        // Pre–Phase 1: refresh inbox summaries after mark-read.
+        await refreshInboxSummaries()
 #if DEBUG
         print("[DMUnread] unread counts refreshed reason=\(reason)")
 #endif
@@ -1890,7 +2333,6 @@ final class ChatViewModel: ObservableObject {
         print("[BadgeSyncDebug] chat list updated (reappear upsert)")
 #endif
         // Enrich names/avatars without blocking the visible restore.
-        scheduleLightweightInboxReconcile(delayNanoseconds: 500_000_000)
         return true
     }
 
@@ -2411,10 +2853,12 @@ final class ChatViewModel: ObservableObject {
             async let groupRowsTask = groupChatService.fetchInboxSummaries()
             async let pendingGroupInvitesTask = groupChatService.fetchPendingInvitationsForMe()
             async let exclusionsTask: Void = refreshServerInboxExclusionsIfAvailable()
+            async let clearsHydrateTask: Void = directChatService.hydrateHistoryClearsFromServer()
             let rows = try await dmRowsTask
             let groupRows = (try? await groupRowsTask) ?? []
             let pendingGroupInvites = (try? await pendingGroupInvitesTask) ?? []
             _ = await exclusionsTask
+            _ = await clearsHydrateTask
             ChatActivationPerf.inboxRPC(
                 ms: Int((CFAbsoluteTimeGetCurrent() - inboxFetchStartedAt) * 1000),
                 dmRows: rows.count,
@@ -2962,6 +3406,16 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    /// After ``clear_direct_conversation``: mirror server soft-hide locally so inbox updates immediately
+    /// for this auth user only (peer history unchanged).
+    @MainActor
+    func noteDirectConversationClearedForCurrentUser(conversationId: UUID, peerUserId: UUID) async {
+        hideInboxConversationLocally(peerUserId: peerUserId, conversationId: conversationId)
+        serverExcludedInboxConversationIds.insert(conversationId)
+        serverInboxExclusionsAvailable = true
+        await refreshServerInboxExclusionsIfAvailable()
+    }
+
     /// Swipe-delete from inbox: per-user soft-delete (Recently Deleted). Does not leave groups.
     /// Does not remove friendships. Shared history remains for other participants.
     func clearInboxConversation(peerUserId: UUID, conversationId: UUID? = nil) async {
@@ -3045,6 +3499,138 @@ final class ChatViewModel: ObservableObject {
             peerUserId: row.peer_user_id,
             reason: "recentlyDeletedRestore"
         )
+    }
+
+    /// Outbound send (share or composer) must make the conversation visible to the sender again.
+    /// Server auto-restore only clears soft-delete for the *recipient* of inbound messages.
+    func restoreInboxVisibilityAfterOutboundSend(
+        serverKind: String,
+        conversationId: UUID,
+        peerUserId: UUID?,
+        reason: String
+    ) async {
+        do {
+            try await recentlyDeletedService.restore(kind: serverKind, conversationId: conversationId)
+#if DEBUG
+            print(
+                "[ChatOutboundRestore] restoreRPC ok kind=\(serverKind) " +
+                "conversationId=\(conversationId.uuidString.lowercased()) reason=\(reason)"
+            )
+#endif
+        } catch {
+#if DEBUG
+            print(
+                "[ChatOutboundRestore] restoreRPC error kind=\(serverKind) " +
+                "conversationId=\(conversationId.uuidString.lowercased()) " +
+                "reason=\(reason) error=\(error.localizedDescription)"
+            )
+#endif
+            // Missing RPC / already-visible: still clear local hide so Recent can show the row.
+            if !Self.isMissingRPCError(error) {
+                // Non-missing failures still proceed to local reveal; refresh reconciles.
+            }
+        }
+
+        await MainActor.run {
+            serverExcludedInboxConversationIds.remove(conversationId)
+            revealInboxConversationIfHidden(
+                conversationId: conversationId,
+                peerUserId: peerUserId,
+                reason: reason
+            )
+        }
+    }
+
+    /// Immediately surfaces an outbound share in Recent conversations (before refresh/realtime).
+    @MainActor
+    func upsertInboxDisplayAfterOutboundShare(
+        conversationId: UUID,
+        peerUserId: UUID?,
+        body: String,
+        inboxKind: ChatInboxConversationKind
+    ) {
+        let subtitle = ChatInboxPreviewFormatting.previewLine(
+            body: body,
+            isFromCurrentUser: true
+        )
+        let lastAt = Date()
+
+        if let idx = friends.firstIndex(where: { $0.conversationId == conversationId }) {
+            let old = friends[idx]
+            let updated = FriendDisplay(
+                id: old.id,
+                preview: old.preview,
+                subtitle: subtitle,
+                lastMessageAt: lastAt,
+                unreadCount: 0,
+                isConversationBacked: true,
+                conversationId: conversationId,
+                inboxKind: old.inboxKind,
+                groupMemberCount: old.groupMemberCount,
+                isGroupMuted: old.isGroupMuted,
+                pickupGameId: old.pickupGameId
+            )
+            var next = friends
+            next[idx] = updated
+            next.sort(by: Self.isInboxRowOrderedBefore)
+            friends = next
+            syncChatPresenceRealtimeIfNeeded(reason: "outboundSharePatchedInbox")
+#if DEBUG
+            print(
+                "[ChatOutboundRestore] inboxUpsert existing conversationId=\(conversationId.uuidString.lowercased())"
+            )
+#endif
+            return
+        }
+
+        guard inboxKind != .group else {
+            // Group rows should already exist when shareable; refresh will reconcile if missing.
+            return
+        }
+
+        let peer = peerUserId
+        let preview: UserPreview = {
+            if let peer,
+               let existing = friends.first(where: { $0.preview.id == peer })?.preview {
+                return existing
+            }
+            return UserPreview(
+                id: peer ?? conversationId,
+                displayName: "Fan",
+                username: nil,
+                email: nil,
+                avatarURL: nil,
+                avatarThumbnailURL: nil,
+                dmConversationId: conversationId
+            )
+        }()
+
+        let display = FriendDisplay(
+            id: conversationId,
+            preview: preview,
+            subtitle: subtitle,
+            lastMessageAt: lastAt,
+            unreadCount: 0,
+            isConversationBacked: true,
+            conversationId: conversationId,
+            inboxKind: inboxKind
+        )
+
+        var next = friends.filter { row in
+            if row.conversationId == conversationId { return false }
+            if let peer, !row.isConversationBacked, row.preview.id == peer { return false }
+            return true
+        }
+        next.insert(display, at: 0)
+        next.sort(by: Self.isInboxRowOrderedBefore)
+        friends = next
+        syncChatPresenceRealtimeIfNeeded(reason: "outboundShareReappearedInbox")
+#if DEBUG
+        print(
+            "[ChatOutboundRestore] inboxUpsert new conversationId=\(conversationId.uuidString.lowercased()) " +
+            "peer=\(peer?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
     }
 
     func permanentlyDeleteRecentlyDeletedConversation(_ row: RecentlyDeletedChatConversationRow) async throws {
@@ -3212,6 +3798,21 @@ final class ChatViewModel: ObservableObject {
                             conversationId: conversationId,
                             body: trimmedBody
                         )
+                        // Group share path unchanged except sender visibility restore if swipe-hidden.
+                        await restoreInboxVisibilityAfterOutboundSend(
+                            serverKind: "group",
+                            conversationId: conversationId,
+                            peerUserId: nil,
+                            reason: "profileShareSent"
+                        )
+                        await MainActor.run {
+                            upsertInboxDisplayAfterOutboundShare(
+                                conversationId: conversationId,
+                                peerUserId: nil,
+                                body: trimmedBody,
+                                inboxKind: .group
+                            )
+                        }
                         sentCount += 1
 
                     case .direct, .business:
@@ -3250,6 +3851,22 @@ final class ChatViewModel: ObservableObject {
                         )
                         RateLimitService.recordDirectChatSend(conversationId: conversationId, body: trimmedBody)
                         FanGeoAnalyticsService.recordDMSent(conversationId: conversationId)
+
+                        // Soft-delete is inbound-only on the server; restore sender visibility here.
+                        await restoreInboxVisibilityAfterOutboundSend(
+                            serverKind: "direct",
+                            conversationId: conversationId,
+                            peerUserId: peerUserId,
+                            reason: "profileShareSent"
+                        )
+                        await MainActor.run {
+                            upsertInboxDisplayAfterOutboundShare(
+                                conversationId: conversationId,
+                                peerUserId: peerUserId,
+                                body: trimmedBody,
+                                inboxKind: recipient.inboxKind
+                            )
+                        }
                         sentCount += 1
                     }
                 } catch {
@@ -3738,6 +4355,30 @@ final class ChatViewModel: ObservableObject {
             friendshipChipByOtherUserId = snapshotChips
             unfriendError = error.localizedDescription
         }
+    }
+
+    /// Public-profile entry point — delegates to ``unfriend(_:)`` (same `remove_friend` path).
+    func unfriend(peerUserId: UUID, displayPreview: UserPreview? = nil) async {
+        if let existing = friends.first(where: { $0.preview.id == peerUserId }) {
+            await unfriend(existing)
+            return
+        }
+        let preview = displayPreview ?? UserPreview(
+            id: peerUserId,
+            displayName: "",
+            avatarURL: nil
+        )
+        await unfriend(
+            FriendDisplay(
+                id: peerUserId,
+                preview: preview,
+                subtitle: nil,
+                lastMessageAt: nil,
+                unreadCount: 0,
+                isConversationBacked: false,
+                conversationId: nil
+            )
+        )
     }
 
     func sendFriendRequest(to addresseeId: UUID) async {
@@ -4824,14 +5465,18 @@ final class ChatViewModel: ObservableObject {
     }
 }
 
-/// Small root-shell projection. `ChatViewModel` remains authoritative and mirrors these values
-/// synchronously from property observers; there is no polling, duplicate computation, or Combine
-/// subscription lifecycle to manage.
+/// Root-shell projection observed by ``MainTabView``.
+/// Conversation chrome (`hidesFloatingTabBarForDirectChat`) is owned here and updated from
+/// parent route presence in ``FriendsTabView`` — never mirrored from a destination `onAppear`.
+/// ``MainTabView`` applies this only while `selectedTab == .chat` so an inactive Chat stack
+/// (preserved DM/group route) cannot suppress the floating tab bar on other tabs.
 @MainActor
 final class ChatMainTabState: ObservableObject {
     @Published private(set) var pendingDmOpenPreview: UserPreview?
     @Published private(set) var pendingGroupOpenConversationId: UUID?
+    @Published private(set) var pendingOpenFriendRequestsSection = false
     @Published private(set) var dmInAppNotification: ChatViewModel.DmInAppNotificationPayload?
+    /// True while FriendsTab has a DM or group conversation route. Shell hide is gated by active Chat tab.
     @Published private(set) var hidesFloatingTabBarForDirectChat = false
 
     func setPendingDmOpenPreview(_ value: UserPreview?) {
@@ -4846,6 +5491,12 @@ final class ChatMainTabState: ObservableObject {
         MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
     }
 
+    func setPendingOpenFriendRequestsSection(_ value: Bool) {
+        guard pendingOpenFriendRequestsSection != value else { return }
+        pendingOpenFriendRequestsSection = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
+    }
+
     func setDmInAppNotification(_ value: ChatViewModel.DmInAppNotificationPayload?) {
         guard dmInAppNotification != value else { return }
         dmInAppNotification = value
@@ -4854,6 +5505,9 @@ final class ChatMainTabState: ObservableObject {
 
     func setHidesFloatingTabBarForDirectChat(_ value: Bool) {
         guard hidesFloatingTabBarForDirectChat != value else { return }
+#if DEBUG
+        print("[ChatNav] mainTab.directChatChrome \(hidesFloatingTabBarForDirectChat)→\(value)")
+#endif
         hidesFloatingTabBarForDirectChat = value
         MainTabObservationPerf.projectionPublished(scope: "routing", category: "navigationChrome")
     }

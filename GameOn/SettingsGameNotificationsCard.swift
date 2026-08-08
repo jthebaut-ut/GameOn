@@ -13,10 +13,12 @@ struct SettingsGameNotificationsCard: View {
     @AppStorage("pickupGameChangeNotifications") private var pickupGameChangeNotifications = true
     @AppStorage("gameon.appleCalendar.lastSuccessfulSyncAt.v1") private var calendarLastSyncedAtRaw: Double = 0
     @State private var calendarAccessEnabled = false
-    @State private var calendarSyncInFlight = false
     @State private var calendarSyncResultMessage = ""
+    @State private var calendarSyncCompletedFlash = false
+    @State private var calendarSyncSuccessFlashTask: Task<Void, Never>?
     @State private var showAppleCalendarSyncDisableConfirmation = false
     @State private var appleCalendarSyncDisableInFlight = false
+    @State private var appleCalendarRemovalSuccessTask: Task<Void, Never>?
 
     private static let fanOnlyNotificationsBusinessToastKey =
         "Watch Spot and pickup notifications are available for Fan accounts."
@@ -348,11 +350,27 @@ struct SettingsGameNotificationsCard: View {
                 )
 
                 if !calendarSyncResultMessage.isEmpty {
-                    Text(localizedCalendarSyncResultMessage(calendarSyncResultMessage))
-                        .font(FGTypography.caption.weight(.semibold))
-                        .foregroundStyle(calendarSyncResultMessageLooksSuccessful ? FGColor.accentGreen : Color.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, FGSpacing.md)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(localizedCalendarSyncResultMessage(calendarSyncResultMessage))
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(calendarSyncResultMessageLooksSuccessful ? FGColor.accentGreen : Color.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel(localizedCalendarSyncResultMessage(calendarSyncResultMessage))
+
+                        if calendarSyncResultMessage == "Some events could not be removed" {
+                            Button {
+                                retryAppleCalendarEventRemoval()
+                            } label: {
+                                Text(L10n.t("Retry", languageCode: appLanguageRaw))
+                                    .font(FGTypography.caption.weight(.bold))
+                                    .foregroundStyle(FGColor.accentGreen)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(appleCalendarSyncDisableInFlight)
+                            .accessibilityLabel(L10n.t("Retry", languageCode: appLanguageRaw))
+                        }
+                    }
+                    .padding(.horizontal, FGSpacing.md)
                 }
 
                 Button {
@@ -363,29 +381,48 @@ struct SettingsGameNotificationsCard: View {
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        if calendarSyncInFlight {
+                        if calendarSyncIsInFlight {
                             ProgressView()
-                                .controlSize(.mini)
+                                .controlSize(.small)
+                                .tint(calendarSyncButtonForegroundColor)
+                                .accessibilityHidden(true)
+                        } else if calendarSyncCompletedFlash {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption.weight(.black))
                         } else {
                             Image(systemName: calendarSyncButtonIconName)
                                 .font(.caption.weight(.black))
                         }
                         Text(calendarSyncButtonTitle)
                             .font(FGTypography.caption.weight(.black))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(calendarSyncButtonForegroundColor)
                     .padding(.horizontal, FGSpacing.md)
                     .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                     .background(
                         calendarSyncButtonBackgroundColor,
                         in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
                     )
+                    .overlay {
+                        if calendarSyncIsInFlight {
+                            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                                .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.35 : 0.55), lineWidth: 1)
+                        }
+                    }
                 }
                 .buttonStyle(.plain)
-                .disabled(!calendarSyncButtonIsInteractive)
-                .opacity(calendarSyncButtonIsInteractive ? 1 : 0.45)
+                .disabled(!calendarSyncButtonAllowsTap)
+                .opacity(calendarSyncButtonLooksDisabled ? 0.45 : 1)
                 .accessibilityLabel(calendarSyncButtonTitle)
+                .accessibilityHint(
+                    calendarSyncIsInFlight
+                        ? L10n.t("calendar_sync_in_progress", languageCode: appLanguageRaw)
+                        : L10n.t("Sync Calendar", languageCode: appLanguageRaw)
+                )
                 .padding(.horizontal, FGSpacing.md)
                 .padding(.bottom, 10)
             }
@@ -433,14 +470,29 @@ struct SettingsGameNotificationsCard: View {
         appleCalendarDependentControlsEnabled && !calendarAccessEnabled
     }
 
-    private var calendarSyncButtonIsInteractive: Bool {
-        guard !calendarSyncInFlight, !appleCalendarSyncDisableInFlight else { return false }
+    private var calendarSyncIsInFlight: Bool {
+        viewModel.appleCalendarSettingsManualSyncInFlight
+    }
+
+    /// Tap allowed for Open Settings, or Sync when master toggle is on and not already syncing.
+    private var calendarSyncButtonAllowsTap: Bool {
+        guard !appleCalendarSyncDisableInFlight else { return false }
+        if calendarSyncIsInFlight { return false }
+        if calendarSyncButtonShowsOpenSettings { return true }
         return appleCalendarDependentControlsEnabled
     }
 
+    /// Only fade when sync is off (not while actively synchronizing).
+    private var calendarSyncButtonLooksDisabled: Bool {
+        !appleCalendarDependentControlsEnabled && !calendarSyncButtonShowsOpenSettings
+    }
+
     private var calendarSyncButtonTitle: String {
-        if calendarSyncInFlight {
-            return L10n.t("Syncing Calendar...", languageCode: appLanguageRaw)
+        if calendarSyncIsInFlight {
+            return L10n.t("calendar_sync_in_progress", languageCode: appLanguageRaw)
+        }
+        if calendarSyncCompletedFlash {
+            return L10n.t("calendar_sync_completed", languageCode: appLanguageRaw)
         }
         if !appleCalendarDependentControlsEnabled {
             return L10n.t("Sync Calendar", languageCode: appLanguageRaw)
@@ -459,17 +511,21 @@ struct SettingsGameNotificationsCard: View {
     }
 
     private var calendarSyncButtonBackgroundColor: Color {
+        if calendarSyncCompletedFlash {
+            return FGColor.accentGreen
+        }
         if !appleCalendarDependentControlsEnabled {
             return Color.gray.opacity(colorScheme == .dark ? 0.35 : 0.28)
         }
         if calendarSyncButtonShowsOpenSettings {
             return Color.orange
         }
+        // Keep full green while syncing so ProgressView stays high-contrast (not faded).
         return FGColor.accentGreen
     }
 
     private var calendarSyncButtonForegroundColor: Color {
-        if !appleCalendarDependentControlsEnabled {
+        if !appleCalendarDependentControlsEnabled && !calendarSyncIsInFlight && !calendarSyncCompletedFlash {
             return FGColor.mutedText(colorScheme)
         }
         return Color.white
@@ -493,22 +549,27 @@ struct SettingsGameNotificationsCard: View {
 
     private func localizedCalendarSyncResultMessage(_ message: String) -> String {
         switch message {
-        case "Calendar synced":
-            return L10n.t("Calendar synced", languageCode: appLanguageRaw)
-        case "Removed FanGeo calendar events":
-            return L10n.t("Removed FanGeo calendar events", languageCode: appLanguageRaw)
+        case "Calendar synced", "calendar_sync_completed":
+            return L10n.t("calendar_sync_completed", languageCode: appLanguageRaw)
+        case "Removed FanGeo calendar events", "calendar_removal_completed":
+            return L10n.t("calendar_removal_completed", languageCode: appLanguageRaw)
         case "No FanGeo calendar events found":
             return L10n.t("No FanGeo calendar events found", languageCode: appLanguageRaw)
+        case "Some events could not be removed", "calendar_removal_partial_failure":
+            return L10n.t("calendar_removal_partial_failure", languageCode: appLanguageRaw)
         case "Calendar permission needed":
             return L10n.t("Calendar permission needed", languageCode: appLanguageRaw)
-        default:
+        case "Calendar sync is off", "Calendar sync already running":
             return message
+        default:
+            return L10n.t("calendar_sync_failed", languageCode: appLanguageRaw)
         }
     }
 
     private var calendarSyncResultMessageLooksSuccessful: Bool {
         switch calendarSyncResultMessage {
-        case "Calendar synced", "Removed FanGeo calendar events", "No FanGeo calendar events found":
+        case "Calendar synced", "calendar_sync_completed",
+             "Removed FanGeo calendar events", "No FanGeo calendar events found":
             return true
         default:
             return false
@@ -545,12 +606,81 @@ struct SettingsGameNotificationsCard: View {
 
     private func disableAppleCalendarSyncAndRemoveEvents() {
         guard !appleCalendarSyncDisableInFlight else { return }
+        guard viewModel.appleCalendarRemovalPhase == .idle else { return }
         appleCalendarSyncDisableInFlight = true
         notificationSettingsStore.syncGoingGamesToAppleCalendar = false
         calendarSyncResultMessage = ""
+        appleCalendarRemovalSuccessTask?.cancel()
+        // Show the non-dismissible sheet-level overlay immediately, then yield so it paints before EventKit work.
+        withAnimation(.easeInOut(duration: 0.2)) {
+            viewModel.appleCalendarRemovalPhase = .removing
+        }
+#if DEBUG
+        AppleCalendarRemovalUIDebug.log("phaseChanged=removing source=disableAndRemove")
+#endif
         Task { @MainActor in
+            await Task.yield()
             let message = await viewModel.removeAllFanGeoAppleCalendarEvents()
+            await finishAppleCalendarEventRemoval(with: message)
+        }
+    }
+
+    private func retryAppleCalendarEventRemoval() {
+        guard !appleCalendarSyncDisableInFlight else { return }
+        guard viewModel.appleCalendarRemovalPhase == .idle else { return }
+        appleCalendarSyncDisableInFlight = true
+        calendarSyncResultMessage = ""
+        appleCalendarRemovalSuccessTask?.cancel()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            viewModel.appleCalendarRemovalPhase = .removing
+        }
+#if DEBUG
+        AppleCalendarRemovalUIDebug.log("phaseChanged=removing source=retry")
+#endif
+        Task { @MainActor in
+            await Task.yield()
+            let message = await viewModel.removeAllFanGeoAppleCalendarEvents()
+            await finishAppleCalendarEventRemoval(with: message)
+        }
+    }
+
+    @MainActor
+    private func finishAppleCalendarEventRemoval(with message: String) async {
+        switch message {
+        case "Removed FanGeo calendar events", "No FanGeo calendar events found":
+#if DEBUG
+            AppleCalendarRemovalUIDebug.log("removalResult=success message=\(message)")
+#endif
+            withAnimation(.easeInOut(duration: 0.28)) {
+                viewModel.appleCalendarRemovalPhase = .success
+            }
+            appleCalendarRemovalSuccessTask?.cancel()
+            appleCalendarRemovalSuccessTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    viewModel.appleCalendarRemovalPhase = .idle
+                }
+                calendarSyncResultMessage = "Removed FanGeo calendar events"
+                appleCalendarSyncDisableInFlight = false
+            }
+        case "Some events could not be removed", "Calendar permission needed":
+#if DEBUG
+            AppleCalendarRemovalUIDebug.log("removalResult=failure message=\(message)")
+#endif
+            withAnimation(.easeInOut(duration: 0.22)) {
+                viewModel.appleCalendarRemovalPhase = .idle
+            }
             calendarSyncResultMessage = message
+            appleCalendarSyncDisableInFlight = false
+        default:
+#if DEBUG
+            AppleCalendarRemovalUIDebug.log("removalResult=failure message=\(message)")
+#endif
+            withAnimation(.easeInOut(duration: 0.22)) {
+                viewModel.appleCalendarRemovalPhase = .idle
+            }
+            calendarSyncResultMessage = "Some events could not be removed"
             appleCalendarSyncDisableInFlight = false
         }
     }
@@ -560,17 +690,41 @@ struct SettingsGameNotificationsCard: View {
     }
 
     private func runSettingsCalendarSync() {
-        guard !calendarSyncInFlight else { return }
-        calendarSyncInFlight = true
+        guard !calendarSyncIsInFlight else { return }
+        guard appleCalendarDependentControlsEnabled else { return }
+        calendarSyncSuccessFlashTask?.cancel()
+        calendarSyncCompletedFlash = false
         calendarSyncResultMessage = ""
         Task { @MainActor in
             let message = await viewModel.syncAppleCalendarFromSettings()
-            calendarSyncResultMessage = message
+            if message == "Calendar sync already running" {
+                return
+            }
             calendarAccessEnabled = viewModel.appleCalendarAccessEnabledForSettings()
             if message == "Calendar synced" {
                 calendarLastSyncedAtRaw = Date().timeIntervalSince1970
+                calendarSyncResultMessage = "Calendar synced"
+                presentCalendarSyncSuccessFlash()
+            } else if message == "Calendar permission needed" {
+                calendarSyncResultMessage = message
+            } else {
+#if DEBUG
+                print("[CalendarSyncDebug] settingsUIFailure message=\(message)")
+#endif
+                calendarSyncResultMessage = message == "Calendar sync is off"
+                    ? message
+                    : "calendar_sync_failed"
             }
-            calendarSyncInFlight = false
+        }
+    }
+
+    private func presentCalendarSyncSuccessFlash() {
+        calendarSyncSuccessFlashTask?.cancel()
+        calendarSyncCompletedFlash = true
+        calendarSyncSuccessFlashTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard !Task.isCancelled else { return }
+            calendarSyncCompletedFlash = false
         }
     }
 
@@ -951,6 +1105,9 @@ struct SettingsGameNotificationsCard: View {
                 pickupJoinRequestUpdateNotifications = enabled
                 pickupPlayerJoinedNotifications = enabled
                 pickupGameChangeNotifications = enabled
+                Task {
+                    await viewModel.syncProGameFinalScorePreferenceToBackend(reason: "pickupGameUpdatesToggle")
+                }
             }
         )
     }

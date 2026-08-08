@@ -13,6 +13,10 @@ struct WatchZoneApp: App {
 
     @AppStorage(FanGeoAppearancePreference.appStorageKey) private var appearancePreferenceRaw = FanGeoAppearancePreference.system.rawValue
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    /// Temporary window light override while `FanGeoSplashView` is mounted (status bar + chrome).
+    /// Starts `true` so cold launch does not paint a dark frame before the splash preference arrives.
+    /// Cleared (not persisted) as soon as no splash reports the preference.
+    @State private var splashForcesLightAppearance = true
 
     init() {
         // Must run before ad-consent acknowledgment so upgrade migration is not polluted.
@@ -33,7 +37,17 @@ struct WatchZoneApp: App {
             FanGeoAdConsentPrePromptHost {
                 ContentView()
             }
-                .preferredColorScheme(appearancePreference.colorScheme)
+                .onPreferenceChange(FanGeoSplashForcesLightAppearanceKey.self) { forcesLight in
+                    splashForcesLightAppearance = forcesLight
+                    #if DEBUG
+                    print("[FanGeoLoadingDebug] splashForcesLightAppearance=\(forcesLight)")
+                    #endif
+                }
+                // Splash may temporarily force `.light` for status-bar / window chrome only.
+                // UserDefaults appearance preference is never written here.
+                .preferredColorScheme(
+                    splashForcesLightAppearance ? .light : appearancePreference.colorScheme
+                )
                 .environment(\.locale, Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)))
                 .onAppear {
                     #if DEBUG
@@ -97,7 +111,20 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .list, .sound, .badge]
+        let userInfo = notification.request.content.userInfo
+        // DM / friend-request pushes: suppress system banner while foregrounded so
+        // realtime + in-app UX remain the single in-app path (no duplicate alerts).
+        if DirectMessageNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo)
+            || FriendRequestNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo)
+            || ChatMessageNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo)
+            || PokeNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
+            return []
+        }
+        return [.banner, .list, .sound, .badge]
     }
 
     func userNotificationCenter(
@@ -107,10 +134,15 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         await MainActor.run {
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             PickupCreatorRatingNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            PickupGameChangeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             SupportReplyNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanGeoAnnouncementNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanGeoPlusAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             BusinessProAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            DirectMessageNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FriendRequestNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            ChatMessageNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            PokeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }
     }
 }

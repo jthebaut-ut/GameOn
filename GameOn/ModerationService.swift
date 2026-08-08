@@ -618,40 +618,15 @@ struct ModerationService {
 
     /// Best-effort increment of `direct_messages.report_count` for admin review queues.
     private func incrementMessageReportCountBestEffort(messageId: UUID) async {
-        struct Row: Decodable { let report_count: Int? }
-        struct Patch: Encodable { let report_count: Int }
-
+        struct Params: Encodable { let p_message_id: UUID }
         do {
-            let rows: [Row] = try await supabase
-                .from("direct_messages")
-                .select("report_count")
-                .eq("id", value: messageId)
-                .limit(1)
+            _ = try await supabase
+                .rpc("bump_direct_message_report_count", params: Params(p_message_id: messageId))
                 .execute()
-                .value
-            let current = rows.first?.report_count ?? 0
-            let next = current + 1
-            if next >= Self.hiddenAfterReportsThreshold {
-                struct PatchHide: Encodable {
-                    let report_count: Int
-                    let is_deleted: Bool
-                }
-                _ = try await supabase
-                    .from("direct_messages")
-                    .update(PatchHide(report_count: next, is_deleted: true))
-                    .eq("id", value: messageId)
-                    .execute()
-            } else {
-                _ = try await supabase
-                    .from("direct_messages")
-                    .update(Patch(report_count: next))
-                    .eq("id", value: messageId)
-                    .execute()
-            }
         } catch {
-            // Column may be missing until migration is applied; report row is still stored.
+            // RPC may be missing until migration 20260915_0003 is applied.
 #if DEBUG
-            print("Moderation: increment report_count skipped:", error)
+            print("Moderation: bump_direct_message_report_count skipped:", error)
 #endif
         }
     }

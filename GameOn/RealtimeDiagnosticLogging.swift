@@ -410,8 +410,32 @@ enum Perf {
 
 /// Image-cache performance tracing; callable from any isolation context (`[Perf]`).
 nonisolated enum PerformanceLog {
+#if DEBUG
+    private static let imageHitLogLock = NSLock()
+    private static var imageHitLogCounts: [String: Int] = [:]
+    private static var imageHitLogsEmitted = 0
+    private static let imageHitLogCap = 12
+#endif
+
     static func imageCacheHit(urlHash: String) {
-        DebugLogGate.hotPathPerf("[Perf] imageCacheHit urlHash=\(urlHash)")
+#if DEBUG
+        guard DebugLogGate.hotPathPerfLoggingEnabled else { return }
+        imageHitLogLock.lock()
+        defer { imageHitLogLock.unlock() }
+        let next = (imageHitLogCounts[urlHash] ?? 0) + 1
+        imageHitLogCounts[urlHash] = next
+        // Log first hit per urlHash, then aggregate every 25 thereafter — cap total lines.
+        guard next == 1 || next.isMultiple(of: 25) else { return }
+        guard imageHitLogsEmitted < imageHitLogCap else { return }
+        imageHitLogsEmitted += 1
+        if next == 1 {
+            DebugLogGate.hotPathPerf("[Perf] imageCacheHit urlHash=\(urlHash)")
+        } else {
+            DebugLogGate.hotPathPerf("[Perf] imageCacheHit urlHash=\(urlHash) aggregateCount=\(next)")
+        }
+#else
+        _ = urlHash
+#endif
     }
 
     static func imageCacheMiss(urlHash: String) {
@@ -1347,12 +1371,14 @@ enum MainTabObservationPerf {
 #if DEBUG
         chatPublicationCounts[category, default: 0] += 1
         let count = chatPublicationCounts[category, default: 0]
+        DirectChatOpenPerf.notePrecedingPublisher(object: "ChatViewModel", property: category)
         notePass("chatPublication category=\(category) count=\(count)")
 #endif
     }
 
     static func projectionPublished(scope: String, category: String) {
 #if DEBUG
+        DirectChatOpenPerf.notePrecedingPublisher(object: "ChatMainTabState", property: "\(scope).\(category)")
         notePass("projection scope=\(scope) category=\(category)")
 #endif
     }
@@ -1669,6 +1695,31 @@ nonisolated enum LiveApplyPerf {
             "reason=\(reason) rowsFetched=\(rowsFetched) "
                 + "mainActorApplyMs=\(String(format: "%.2f", mainActorApplyMs)) "
                 + "publishCount=\(publishCount)"
+        )
+#endif
+    }
+
+    /// Cache-hit / timer tick where full Equatable equality short-circuited before hydration.
+    static func identicalPayloadSkipped(
+        rowsFetched: Int,
+        mainActorApplyMs: Double,
+        reason: String
+    ) {
+#if DEBUG
+        log(
+            "reason=\(reason) identicalPayload=true hydrationSkipped=true "
+                + "rowsFetched=\(rowsFetched) "
+                + "mainActorApplyMs=\(String(format: "%.2f", mainActorApplyMs)) "
+                + "publishCount=0"
+        )
+#endif
+    }
+
+    static func favoriteIndexBuild(rows: Int, favorites: Int, buildMs: Double, reason: String) {
+#if DEBUG
+        log(
+            "reason=\(reason) favoriteIndexBuild=true rows=\(rows) favorites=\(favorites) "
+                + "buildMs=\(String(format: "%.2f", buildMs))"
         )
 #endif
     }

@@ -193,12 +193,33 @@ public nonisolated enum AppSportCatalog {
         calendarAndPickerSportsOrdered.filter { $0 != "All" }
     }
 
-    /// Stored sport strings for pickup + venue owner game forms (same tokens Discover filters on).
-    public static var formPickerSportsOrdered: [String] { sportsExcludingAll }
+    /// Canonical stored token for form pickers / Open To (e.g. `Hockey` / `NHL` → `NHL`).
+    /// Calendar filters intentionally keep both friendly and league strings; forms must not.
+    public static func canonicalFormPickerToken(for raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
 
-    /// Friendly label for a stored sport token, e.g. `NBA` -> `Basketball`.
-    /// Uses ``L10n`` so catalog English labels resolve to the active app language (e.g. Parapente).
-    public static func displayLabel(forSportToken token: String) -> String {
+        for category in SportCatalog.groupedCategories {
+            if let row = category.rows.first(where: {
+                $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+                    || $0.label.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+            }) {
+                return row.selection
+            }
+        }
+
+        if let pair = discoverMapDefaultPopularPairs.first(where: {
+            $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+                || $0.display.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
+            return pair.selection
+        }
+
+        return trimmed
+    }
+
+    /// English catalog label for a stored token (no localization) — used for dedupe keys / DEBUG asserts.
+    public static func catalogEnglishLabel(forSportToken token: String) -> String {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
 
@@ -207,17 +228,50 @@ public nonisolated enum AppSportCatalog {
                 $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
                     || $0.label.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
             }) {
-                return L10n.t(row.label)
+                return row.label
             }
         }
 
         if let pair = discoverMapDefaultPopularPairs.first(where: {
             $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+                || $0.display.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
         }) {
-            return L10n.t(pair.display)
+            return pair.display
         }
 
-        return L10n.t(trimmed)
+        return trimmed
+    }
+
+    /// Stored sport strings for pickup + venue owner game forms and Open To.
+    /// Same toolbar-priority order as ``sportsExcludingAll``, but friendly↔league aliases
+    /// (`Basketball`/`NBA`, `Football`/`NFL`, `Hockey`/`NHL`) collapse to one canonical token.
+    /// Does **not** change ``calendarAndPickerSportsOrdered`` / filter token lists.
+    public static let formPickerSportsOrdered: [String] = {
+        var seenTokens = Set<String>()
+        var seenDisplayNames = Set<String>()
+        var out: [String] = []
+        out.reserveCapacity(48)
+
+        for raw in calendarAndPickerSportsOrdered where raw != "All" {
+            let token = canonicalFormPickerToken(for: raw)
+            let displayKey = catalogEnglishLabel(forSportToken: token)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !displayKey.isEmpty else { continue }
+            guard seenTokens.insert(token).inserted else { continue }
+            guard seenDisplayNames.insert(displayKey).inserted else { continue }
+            out.append(token)
+        }
+
+        return out
+    }()
+
+    /// Friendly label for a stored sport token, e.g. `NBA` -> `Basketball`.
+    /// Uses ``L10n`` so catalog English labels resolve to the active app language (e.g. Parapente).
+    public static func displayLabel(forSportToken token: String) -> String {
+        let english = catalogEnglishLabel(forSportToken: token)
+        guard !english.isEmpty else { return "" }
+        return L10n.t(english)
     }
 
     /// Compact Discover toolbar: stored selection token + chip label (see ``DiscoverSportFilterRowLayout``).

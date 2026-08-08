@@ -3,7 +3,7 @@ import Foundation
 import Supabase
 
 let pickupGamesSelectColumns =
-    "id,creator_user_id,creator_email,title,sport,description,game_format,skill_level,game_start_at,end_time,address,city,state,latitude,longitude,is_visible,players_needed,play_environment,participant_preference,age_min,age_max,is_free,entry_fee_amount,max_players,status,approved_join_count,cleanup_delay_hours,remove_after_at,created_at,updated_at"
+    "id,creator_user_id,creator_email,title,sport,description,game_format,skill_level,game_start_at,end_time,address,city,state,latitude,longitude,is_visible,players_needed,play_environment,participant_preference,age_min,age_max,is_free,entry_fee_amount,max_players,status,approved_join_count,cleanup_delay_hours,remove_after_at,created_at,updated_at,poll_create_permission"
 
 private let pickupOrganizerSettingsHistoryUserClearedIdsKeyPrefix = "gameon.settings.pickupOrganizerHistoryClearedIds."
 private let pickupGamesDiscoverCacheTTL: TimeInterval = 150
@@ -592,7 +592,8 @@ extension MapViewModel {
             return
         }
         print("[PickupGamesWarmCache] warmFetchStarted key=\(cacheKey)")
-        await refreshPickupGamesForDiscoverMap(force: true, preservePickupCalendarDotDatesCache: true)
+        // force:false so mode/TTL coalescing apply — warm must not bypass Discover mode gates.
+        await refreshPickupGamesForDiscoverMap(force: false, preservePickupCalendarDotDatesCache: true)
     }
 
     func refreshPickupGameAfterDiscoverPickupPlaceCreate(_ row: PickupGameRow) async {
@@ -654,6 +655,14 @@ extension MapViewModel {
                 "[DiscoverPickupDiag] op=mapRefresh SKIP earlyExit force=\(force) discoverMapContentMode=\(discoverMapContentMode.rawValue) reason=refreshOnlyRunsForPickupModeUnlessForced"
             )
 #endif
+            return
+        }
+
+        if !discoverGeographicNetworkFetchAllowed() {
+#if DEBUG
+            print("[DiscoverPickupDiag] op=mapRefresh SKIP reason=viewportTooBroad")
+#endif
+            print("[PickupGamesWarmCache] skipped reason=viewportTooBroad")
             return
         }
 
@@ -1105,7 +1114,8 @@ extension MapViewModel {
         isFree: Bool,
         entryFeeAmount: Double?,
         maxPlayers: Int?,
-        gameFormat: GameType = .pickup
+        gameFormat: GameType = .pickup,
+        pollCreatePermission: PickupPollCreatePermission = .organizerOnly
     ) async throws -> PickupGameRow {
         guard let uid = currentUserAuthId else {
             throw PickupGameClientError.notSignedIn
@@ -1156,7 +1166,8 @@ extension MapViewModel {
             entry_fee_amount: feePayload,
             max_players: maxPlayersClamped,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
-            remove_after_at: removeISO
+            remove_after_at: removeISO,
+            poll_create_permission: pollCreatePermission.rawValue
         ).withCanonicalPickupCleanupDelay()
 
 #if DEBUG
@@ -1197,7 +1208,8 @@ extension MapViewModel {
 
     func updatePickupGame(id: UUID, full: PickupGameFullUpdate) async throws {
         let normalized = full.withCanonicalPickupCleanupDelay()
-        let oldStart = resolvedPickupGameRow(for: id)?.game_start_at
+        let before = resolvedPickupGameRow(for: id)
+        let oldStart = before?.game_start_at
         PickupExpirationEditDebug.log(
             oldGameStartAt: oldStart,
             newGameStartAt: normalized.game_start_at,
@@ -1207,6 +1219,10 @@ extension MapViewModel {
 #if DEBUG
         print("[PickupVisibilityDebug] discoverVisibilityForced=true")
 #endif
+        // Ensure private pickup chat exists before UPDATE so the DB edit-notify trigger
+        // can insert a system message for approved participants.
+        await ensurePickupGameChatForEditNotificationsIfNeeded(pickupGameId: id)
+
         let updated: [PickupGameRow] = try await supabase
             .from("pickup_games")
             .update(normalized)
@@ -1225,7 +1241,57 @@ extension MapViewModel {
         print(
             "[DiscoverDotsSave] table=pickup_games op=update id=\(row.id.uuidString.lowercased()) game_start_at=\(row.game_start_at) sport=\(row.sport) status=\(row.status) is_visible=\(row.is_visible) remove_after_at=\(row.remove_after_at ?? "nil")"
         )
+        if let before {
+            let changes = PickupGameMeaningfulChange.diff(before: before, after: row)
+            print("[PickupEditNotify] meaningfulKinds=\(changes.kinds.map(\.rawValue).joined(separator: ","))")
+        }
 #endif
+        mergePickupInsertedLocally(row)
+    }
+
+    /// Opens/creates the private pickup chat when the organizer has approved participants
+    /// so the DB edit-notify trigger can post a system message.
+    private func ensurePickupGameChatForEditNotificationsIfNeeded(pickupGameId: UUID) async {
+        do {
+            _ = try await GroupChatService().ensurePickupGameConversation(pickupGameId: pickupGameId)
+#if DEBUG
+            print("[PickupEditNotify] ensureChat ok id=\(pickupGameId.uuidString.lowercased())")
+#endif
+        } catch {
+#if DEBUG
+            print(
+                "[PickupEditNotify] ensureChat skipped id=\(pickupGameId.uuidString.lowercased()) " +
+                "error=\(error.localizedDescription)"
+            )
+#endif
+        }
+    }
+
+    /// Organizer-only: updates who may create polls in this pickup chat.
+    func updatePickupGamePollCreatePermission(
+        id: UUID,
+        permission: PickupPollCreatePermission
+    ) async throws {
+        guard let existing = resolvedPickupGameRow(for: id) else {
+            throw PickupGameClientError.pickupGameNotFound
+        }
+        guard let uid = currentUserAuthId, existing.creator_user_id == uid else {
+            throw PickupGameClientError.pickupGameNotOrganizer
+        }
+        struct PollCreatePermissionUpdate: Encodable {
+            let poll_create_permission: String
+        }
+        let payload = PollCreatePermissionUpdate(poll_create_permission: permission.rawValue)
+        let updated: [PickupGameRow] = try await supabase
+            .from("pickup_games")
+            .update(payload)
+            .eq("id", value: id.uuidString.lowercased())
+            .select(pickupGamesSelectColumns)
+            .execute()
+            .value
+        guard let row = updated.first else {
+            throw PickupGameClientError.missingRowAfterWrite
+        }
         mergePickupInsertedLocally(row)
     }
 
@@ -1249,6 +1315,7 @@ extension MapViewModel {
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
             remove_after_at: removeISO
         )
+        await ensurePickupGameChatForEditNotificationsIfNeeded(pickupGameId: id)
         let updated: [PickupGameRow] = try await supabase
             .from("pickup_games")
             .update(payload)
@@ -1275,6 +1342,73 @@ extension MapViewModel {
 #if DEBUG
         print("[PickupGames] edit requested id=\(id.uuidString.lowercased())")
 #endif
+    }
+
+    /// Soft-clears hosted games whose auto-clear deadline has passed (Going → Hosting).
+    /// Idempotent; safe to call from appear / minute tick / foreground.
+    func clearExpiredHostedPickupGamesIfNeeded(now: Date = Date(), reason: String) async {
+        let candidates = myPickupGamesForSettings.filter { PickupHostingAutoClear.isPastDeadline(row: $0, now: now) }
+        guard !candidates.isEmpty else { return }
+#if DEBUG
+        print("[PickupHostingAutoClear] reason=\(reason) candidates=\(candidates.count)")
+#endif
+        for row in candidates {
+            do {
+                try await clearHostedPickupGame(id: row.id, reason: reason)
+            } catch {
+#if DEBUG
+                print(
+                    "[PickupHostingAutoClear] failed id=\(row.id.uuidString.lowercased()) " +
+                    "reason=\(reason) error=\(error.localizedDescription)"
+                )
+#endif
+            }
+        }
+    }
+
+    /// Soft-clears one hosted pickup (auto or manual). Dedupes overlapping attempts via in-flight set.
+    func clearHostedPickupGame(id: UUID, reason: String) async throws {
+        let started: Bool = await MainActor.run {
+            pickupHostingAutoClearInFlightIds.insert(id).inserted
+        }
+        if !started {
+            // Another clear is already running for this game — wait briefly for it to finish.
+            for _ in 0..<50 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                let stillPresent = await MainActor.run { myPickupGamesForSettings.contains(where: { $0.id == id }) }
+                let stillInFlight = await MainActor.run { pickupHostingAutoClearInFlightIds.contains(id) }
+                if !stillPresent { return }
+                if !stillInFlight { break }
+            }
+            let stillPresent = await MainActor.run { myPickupGamesForSettings.contains(where: { $0.id == id }) }
+            guard stillPresent else { return }
+            let retried = await MainActor.run { pickupHostingAutoClearInFlightIds.insert(id).inserted }
+            guard retried else { return }
+        }
+
+        defer {
+            Task { @MainActor in
+                pickupHostingAutoClearInFlightIds.remove(id)
+            }
+        }
+
+#if DEBUG
+        print("[PickupHostingAutoClear] clear start id=\(id.uuidString.lowercased()) reason=\(reason)")
+#endif
+        do {
+            try await deletePickupGame(id: id)
+            _ = await MainActor.run {
+                pickupHostingAutoClearFailedIds.remove(id)
+            }
+#if DEBUG
+            print("[PickupHostingAutoClear] clear success id=\(id.uuidString.lowercased()) reason=\(reason)")
+#endif
+        } catch {
+            _ = await MainActor.run {
+                pickupHostingAutoClearFailedIds.insert(id)
+            }
+            throw error
+        }
     }
 
     /// Organizer cancels the pickup (soft delete). Join requests are cancelled server-side; ratings/history rows are not deleted.
@@ -1304,6 +1438,9 @@ extension MapViewModel {
             .limit(1)
             .execute()
         let affectedRequests = affectedResponse.count ?? 0
+
+        // Cancellation system message needs an existing private chat when members are present.
+        await ensurePickupGameChatForEditNotificationsIfNeeded(pickupGameId: id)
 
         let softPayload = PickupGameSoftRemoveUpdate(status: "removed", is_visible: false, remove_after_at: nowISO)
         let updatedRows: [PickupGameRow] = try await supabase

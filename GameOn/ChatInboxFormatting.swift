@@ -18,7 +18,15 @@ enum ChatInboxPreviewFormatting {
         if trimmed.isEmpty {
             displayBody = ""
         } else {
-            displayBody = FanProfileShareMessage.inboxPreview(from: trimmed) ?? trimmed
+            displayBody = FanProfileShareMessage.inboxPreview(from: trimmed)
+                ?? PickupGameShareMessage.inboxPreview(from: trimmed)
+                ?? ProGameShareMessage.inboxPreview(from: trimmed)
+                ?? VenueShareMessage.inboxPreview(from: trimmed)
+                ?? ChatLocationShareMessage.inboxPreview(from: trimmed, languageCode: languageCode)
+                ?? ChatLiveLocationShareMessage.inboxPreview(from: trimmed, languageCode: languageCode)
+                ?? ChatOnMyWayMessage.inboxPreview(from: trimmed, languageCode: languageCode)
+                ?? PickupGamePollMessage.inboxPreview(from: trimmed, languageCode: languageCode)
+                ?? trimmed
         }
 
         let cleaned = displayBody.trimmingCharacters(in: .whitespacesAndNewlines)

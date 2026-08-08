@@ -43,4 +43,63 @@ extension MapViewModel {
     private func liveMatchForSavedProGameDeepLink(_ saved: SavedProGame) -> LiveMatch? {
         liveMatches.first(where: { SavedProGame.directlyMatchesSavedProGame($0, saved) })
     }
+
+    /// Opens professional game detail from a chat share card.
+    @MainActor
+    func presentSharedProGameDetail(payload: ProGameSharePayload) {
+        if let match = resolveLiveMatchForSharedProGame(payload: payload) {
+            pendingSharedProGameDetailMatch = match
+#if DEBUG
+            print("[ProGameShareDebug] presentDetail gameId=\(match.id) source=resolved")
+#endif
+            return
+        }
+
+        let languageCode = L10n.normalizedLanguageCode(
+            UserDefaults.standard.string(forKey: L10n.appLanguageKey) ?? L10n.defaultLanguageCode
+        )
+        showSocialActionToast(
+            L10n.t("share_pro_game_unavailable", languageCode: languageCode),
+            isError: true
+        )
+#if DEBUG
+        print("[ProGameShareDebug] presentDetailUnavailable gameId=\(payload.gameId)")
+#endif
+    }
+
+    @MainActor
+    func clearSharedProGameDetailPresentation() {
+        pendingSharedProGameDetailMatch = nil
+    }
+
+    /// Prefer live/saved hydration; fall back to payload snapshot for offline/unavailable feeds.
+    func resolveLiveMatchForSharedProGame(payload: ProGameSharePayload) -> LiveMatch? {
+        let candidates = [
+            payload.gameId,
+            payload.stableKey
+        ]
+        .map { SavedProGame.normalizedHydrationToken($0) }
+        .filter { !$0.isEmpty }
+
+        for token in candidates {
+            if let match = resolveLiveMatchForProGameNotificationDeepLink(matchID: token) {
+                return match
+            }
+        }
+
+        if let saved = savedProGames.first(where: { saved in
+            let idToken = SavedProGame.normalizedHydrationToken(saved.id)
+            let keyToken = SavedProGame.normalizedHydrationToken(saved.stableKey)
+            return candidates.contains(idToken) || candidates.contains(keyToken)
+        }) {
+            if let live = liveMatchForSavedProGameDeepLink(saved) {
+                return live
+            }
+            if let reconstructed = saved.reconstructedLiveMatchForVenueImport() {
+                return reconstructed
+            }
+        }
+
+        return ProGameShareMessage.reconstructedLiveMatch(from: payload)
+    }
 }

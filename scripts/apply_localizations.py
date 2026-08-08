@@ -8504,6 +8504,7 @@ def main() -> None:
     bulk_paths = [
         Path(__file__).with_name("ui_translations_bulk.json"),
         Path(__file__).with_name("ui_hand_translations.json"),
+        Path(__file__).with_name("trust_safety_localizations.json"),
     ]
     for bulk_path in bulk_paths:
         if not bulk_path.exists():

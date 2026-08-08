@@ -41,6 +41,46 @@ extension MapViewModel {
         pendingFollowingMapVenueSnapshot = snapshot
     }
 
+    /// Opens favorite-spot / venue detail from a chat share card (Discover + venue sheet when available).
+    @MainActor
+    func presentSharedVenueDetail(payload: VenueSharePayload) {
+        Task { @MainActor in
+            let languageCode = L10n.normalizedLanguageCode(
+                UserDefaults.standard.string(forKey: L10n.appLanguageKey) ?? L10n.defaultLanguageCode
+            )
+            guard let bar = await resolveBarVenueForShare(payload: payload) else {
+                showSocialActionToast(
+                    L10n.t("share_favorite_spot_unavailable", languageCode: languageCode),
+                    isError: true
+                )
+#if DEBUG
+                print("[VenueShareDebug] presentDetailUnavailable venueId=\(payload.venueId.uuidString.lowercased())")
+#endif
+                return
+            }
+
+            if !bars.contains(where: { $0.id == bar.id }) {
+                bars.append(bar)
+            }
+            prepareDiscoverFavoriteSpotBrowsingContext()
+            // Focus map + open canonical VenueDetailView via Discover's discoverFocusVenueId path.
+            pendingFollowingMapVenueID = bar.id
+            pendingFollowingMapVenueSnapshot = bar
+            discoverFocusVenueId = bar.id
+#if DEBUG
+            print("[VenueShareDebug] presentDetail venueId=\(bar.id.uuidString.lowercased()) name=\(bar.name)")
+#endif
+        }
+    }
+
+    /// Prefer live/saved caches; fetch active venue by id; never invent a venue from payload alone.
+    func resolveBarVenueForShare(payload: VenueSharePayload) async -> BarVenue? {
+        let id = payload.venueId
+        if let bar = bars.first(where: { $0.id == id }) { return bar }
+        if let bar = followingTabSavedVenues.first(where: { $0.id == id }) { return bar }
+        return await fetchBarVenueByIdFromSupabase(id: id)
+    }
+
     /// Pickup row in Following: switch to Discover and focus this pickup game when consumed.
     func requestDiscoverFocusForPickupGame(id: UUID, snapshot: PickupGameRow?) {
         pendingFollowingMapPickupGameID = id
@@ -50,6 +90,62 @@ extension MapViewModel {
     /// Hosted pickup row in Following: switch to Discover and focus this pickup game when consumed.
     func requestDiscoverFocusForHostedPickupGame(_ row: PickupGameRow) {
         requestDiscoverFocusForPickupGame(id: row.id, snapshot: row)
+    }
+
+    /// Group Info “View Pickup Game”: dismiss overlays first (caller), then Discover focus + existing detail sheet.
+    /// Avoids presenting `pendingSharedPickupGameDetailToken` behind an already-presented Group Info sheet.
+    func openPickupGameFromChatGroupInfo(gameId: UUID, snapshot: PickupGameRow?) {
+        guard !isRoutingPickupGameFromChatGroupInfo else { return }
+        isRoutingPickupGameFromChatGroupInfo = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isRoutingPickupGameFromChatGroupInfo = false }
+
+            // Let Group Info finish dismissing before touching MainTab presentation / tab switch.
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 50_000_000)
+
+            if self.discoverMapContentMode != .pickupGames {
+                self.clearDiscoverMapContentSelectionsWhenSwitching(to: .pickupGames)
+                self.discoverMapContentMode = .pickupGames
+            }
+            if self.discoverPickupSubMode != .games {
+                self.discoverPickupSubMode = .games
+            }
+
+            let row = self.resolvedPickupGameRow(for: gameId) ?? snapshot
+
+            // Clear any prior pending id so MainTab `onChange` always fires for this tap.
+            if self.pendingFollowingMapPickupGameID != nil {
+                self.pendingFollowingMapPickupGameID = nil
+                self.pendingFollowingMapPickupGameSnapshot = nil
+                await Task.yield()
+            }
+
+            self.requestDiscoverFocusForPickupGame(id: gameId, snapshot: row)
+
+            // Wait briefly for MainTab Discover switch + consumeFollowingPickupGameNavigationIfPending.
+            for _ in 0..<24 {
+                if self.pendingFollowingMapPickupGameID == nil { break }
+                await Task.yield()
+                try? await Task.sleep(nanoseconds: 25_000_000)
+            }
+
+            // No-coordinate / consume-early-exit: still select so Discover has a focused game.
+            if self.selectedPickupGameForMap?.id != gameId, let row {
+                self.mergePickupInsertedLocally(row)
+                self.selectPickupGameOnMap(row)
+            }
+
+            if self.pendingSharedPickupGameDetailToken != nil {
+                self.pendingSharedPickupGameDetailToken = nil
+                await Task.yield()
+            }
+            self.presentSharedPickupGameDetail(gameId: gameId)
+#if DEBUG
+            print("[PickupGroupInfoNav] openDiscoverDetail gameId=\(gameId.uuidString.lowercased()) selected=\(self.selectedPickupGameForMap?.id.uuidString.lowercased() ?? "nil")")
+#endif
+        }
     }
 
     /// Resolve ``pendingFollowingMapVenueID`` using snapshot, ``bars``, Supabase by id, coordinates, or geocoded address — never requires the venue to already be in the current map region.
@@ -158,16 +254,6 @@ extension MapViewModel {
             return
         }
 
-        guard let coordinate = await followingPickupCoordinate(for: row) else {
-#if DEBUG
-            print("[FollowingPickupMapNav] no usable coordinates gameId=\(id.uuidString.lowercased())")
-#endif
-            followingMapNavigationMessage = "This game does not have a map location yet."
-            scheduleFollowingMapNavigationMessageClear()
-            return
-        }
-        let focusedRow = Self.pickupRow(row, withCoordinate: coordinate)
-
         if discoverMapContentMode != .pickupGames {
             clearDiscoverMapContentSelectionsWhenSwitching(to: .pickupGames)
             discoverMapContentMode = .pickupGames
@@ -176,8 +262,8 @@ extension MapViewModel {
             discoverPickupSubMode = .games
         }
 
-        selectedSport = focusedRow.sport
-        if let start = PickupGameModels.parseSupabaseTimestamptz(focusedRow.game_start_at) {
+        selectedSport = row.sport
+        if let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) {
             let requestID = beginDiscoverDateChange(to: start)
             scheduleDiscoverSelectedDayRefresh(requestID: requestID)
         }
@@ -185,6 +271,18 @@ extension MapViewModel {
         selectedBar = nil
         selectedEvent = nil
         selectedPickupPlaceForMap = nil
+
+        guard let coordinate = await followingPickupCoordinate(for: row) else {
+#if DEBUG
+            print("[FollowingPickupMapNav] no usable coordinates gameId=\(id.uuidString.lowercased()) — selecting without center")
+#endif
+            // Still select so preview/detail deep links can open without a map pin.
+            mergePickupInsertedLocally(row)
+            selectPickupGameOnMap(row)
+            return
+        }
+        let focusedRow = Self.pickupRow(row, withCoordinate: coordinate)
+
         centerDiscoverMapOnPickupCoordinate(coordinate)
         mergePickupInsertedLocally(focusedRow)
         selectPickupGameOnMap(focusedRow)

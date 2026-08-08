@@ -6623,7 +6623,8 @@ extension MapViewModel {
         }
     }
 
-    // Uploads full + thumbnail JPEGs under the owner’s email folder in `venue-photos`; returns the full image public URL.
+    // Uploads full + thumbnail JPEGs under the owner's auth.uid() folder in `venue-photos`.
+    // Legacy email-folder URLs remain readable; new writes use UID ownership (20260915_0004).
     func uploadVenuePhoto(data: Data, fileName: String, assignToCurrentVenueProfile: Bool = true) async -> String? {
         if await businessBanGuardBlocks(path: "venuePhoto", action: "uploadVenuePhoto") {
             return nil
@@ -6634,17 +6635,19 @@ extension MapViewModel {
             DebugLogGate.debug("CURRENT SUPABASE USER: \(session?.user.email ?? "NO USER")")
             DebugLogGate.debug("VENUE OWNER EMAIL: \(venueOwnerEmail)")
 
-            let safeEmail = OwnerBusinessEmail.normalized(venueOwnerEmail)
-                .replacingOccurrences(of: "@", with: "_")
-                .replacingOccurrences(of: ".", with: "_")
+            guard let ownerUserId = session?.user.id else {
+                DebugLogGate.debug("[VenuePhotoSaveDebug] uploadAborted reason=missing_auth_uid")
+                return nil
+            }
+            let folder = ownerUserId.uuidString.lowercased()
 
             let fieldName = fileName.lowercased().contains("menu") ? "menu_photo_url" : "cover_photo_url"
-            DebugLogGate.debug("[VenuePhotoSaveDebug] uploadStarted field=\(fieldName)")
+            DebugLogGate.debug("[VenuePhotoSaveDebug] uploadStarted field=\(fieldName) folder=\(folder)")
 
             let storedFileName = Self.versionedVenuePhotoFileName(for: fileName)
-            let pathFull = "\(safeEmail)/\(storedFileName)"
+            let pathFull = "\(folder)/\(storedFileName)"
             let thumbName = Self.companionVenueThumbnailFileName(for: storedFileName)
-            let pathThumb = "\(safeEmail)/\(thumbName)"
+            let pathThumb = "\(folder)/\(thumbName)"
 
             let oldFull: String
             let oldThumb: String

@@ -56,12 +56,14 @@ enum ProfilePhase1PersonalizationCache {
             incomingPokesByAuthId.removeAll()
             suggestedFansLoadedAtByAuthId.removeAll()
             suggestedFansByAuthId.removeAll()
+            PublicUserProfileProcessCache.clearAll(reason: "personalizationCacheClearedAll")
             return
         }
         incomingPokesLoadedAtByAuthId.removeValue(forKey: authId)
         incomingPokesByAuthId.removeValue(forKey: authId)
         suggestedFansLoadedAtByAuthId.removeValue(forKey: authId)
         suggestedFansByAuthId.removeValue(forKey: authId)
+        PublicUserProfileProcessCache.invalidate(userId: authId, reason: "personalizationCacheCleared")
     }
 }
 
@@ -374,7 +376,8 @@ struct ProfileIdentityCard: View {
         viewModel.currentUserFanXP
     }
 
-    private var reputation: FanReputationProfile {
+    /// Reputation is DEBUG-logged on appear only — never evaluate during SwiftUI body.
+    private func evaluateReputationForDebugLog() -> FanReputationProfile {
         FanReputationEngine.evaluate(
             FanReputationSignals(
                 fanXP: fanXP,
@@ -659,7 +662,10 @@ struct ProfileIdentityCard: View {
 #endif
                 DebugLogGate.debug("[PokesConsolidation] propsUIRemoved")
                 DebugLogGate.debug("[PokesConsolidation] primarySocialSurface=pokes")
-                FanReputationEngine.log(reputation)
+                seedPersonalizationFromProcessCacheIfNeeded()
+#if DEBUG
+                FanReputationEngine.log(evaluateReputationForDebugLog())
+#endif
                 scheduleProfileBelowFoldSectionsIfNeeded()
             }
             .onChange(of: viewModel.currentUserBio) { _, newValue in
@@ -1602,6 +1608,37 @@ struct ProfileIdentityCard: View {
     private func refreshIncomingPokesLive(reason: String, forceRefresh: Bool = false) async {
         guard isAccountTabActive else { return }
         await loadIncomingPokes(ignoreCache: forceRefresh, reason: reason)
+    }
+
+    @MainActor
+    private func seedPersonalizationFromProcessCacheIfNeeded() {
+        guard let authId = viewModel.currentUserAuthId else { return }
+        if incomingPokes.isEmpty,
+           let cached = ProfilePhase1PersonalizationCache.incomingPokesByAuthId[authId],
+           !cached.isEmpty {
+            incomingPokes = cached
+            incomingPokeTotalCount = cached.count
+            incomingPokesMessage = nil
+            isLoadingIncomingPokes = false
+            lastIncomingPokesFingerprint = cached.map(\.id.uuidString).joined(separator: "|")
+#if DEBUG
+            AccountActivationPerf.log("seededPokesFromProcessCache count=\(cached.count)")
+#endif
+        }
+        if suggestedFans.isEmpty,
+           let loadedAt = ProfilePhase1PersonalizationCache.suggestedFansLoadedAtByAuthId[authId],
+           Date().timeIntervalSince(loadedAt) < ProfilePhase1PersonalizationCache.ttlSeconds {
+            let cached = ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] ?? []
+            suggestedFans = cached
+            suggestedFansMessage = nil
+            suggestedFansLoadFailed = false
+            isLoadingSuggestedFans = false
+            hasCompletedSuggestedFansLoad = true
+            rememberSuggestedFansSignalFingerprint()
+#if DEBUG
+            AccountActivationPerf.log("seededSuggestedFansFromProcessCache count=\(cached.count)")
+#endif
+        }
     }
 
     @MainActor

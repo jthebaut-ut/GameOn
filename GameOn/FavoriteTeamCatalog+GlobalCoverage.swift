@@ -72,6 +72,7 @@ extension FavoriteTeamCatalog {
         make("wnba-lynx", "Minnesota Lynx", .basketball, "WNBA", "basketball.fill", 0.12, 0.42, 0.32, region: "North America", kind: .team, shortCode: "LYN"),
         make("wnba-storm", "Seattle Storm", .basketball, "WNBA", "basketball.fill", 0.12, 0.48, 0.28, region: "North America", kind: .team, shortCode: "SEA"),
         make("wnba-mercury", "Phoenix Mercury", .basketball, "WNBA", "basketball.fill", 0.78, 0.22, 0.42, region: "North America", kind: .team, shortCode: "PHX"),
+        make("wnba-fever", "Indiana Fever", .basketball, "WNBA", "basketball.fill", 0.78, 0.12, 0.22, region: "North America", kind: .team, shortCode: "IND", aliases: ["Fever"]),
     ]
 
     private static let globalBasketballNationalTeams: [FavoriteTeam] = [

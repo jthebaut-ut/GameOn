@@ -1,6 +1,8 @@
 import CoreLocation
 import Foundation
+import MapKit
 import Supabase
+import SwiftUI
 
 private enum DiscoverVenueGameDateFormatting {
     static let sqlDate: DateFormatter = {
@@ -66,7 +68,7 @@ private struct GameonCalendarDotRPCRow: Decodable {
 
 // MARK: - Discover disk snapshot (venues + venue_events + merged events for instant map/calendar)
 
-nonisolated private struct DiscoverPersistedBarVenue: Codable {
+nonisolated struct DiscoverPersistedBarVenue: Codable {
     let id: UUID
     let name: String
     let address: String
@@ -178,11 +180,34 @@ nonisolated private struct DiscoverPersistedBarVenue: Codable {
     }
 }
 
-nonisolated private struct DiscoverCoreDiskSnapshot: Codable {
+nonisolated struct DiscoverCoreDiskSnapshot: Codable {
     var savedAt: Date
     var bars: [DiscoverPersistedBarVenue]
     var venueEventRows: [VenueEventRow]
     var events: [SportsEvent]
+    /// Optional coverage of the viewport that produced this snapshot (absent on legacy files).
+    var coverageMinLat: Double?
+    var coverageMaxLat: Double?
+    var coverageMinLon: Double?
+    var coverageMaxLon: Double?
+    var centerLat: Double?
+    var centerLon: Double?
+    var latitudeDelta: Double?
+    var longitudeDelta: Double?
+
+    var hasGeographicMetadata: Bool {
+        coverageMinLat != nil && coverageMaxLat != nil && coverageMinLon != nil && coverageMaxLon != nil
+    }
+
+    func resolvedCoverageBounds() -> (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)? {
+        if let minLat = coverageMinLat,
+           let maxLat = coverageMaxLat,
+           let minLon = coverageMinLon,
+           let maxLon = coverageMaxLon {
+            return (minLat, maxLat, minLon, maxLon)
+        }
+        return nil
+    }
 }
 
 private struct DiscoverVisibleVenueContext {
@@ -471,6 +496,7 @@ extension MapViewModel {
     func renderCachedDiscoverCore() async {
         let t0 = Date()
         discoverSnapshotRestoredThisLaunch = false
+        pendingDiscoverCoreSnapshot = nil
         let snap = await Task.detached(priority: .userInitiated) {
             MapViewModel.decodeDiscoverCoreDiskSnapshotIfPresent()
         }.value
@@ -481,17 +507,93 @@ extension MapViewModel {
             #endif
             return
         }
+        pendingDiscoverCoreSnapshot = snap
+        // Do not paint pins until the startup camera basis is known and geo-overlap is validated.
+        // Applying here races GPS and caused wrong-region flashes (e.g. Utah while resolving France).
+        #if DEBUG
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        let geo = snap.hasGeographicMetadata ? "keyed" : "unkeyedLegacy"
+        print("[CriticalPath] cached core decoded ms=\(ms) bars=\(snap.bars.count) events=\(snap.events.count) geo=\(geo) pendingApply=true")
+        #endif
+    }
+
+    /// Applies a pending Discover disk snapshot only when it overlaps the current startup viewport
+    /// and the camera is not a provisional broad fallback (device region / world).
+    @discardableResult
+    func applyPendingDiscoverCoreSnapshotIfGeographicallyRelevant() -> Bool {
+        guard let snap = pendingDiscoverCoreSnapshot else { return false }
+
+        // Provisional broad cameras must not paint local caches (Utah-in-world flash).
+        if !discoverStartupCameraBasis.isTrustedForGeographicFetch {
+            #if DEBUG
+            print(
+                "[CriticalPath] cached core skipped reason=provisionalBroadCamera "
+                    + "basis=\(discoverStartupCameraBasis.rawValue) bars=\(snap.bars.count)"
+            )
+            #endif
+            return false
+        }
+
+        guard discoverGeographicNetworkFetchAllowed() else {
+            #if DEBUG
+            print("[CriticalPath] cached core skipped reason=viewportTooBroadForCacheApply")
+            #endif
+            return false
+        }
+
+        guard let cameraBounds = currentMapRegionBounds() else {
+            #if DEBUG
+            print("[CriticalPath] cached core skipped reason=noCameraBounds")
+            #endif
+            return false
+        }
+
+        let coverage = snap.resolvedCoverageBounds()
+        guard let coverage else {
+            // Legacy unkeyed snapshots: never auto-paint on startup (wrong-region flash risk).
+            pendingDiscoverCoreSnapshot = nil
+            #if DEBUG
+            print("[CriticalPath] cached core skipped reason=unkeyedLegacyNoGeoMetadata bars=\(snap.bars.count)")
+            #endif
+            return false
+        }
+
+        guard Self.discoverCoverageOverlapsCamera(coverage: coverage, camera: cameraBounds) else {
+            pendingDiscoverCoreSnapshot = nil
+            #if DEBUG
+            print(
+                "[CriticalPath] cached core skipped reason=geoMismatch "
+                    + "basis=\(discoverStartupCameraBasis.rawValue) bars=\(snap.bars.count)"
+            )
+            #endif
+            return false
+        }
+
+        pendingDiscoverCoreSnapshot = nil
         applyRestoredDiscoverCoreSnapshot(snap, deferRecomputeCalendarDotDates: true)
         discoverSnapshotRestoredThisLaunch = true
         #if DEBUG
-        let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        print("[CriticalPath] cached core rendered ms=\(ms) bars=\(bars.count) events=\(events.count)")
+        print(
+            "[CriticalPath] cached core applied bars=\(bars.count) events=\(events.count) "
+                + "basis=\(discoverStartupCameraBasis.rawValue)"
+        )
         #endif
         Task { @MainActor [weak self] in
             await Task.yield()
             guard let self else { return }
             self.recomputeCalendarDotDates()
         }
+        return true
+    }
+
+    private static func discoverCoverageOverlapsCamera(
+        coverage: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double),
+        camera: (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)
+    ) -> Bool {
+        coverage.minLat <= camera.maxLat
+            && coverage.maxLat >= camera.minLat
+            && coverage.minLon <= camera.maxLon
+            && coverage.maxLon >= camera.minLon
     }
 
     private func applyRestoredDiscoverCoreSnapshot(
@@ -527,11 +629,21 @@ extension MapViewModel {
 
     func persistDiscoverCoreSnapshot() {
         guard !bars.isEmpty else { return }
+        let bounds = currentMapRegionBounds()
+        let region = cameraPosition.region
         let snap = DiscoverCoreDiskSnapshot(
             savedAt: Date(),
             bars: bars.map { DiscoverPersistedBarVenue(bar: $0) },
             venueEventRows: venueEventRows,
-            events: events
+            events: events,
+            coverageMinLat: bounds?.minLat,
+            coverageMaxLat: bounds?.maxLat,
+            coverageMinLon: bounds?.minLon,
+            coverageMaxLon: bounds?.maxLon,
+            centerLat: region?.center.latitude,
+            centerLon: region?.center.longitude,
+            latitudeDelta: region?.span.latitudeDelta,
+            longitudeDelta: region?.span.longitudeDelta
         )
         let url = Self.discoverCoreSnapshotFileURL()
         let dataToWrite: Data
@@ -564,6 +676,7 @@ extension MapViewModel {
         TabPerfDebug.log("[TabPerfDebug] refreshStarted=discover source=core force=\(forceVenueRefresh)")
         print("[Perf] Discover startup begin forceVenueRefresh=\(forceVenueRefresh)")
         #endif
+        applyPendingDiscoverCoreSnapshotIfGeographicallyRelevant()
         await loadVenuesFromSupabase(forceRefresh: forceVenueRefresh)
         scheduleDiscoverFullEnrichmentInBackground()
         lastDiscoverCoreRefreshAt = Date()
@@ -573,7 +686,7 @@ extension MapViewModel {
         print("[CriticalPath] fresh core visible ms=\(ms) bars=\(bars.count) events=\(events.count)")
         if startupDiscoverPreloadCompletionLogPending {
             startupDiscoverPreloadCompletionLogPending = false
-            print("[StartupDiscover] preloadCompleted venues=\(bars.count) events=\(events.count)")
+            print("[StartupDiscover] preloadCompleted venues=\(bars.count) events=\(events.count) basis=\(discoverStartupCameraBasis.rawValue)")
         }
         #endif
     }
@@ -2974,6 +3087,23 @@ extension MapViewModel {
         discoverSelectedDayRefreshTask?.cancel()
         discoverSelectedDayRefreshTask = nil
 
+        // Broad provisional cameras (device region / world) and user zoomed-out country/world
+        // views must not issue giant Phase‑1 queries. Local GPS / lastKnown / bounded user
+        // viewports proceed with existing semantics.
+        if !discoverGeographicNetworkFetchAllowed() {
+            isLoadingMapVenues = false
+            isRefreshingMapVenues = false
+            if loadVenuesRequestID == requestID {
+                loadVenuesRequestID = nil
+                loadVenuesPhase1AppliedRequestID = nil
+            }
+#if DEBUG
+            print("[CommunityVenuePerf] fetchSkipped reason=viewportTooBroad basis=\(discoverStartupCameraBasis.rawValue)")
+            print("[DiscoverPerf] map venue reload SKIPPED broadViewport")
+#endif
+            return
+        }
+
         if forceRefresh {
             discoverViewportVenueRowsCache.removeAll()
             discoverVenueEventsFetchCache = nil
@@ -3125,6 +3255,12 @@ extension MapViewModel {
             print("[CommunityVenuePerf] decodeMs=\(decodeMs)")
 #endif
 
+            guard loadVenuesRequestIsCurrent(phase: "phase1PrePublish") else { return }
+            if !isDiscoverTabSelectedForEnrichment {
+                _ = await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: "discoverPhase1Apply")
+                guard loadVenuesRequestIsCurrent(phase: "phase1AfterTabYield") else { return }
+            }
+
             discoverClusteredBarsCacheKey = nil
             discoverClusteredBarsCache = nil
 
@@ -3217,6 +3353,10 @@ extension MapViewModel {
             }.value
 
             guard loadVenuesRequestIsCurrent(phase: "phase2") else { return }
+            if !isDiscoverTabSelectedForEnrichment {
+                _ = await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: "discoverPhase2Apply")
+                guard loadVenuesRequestIsCurrent(phase: "phase2AfterTabYield") else { return }
+            }
             discoverClusteredBarsCacheKey = nil
             discoverClusteredBarsCache = nil
 

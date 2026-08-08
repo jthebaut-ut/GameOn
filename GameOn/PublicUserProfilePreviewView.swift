@@ -28,6 +28,7 @@ struct PublicUserProfilePreviewView: View {
     @State private var showBlockFanConfirmation = false
     @State private var showReportFanSheet = false
     @State private var showCancelFriendRequestConfirmation = false
+    @State private var showRemoveFriendConfirmation = false
     @State private var isBlockActionInFlight = false
     @State private var safetyActionBanner: String?
 
@@ -101,7 +102,10 @@ struct PublicUserProfilePreviewView: View {
                 }
                 if profile?.isPubliclyVisible == true,
                    !viewingAsSelfPreview,
-                   (profile?.isDiscoverableByFans == true || canShowSafetyActions) {
+                   (profile?.isDiscoverableByFans == true
+                    || canShowSafetyActions
+                    || friendButtonState == .messageFriend
+                    || friendButtonState == .friendshipRequested) {
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
                             if profile?.isDiscoverableByFans == true {
@@ -110,6 +114,24 @@ struct PublicUserProfilePreviewView: View {
                                 } label: {
                                     Label(L10n.t("share_profile", languageCode: appLanguageRaw), systemImage: "square.and.arrow.up")
                                 }
+                            }
+
+                            if friendButtonState == .messageFriend {
+                                Button(role: .destructive) {
+                                    showRemoveFriendConfirmation = true
+                                } label: {
+                                    Label("Remove Friend", systemImage: "person.badge.minus")
+                                }
+                                .disabled(isFriendActionInFlight)
+                            }
+
+                            if friendButtonState == .friendshipRequested {
+                                Button(role: .destructive) {
+                                    showCancelFriendRequestConfirmation = true
+                                } label: {
+                                    Label(L10n.t("cancel_friend_request", languageCode: appLanguageRaw), systemImage: "person.badge.minus")
+                                }
+                                .disabled(isFriendActionInFlight)
                             }
 
                             if canShowSafetyActions {
@@ -123,23 +145,6 @@ struct PublicUserProfilePreviewView: View {
                                     showBlockFanConfirmation = true
                                 } label: {
                                     Label(L10n.t("block_fan", languageCode: appLanguageRaw), systemImage: "nosign")
-                                }
-
-                                if canShowPokeControls(for: userId) {
-                                    Button {
-                                        Task { await sendPoke(to: userId) }
-                                    } label: {
-                                        Label(pokeButtonTitle, systemImage: "hand.wave.fill")
-                                    }
-                                    .disabled(isPokeActionDisabled || isPokeInFlight)
-                                }
-
-                                if friendButtonState == .friendshipRequested {
-                                    Button(role: .destructive) {
-                                        showCancelFriendRequestConfirmation = true
-                                    } label: {
-                                        Label(L10n.t("cancel_friend_request", languageCode: appLanguageRaw), systemImage: "person.badge.minus")
-                                    }
                                 }
                             }
                         } label: {
@@ -178,6 +183,18 @@ struct PublicUserProfilePreviewView: View {
                 Text("This will remove your pending request.")
             }
             .confirmationDialog(
+                removeFriendConfirmationTitle,
+                isPresented: $showRemoveFriendConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Remove Friend", role: .destructive) {
+                    Task { await removeFriend() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(L10n.t("dm_unfriend_confirm_body", languageCode: appLanguageRaw))
+            }
+            .confirmationDialog(
                 "Block \(profile?.displayName ?? "this fan")?",
                 isPresented: $showBlockFanConfirmation,
                 titleVisibility: .visible
@@ -191,20 +208,34 @@ struct PublicUserProfilePreviewView: View {
             }
         }
         .task(id: userId) {
-            // Clear cached profile/poke state when switching users so mutual-friend
-            // (and other) data from the previous profile never flash or stick.
-            profile = nil
-            pokeSummary = nil
-            pokeActionError = nil
-            pokeJustSucceeded = false
-            friendActionError = nil
+            // Prefer a process-cache snapshot immediately; never flash another user's data.
+            if let cached = PublicUserProfileProcessCache.lookup(for: userId) {
+                profile = cached.data
+                pokeSummary = nil
+                pokeActionError = nil
+                pokeJustSucceeded = false
+                friendActionError = nil
+                isLoading = false
+#if DEBUG
+                print(
+                    "[PublicProfileCache] reopenHit userId=\(userId.uuidString.lowercased()) fresh=\(cached.isFresh)"
+                )
+#endif
+            } else {
+                profile = nil
+                pokeSummary = nil
+                pokeActionError = nil
+                pokeJustSucceeded = false
+                friendActionError = nil
+            }
             await loadProfile()
             await loadPokeSummary(for: userId)
         }
         .onReceive(NotificationCenter.default.publisher(for: FanProfileChangeCenter.avatarDidChangeNotification)) { notification in
             guard let change = FanProfileChangeCenter.avatarChange(from: notification),
-                  change.userId == userId,
-                  let current = profile else { return }
+                  change.userId == userId else { return }
+            PublicUserProfileProcessCache.invalidate(userId: userId, reason: "avatarChange")
+            guard let current = profile else { return }
             let nextFull = change.avatarURL.isEmpty ? current.avatarURL : change.avatarURL
             let nextThumb = change.avatarThumbnailURL ?? current.avatarThumbnailURL
             let curFull = ImageDisplayURL.canonicalStorageURLString(current.avatarURL)
@@ -212,18 +243,23 @@ struct PublicUserProfilePreviewView: View {
             let newFull = ImageDisplayURL.canonicalStorageURLString(nextFull)
             let newThumb = ImageDisplayURL.canonicalStorageURLString(nextThumb)
             guard curFull != newFull || curThumb != newThumb else { return }
-            profile = current.replacingAvatars(avatarURL: nextFull, avatarThumbnailURL: nextThumb)
+            let updated = current.replacingAvatars(avatarURL: nextFull, avatarThumbnailURL: nextThumb)
+            profile = updated
+            PublicUserProfileProcessCache.store(updated)
         }
         .onChange(of: viewModel.publicProfileOpenToRevision) { _, _ in
             guard userId == viewModel.currentUserAuthId else { return }
+            PublicUserProfileProcessCache.invalidate(userId: userId, reason: "openToRevision")
             Task { await loadProfile() }
         }
         .onChange(of: viewModel.publicProfileHomeCrowdRevision) { _, _ in
             guard userId == viewModel.currentUserAuthId else { return }
+            PublicUserProfileProcessCache.invalidate(userId: userId, reason: "homeCrowdRevision")
             Task { await loadProfile() }
         }
         .onChange(of: viewModel.publicProfileBioRevision) { _, _ in
             guard userId == viewModel.currentUserAuthId else { return }
+            PublicUserProfileProcessCache.invalidate(userId: userId, reason: "bioRevision")
             Task { await loadProfile() }
         }
         .onChange(of: chatViewModel.friendshipChipByOtherUserId) { _, _ in
@@ -241,7 +277,6 @@ struct PublicUserProfilePreviewView: View {
                 isSelfPreview: viewingAsSelfPreview,
                 friendState: friendButtonState,
                 isFriendActionInFlight: isFriendActionInFlight,
-                canShowSafetyActions: canShowSafetyActions,
                 canPoke: canShowPokeControls(for: data.userId),
                 pokeTitle: pokeButtonTitle,
                 isPokeDisabled: isPokeActionDisabled,
@@ -257,19 +292,6 @@ struct PublicUserProfilePreviewView: View {
                 onMessage: {
                     guard !viewingAsSelfPreview else { return }
                     Task { await messageFriend(data) }
-                },
-                onEditProfile: { onDismiss() },
-                onShare: {
-                    guard !viewingAsSelfPreview else { return }
-                    showShareFanProfileSheet = true
-                },
-                onReport: {
-                    guard !viewingAsSelfPreview else { return }
-                    showReportFanSheet = true
-                },
-                onBlock: {
-                    guard !viewingAsSelfPreview else { return }
-                    showBlockFanConfirmation = true
                 },
                 onPoke: {
                     guard !viewingAsSelfPreview else { return }
@@ -372,7 +394,7 @@ struct PublicUserProfilePreviewView: View {
     private func performFriendAction(_ data: PublicUserProfileData) async {
         switch friendButtonState {
         case .messageFriend:
-            await messageFriend(data)
+            showRemoveFriendConfirmation = true
         case .requestFriendship:
             await requestFriendship(userId: data.userId)
         case .friendshipRequested:
@@ -380,6 +402,14 @@ struct PublicUserProfilePreviewView: View {
         case .hidden:
             break
         }
+    }
+
+    private var removeFriendConfirmationTitle: String {
+        let name = profile?.displayName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.isEmpty {
+            return "Remove Friend?"
+        }
+        return "Remove \(name)?"
     }
 
     private var profileUnavailableState: some View {
@@ -502,10 +532,20 @@ struct PublicUserProfilePreviewView: View {
 
     private func loadProfile() async {
         SuggestedFanProfileOpenDebug.serviceRequestStarted()
+        let processLookup = PublicUserProfileProcessCache.lookup(for: userId)
         await MainActor.run {
-            let isSilentRefresh = profile != nil
+            let isSilentRefresh = profile != nil || processLookup != nil
             if isSilentRefresh {
                 friendActionError = nil
+                if profile == nil, let processLookup {
+                    profile = processLookup.data
+                    isLoading = false
+#if DEBUG
+                    print(
+                        "[PublicProfileCache] appliedBeforeNetwork userId=\(userId.uuidString.lowercased()) fresh=\(processLookup.isFresh)"
+                    )
+#endif
+                }
             } else {
                 isLoading = true
                 friendActionError = nil
@@ -516,6 +556,36 @@ struct PublicUserProfilePreviewView: View {
         }
 
         await chatViewModel.loadIfNeeded()
+
+        // Fresh process cache: paint immediately and skip the network round-trip.
+        if let processLookup, processLookup.isFresh, !viewingAsSelfPreview {
+            let chip = chatViewModel.chipKind(forOtherUserId: userId)
+            let blocked = chatViewModel.isEitherDirectionBlocked(with: userId)
+            let isSelf = viewModel.currentUserAuthId == userId
+            let friendState = PublicUserProfileService.friendButtonState(
+                for: userId,
+                chipKind: chip,
+                isBlocked: blocked,
+                isSelf: isSelf,
+                isBusiness: processLookup.data.isBusinessAccount
+            )
+            await MainActor.run {
+                SuggestedFanProfileOpenDebug.rendererConstructionStarted()
+                profile = processLookup.data
+                isLoading = false
+                identityLoadWarning = processLookup.data.hasResolvedIdentity || !processLookup.data.isPubliclyVisible
+                    ? nil
+                    : "Limited profile — identity still loading. Tap Retry."
+                friendButtonState = friendState
+                if processLookup.data.isPubliclyVisible {
+                    SuggestedFanProfileOpenDebug.sheetPresented()
+                }
+#if DEBUG
+                print("[PublicProfileCache] networkSkippedFreshTTL userId=\(userId.uuidString.lowercased())")
+#endif
+            }
+            return
+        }
 
         var cached = viewModel.cachedUserProfileRowForPublicProfile(userId: userId)
         if cached == nil,
@@ -637,6 +707,7 @@ struct PublicUserProfilePreviewView: View {
 
         do {
             _ = try await profilePokesService.pokeProfile(targetUserId: targetUserId)
+            PublicUserProfileProcessCache.invalidate(userId: targetUserId, reason: "poke")
             await loadPokeSummary(for: targetUserId)
             await MainActor.run {
                 pokeJustSucceeded = true
@@ -699,8 +770,46 @@ struct PublicUserProfilePreviewView: View {
             friendActionError = nil
         }
         await chatViewModel.cancelOutgoingFriendRequest(to: userId)
+        PublicUserProfileProcessCache.invalidate(userId: userId, reason: "cancelFriendRequest")
         await MainActor.run {
             isFriendActionInFlight = false
+            refreshFriendButtonState()
+        }
+    }
+
+    private func removeFriend() async {
+        guard !isFriendActionInFlight else { return }
+        await MainActor.run {
+            isFriendActionInFlight = true
+            friendActionError = nil
+            chatViewModel.unfriendError = nil
+        }
+        let preview = profile?.userPreviewForMessaging
+        await chatViewModel.unfriend(peerUserId: userId, displayPreview: preview)
+
+        let removalFailed = await MainActor.run { () -> Bool in
+            if let error = chatViewModel.unfriendError, !error.isEmpty {
+                friendActionError = error
+                chatViewModel.unfriendError = nil
+                isFriendActionInFlight = false
+                refreshFriendButtonState()
+                return true
+            }
+            return false
+        }
+        guard !removalFailed else { return }
+
+        PublicUserProfileProcessCache.invalidate(userId: userId, reason: "removeFriend")
+        if let viewerId = viewModel.currentUserAuthId {
+            PublicUserProfileProcessCache.invalidate(userId: viewerId, reason: "removeFriend")
+        }
+        await MainActor.run {
+            isFriendActionInFlight = false
+            refreshFriendButtonState()
+        }
+        // Reload viewed profile so mutual/social chips stay consistent after friendship ends.
+        await loadProfile()
+        await MainActor.run {
             refreshFriendButtonState()
         }
     }
@@ -713,6 +822,7 @@ struct PublicUserProfilePreviewView: View {
         }
         await chatViewModel.sendFriendRequest(to: userId)
         await chatViewModel.refresh()
+        PublicUserProfileProcessCache.invalidate(userId: userId, reason: "friendRequest")
         await MainActor.run {
             isFriendActionInFlight = false
             refreshFriendButtonState()

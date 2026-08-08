@@ -33,116 +33,125 @@ struct ProfileSettingsSheetHost<Root: View>: View {
     }
 
     var body: some View {
-        NavigationStack(path: $navigator.path) {
-            root()
-                .environmentObject(navigator)
-                .environment(\.profileSettingsPrivacyRefreshToken, privacyRefreshToken)
-                .navigationTitle(navigationTitle)
-                .navigationBarTitleDisplayMode(.large)
-                .navigationDestination(for: ProfileSettingsRoute.self) { route in
-                    ProfileSettingsDestinationView(
-                        route: route,
-                        viewModel: viewModel,
-                        notificationSettingsStore: notificationSettingsStore,
-                        loginEmail: $loginEmail,
-                        onRequestFanSignIn: onRequestFanSignIn
-                    )
+        // Overlay must live in this sheet hierarchy (not MainTabView) — Settings is a
+        // separate presentation layer above the tab shell.
+        ZStack {
+            NavigationStack(path: $navigator.path) {
+                root()
                     .environmentObject(navigator)
-                }
-                .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button(closeTitle) {
-#if DEBUG
-                            SettingsNavigationDebug.log(
-                                "dismissSource=settingsCloseButton pathCount=\(navigator.path.count) path=\(navigator.pathSummary()) hostId=\(hostInstanceId.uuidString)"
-                            )
-#endif
-                            isPresented = false
-                        }
-                        .disabled(isCloseDisabled)
-                    }
-                }
-                .toolbarBackground(SettingsPremiumChrome.presentationBackground(colorScheme), for: .navigationBar)
-                .toolbarBackground(.visible, for: .navigationBar)
-                .toolbarColorScheme(colorScheme, for: .navigationBar)
-                .onAppear {
-#if DEBUG
-                    SettingsNavigationDebug.log(
-                        "settingsRootAppear pathCount=\(navigator.path.count) path=\(navigator.pathSummary()) hostId=\(hostInstanceId.uuidString)"
-                    )
-                    if !navigator.path.isEmpty {
-                        SettingsNavigationDebug.log(
-                            "pathDesyncDetected route=\(navigator.topRoute?.debugName ?? "nil") pathCount=\(navigator.path.count) source=settingsRootAppearWhilePathNonEmpty path=\(navigator.pathSummary())"
+                    .environment(\.profileSettingsPrivacyRefreshToken, privacyRefreshToken)
+                    .navigationTitle(navigationTitle)
+                    .navigationBarTitleDisplayMode(.large)
+                    .navigationDestination(for: ProfileSettingsRoute.self) { route in
+                        ProfileSettingsDestinationView(
+                            route: route,
+                            viewModel: viewModel,
+                            notificationSettingsStore: notificationSettingsStore,
+                            loginEmail: $loginEmail,
+                            onRequestFanSignIn: onRequestFanSignIn
                         )
+                        .environmentObject(navigator)
                     }
-#endif
-                }
-        }
-        .tint(FGColor.accentGreen)
-        // Keep the already-presented Settings sheet aligned with the canonical preference.
-        // WindowGroup `.preferredColorScheme` alone does not reliably update sheet UIKit chrome mid-presentation.
-        .preferredColorScheme(appearancePreference.colorScheme)
-        .background(SettingsPremiumChrome.presentationBackground(colorScheme).ignoresSafeArea())
-        .onChange(of: appearancePreferenceRaw) { _, newRaw in
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button(closeTitle) {
 #if DEBUG
-            let preference = FanGeoAppearancePreference(rawValue: newRaw) ?? .system
-            print("[SettingsAppearanceDebug] preferenceChanged=\(preference.rawValue) effectiveColorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
+                                SettingsNavigationDebug.log(
+                                    "dismissSource=settingsCloseButton pathCount=\(navigator.path.count) path=\(navigator.pathSummary()) hostId=\(hostInstanceId.uuidString)"
+                                )
 #endif
-        }
-        .onAppear {
+                                isPresented = false
+                            }
+                            .disabled(isCloseDisabled)
+                        }
+                    }
+                    .toolbarBackground(SettingsPremiumChrome.presentationBackground(colorScheme), for: .navigationBar)
+                    .toolbarBackground(.visible, for: .navigationBar)
+                    .toolbarColorScheme(colorScheme, for: .navigationBar)
+                    .onAppear {
 #if DEBUG
-            print("[SettingsAppearanceDebug] hostAppear preference=\(appearancePreference.rawValue) colorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
-            SettingsNavigationDebug.log(
-                "hostContentAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
-            )
-            SettingsNavigationDebug.log(
-                "hostAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
-            )
+                        SettingsNavigationDebug.log(
+                            "settingsRootAppear pathCount=\(navigator.path.count) path=\(navigator.pathSummary()) hostId=\(hostInstanceId.uuidString)"
+                        )
+                        if !navigator.path.isEmpty {
+                            SettingsNavigationDebug.log(
+                                "pathDesyncDetected route=\(navigator.topRoute?.debugName ?? "nil") pathCount=\(navigator.path.count) source=settingsRootAppearWhilePathNonEmpty path=\(navigator.pathSummary())"
+                            )
+                        }
 #endif
-            scheduleSettledRefreshIfNeeded()
+                    }
+            }
+            .tint(FGColor.accentGreen)
+            // Keep the already-presented Settings sheet aligned with the canonical preference.
+            // WindowGroup `.preferredColorScheme` alone does not reliably update sheet UIKit chrome mid-presentation.
+            .preferredColorScheme(appearancePreference.colorScheme)
+            .background(SettingsPremiumChrome.presentationBackground(colorScheme).ignoresSafeArea())
+            .onChange(of: appearancePreferenceRaw) { _, newRaw in
 #if DEBUG
-            // Manual validation / UI testing only; requires the explicit
-            // -FanGeoRunProfileSettingsSequentialNavValidation launch argument.
-            // The coordinator rejects duplicate runs from repeated host appearances.
-            ProfileSettingsSequentialNavValidation.scheduleIfExplicitlyEnabled(
-                navigator: navigator,
-                source: "hostAppear"
-            )
+                let preference = FanGeoAppearancePreference(rawValue: newRaw) ?? .system
+                print("[SettingsAppearanceDebug] preferenceChanged=\(preference.rawValue) effectiveColorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
 #endif
-        }
-        .onDisappear {
+            }
+            .onAppear {
 #if DEBUG
-            SettingsNavigationDebug.log(
-                "hostDisappear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
-            )
-            ProfileSettingsSequentialNavValidation.cancelRun(
-                navigatorId: navigator.instanceId,
-                reason: "hostDisappear"
-            )
-#endif
-        }
-        .onChange(of: navigator.path.count) { oldCount, newCount in
-#if DEBUG
-            SettingsNavigationDebug.log(
-                "pathCount \(oldCount)->\(newCount) path=\(navigator.pathSummary()) top=\(navigator.topRoute?.debugName ?? "nil") hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString)"
-            )
-#endif
-        }
-        .onChange(of: isPresented) { _, presented in
-#if DEBUG
-            SettingsNavigationDebug.log(
-                "hostIsPresented=\(presented) hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
-            )
-#endif
-            if !presented {
-#if DEBUG
-                ProfileSettingsSequentialNavValidation.cancelRun(
-                    navigatorId: navigator.instanceId,
-                    reason: "sheetDismissed"
+                print("[SettingsAppearanceDebug] hostAppear preference=\(appearancePreference.rawValue) colorScheme=\(colorScheme == .dark ? "dark" : "light") hostId=\(hostInstanceId.uuidString)")
+                SettingsNavigationDebug.log(
+                    "hostContentAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
+                )
+                SettingsNavigationDebug.log(
+                    "hostAppear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
                 )
 #endif
-                navigator.reset(reason: "sheetDismissed")
+                scheduleSettledRefreshIfNeeded()
+#if DEBUG
+                // Manual validation / UI testing only; requires the explicit
+                // -FanGeoRunProfileSettingsSequentialNavValidation launch argument.
+                // The coordinator rejects duplicate runs from repeated host appearances.
+                ProfileSettingsSequentialNavValidation.scheduleIfExplicitlyEnabled(
+                    navigator: navigator,
+                    source: "hostAppear"
+                )
+#endif
             }
+            .onDisappear {
+#if DEBUG
+                SettingsNavigationDebug.log(
+                    "hostDisappear hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
+                )
+                ProfileSettingsSequentialNavValidation.cancelRun(
+                    navigatorId: navigator.instanceId,
+                    reason: "hostDisappear"
+                )
+#endif
+            }
+            .onChange(of: navigator.path.count) { oldCount, newCount in
+#if DEBUG
+                SettingsNavigationDebug.log(
+                    "pathCount \(oldCount)->\(newCount) path=\(navigator.pathSummary()) top=\(navigator.topRoute?.debugName ?? "nil") hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString)"
+                )
+#endif
+            }
+            .onChange(of: isPresented) { _, presented in
+#if DEBUG
+                SettingsNavigationDebug.log(
+                    "hostIsPresented=\(presented) hostId=\(hostInstanceId.uuidString) navigatorId=\(navigator.instanceId.uuidString) pathCount=\(navigator.path.count)"
+                )
+#endif
+                if !presented {
+#if DEBUG
+                    ProfileSettingsSequentialNavValidation.cancelRun(
+                        navigatorId: navigator.instanceId,
+                        reason: "sheetDismissed"
+                    )
+#endif
+                    navigator.reset(reason: "sheetDismissed")
+                }
+            }
+
+            // Thin observer leaf — does not make the Host `@ObservedObject` on MapViewModel
+            // (that would remount NavigationStack on every publish).
+            AppleCalendarRemovalSheetOverlayHost(viewModel: viewModel)
+                .zIndex(10_000)
         }
     }
 

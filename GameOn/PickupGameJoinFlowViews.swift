@@ -116,6 +116,9 @@ struct DiscoverPickupGameDetailSheet: View {
     @State private var withdrawConfirm: PickupJoinWithdrawConfirmState?
     @State private var isRequestingDiscoverMapFocus = false
     @State private var mapFocusUnavailableMessage: String?
+    @State private var isLoadingSharedPickupDetail = false
+    @State private var didAttemptSharedPickupLoad = false
+    @State private var showInAppShareSheet = false
 
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
@@ -143,31 +146,40 @@ struct DiscoverPickupGameDetailSheet: View {
                     } else {
                         detailContent(for: g)
                     }
+                } else if isLoadingSharedPickupDetail {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView(
-                        "Pickup unavailable",
+                        L10n.t("pickup_share_unavailable_title", languageCode: languageCode),
                         systemImage: "person.3.fill",
-                        description: Text("This game may be full or no longer listed.")
+                        description: Text(L10n.t("pickup_share_unavailable_message", languageCode: languageCode))
                     )
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                 }
             }
-            .navigationTitle("Pickup game")
+            .navigationTitle(L10n.t("share_pickup_card_badge", languageCode: languageCode))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
+                    Button(L10n.t("Done", languageCode: languageCode)) { dismiss() }
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    if let g = game, !viewModel.isGuestDiscoverMode {
+                    if let g = game, !viewModel.isGuestDiscoverMode, g.isEligibleForInAppShare() {
                         Menu {
+                            Button {
+                                showInAppShareSheet = true
+                            } label: {
+                                Label(L10n.t("Share", languageCode: languageCode), systemImage: "square.and.arrow.up")
+                            }
                             ShareLink(item: pickupShareText(for: g)) {
-                                Label("Share", systemImage: "square.and.arrow.up")
+                                Label(L10n.t("share_pickup_os_share", languageCode: languageCode), systemImage: "square.and.arrow.up.on.square")
                             }
                         } label: {
                             Image(systemName: "ellipsis.circle")
+                                .frame(minWidth: 44, minHeight: 44)
                         }
-                        .accessibilityLabel("More options")
+                        .accessibilityLabel(L10n.t("share_pickup_more_options_a11y", languageCode: languageCode))
                     }
                 }
             }
@@ -181,6 +193,12 @@ struct DiscoverPickupGameDetailSheet: View {
             .sheet(isPresented: $showInviteComposer) {
                 if let g = game {
                     PickupGameInviteFriendsSheet(viewModel: viewModel, game: g)
+                }
+            }
+            .sheet(isPresented: $showInAppShareSheet) {
+                if let g = game {
+                    SharePickupGameSheet(game: g, mapViewModel: viewModel)
+                        .environmentObject(chatViewModel)
                 }
             }
             .sheet(isPresented: $showPickupChat, onDismiss: {
@@ -210,6 +228,12 @@ struct DiscoverPickupGameDetailSheet: View {
                     .environmentObject(viewModel)
             }
             .task(id: gameId) {
+                if viewModel.resolvedPickupGameRow(for: gameId) == nil, !didAttemptSharedPickupLoad {
+                    didAttemptSharedPickupLoad = true
+                    isLoadingSharedPickupDetail = true
+                    _ = await viewModel.loadPickupGameRowForDetailIfNeeded(id: gameId)
+                    isLoadingSharedPickupDetail = false
+                }
                 if viewModel.isGuestDiscoverMode {
                     if let g = viewModel.resolvedPickupGameRow(for: gameId) {
                         await viewModel.loadPickupOrganizerTrustStatsForPickupDetail(creatorUserId: g.creator_user_id)
@@ -337,9 +361,15 @@ struct DiscoverPickupGameDetailSheet: View {
 
                 if isCreator, g.isPickupGameInvitable() {
                     pickupInviteActionRow(for: g)
+                    pickupChatEntrySection(for: g)
+                } else if g.isEligibleForInAppShare(), canAccessPickupGameChat {
+                    pickupShareAndChatActionRow(for: g)
+                } else if g.isEligibleForInAppShare() {
+                    pickupShareOnlyActionRow(for: g)
+                    pickupChatEntrySection(for: g)
+                } else {
+                    pickupChatEntrySection(for: g)
                 }
-
-                pickupChatEntrySection(for: g)
 
                 pickupCapacityCard(for: g)
 
@@ -1103,13 +1133,19 @@ struct DiscoverPickupGameDetailSheet: View {
         }()
         // Organizer + approved joiners (approved_join_count is joiners only).
         let approvedCount = max(0, g.approved_join_count ?? 0) + 1
+        let coordsUsable = FanGeoDirectionsActions.hasUsableCoordinate(
+            latitude: g.latitude,
+            longitude: g.longitude
+        )
         return PickupGameChatContext(
             pickupGameId: g.id,
             title: title,
             sportLabel: AppSportCatalog.displayLabel(forSportToken: g.sport),
             whenLabel: when,
             locationLabel: location,
-            approvedParticipantCount: approvedCount
+            approvedParticipantCount: approvedCount,
+            latitude: coordsUsable ? g.latitude : nil,
+            longitude: coordsUsable ? g.longitude : nil
         )
     }
 
@@ -1126,17 +1162,73 @@ struct DiscoverPickupGameDetailSheet: View {
 
     private func pickupInviteActionRow(for g: PickupGameRow) -> some View {
         HStack(spacing: FGSpacing.md) {
-            ShareLink(item: pickupShareText(for: g)) {
-                pickupTintedActionLabel(title: "Share", systemImage: "square.and.arrow.up", tint: FGColor.accentBlue)
+            PickupGameShareActionButton(game: g, mapViewModel: viewModel) {
+                pickupTintedActionLabel(
+                    title: L10n.t("Share", languageCode: languageCode),
+                    systemImage: "square.and.arrow.up",
+                    tint: FGColor.accentBlue
+                )
             }
-            .buttonStyle(.plain)
 
             Button {
                 showInviteComposer = true
             } label: {
-                pickupTintedActionLabel(title: "Invite friends", systemImage: "person.badge.plus", tint: Color.orange)
+                pickupTintedActionLabel(
+                    title: L10n.t("Invite friends", languageCode: languageCode),
+                    systemImage: "person.badge.plus",
+                    tint: Color.orange
+                )
             }
             .buttonStyle(.plain)
+        }
+    }
+
+    private func pickupShareOnlyActionRow(for g: PickupGameRow) -> some View {
+        PickupGameShareActionButton(game: g, mapViewModel: viewModel) {
+            pickupTintedActionLabel(
+                title: L10n.t("Share", languageCode: languageCode),
+                systemImage: "square.and.arrow.up",
+                tint: FGColor.accentBlue
+            )
+        }
+    }
+
+    /// Share + Chat side-by-side (50/50) under the hero Directions button.
+    private func pickupShareAndChatActionRow(for g: PickupGameRow) -> some View {
+        VStack(alignment: .leading, spacing: FGSpacing.sm) {
+            HStack(spacing: FGSpacing.md) {
+                PickupGameShareActionButton(game: g, mapViewModel: viewModel) {
+                    pickupTintedActionLabel(
+                        title: L10n.t("Share", languageCode: languageCode),
+                        systemImage: "square.and.arrow.up",
+                        tint: FGColor.accentBlue
+                    )
+                }
+                .frame(maxWidth: .infinity)
+                .layoutPriority(1)
+
+                Button {
+                    Task { await openPickupGameChat(for: g) }
+                } label: {
+                    pickupTintedActionLabel(
+                        title: isOpeningPickupChat ? "Opening chat…" : "Chat",
+                        systemImage: "bubble.left.and.bubble.right.fill",
+                        tint: FGColor.accentGreen
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(isOpeningPickupChat)
+                .frame(maxWidth: .infinity)
+                .layoutPriority(1)
+                .accessibilityLabel("Open pickup game chat")
+                .accessibilityHint("Opens the private chat for approved players of this pickup game")
+            }
+
+            if let pickupChatError, !pickupChatError.isEmpty {
+                Text(pickupChatError)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.dangerRed)
+            }
         }
     }
 
@@ -1147,18 +1239,9 @@ struct DiscoverPickupGameDetailSheet: View {
             .labelStyle(.titleAndIcon)
             .foregroundStyle(tint)
             .lineLimit(1)
-            .minimumScaleFactor(0.8)
-            .frame(maxWidth: .infinity, minHeight: 30)
-            .padding(.vertical, 12)
-            .background {
-                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                    .fill(tint.opacity(colorScheme == .dark ? 0.20 : 0.11))
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                    .strokeBorder(tint.opacity(colorScheme == .dark ? 0.42 : 0.26), lineWidth: 1)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+            .minimumScaleFactor(0.75)
+            .multilineTextAlignment(.center)
+            .pickupCardTintedActionChrome(tint: tint, colorScheme: colorScheme)
     }
 
     private func pickupShareText(for g: PickupGameRow) -> String {

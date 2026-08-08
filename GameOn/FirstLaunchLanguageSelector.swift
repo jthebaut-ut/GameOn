@@ -255,7 +255,8 @@ struct FirstLaunchLanguageSelectorOverlay: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(colorScheme == .dark ? 0.55 : 0.42)
+            // Dark mode needs a stronger scrim so Discover map labels/pins stay secondary.
+            Color.black.opacity(colorScheme == .dark ? 0.74 : 0.42)
                 .ignoresSafeArea()
                 .accessibilityHidden(true)
 
@@ -298,18 +299,40 @@ struct FirstLaunchLanguageSelectorOverlay: View {
         }
         .background {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .fill(cardFill)
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.45 : 0.18), radius: 28, y: 14)
+                .fill(cardSurfaceFill)
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.55 : 0.18), radius: 28, y: 14)
         }
         .overlay {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.06), lineWidth: 0.75)
+                .strokeBorder(cardBorderColor, lineWidth: colorScheme == .dark ? 1 : 0.75)
         }
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
     }
 
-    private var cardFill: Color {
-        colorScheme == .dark ? FGColor.cardBackground(colorScheme) : Color.white
+    /// Light: unchanged solid white. Dark: near-opaque elevated surface (not thin glass over the map).
+    private var cardSurfaceFill: Color {
+        if colorScheme == .dark {
+            return Color(red: 0.10, green: 0.12, blue: 0.16).opacity(0.96)
+        }
+        return Color.white
+    }
+
+    private var cardBorderColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.18)
+            : Color.primary.opacity(0.06)
+    }
+
+    private var languageListSurfaceFill: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.10)
+            : Color(white: 0.97)
+    }
+
+    private var languageListBorderColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.16)
+            : Color.primary.opacity(0.10)
     }
 
     private var header: some View {
@@ -317,7 +340,7 @@ struct FirstLaunchLanguageSelectorOverlay: View {
             VStack(spacing: 0) {
                 ZStack {
                     Circle()
-                        .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.22 : 0.16))
+                        .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.28 : 0.16))
                         .frame(width: 64, height: 64)
                     Image(systemName: "globe")
                         .font(.system(size: 28, weight: .semibold))
@@ -331,7 +354,11 @@ struct FirstLaunchLanguageSelectorOverlay: View {
             Button(action: confirmAndDismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .foregroundStyle(
+                        colorScheme == .dark
+                            ? FGColor.secondaryText(colorScheme)
+                            : FGColor.mutedText(colorScheme)
+                    )
                     .frame(width: 32, height: 32)
                     .contentShape(Rectangle())
             }
@@ -352,7 +379,11 @@ struct FirstLaunchLanguageSelectorOverlay: View {
 
             Text(L10n.t("first_launch_language_subtitle", languageCode: languageCode))
                 .font(.system(size: 15, weight: .medium, design: .rounded))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .foregroundStyle(
+                    colorScheme == .dark
+                        ? Color.white.opacity(0.82)
+                        : FGColor.secondaryText(colorScheme)
+                )
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -364,25 +395,29 @@ struct FirstLaunchLanguageSelectorOverlay: View {
         VStack(spacing: 0) {
             ForEach(Array(displayedLanguages.enumerated()), id: \.element.id) { index, language in
                 if index > 0 {
-                    Divider()
+                    Rectangle()
+                        .fill(FGColor.divider(colorScheme))
+                        .frame(height: 1)
                         .padding(.leading, 52)
                 }
                 languageRow(language)
             }
 
             if !isExpanded {
-                Divider()
+                Rectangle()
+                    .fill(FGColor.divider(colorScheme))
+                    .frame(height: 1)
                     .padding(.leading, 16)
                 expandRow
             }
         }
         .background {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(colorScheme == .dark ? Color.white.opacity(0.04) : Color(white: 0.97))
+                .fill(languageListSurfaceFill)
         }
         .overlay {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Color.primary.opacity(colorScheme == .dark ? 0.14 : 0.10), lineWidth: 1)
+                .strokeBorder(languageListBorderColor, lineWidth: 1)
         }
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
@@ -419,7 +454,11 @@ struct FirstLaunchLanguageSelectorOverlay: View {
                 ZStack {
                     Circle()
                         .strokeBorder(
-                            isSelected ? FGColor.accentGreen : FGColor.mutedText(colorScheme).opacity(0.45),
+                            isSelected
+                                ? FGColor.accentGreen
+                                : (colorScheme == .dark
+                                    ? Color.white.opacity(0.42)
+                                    : FGColor.mutedText(colorScheme).opacity(0.45)),
                             lineWidth: 2
                         )
                         .frame(width: 22, height: 22)
@@ -437,7 +476,7 @@ struct FirstLaunchLanguageSelectorOverlay: View {
             .background {
                 if isSelected {
                     Rectangle()
-                        .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.10))
+                        .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.22 : 0.10))
                 }
             }
             .contentShape(Rectangle())
@@ -465,7 +504,11 @@ struct FirstLaunchLanguageSelectorOverlay: View {
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .foregroundStyle(
+                        colorScheme == .dark
+                            ? FGColor.secondaryText(colorScheme)
+                            : FGColor.mutedText(colorScheme)
+                    )
                     .accessibilityHidden(true)
             }
             .padding(.horizontal, 14)
@@ -493,7 +536,11 @@ struct FirstLaunchLanguageSelectorOverlay: View {
 
             Text(L10n.t("first_launch_language_footer", languageCode: languageCode))
                 .font(.system(size: 12, weight: .medium, design: .rounded))
-                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .foregroundStyle(
+                    colorScheme == .dark
+                        ? Color.white.opacity(0.68)
+                        : FGColor.mutedText(colorScheme)
+                )
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
         }

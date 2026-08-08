@@ -6,6 +6,8 @@ final class GroupChatService {
     private let client: SupabaseClient
 
     private static let groupMessageListColumns =
+        "id,conversation_id,sender_id,body,message_type,system_event,system_payload,created_at,deleted_at,report_count,is_deleted,reply_to_message_id"
+    private static let groupMessageListColumnsLegacy =
         "id,conversation_id,sender_id,body,message_type,system_event,system_payload,created_at,deleted_at,report_count,is_deleted"
 
     init(client: SupabaseClient = supabase) {
@@ -348,22 +350,67 @@ final class GroupChatService {
             .value
     }
 
-    func sendMessage(conversationId: UUID, body: String) async throws -> UUID {
+    func sendMessage(
+        conversationId: UUID,
+        body: String,
+        replyToMessageId: UUID? = nil
+    ) async throws -> UUID {
         struct Params: Encodable {
             let p_conversation_id: UUID
             let p_body: String
+            let p_reply_to_message_id: UUID?
+
+            enum CodingKeys: String, CodingKey {
+                case p_conversation_id
+                case p_body
+                case p_reply_to_message_id
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(p_conversation_id, forKey: .p_conversation_id)
+                try c.encode(p_body, forKey: .p_body)
+                // Omit when nil so pre-reply RPC signatures stay compatible.
+                try c.encodeIfPresent(p_reply_to_message_id, forKey: .p_reply_to_message_id)
+            }
         }
         let data = try await client
-            .rpc("send_group_message", params: Params(p_conversation_id: conversationId, p_body: body))
+            .rpc(
+                "send_group_message",
+                params: Params(
+                    p_conversation_id: conversationId,
+                    p_body: body,
+                    p_reply_to_message_id: replyToMessageId
+                )
+            )
             .execute()
             .data
         return try decodeUUID(from: data)
     }
 
     func fetchLatestMessages(conversationId: UUID, limit: Int = 50) async throws -> [GroupMessageRow] {
+        do {
+            return try await fetchLatestMessages(conversationId: conversationId, limit: limit, columns: Self.groupMessageListColumns)
+        } catch {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                return try await fetchLatestMessages(
+                    conversationId: conversationId,
+                    limit: limit,
+                    columns: Self.groupMessageListColumnsLegacy
+                )
+            }
+            throw error
+        }
+    }
+
+    private func fetchLatestMessages(
+        conversationId: UUID,
+        limit: Int,
+        columns: String
+    ) async throws -> [GroupMessageRow] {
         let rows: [GroupMessageRow] = try await client
             .from("group_messages")
-            .select(Self.groupMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or("is_deleted.is.null,is_deleted.eq.false")
@@ -382,10 +429,39 @@ final class GroupChatService {
         beforeId: UUID,
         limit: Int = 40
     ) async throws -> [GroupMessageRow] {
+        do {
+            return try await fetchOlderMessages(
+                conversationId: conversationId,
+                beforeCreatedAt: beforeCreatedAt,
+                beforeId: beforeId,
+                limit: limit,
+                columns: Self.groupMessageListColumns
+            )
+        } catch {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                return try await fetchOlderMessages(
+                    conversationId: conversationId,
+                    beforeCreatedAt: beforeCreatedAt,
+                    beforeId: beforeId,
+                    limit: limit,
+                    columns: Self.groupMessageListColumnsLegacy
+                )
+            }
+            throw error
+        }
+    }
+
+    private func fetchOlderMessages(
+        conversationId: UUID,
+        beforeCreatedAt: String,
+        beforeId: UUID,
+        limit: Int,
+        columns: String
+    ) async throws -> [GroupMessageRow] {
         _ = beforeId // Reserved for tie-break if needed; created_at cursor is sufficient for UX paging.
         let rows: [GroupMessageRow] = try await client
             .from("group_messages")
-            .select(Self.groupMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or("is_deleted.is.null,is_deleted.eq.false")
@@ -396,6 +472,14 @@ final class GroupChatService {
             .execute()
             .value
         return rows.reversed()
+    }
+
+    private static func shouldFallbackWithoutReplyColumn(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        guard text.contains("reply_to_message_id") else { return false }
+        return text.contains("does not exist")
+            || text.contains("undefined column")
+            || text.contains("42703")
     }
 
     func groupMessagesInsertChannel(conversationId: UUID) -> (RealtimeChannelV2, AsyncStream<InsertAction>) {

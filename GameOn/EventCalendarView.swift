@@ -19,7 +19,7 @@ enum LiquidGlassCalendarChrome: Equatable {
 /// Layout constants for date pickers presented while ``MainTabView`` floating tab bar may sit above tab content (`zIndex` 2). Scroll tail padding keeps the month grid and Today/Done tappable after scrolling to the end on SE through Pro Max.
 enum EventCalendarSheetLayout {
     /// Matches `MainTabView.floatingTabBarStackHeight` (capsule + margins).
-    static let floatingTabChromeOverlapScrollInset: CGFloat = 92
+    static let floatingTabChromeOverlapScrollInset: CGFloat = 108
     /// Breathing room above the home indicator / sheet drag indicator when content is scrolled flush to the bottom.
     static let sheetDragAndHomeComfortInset: CGFloat = 20
     /// Small top inset so the title clears the sheet grabber on all phones.

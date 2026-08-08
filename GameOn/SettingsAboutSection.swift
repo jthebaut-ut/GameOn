@@ -20,7 +20,11 @@ struct ProfileSettingsAboutSection: View {
                         Text("Version \(SettingsAboutFanGeoMetadata.version)")
                             .font(.system(size: 13, weight: .medium, design: .rounded))
                             .foregroundStyle(SettingsPremiumChrome.secondaryText(colorScheme))
-                        Text("Build \(SettingsAboutFanGeoMetadata.build)")
+                        Text(
+                            SettingsAboutFanGeoMetadata.buildDisplayLine(
+                                languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                            )
+                        )
                             .font(.system(size: 12, weight: .regular, design: .rounded))
                             .foregroundStyle(SettingsPremiumChrome.mutedText(colorScheme))
                     }

@@ -569,6 +569,8 @@ struct DirectMessageRow: Codable, Hashable, Identifiable {
     /// Moderation metadata (optional for older rows / pre-migration).
     let report_count: Int?
     let is_deleted: Bool?
+    /// Same-conversation parent message id (migration `20260917_0001`). Nil on older clients / rows.
+    let reply_to_message_id: UUID?
 }
 
 struct DmInboxSummaryRow: Codable, Hashable {

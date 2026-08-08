@@ -95,6 +95,47 @@ enum FanProfileAvatarRefreshSelfTests {
         expect(suggestionUpdated.userID == userA, "suggestion_identity_preserved")
         expect(suggestionUpdated.avatarURL == change.avatarURL, "suggestion_avatar_updated")
 
+        // Inbox fingerprint must change when only avatar URLs change (Conversations stale-bug guard).
+        let baseRow = ChatFriendDisplaySnapshotFingerprint.Row(
+            id: userA,
+            previewId: userA,
+            unreadCount: 0,
+            lastMessageAtEpoch: 0,
+            subtitle: "hi",
+            lastSeenAtRaw: "2026-01-01T00:00:00Z",
+            avatarURL: "https://old.example/a.jpg",
+            avatarThumbnailURL: "https://old.example/a_thumb.jpg",
+            isConversationBacked: true,
+            inboxKind: "direct",
+            chip: .friends,
+            groupConversationId: nil,
+            groupMemberIds: [],
+            groupMemberAvatarKeys: [],
+            groupMemberCount: 0,
+            isGroupMuted: false
+        )
+        let nextRow = ChatFriendDisplaySnapshotFingerprint.Row(
+            id: userA,
+            previewId: userA,
+            unreadCount: 0,
+            lastMessageAtEpoch: 0,
+            subtitle: "hi",
+            lastSeenAtRaw: "2026-01-01T00:00:00Z",
+            avatarURL: change.avatarURL,
+            avatarThumbnailURL: change.avatarThumbnailURL ?? "",
+            isConversationBacked: true,
+            inboxKind: "direct",
+            chip: .friends,
+            groupConversationId: nil,
+            groupMemberIds: [],
+            groupMemberAvatarKeys: [],
+            groupMemberCount: 0,
+            isGroupMuted: false
+        )
+        let fpOld = ChatFriendDisplaySnapshotFingerprint(query: "", rows: [baseRow])
+        let fpNew = ChatFriendDisplaySnapshotFingerprint(query: "", rows: [nextRow])
+        expect(fpOld != fpNew, "inbox_fingerprint_changes_when_only_avatar_urls_change")
+
         if failures == 0 {
             print("[AvatarRefreshTest] ALL_PASSED")
         } else {

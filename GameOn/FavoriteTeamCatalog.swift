@@ -281,6 +281,245 @@ nonisolated struct FavoriteTeam: Identifiable, Hashable, Codable, Sendable {
     var identityStyle: FanGeoTeamIdentityStyle {
         FanGeoTeamIdentityStyle.forSport(sport)
     }
+
+    /// Explicit CURRENT team catalog IDs used for game discovery (club / national).
+    /// Empty for ordinary teams and for athletes without a mapped relationship.
+    /// Resolved from ``FavoritePlayerTeamRelationships`` — never stored on user favorites.
+    var associatedTeamIDs: [String] {
+        FavoritePlayerTeamRelationships.associatedTeamIDs(forFavoriteID: id)
+    }
+
+    /// True when this favorite expands into team identities for Live/Going matching.
+    var expandsToAssociatedTeamsForGameMatching: Bool {
+        switch kind {
+        case .player, .driver, .fighter:
+            return !associatedTeamIDs.isEmpty
+        default:
+            return false
+        }
+    }
+}
+
+/// Authoritative player/driver → CURRENT club + national-team relationships for game matching.
+/// Update this table when a transfer or roster change occurs; user favorite IDs stay unchanged.
+nonisolated enum FavoritePlayerTeamRelationships {
+    /// How a catalog `.player` participates in Live/Going game discovery.
+    enum ResolutionKind: String, Sendable {
+        case teamSport
+        case individual
+        case retired
+        case unmapped
+    }
+
+    struct TeamAliasSeed: Sendable {
+        let id: String
+        let name: String
+        let shortCode: String?
+        let aliases: [String]
+    }
+
+    static func associatedTeamIDs(forFavoriteID id: String) -> [String] {
+        table[id] ?? []
+    }
+
+    /// Nonisolated alias seeds for associated teams (mirrors catalog entries).
+    /// Lets game discovery expand player favorites without MainActor catalog lookup.
+    static func associatedTeamAliasSeeds(forFavoriteID id: String) -> [TeamAliasSeed] {
+        associatedTeamIDs(forFavoriteID: id).compactMap { teamAliasSeedsByID[$0] }
+    }
+
+    static func isRetiredPlayer(favoriteID id: String) -> Bool {
+        retiredPlayerIDs.contains(id)
+    }
+
+    static func isTeamSportPlayerSport(_ sport: FavoriteTeamSport) -> Bool {
+        switch sport {
+        case .soccer, .basketball, .football, .baseball, .hockey:
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func isIndividualPlayerSport(_ sport: FavoriteTeamSport) -> Bool {
+        switch sport {
+        case .tennis, .golf, .badminton, .combat:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Classification for audit / resolver branching (`.player` entries).
+    static func resolutionKind(for player: FavoriteTeam) -> ResolutionKind {
+        guard player.kind == .player else { return .unmapped }
+        if isRetiredPlayer(favoriteID: player.id) { return .retired }
+        if isTeamSportPlayerSport(player.sport) {
+            return associatedTeamIDs(forFavoriteID: player.id).isEmpty ? .unmapped : .teamSport
+        }
+        if isIndividualPlayerSport(player.sport) {
+            return .individual
+        }
+        return associatedTeamIDs(forFavoriteID: player.id).isEmpty ? .unmapped : .teamSport
+    }
+
+    /// True when this favorite must not contribute match identities (retired / unmapped team-sport).
+    static func suppressesGameDiscovery(for favorite: FavoriteTeam) -> Bool {
+        guard favorite.kind == .player else { return false }
+        switch resolutionKind(for: favorite) {
+        case .retired, .unmapped:
+            return true
+        case .teamSport, .individual:
+            return false
+        }
+    }
+
+#if DEBUG
+    /// Test seam: temporarily override a relationship (restored when `perform` returns).
+    static func withOverride(
+        favoriteID: String,
+        teamIDs: [String],
+        perform: () -> Void
+    ) {
+        let previous = debugOverrides[favoriteID]
+        debugOverrides[favoriteID] = teamIDs
+        defer {
+            if let previous {
+                debugOverrides[favoriteID] = previous
+            } else {
+                debugOverrides.removeValue(forKey: favoriteID)
+            }
+        }
+        perform()
+    }
+
+    private static var debugOverrides: [String: [String]] = [:]
+
+    /// Every catalog `.player` id (for completeness self-tests).
+    static var allCatalogPlayerIDs: [String] {
+        [
+            "golf-scottie-scheffler",
+            "golf-rory-mcilroy",
+            "golf-tiger-woods",
+            "golf-nelly-korda",
+            "golf-lydia-ko",
+            "tennis-carlos-alcaraz",
+            "tennis-novak-djokovic",
+            "tennis-jannik-sinner",
+            "tennis-iga-swiatek",
+            "tennis-aryna-sabalenka",
+            "tennis-coco-gauff",
+            "tennis-naomi-osaka",
+            "tennis-rafael-nadal",
+            "tennis-serena-williams",
+            "badminton-viktor-axelsen",
+            "badminton-an-se-young",
+            "badminton-pv-sindhu",
+            "badminton-carolina-marin",
+            "badminton-tai-tzu-ying",
+            "badminton-lee-zii-jia",
+            "player-lionel-messi",
+            "player-cristiano-ronaldo",
+            "player-kylian-mbappe",
+            "player-lebron-james",
+            "player-stephen-curry",
+            "player-caitlin-clark",
+            "player-patrick-mahomes",
+            "player-shohei-ohtani"
+        ]
+    }
+#endif
+
+    private static var table: [String: [String]] {
+#if DEBUG
+        if !debugOverrides.isEmpty {
+            return baseTable.merging(debugOverrides) { _, new in new }
+        }
+#endif
+        return baseTable
+    }
+
+    /// Explicitly retired / inactive players — keep as favorites, never map to former clubs,
+    /// and do not invent upcoming games from historical affiliation.
+    private static let retiredPlayerIDs: Set<String> = [
+        "tennis-serena-williams",
+        "tennis-rafael-nadal"
+    ]
+
+    /// Current club + national team only — no former clubs.
+    private static let baseTable: [String: [String]] = [
+        // Soccer
+        "player-kylian-mbappe": ["soccer-real-madrid", "soccer-france"],
+        "player-lionel-messi": ["soccer-inter-miami", "soccer-argentina"],
+        "player-cristiano-ronaldo": ["soccer-al-nassr", "soccer-portugal"],
+        // Basketball
+        "player-lebron-james": ["nba-lakers"],
+        "player-stephen-curry": ["nba-warriors"],
+        "player-caitlin-clark": ["wnba-fever"],
+        // American football
+        "player-patrick-mahomes": ["nfl-chiefs"],
+        // Baseball
+        "player-shohei-ohtani": ["mlb-dodgers"]
+        // Individual-sport athletes (tennis/golf/badminton) intentionally omitted —
+        // active players match Live home/away by their own name aliases.
+        // Retired players are listed in ``retiredPlayerIDs`` (no self / team matching).
+    ]
+
+    /// Keep in sync with ``FavoriteTeamCatalog`` entries referenced by ``baseTable``.
+    private static let teamAliasSeedsByID: [String: TeamAliasSeed] = [
+        "soccer-real-madrid": .init(
+            id: "soccer-real-madrid",
+            name: "Real Madrid",
+            shortCode: "RMA",
+            aliases: ["Real Madrid CF"]
+        ),
+        "soccer-france": .init(
+            id: "soccer-france",
+            name: "France",
+            shortCode: "FRA",
+            aliases: ["France National Team", "French National Team", "Les Bleus", "French"]
+        ),
+        "soccer-inter-miami": .init(
+            id: "soccer-inter-miami",
+            name: "Inter Miami",
+            shortCode: "MIA",
+            aliases: ["Inter Miami CF", "Club Internacional de Fútbol Miami"]
+        ),
+        "soccer-argentina": .init(
+            id: "soccer-argentina",
+            name: "Argentina",
+            shortCode: "ARG",
+            aliases: ["Argentina National Team", "Albiceleste", "La Albiceleste"]
+        ),
+        "soccer-al-nassr": .init(
+            id: "soccer-al-nassr",
+            name: "Al Nassr",
+            shortCode: "NAS",
+            aliases: ["Al-Nassr", "Al Nassr FC"]
+        ),
+        "soccer-portugal": .init(
+            id: "soccer-portugal",
+            name: "Portugal",
+            shortCode: "POR",
+            aliases: ["Portugal National Team", "A Selecao", "A Seleção"]
+        ),
+        "soccer-psg": .init(
+            id: "soccer-psg",
+            name: "Paris Saint-Germain",
+            shortCode: "PSG",
+            aliases: ["PSG", "Paris SG", "Paris Saint Germain", "Paris Saint-Germain FC"]
+        ),
+        "nba-lakers": .init(id: "nba-lakers", name: "Los Angeles Lakers", shortCode: nil, aliases: []),
+        "nba-warriors": .init(id: "nba-warriors", name: "Golden State Warriors", shortCode: nil, aliases: []),
+        "wnba-fever": .init(
+            id: "wnba-fever",
+            name: "Indiana Fever",
+            shortCode: "IND",
+            aliases: ["Fever"]
+        ),
+        "nfl-chiefs": .init(id: "nfl-chiefs", name: "Kansas City Chiefs", shortCode: nil, aliases: []),
+        "mlb-dodgers": .init(id: "mlb-dodgers", name: "Los Angeles Dodgers", shortCode: nil, aliases: [])
+    ]
 }
 
 // MARK: - Catalog
@@ -1054,7 +1293,9 @@ enum FavoriteTeamCatalog {
 
 // MARK: - Live tab team matching
 
-enum FavoriteTeamLiveMatcher {
+/// Pure string/alias matching for Live + Going favorite-team cards.
+/// Explicitly nonisolated so snapshot index builds can stay off MainActor.
+nonisolated enum FavoriteTeamLiveMatcher {
     private static let genericTokens: Set<String> = [
         "club",
         "city",
@@ -1095,23 +1336,78 @@ enum FavoriteTeamLiveMatcher {
         return unique.sorted { $0.count > $1.count }
     }
 
+    /// Aliases used for Live/Going game discovery.
+    /// Player/driver favorites with explicit relationships expand to associated team aliases only
+    /// (never invent clubs; never match on unrelated player-name text in club fixtures).
+    static func matchAliasesForGameDiscovery(for favorite: FavoriteTeam) -> [String] {
+        if FavoritePlayerTeamRelationships.suppressesGameDiscovery(for: favorite) {
+#if DEBUG
+            print(
+                "[FavoritePlayerTeams] gameDiscoverySuppressed favorite=\(favorite.id) "
+                    + "kind=\(FavoritePlayerTeamRelationships.resolutionKind(for: favorite).rawValue)"
+            )
+#endif
+            return []
+        }
+        guard favorite.expandsToAssociatedTeamsForGameMatching else {
+            return matchAliases(for: favorite)
+        }
+        var unique: [String] = []
+        func add(_ raw: String) {
+            let normalized = normalizedSearchText(raw)
+            guard !normalized.isEmpty, !unique.contains(normalized) else { return }
+            unique.append(normalized)
+        }
+        let seeds = FavoritePlayerTeamRelationships.associatedTeamAliasSeeds(forFavoriteID: favorite.id)
+        for seed in seeds {
+            add(seed.name)
+            if let shortCode = seed.shortCode {
+                add(shortCode)
+            }
+            for alias in seed.aliases {
+                add(alias)
+            }
+        }
+#if DEBUG
+        if seeds.isEmpty {
+            print("[FavoritePlayerTeams] noResolvableTeams favorite=\(favorite.id)")
+        }
+#endif
+        return unique.sorted { $0.count > $1.count }
+    }
+
     static func matchesLiveMatch(_ team: FavoriteTeam, homeTeam: String, awayTeam: String) -> Bool {
-        let participants = [homeTeam, awayTeam]
-        return matchAliases(for: team).contains { alias in
-            participants.contains { matchesAlias(alias, inParticipantName: $0) }
+        matchesLiveMatch(
+            aliases: matchAliasesForGameDiscovery(for: team),
+            normalizedHome: normalizedSearchText(homeTeam),
+            normalizedAway: normalizedSearchText(awayTeam)
+        )
+    }
+
+    /// Same semantics as ``matchesLiveMatch(_:homeTeam:awayTeam:)`` using pre-normalized names
+    /// (avoids re-folding participant strings inside a Live snapshot scan).
+    static func matchesLiveMatch(
+        aliases: [String],
+        normalizedHome: String,
+        normalizedAway: String
+    ) -> Bool {
+        guard !aliases.isEmpty else { return false }
+        return aliases.contains { alias in
+            matchesNormalizedAlias(alias, inParticipantName: normalizedHome)
+                || matchesNormalizedAlias(alias, inParticipantName: normalizedAway)
         }
     }
 
     static func matchesVenueEventTitle(_ team: FavoriteTeam, title: String) -> Bool {
         let normalizedTitle = normalizedSearchText(title)
         guard !normalizedTitle.isEmpty else { return false }
-        return matchAliases(for: team).contains { alias in
-            matchesAlias(alias, inParticipantName: normalizedTitle)
+        return matchAliasesForGameDiscovery(for: team).contains { alias in
+            matchesNormalizedAlias(alias, inParticipantName: normalizedTitle)
         }
     }
 
-    private static func matchesAlias(_ alias: String, inParticipantName participant: String) -> Bool {
-        let normalizedParticipant = normalizedSearchText(participant)
+    /// Public so snapshot indexes can reuse alias phrase rules without re-normalizing.
+    static func matchesNormalizedAlias(_ alias: String, inParticipantName normalizedParticipant: String) -> Bool {
         guard !normalizedParticipant.isEmpty else { return false }
 
         if alias.count <= 2 { return false }
@@ -1135,6 +1431,10 @@ enum FavoriteTeamLiveMatcher {
         return containsPhrase(alias, in: normalizedParticipant)
     }
 
+    static func normalizedParticipantName(_ raw: String) -> String {
+        normalizedSearchText(raw)
+    }
+
     private static func containsPhrase(_ phrase: String, in text: String) -> Bool {
         guard !phrase.isEmpty else { return false }
         if text == phrase { return true }
@@ -1150,6 +1450,167 @@ enum FavoriteTeamLiveMatcher {
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+    }
+}
+
+/// Resolves favorites (teams + players) into a deduplicated set of matchable team identities
+/// for Live/Going game discovery. Attribution prefers a directly favorited club/national team
+/// over a player that expands to the same club.
+///
+/// Called from MainActor Going/Live refresh paths that already own catalog access.
+enum FavoriteTeamMatchIdentityResolver {
+    struct Identity: Sendable {
+        /// Catalog team whose aliases are used against home/away.
+        let matchTeam: FavoriteTeam
+        /// Original favorite used for Going/Live attribution (player or team).
+        let sourceFavorite: FavoriteTeam
+    }
+
+    static func resolve(from favorites: [FavoriteTeam]) -> [Identity] {
+        guard !favorites.isEmpty else { return [] }
+
+        var matchTeamToSource: [String: FavoriteTeam] = [:]
+        var orderedMatchTeams: [FavoriteTeam] = []
+
+        func prefers(_ candidate: FavoriteTeam, over existing: FavoriteTeam) -> Bool {
+            let candidateIsDirectTeam = candidate.kind == .team || candidate.kind == .nationalTeam
+            let existingIsDirectTeam = existing.kind == .team || existing.kind == .nationalTeam
+            if candidateIsDirectTeam && !existingIsDirectTeam { return true }
+            return false
+        }
+
+        func register(matchTeam: FavoriteTeam, source: FavoriteTeam) {
+            if let existing = matchTeamToSource[matchTeam.id] {
+                if prefers(source, over: existing) {
+                    matchTeamToSource[matchTeam.id] = source
+                }
+                return
+            }
+            matchTeamToSource[matchTeam.id] = source
+            orderedMatchTeams.append(matchTeam)
+        }
+
+        for favorite in favorites {
+            if FavoritePlayerTeamRelationships.suppressesGameDiscovery(for: favorite) {
+#if DEBUG
+                print(
+                    "[FavoritePlayerTeams] identitySkipped favorite=\(favorite.id) "
+                        + "kind=\(FavoritePlayerTeamRelationships.resolutionKind(for: favorite).rawValue)"
+                )
+#endif
+                continue
+            }
+
+            if favorite.expandsToAssociatedTeamsForGameMatching {
+                var resolvedAny = false
+                for teamID in favorite.associatedTeamIDs {
+                    guard let team = FavoriteTeamCatalog.team(id: teamID) else {
+#if DEBUG
+                        print("[FavoritePlayerTeams] missingAssociatedTeam favorite=\(favorite.id) teamId=\(teamID)")
+#endif
+                        continue
+                    }
+                    resolvedAny = true
+                    register(matchTeam: team, source: favorite)
+                }
+#if DEBUG
+                if !resolvedAny {
+                    print("[FavoritePlayerTeams] unmappedPlayerFavorite favorite=\(favorite.id) — no team games")
+                }
+#endif
+                continue
+            }
+
+            // Clubs, national teams, competitions, and active individual-sport athletes (name match).
+            register(matchTeam: favorite, source: favorite)
+        }
+
+        return orderedMatchTeams.compactMap { matchTeam in
+            guard let source = matchTeamToSource[matchTeam.id] else { return nil }
+            return Identity(matchTeam: matchTeam, sourceFavorite: source)
+        }
+    }
+}
+
+/// One Live snapshot → O(rows) normalized participant names for favorite-team lookups.
+/// Preserves ``FavoriteTeamLiveMatcher`` alias / phrase semantics; callers still apply
+/// live-or-soon / country / ranking filters on the returned rows.
+nonisolated struct FavoriteTeamLiveSnapshotIndex {
+    private let matches: [LiveMatch]
+    private let normalizedHome: [String]
+    private let normalizedAway: [String]
+    let buildMs: Double
+    let sourceCount: Int
+    let sourceSignature: Int
+
+    static let empty = FavoriteTeamLiveSnapshotIndex(
+        matches: [],
+        normalizedHome: [],
+        normalizedAway: [],
+        buildMs: 0,
+        sourceCount: 0,
+        sourceSignature: LiveMatchHydrationIndex.signature(of: [])
+    )
+
+    static func build(from matches: [LiveMatch]) -> FavoriteTeamLiveSnapshotIndex {
+        let started = CFAbsoluteTimeGetCurrent()
+        var homes: [String] = []
+        var aways: [String] = []
+        homes.reserveCapacity(matches.count)
+        aways.reserveCapacity(matches.count)
+        for match in matches {
+            homes.append(FavoriteTeamLiveMatcher.normalizedParticipantName(match.homeTeam))
+            aways.append(FavoriteTeamLiveMatcher.normalizedParticipantName(match.awayTeam))
+        }
+        return FavoriteTeamLiveSnapshotIndex(
+            matches: matches,
+            normalizedHome: homes,
+            normalizedAway: aways,
+            buildMs: (CFAbsoluteTimeGetCurrent() - started) * 1000,
+            sourceCount: matches.count,
+            sourceSignature: LiveMatchHydrationIndex.signature(of: matches)
+        )
+    }
+
+    func isValid(for matches: [LiveMatch]) -> Bool {
+        matches.count == sourceCount && LiveMatchHydrationIndex.signature(of: matches) == sourceSignature
+    }
+
+    func matchingMatches(for team: FavoriteTeam) -> [LiveMatch] {
+        matchingMatches(aliases: FavoriteTeamLiveMatcher.matchAliases(for: team))
+    }
+
+    func matchingMatches(aliases: [String]) -> [LiveMatch] {
+        guard !aliases.isEmpty, !matches.isEmpty else { return [] }
+        var result: [LiveMatch] = []
+        result.reserveCapacity(min(8, matches.count))
+        for index in matches.indices {
+            if FavoriteTeamLiveMatcher.matchesLiveMatch(
+                aliases: aliases,
+                normalizedHome: normalizedHome[index],
+                normalizedAway: normalizedAway[index]
+            ) {
+                result.append(matches[index])
+            }
+        }
+        return result
+    }
+
+    /// First favorite team that matches a row (array order preserved — same as prior `first(where:)`).
+    func firstMatchingTeam(in teams: [(team: FavoriteTeam, aliases: [String])], at matchIndex: Int) -> FavoriteTeam? {
+        guard matches.indices.contains(matchIndex) else { return nil }
+        let home = normalizedHome[matchIndex]
+        let away = normalizedAway[matchIndex]
+        for entry in teams {
+            if FavoriteTeamLiveMatcher.matchesLiveMatch(
+                aliases: entry.aliases,
+                normalizedHome: home,
+                normalizedAway: away
+            ) {
+                return entry.team
+            }
+        }
+        return nil
     }
 }
 

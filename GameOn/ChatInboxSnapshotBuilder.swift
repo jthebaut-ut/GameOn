@@ -93,11 +93,16 @@ nonisolated struct ChatFriendDisplaySnapshotFingerprint: Hashable, Sendable {
         let lastMessageAtEpoch: TimeInterval
         let subtitle: String
         let lastSeenAtRaw: String
+        /// Canonical list/thumbnail avatar URLs — required so photo changes rebuild inbox snapshots.
+        let avatarURL: String
+        let avatarThumbnailURL: String
         let isConversationBacked: Bool
         let inboxKind: String
         let chip: ChipKind
         let groupConversationId: UUID?
         let groupMemberIds: [UUID]
+        /// Canonical avatar keys for stacked group faces (id + thumb/full), sorted.
+        let groupMemberAvatarKeys: [String]
         let groupMemberCount: Int
         let isGroupMuted: Bool
     }

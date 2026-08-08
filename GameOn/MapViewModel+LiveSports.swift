@@ -203,22 +203,42 @@ extension MapViewModel {
 #endif
         let applyStartedAt = CFAbsoluteTimeGetCurrent()
         var publishCount = 0
-        handleSavedProGameStatusUpdates(from: matches, reason: "liveRefresh")
-        // Full-content equality (LiveMatch is Equatable): publish whenever anything visible
-        // changed (scores, minute, status, clock), and skip only byte-identical snapshots.
-        // The previous ID-only comparison dropped same-ID score/status updates entirely.
+        // Full-content equality (LiveMatch is Equatable) BEFORE hydration/index work.
+        // Unchanged logical payloads must not rebuild LiveMatchHydrationIndex or reconcile
+        // saved games. Score/status/start-time/provider identity changes still publish.
         let contentChanged = liveMatches != matches
-        if contentChanged {
-            liveMatches = matches
-            publishCount += 1
-            bumpScheduleLiveMatchesContentRevision(reason: "liveRefresh", rows: matches.count)
-            publishCount += 1
-            LiveActivationPerf.publishApplied(rows: matches.count, reason: "contentChanged")
-        } else {
+        if !contentChanged {
+            lastLiveMatchesRefreshAt = Date()
+            if liveMatchesLoadError != nil {
+                liveMatchesLoadError = nil
+            }
+            let emptyHint = Self.makeLiveMatchesEmptyDebugHint(
+                matches: matches,
+                diagnostics: diagnostics
+            )
+            if liveMatchesEmptyDebugHint != emptyHint {
+                liveMatchesEmptyDebugHint = emptyHint
+            }
             Perf.publishedWriteSkipped(name: "liveMatches", reason: "unchanged")
             LiveActivationPerf.publishSkippedIdentical(rows: matches.count)
             SchedulePerf.inventoryPublishSkippedIdentical(rows: matches.count)
+            LiveApplyPerf.identicalPayloadSkipped(
+                rowsFetched: matches.count,
+                mainActorApplyMs: (CFAbsoluteTimeGetCurrent() - applyStartedAt) * 1000,
+                reason: "liveRefresh"
+            )
+#if DEBUG
+            logLiveTabAssignment(matches: matches)
+#endif
+            return
         }
+
+        handleSavedProGameStatusUpdates(from: matches, reason: "liveRefresh")
+        liveMatches = matches
+        publishCount += 1
+        bumpScheduleLiveMatchesContentRevision(reason: "liveRefresh", rows: matches.count)
+        publishCount += 1
+        LiveActivationPerf.publishApplied(rows: matches.count, reason: "contentChanged")
         lastLiveMatchesRefreshAt = Date()
         if liveMatchesLoadError != nil {
             liveMatchesLoadError = nil
@@ -230,9 +250,7 @@ extension MapViewModel {
         if liveMatchesEmptyDebugHint != emptyHint {
             liveMatchesEmptyDebugHint = emptyHint
         }
-        if contentChanged {
-            invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded()
-        }
+        invalidateCalendarTabEventsListCacheAfterLiveRefreshIfNeeded()
         LiveApplyPerf.apply(
             rowsFetched: matches.count,
             mainActorApplyMs: (CFAbsoluteTimeGetCurrent() - applyStartedAt) * 1000,

@@ -188,6 +188,10 @@ enum ProfileSettingsSequentialNavValidation {
         steps.append(contentsOf: [
             ProfileSettingsRoute.language,
             .timeZone,
+            .chatSecurity,
+            .reportingModeration,
+            .blockingUsersInfo,
+            .privacyLocationSharing,
             .communityGuidelines,
             .trustSafety,
             .liveActivitySharing,

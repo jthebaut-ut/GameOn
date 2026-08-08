@@ -98,7 +98,23 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
         self == .live || self == .halfTime
     }
 
-    static func normalized(from raw: String?) -> MatchStatus {
+    /// Normalize provider/DB status. Optional ``progressHint`` (e.g. payload `strProgress`)
+    /// upgrades a stale `SCHEDULED` when the hint clearly indicates live/final baseball progress.
+    static func normalized(from raw: String?, progressHint: String? = nil) -> MatchStatus {
+        let primary = normalizedSingle(raw)
+        if primary != .scheduled { return primary }
+        let hint = progressHint?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !hint.isEmpty else { return primary }
+        let fromHint = normalizedSingle(hint)
+        switch fromHint {
+        case .live, .halfTime, .fullTime:
+            return fromHint
+        case .scheduled:
+            return primary
+        }
+    }
+
+    private static func normalizedSingle(_ raw: String?) -> MatchStatus {
         let status = normalizedStatusText(raw)
         guard !status.isEmpty else { return .scheduled }
 
@@ -119,6 +135,23 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
             return .fullTime
         }
 
+        // Explicit non-live before STARTED / inning heuristics ("NOT STARTED" contains "STARTED").
+        if scheduledStatusTokens.contains(status)
+            || status.contains("NOT STARTED")
+            || status.contains("PRE GAME")
+            || status.contains("PREGAME")
+            || status.contains("WARMUP")
+            || status.contains("SCHED")
+            || status.contains("POSTPON")
+            || status.contains("DELAY")
+            || status.contains("CANCEL") {
+            return .scheduled
+        }
+
+        if looksLikeBaseballInningProgress(status) {
+            return .live
+        }
+
         if liveStatusTokens.contains(status)
             || status.contains("LIVE")
             || status.contains("IN PROGRESS")
@@ -134,13 +167,24 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
             return .live
         }
 
-        if scheduledStatusTokens.contains(status)
-            || status.contains("SCHED")
-            || status.contains("NOT STARTED") {
-            return .scheduled
+        return .scheduled
+    }
+
+    /// Narrow baseball inning-progress detector (shared by normalizer + UI audit).
+    /// Input may be raw or already ``normalizedStatusText``-folded.
+    static func looksLikeBaseballInningProgress(_ raw: String?) -> Bool {
+        let status = normalizedStatusText(raw)
+        guard !status.isEmpty else { return false }
+
+        // TheSportsDB compact inning codes: IN1…IN99 (e.g. production strStatus=IN9).
+        if status.range(of: #"^IN[0-9]{1,2}$"#, options: .regularExpression) != nil {
+            return true
         }
 
-        return .scheduled
+        if status.contains("EXTRA INNING") { return true }
+
+        let pattern = #"\b(?:TOP|BOT|BOTTOM|MID|MIDDLE|END)\s+(?:OF\s+(?:THE\s+)?)?\d{1,2}(?:ST|ND|RD|TH)?\b|\bINNING\s+\d{1,2}\b|\b\d{1,2}(?:ST|ND|RD|TH)?\s+INNING\b"#
+        return status.range(of: pattern, options: .regularExpression) != nil
     }
 
     private static let finalStatusTokens: Set<String> = [
@@ -177,6 +221,8 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
         "COMPLETE",
         "ENDED",
         "FINISHED"
+        // "END" intentionally omitted as a leading token so "END 5" can be baseball inning progress.
+        // Bare "END" remains final via ``finalStatusTokens``.
     ]
 
     private static let liveStatusTokens: Set<String> = [
@@ -198,7 +244,9 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
         "TBD",
         "SCHEDULED",
         "POSTPONED",
-        "DELAYED"
+        "DELAYED",
+        "CANCELLED",
+        "CANCELED"
     ]
 
     private static func normalizedStatusText(_ raw: String?) -> String {
@@ -213,6 +261,8 @@ nonisolated enum MatchStatus: String, Codable, CaseIterable, Equatable {
 
     private static func isFinalStatusText(_ status: String) -> Bool {
         if finalStatusTokens.contains(status) { return true }
+        // "FINAL 10" / "FINAL 10 INNINGS" — leading FINAL is final.
+        // Do not treat "END 5" as final (baseball inning transition).
         guard let firstToken = status.split(separator: " ").first.map(String.init) else { return false }
         return finalStatusLeadingTokens.contains(firstToken)
     }

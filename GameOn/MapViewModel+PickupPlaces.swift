@@ -176,6 +176,10 @@ extension MapViewModel {
     }
 
     func warmPreloadPickupPlacesForCurrentRegion() async {
+        guard discoverGeographicNetworkFetchAllowed() else {
+            print("[PickupPlacesWarmCache] warmSkipped reason=viewportTooBroad")
+            return
+        }
         guard let bounds = currentMapRegionBounds() else {
             print("[PickupPlacesWarmCache] warmSkipped reason=noBounds")
             return

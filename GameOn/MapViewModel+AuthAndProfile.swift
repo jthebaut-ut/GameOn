@@ -1557,6 +1557,7 @@ extension MapViewModel {
         currentUserAuthId = nil
         FanGeoUserEntitlements.reset()
         clearUnseenPokesBadgeState()
+        clearPendingPokeNotificationDeepLink()
         clearPostSignupPresentation(reason: "clearAuthenticatedSessionCaches")
         emailVerifiedSignInNotice = ""
         dismissPublicProfile()
@@ -1589,10 +1590,16 @@ extension MapViewModel {
         followingMapNavigationMessage = nil
         pendingFollowingMapPickupGameID = nil
         pendingFollowingMapPickupGameSnapshot = nil
+        isRoutingPickupGameFromChatGroupInfo = false
         clearFollowingTabCaches()
         clearFollowingInterestedOnlyDefaults()
+        // Live sessions are stopped in forceLogout before auth invalidation.
+        // Clear residual local cache only (never restart GPS / never network stop here).
+        ChatLiveLocationManager.shared.clearLocalLiveLocationStateAfterLogout()
         pendingPickupCreatorRatingNotificationDeepLink = nil
         pendingPickupPlayingHighlightGameID = nil
+        pendingSharedPickupGameDetailToken = nil
+        pendingSharedProGameDetailMatch = nil
         clearPendingSaveProGameIntent()
         presentSaveProGameSignInPrompt = false
 
@@ -2236,6 +2243,11 @@ extension MapViewModel {
             abandonAuthenticatedRealtimeForLogout()
         }
         SafeLogoutDebug.step("realtime_teardown_completed")
+
+        // Stop live-location shares while JWT is still valid (bounded). Local GPS ends first.
+        SafeLogoutDebug.step("live_location_stop_begin")
+        await ChatLiveLocationManager.shared.stopOutgoingSessionsBeforeAuthInvalidation()
+        SafeLogoutDebug.step("live_location_stop_completed")
 
         SafeLogoutDebug.step("push_token_delete_begin")
         // Best-effort: never block logout on PostgREST / network for token deletion.
@@ -4502,6 +4514,9 @@ extension MapViewModel {
                     return
                 }
 
+                // Resume only an explicitly active, unexpired chat live-location session.
+                await ChatLiveLocationManager.shared.restoreActiveOutgoingSessionsIfNeeded(userId: session.user.id)
+
                 let persisted = readPersistedAccountMode()
 #if DEBUG
                 print("[AuthRestore] storedAccountMode=\(persisted.mode.rawValue)")
@@ -4932,6 +4947,12 @@ extension MapViewModel {
                 userId: authId,
                 avatarURL: canonFull,
                 avatarThumbnailURL: finalThumb
+            )
+            FanProfileChangeCenter.invalidateCachedAvatarImages(
+                previousAvatarURL: replacedFullURL,
+                previousThumbnailURL: replacedThumbnailURL,
+                nextAvatarURL: canonFull,
+                nextThumbnailURL: finalThumb
             )
             await MainActor.run {
                 currentUserAvatarURL = canonFull

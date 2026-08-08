@@ -10,6 +10,10 @@ enum ProfileSettingsRoute: Hashable {
     case support
     case communityGuidelines
     case trustSafety
+    case chatSecurity
+    case reportingModeration
+    case blockingUsersInfo
+    case privacyLocationSharing
     case privacyPolicy
     case termsOfService
     case resetPassword
@@ -26,6 +30,10 @@ enum ProfileSettingsRoute: Hashable {
         case .support: return "support"
         case .communityGuidelines: return "communityGuidelines"
         case .trustSafety: return "trustSafety"
+        case .chatSecurity: return "chatSecurity"
+        case .reportingModeration: return "reportingModeration"
+        case .blockingUsersInfo: return "blockingUsersInfo"
+        case .privacyLocationSharing: return "privacyLocationSharing"
         case .privacyPolicy: return "privacyPolicy"
         case .termsOfService: return "termsOfService"
         case .resetPassword: return "resetPassword"

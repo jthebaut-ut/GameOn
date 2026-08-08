@@ -48,6 +48,9 @@ struct MainTabView: View {
     @State private var postAuthBadgeRefreshUserId: UUID?
     @State private var lastPostAuthBadgeRefreshAt: Date?
     @State private var lastPostAuthBadgeRefreshUserId: UUID?
+    /// Available overlay width for compact tab-bar *label* metrics (no device-name checks).
+    /// Start under the compact threshold so the first frame on narrow phones does not wrap labels.
+    @State private var floatingTabBarWidth: CGFloat = 390
 
     private static let pokesBadgePollIntervalUnseenSeconds = 22
     private static let pokesBadgePollIntervalIdleSeconds = 105
@@ -126,8 +129,11 @@ struct MainTabView: View {
         case account
     }
 
-    /// Vertical space occupied by the floating capsule tab bar (padding + control height). Keeps Chat tab content above the overlay.
-    private static let floatingTabBarStackHeight: CGFloat = 92
+    /// List / sheet breathing room under the floating tab bar (slightly taller than the visual capsule).
+    /// Discover AdMob clearance uses ``MainTabViewFloatingTabBarMetrics/overlayHeight`` instead —
+    /// do not reuse this constant as the Discover→banner spacer (it over-gaps the ad).
+    /// Inbox lists reserve this; pushed destinations (DM/group) must not.
+    static let floatingTabBarStackHeight: CGFloat = 108
 
     var body: some View {
         let _ = MainTabObservationPerf.mainBodyEvaluated(selectedTab: selectedTab.rawValue)
@@ -183,6 +189,30 @@ struct MainTabView: View {
                 }
             } message: {
                 Text(chatGateAlertMessage ?? "")
+            }
+            .sheet(
+                item: Binding(
+                    get: { viewModel.pendingSharedPickupGameDetailToken },
+                    set: { viewModel.pendingSharedPickupGameDetailToken = $0 }
+                ),
+                onDismiss: {
+                    viewModel.clearSharedPickupGameDetailPresentation()
+                }
+            ) { token in
+                DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                    .environmentObject(chatViewModel)
+            }
+            .sheet(
+                item: Binding(
+                    get: { viewModel.pendingSharedProGameDetailMatch },
+                    set: { viewModel.pendingSharedProGameDetailMatch = $0 }
+                ),
+                onDismiss: {
+                    viewModel.clearSharedProGameDetailPresentation()
+                }
+            ) { match in
+                LiveMatchDetailSheet(match: match, viewModel: viewModel)
+                    .environmentObject(chatViewModel)
             }
             .onAppear {
                 // Observation-race reconciliation: if the reset flag is already true when this
@@ -285,14 +315,23 @@ struct MainTabView: View {
                 )
             }
 
-            if !chatMainTabState.hidesFloatingTabBarForDirectChat {
-                floatingTabBarChrome
-                    .opacity(discoverCalendarOverlayPresented && selectedTab == .discover ? 0.32 : 1)
-                    .blur(radius: discoverCalendarOverlayPresented && selectedTab == .discover ? 1.25 : 0)
-                    .allowsHitTesting(!(discoverCalendarOverlayPresented && selectedTab == .discover))
-                    .animation(.easeInOut(duration: 0.24), value: discoverCalendarOverlayPresented)
-
-            }
+            // Permanently mount the floating tab bar. Hide only visually while Chat is active
+            // and a conversation destination requires chrome hide — never insert/remove this
+            // subtree mid NavigationStack push, and never let an inactive Chat stack suppress
+            // the bar on Discover / Live / Schedule / Going / Account.
+            floatingTabBarChrome
+                .opacity(
+                    hidesFloatingTabBarForActiveChatConversation
+                        ? 0
+                        : (discoverCalendarOverlayPresented && selectedTab == .discover ? 0.32 : 1)
+                )
+                .blur(radius: discoverCalendarOverlayPresented && selectedTab == .discover ? 1.25 : 0)
+                .allowsHitTesting(
+                    !hidesFloatingTabBarForActiveChatConversation
+                        && !(discoverCalendarOverlayPresented && selectedTab == .discover)
+                )
+                .accessibilityHidden(hidesFloatingTabBarForActiveChatConversation)
+                .animation(.easeInOut(duration: 0.24), value: discoverCalendarOverlayPresented)
         }
         )
     }
@@ -327,6 +366,8 @@ struct MainTabView: View {
             viewModel.isDiscoverTabSelectedForEnrichment = true
             if !Self.hasForcedDiscoverTabThisProcess {
                 Self.hasForcedDiscoverTabThisProcess = true
+                // Still force Discover first for stack-safety, then immediately reconcile any
+                // cold-start chat push route (onChange alone misses already-set pending values).
                 selectTab(.discover, animated: false, reason: "startupForceDiscover")
 #if DEBUG
                 print("[StartupDiscover] selectedTab=\(AppTab.discover.rawValue)")
@@ -343,6 +384,7 @@ struct MainTabView: View {
                 TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(selectedTab.rawValue)")
 #endif
             }
+            reconcilePendingChatPushRoutesIfNeeded(reason: "mainTabOnAppear")
 #if DEBUG
             if ProfileSettingsSequentialNavValidation.isExplicitlyEnabled {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
@@ -377,7 +419,7 @@ struct MainTabView: View {
             schedulePostAuthBadgeRefresh(reason: "mainTabOnAppear")
             routePostSignupDiscoverWelcomeGuideIfReady(reason: "mainTabOnAppear")
         }
-        .animation(.spring(response: 0.38, dampingFraction: 0.88), value: chatMainTabState.hidesFloatingTabBarForDirectChat)
+        .animation(.spring(response: 0.38, dampingFraction: 0.88), value: hidesFloatingTabBarForActiveChatConversation)
         .onChange(of: viewModel.switchToAccountForVenueClaim) { _, shouldSwitch in
             guard shouldSwitch else { return }
             viewModel.switchToAccountForVenueClaim = false
@@ -513,6 +555,9 @@ struct MainTabView: View {
         }
         .onChange(of: chatMainTabState.pendingGroupOpenConversationId) { _, groupId in
             handlePendingGroupOpenConversationChange(groupId)
+        }
+        .onChange(of: chatMainTabState.pendingOpenFriendRequestsSection) { _, open in
+            handlePendingOpenFriendRequestsSectionChange(open)
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -1166,11 +1211,40 @@ struct MainTabView: View {
         return String(format: "%.1f", Date().timeIntervalSince(date))
     }
 
+    /// Cold-start / already-set pending routes: `onChange` does not fire when the value existed
+    /// before ``MainTabView`` mounted. Drain APNs → UI pending, then select Chat.
+    private func reconcilePendingChatPushRoutesIfNeeded(reason: String) {
+        chatViewModel.deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: reason)
+        chatViewModel.deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: reason)
+        chatViewModel.deliverPendingChatMessageNotificationDeepLinkIfReady(reason: reason)
+
+        if chatMainTabState.pendingOpenFriendRequestsSection {
+            handlePendingOpenFriendRequestsSectionChange(true)
+            return
+        }
+        if let groupId = chatMainTabState.pendingGroupOpenConversationId {
+            handlePendingGroupOpenConversationChange(groupId)
+            return
+        }
+        if let preview = chatMainTabState.pendingDmOpenPreview {
+            handlePendingDmOpenPreviewChange(preview)
+            return
+        }
+        if chatViewModel.hasPendingChatPushDeepLinkRoute {
+#if DEBUG
+            PushDeepLinkLog.waiting(reason: "bootstrap")
+#endif
+        }
+    }
+
     private func handlePendingDmOpenPreviewChange(_ preview: UserPreview?) {
         guard preview != nil else {
             routePostSignupDiscoverWelcomeGuideIfReady(reason: "pendingDmCleared")
             return
         }
+#if DEBUG
+        PushDeepLinkLog.selectingChatTab(reason: "pendingDmOpenPreview")
+#endif
         if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
             Task { await selectChatTabAfterDeviceAuth() }
         } else {
@@ -1185,11 +1259,31 @@ struct MainTabView: View {
 
     private func handlePendingGroupOpenConversationChange(_ groupId: UUID?) {
         guard groupId != nil else { return }
+#if DEBUG
+        PushDeepLinkLog.selectingChatTab(reason: "pendingGroupOpenConversationId")
+#endif
         if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
             Task { await selectChatTabAfterDeviceAuth() }
         } else {
             privateChatUnlockedForCurrentSelection = true
             selectTab(.chat, reason: "pendingGroupOpenConversationId")
+            updateDirectChatReadStateVisibility()
+        }
+    }
+
+    private func handlePendingOpenFriendRequestsSectionChange(_ open: Bool) {
+        guard open else { return }
+#if DEBUG
+        PushDeepLinkLog.selectingChatTab(reason: "pendingOpenFriendRequestsSection")
+#endif
+        if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
+            Task { await selectChatTabAfterDeviceAuth() }
+        } else {
+            if !requireDeviceAuthForPrivateChat {
+                print("[PrivateChatSecurityDebug] biometricPromptSkippedReason=settingDisabled")
+            }
+            privateChatUnlockedForCurrentSelection = true
+            selectTab(.chat, reason: "pendingOpenFriendRequestsSection")
             updateDirectChatReadStateVisibility()
         }
     }
@@ -1206,6 +1300,7 @@ struct MainTabView: View {
             return
         }
         Task { await handleAppBecameActive() }
+        reconcilePendingChatPushRoutesIfNeeded(reason: "sceneBecameActive")
         viewModel.refreshAutomaticTimeZonePresentationIfNeeded()
     }
 
@@ -1421,7 +1516,7 @@ struct MainTabView: View {
     private var dmInAppNotificationBannerLayer: some View {
         VStack {
             if let banner = chatMainTabState.dmInAppNotification,
-               !chatMainTabState.hidesFloatingTabBarForDirectChat {
+               !hidesFloatingTabBarForActiveChatConversation {
                 dmInAppNotificationCard(banner)
                     .padding(.horizontal, 14)
                     .padding(.top, 12)
@@ -1438,7 +1533,7 @@ struct MainTabView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .allowsHitTesting(chatMainTabState.dmInAppNotification != nil && !chatMainTabState.hidesFloatingTabBarForDirectChat)
+        .allowsHitTesting(chatMainTabState.dmInAppNotification != nil && !hidesFloatingTabBarForActiveChatConversation)
         .animation(.spring(response: 0.38, dampingFraction: 0.86), value: chatMainTabState.dmInAppNotification?.id)
         .zIndex(90)
     }
@@ -1490,49 +1585,74 @@ struct MainTabView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Independent overlay: does not participate in `DirectChatView` layout; hidden during DM threads via ``ChatViewModel/hidesFloatingTabBarForDirectChat``.
+    /// Shell visibility: conversation chrome from Chat only suppresses the bar while Chat is the
+    /// selected tab. An inactive Chat navigation stack (DM/group route preserved) must not hide
+    /// chrome on other tabs — e.g. Group Info → View Pickup Game → Discover.
+    private var hidesFloatingTabBarForActiveChatConversation: Bool {
+        selectedTab == .chat && chatMainTabState.hidesFloatingTabBarForDirectChat
+    }
+
+    /// Independent overlay: does not participate in `DirectChatView` layout; hidden while Chat is
+    /// selected and a conversation destination requires chrome hide (see ``hidesFloatingTabBarForActiveChatConversation``).
     private var floatingTabBarChrome: some View {
         let _ = MainTabObservationPerf.floatingBarEvaluated(selectedTab: selectedTab.rawValue)
+        let layout = FloatingTabBarLayout.resolve(barWidth: floatingTabBarWidth)
         return VStack {
             Spacer()
 
-            HStack(spacing: 6) {
-                tabButton(.discover, title: localized("discover"), icon: "map.fill")
+            HStack(spacing: layout.itemSpacing) {
+                tabButton(.discover, title: localized("discover"), icon: "map.fill", layout: layout)
 
-                tabButton(.live, title: localized("live"), icon: "dot.radiowaves.left.and.right", glow: FGColor.accentGreen)
+                tabButton(
+                    .live,
+                    title: localized("live"),
+                    icon: "dot.radiowaves.left.and.right",
+                    glow: FGColor.accentGreen,
+                    layout: layout
+                )
 
-                calendarTabButton()
+                calendarTabButton(layout: layout)
 
-                followingTabButton()
+                followingTabButton(layout: layout)
 
-                chatTabButton()
+                chatTabButton(layout: layout)
 
                 Button {
                     handleTabBarTap(.account, reason: "accountTabButton")
                 } label: {
-                    accountTabAvatar
+                    accountTabAvatar(layout: layout)
                 }
                 .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+                .layoutPriority(-1)
+                .fixedSize(horizontal: true, vertical: false)
                 .disabled(viewModel.isSafeLogoutBlockingUI)
             }
-            .padding(8)
+            .padding(.horizontal, layout.barHorizontalPadding)
+            .padding(.vertical, layout.barVerticalPadding)
             .background {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
                         .fill(.ultraThinMaterial)
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
                         .fill(floatingTabBarTint)
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
                     .strokeBorder(floatingTabBarBorder, lineWidth: 1)
             }
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.12), radius: colorScheme == .dark ? 18 : 10, y: 8)
             .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.08 : 0.04), radius: 10, y: 2)
-            .padding(.horizontal)
-            .padding(.bottom, 6)
+            .padding(.horizontal, layout.screenHorizontalInset)
+            .padding(.bottom, layout.screenBottomInset)
+        }
+        // Available overlay width (not intrinsic capsule width) drives compact *label* metrics.
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.width
+        } action: { newWidth in
+            guard abs(floatingTabBarWidth - newWidth) > 0.5 else { return }
+            floatingTabBarWidth = newWidth
         }
         .allowsHitTesting(!viewModel.isSafeLogoutBlockingUI)
         .zIndex(2)
@@ -1583,11 +1703,8 @@ struct MainTabView: View {
         @ViewBuilder content: () -> Content
     ) -> some View {
         let isSelected = selectedTab == tab
-        // While a DM thread is open, collapse only inactive tab roots so the custom ZStack tab shell
-        // does not expand under the keyboard. Never branch the active Chat root — that recreates
-        // FriendsTabView/NavigationStack and pops Direct Chat.
-        let collapseInactiveForDirectChat =
-            chatMainTabState.hidesFloatingTabBarForDirectChat && !isSelected
+        // Do not collapse sibling tab frames when a conversation is presented — changing
+        // inactive-root geometry on the shell ZStack can remount NavigationStack destinations.
         content()
             .environment(\.hostTabAdInteractionEnabled, isSelected)
             .opacity(isSelected ? 1 : 0)
@@ -1595,22 +1712,27 @@ struct MainTabView: View {
             .accessibilityHidden(!isSelected)
             .zIndex(isSelected ? 1 : 0)
             .animation(nil, value: isSelected)
-            .modifier(DirectChatInactiveTabCollapseModifier(collapse: collapseInactiveForDirectChat))
             .id(tab)
     }
 
     /// Chat tab content keeps a single stable modifier chain so NavigationStack identity
-    /// (and the Direct Chat destination) survives floating-tab hide toggles.
+    /// (and the Direct Chat destination) survives floating-tab visual hide.
     private var chatTabRoot: some View {
-        FriendsTabView(
+#if DEBUG
+        let _ = {
+            if !DirectChatInvestigation.quietConsole {
+                ChatNavDebugCounters.log("chatRoot.body")
+            }
+        }()
+#endif
+        return FriendsTabView(
             mapViewModel: viewModel,
             viewModel: chatViewModel,
             isTabSelected: selectedTab == .chat
         )
-        .padding(
-            .bottom,
-            chatMainTabState.hidesFloatingTabBarForDirectChat ? 0 : Self.floatingTabBarStackHeight
-        )
+        // No outer bottom padding — NavigationStack must be full-height so DM/group
+        // composers are not double-reserved under the visually-hidden floating tab bar.
+        // Inbox-only clearance lives inside FriendsTabView's root content.
         .background(chatTabRootBackground.ignoresSafeArea())
     }
     
@@ -1692,7 +1814,7 @@ struct MainTabView: View {
             : Color.white.opacity(0.92)
     }
     
-    private func chatTabButton() -> some View {
+    private func chatTabButton(layout: FloatingTabBarLayout) -> some View {
         Button {
             // Face ID off / signed-out: select synchronously on first tap (no Task hop).
             if !viewModel.isAuthenticatedForSocialFeatures || !requireDeviceAuthForPrivateChat {
@@ -1716,32 +1838,27 @@ struct MainTabView: View {
             }
         } label: {
             MainTabChatBadgeObserver(state: chatTabBadgeState) { unreadCount, pendingCount, requiresSignIn in
+                let isSelected = selectedTab == .chat
                 ZStack(alignment: .topTrailing) {
-                    HStack(spacing: 5) {
+                    floatingTabBarCapsuleLabel(
+                        isSelected: isSelected,
+                        title: localized("chat"),
+                        layout: layout
+                    ) {
                         chatTabMessageIconWithUnreadBadge(
                             unreadCount: unreadCount,
-                            requiresSignIn: requiresSignIn
+                            requiresSignIn: requiresSignIn,
+                            iconSlotWidth: layout.chatIconSlotWidth
                         )
-                        if selectedTab == .chat {
-                            Text(localized("chat"))
-                        }
                     }
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .padding(.horizontal, selectedTab == .chat ? 12 : 10)
-                    .padding(.vertical, 10)
-                    .frame(minWidth: 44, minHeight: 44)
-                    .contentShape(Rectangle())
-                    .foregroundStyle(selectedTab == .chat ? Color.white : unselectedTabForegroundColor)
-                    .background(selectedTab == .chat ? selectedTabBackgroundColor : Color.clear)
-                    .clipShape(Capsule())
-                    .softActiveGlow(selectedTab == .chat, color: FGColor.accentBlue)
+                    .softActiveGlow(isSelected, color: FGColor.accentBlue)
 
                     if pendingCount > 0 {
                         chatTabPillBadge(count: pendingCount)
                             .offset(x: 6, y: -6)
                     }
                 }
+                .layoutPriority(isSelected ? 1 : 0)
             }
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
@@ -1754,19 +1871,22 @@ struct MainTabView: View {
     }
 
     /// Manual unread pill: SwiftUI `.badge` on custom floating-tab labels is unreliable; match inbox ``unreadDirectMessageCount``.
-    /// Fixed layout size + padded overlay keeps the pill inside the tab row ``Capsule`` / floating bar clips (offsets do not expand layout).
+    /// Icon slot stays compact so the selected “Chat” label can share the pill on narrow widths; badge overlays inset.
     private func chatTabMessageIconWithUnreadBadge(
         unreadCount n: Int,
-        requiresSignIn: Bool
+        requiresSignIn: Bool,
+        iconSlotWidth: CGFloat
     ) -> some View {
         let show = chatTabUnreadBadgeVisible(
             unreadCount: n,
             requiresSignIn: requiresSignIn
         )
         let label = n > 99 ? "99+" : "\(n)"
+        // Slightly wider when a badge is visible so the capsule does not clip digits.
+        let slotWidth = show ? max(iconSlotWidth, 28) : iconSlotWidth
 
         return ZStack {
-            Color.clear.frame(width: 44, height: 28)
+            Color.clear.frame(width: slotWidth, height: 28)
 
             Image(systemName: "message.fill")
                 .font(.system(size: 15, weight: .semibold))
@@ -1811,57 +1931,39 @@ struct MainTabView: View {
             .clipShape(Capsule())
     }
 
-    private func calendarTabButton() -> some View {
+    private func calendarTabButton(layout: FloatingTabBarLayout) -> some View {
+        let isSelected = selectedTab == .calendar
         return Button {
             handleTabBarTap(.calendar, reason: "calendarTabButton")
         } label: {
-            ZStack(alignment: .topTrailing) {
-                HStack(spacing: 5) {
-                    Image(systemName: "calendar")
-
-                    if selectedTab == .calendar {
-                        Text(localized("Schedule"))
-                    }
-                }
-                .font(.caption)
-                .fontWeight(.bold)
-                .padding(.horizontal, selectedTab == .calendar ? 12 : 10)
-                .padding(.vertical, 10)
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
-                .foregroundStyle(selectedTab == .calendar ? Color.white : unselectedTabForegroundColor)
-                .background(selectedTab == .calendar ? selectedTabBackgroundColor : Color.clear)
-                .clipShape(Capsule())
-                .softActiveGlow(selectedTab == .calendar, color: FGColor.accentBlue)
-
+            floatingTabBarCapsuleLabel(
+                isSelected: isSelected,
+                title: localized("Schedule"),
+                layout: layout
+            ) {
+                Image(systemName: "calendar")
             }
+            .softActiveGlow(isSelected, color: FGColor.accentBlue)
+            .layoutPriority(isSelected ? 1 : 0)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
         .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
-    private func followingTabButton() -> some View {
-        Button {
+    private func followingTabButton(layout: FloatingTabBarLayout) -> some View {
+        let isSelected = selectedTab == .following
+        return Button {
             handleTabBarTap(.following, reason: "followingTabButton")
         } label: {
             ZStack(alignment: .topTrailing) {
-                HStack(spacing: 5) {
+                floatingTabBarCapsuleLabel(
+                    isSelected: isSelected,
+                    title: localized("going"),
+                    layout: layout
+                ) {
                     Image(systemName: "heart.fill")
-
-                    if selectedTab == .following {
-                        Text(localized("going"))
-                    }
                 }
-                .font(.caption)
-                .fontWeight(.bold)
-                .padding(.horizontal, selectedTab == .following ? 12 : 10)
-                .padding(.vertical, 10)
-                .frame(minWidth: 44, minHeight: 44)
-                .contentShape(Rectangle())
-                .foregroundStyle(selectedTab == .following ? Color.white : unselectedTabForegroundColor)
-                .background(selectedTab == .following ? selectedTabBackgroundColor : Color.clear)
-                .clipShape(Capsule())
-                .softActiveGlow(selectedTab == .following, color: FGColor.accentGreen)
+                .softActiveGlow(isSelected, color: FGColor.accentGreen)
 
                 if goingTabHasActivity {
                     Circle()
@@ -1872,6 +1974,7 @@ struct MainTabView: View {
                         .accessibilityLabel("Pickup games activity")
                 }
             }
+            .layoutPriority(isSelected ? 1 : 0)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
         .disabled(viewModel.isSafeLogoutBlockingUI)
@@ -1884,30 +1987,62 @@ struct MainTabView: View {
             || !viewModel.incomingPickupGameInvites.isEmpty
     }
 
-    private func tabButton(_ tab: AppTab, title: String, icon: String, glow: Color = FGColor.accentBlue) -> some View {
-        Button {
+    private func tabButton(
+        _ tab: AppTab,
+        title: String,
+        icon: String,
+        glow: Color = FGColor.accentBlue,
+        layout: FloatingTabBarLayout
+    ) -> some View {
+        let isSelected = selectedTab == tab
+        return Button {
             handleTabBarTap(tab, reason: "tabButton")
         } label: {
-            HStack(spacing: 5) {
+            floatingTabBarCapsuleLabel(
+                isSelected: isSelected,
+                title: title,
+                layout: layout
+            ) {
                 Image(systemName: icon)
-                
-                if selectedTab == tab {
-                    Text(title)
-                }
             }
-            .font(.caption)
-            .fontWeight(.bold)
-            .padding(.horizontal, selectedTab == tab ? 12 : 10)
-            .padding(.vertical, 10)
-            .frame(minWidth: 44, minHeight: 44)
-            .contentShape(Rectangle())
-            .foregroundStyle(selectedTab == tab ? Color.white : unselectedTabForegroundColor)
-            .background(selectedTab == tab ? selectedTabBackgroundColor : Color.clear)
-            .clipShape(Capsule())
-            .softActiveGlow(selectedTab == tab, color: glow)
+            .softActiveGlow(isSelected, color: glow)
+            .layoutPriority(isSelected ? 1 : 0)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
         .disabled(viewModel.isSafeLogoutBlockingUI)
+    }
+
+    /// Shared selected/unselected capsule chrome for every floating tab (except the avatar).
+    /// Compact widths only scale the selected label slightly so “Chat” / “Schedule” stay one line.
+    @ViewBuilder
+    private func floatingTabBarCapsuleLabel<Icon: View>(
+        isSelected: Bool,
+        title: String,
+        layout: FloatingTabBarLayout,
+        @ViewBuilder icon: () -> Icon
+    ) -> some View {
+        let labelSize = isSelected ? layout.selectedLabelFontSize : layout.labelFontSize
+        HStack(spacing: layout.labelSpacing) {
+            icon()
+
+            if isSelected {
+                Text(title)
+                    .font(.system(size: labelSize, weight: .bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(layout.selectedLabelMinimumScale)
+                    .allowsTightening(true)
+                    .layoutPriority(1)
+            }
+        }
+        .font(.system(size: layout.labelFontSize, weight: .bold))
+        .padding(.horizontal, isSelected ? layout.selectedHorizontalPadding : layout.unselectedHorizontalPadding)
+        .padding(.vertical, layout.itemVerticalPadding)
+        .frame(minWidth: layout.unselectedMinWidth, minHeight: layout.itemMinHeight)
+        .fixedSize(horizontal: isSelected, vertical: false)
+        .contentShape(Rectangle())
+        .foregroundStyle(isSelected ? Color.white : unselectedTabForegroundColor)
+        .background(isSelected ? selectedTabBackgroundColor : Color.clear)
+        .clipShape(Capsule())
     }
     
     private var accountTabIcon: String {
@@ -2172,10 +2307,10 @@ struct MainTabView: View {
     }
 
     /// Avatar only; pickup participation activity now belongs in Going.
-    private var accountTabAvatar: some View {
+    private func accountTabAvatar(layout: FloatingTabBarLayout) -> some View {
         ZStack(alignment: .topTrailing) {
-            accountTabAvatarCircleOnly
-                .frame(width: 44, height: 44)
+            accountTabAvatarCircleOnly(size: layout.avatarInner)
+                .frame(width: layout.avatarInner, height: layout.avatarInner)
                 .clipShape(Circle())
 
             if accountTabPokesBadgeVisible {
@@ -2188,7 +2323,7 @@ struct MainTabView: View {
                     .offset(x: -4, y: 2)
             }
         }
-        .frame(width: 52, height: 52)
+        .frame(width: layout.avatarOuter, height: layout.avatarOuter)
         .accessibilityLabel(accountTabPokesBadgeVisible ? "Account, new Pokes" : accountTabTitle)
         .onAppear {
             DebugLogGate.debug("[PokesBadgeUI] accountBadge visible=\(accountTabPokesBadgeVisible)")
@@ -2202,13 +2337,13 @@ struct MainTabView: View {
         viewModel.canReceiveProfilePokes && viewModel.hasUnseenPokes
     }
 
-    private var accountTabAvatarCircleOnly: some View {
+    private func accountTabAvatarCircleOnly(size: CGFloat) -> some View {
         Group {
             if isBusinessAccountTabContext {
                 Image(systemName: accountIconName)
                     .font(.title3)
                     .foregroundStyle(accountIconColor)
-                    .frame(width: 44, height: 44)
+                    .frame(width: size, height: size)
                     .background(accountIconBackgroundColor)
             } else if viewModel.isLoggedIn {
                 UserAvatarView(
@@ -2228,7 +2363,7 @@ struct MainTabView: View {
                         userEmail: viewModel.currentUserEmail,
                         venueOwnerEmail: viewModel.venueOwnerEmail
                     ),
-                    size: 44,
+                    size: size,
                     fallbackStyle: colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome,
                     imagePlaceholderTint: colorScheme == .dark ? .white : nil
                 )
@@ -2237,7 +2372,7 @@ struct MainTabView: View {
                 Image(systemName: accountIconName)
                     .font(.title3)
                     .foregroundStyle(accountIconColor)
-                    .frame(width: 44, height: 44)
+                    .frame(width: size, height: size)
                     .background(accountIconBackgroundColor)
             }
         }
@@ -2254,6 +2389,86 @@ struct MainTabView: View {
             .shadow(color: Color.orange.opacity(0.24), radius: 4, y: 1)
             .accessibilityHidden(true)
     }
+}
+
+/// Width-driven metrics for the floating capsule tab bar (no device-name checks).
+///
+/// Shared chrome sized to match Discover Watch/Play dock weight (stack 108, corner 28).
+/// Compact widths only reduce selected-label font / scale so “Chat” and “Schedule” stay one line.
+private struct FloatingTabBarLayout: Equatable {
+    // Shared chrome — identical on all phones.
+    var screenHorizontalInset: CGFloat
+    var screenBottomInset: CGFloat
+    var barHorizontalPadding: CGFloat
+    var barVerticalPadding: CGFloat
+    var barCornerRadius: CGFloat
+    var itemVerticalPadding: CGFloat
+    var itemMinHeight: CGFloat
+    var labelFontSize: CGFloat
+    var itemSpacing: CGFloat
+    var labelSpacing: CGFloat
+    var unselectedHorizontalPadding: CGFloat
+    var unselectedMinWidth: CGFloat
+    var avatarInner: CGFloat
+    var avatarOuter: CGFloat
+    var chatIconSlotWidth: CGFloat
+
+    // Compact-only selected-label tweaks (never shrink icons / avatar / bar chrome).
+    var selectedLabelFontSize: CGFloat
+    var selectedHorizontalPadding: CGFloat
+    var selectedLabelMinimumScale: CGFloat
+
+    /// `availableWidth` is the floating-bar overlay width (≈ screen width).
+    static func resolve(barWidth availableWidth: CGFloat) -> FloatingTabBarLayout {
+        // Compact phones (≤ ~iPhone 11 / 16 class) only scale selected labels.
+        // Pro Max-class widths keep the baseline caption size.
+        if availableWidth < 430 {
+            return .compact
+        }
+        return .regular
+    }
+
+    static let compact = FloatingTabBarLayout(
+        screenHorizontalInset: 16,
+        screenBottomInset: 6,
+        barHorizontalPadding: 16,
+        barVerticalPadding: 10,
+        barCornerRadius: 28,
+        itemVerticalPadding: 10,
+        itemMinHeight: 44,
+        labelFontSize: 12,
+        itemSpacing: 6,
+        labelSpacing: 5,
+        unselectedHorizontalPadding: 10,
+        unselectedMinWidth: 44,
+        avatarInner: 44,
+        avatarOuter: 52,
+        chatIconSlotWidth: 22,
+        selectedLabelFontSize: 11,
+        selectedHorizontalPadding: 10,
+        selectedLabelMinimumScale: 0.82
+    )
+
+    static let regular = FloatingTabBarLayout(
+        screenHorizontalInset: 16,
+        screenBottomInset: 6,
+        barHorizontalPadding: 16,
+        barVerticalPadding: 10,
+        barCornerRadius: 28,
+        itemVerticalPadding: 10,
+        itemMinHeight: 44,
+        labelFontSize: 12,
+        itemSpacing: 6,
+        labelSpacing: 5,
+        unselectedHorizontalPadding: 10,
+        unselectedMinWidth: 44,
+        avatarInner: 44,
+        avatarOuter: 52,
+        chatIconSlotWidth: 24,
+        selectedLabelFontSize: 12,
+        selectedHorizontalPadding: 12,
+        selectedLabelMinimumScale: 0.9
+    )
 }
 
 /// Shallow badge leaf: only this subtree observes unread/request/auth-gate changes.
@@ -2281,24 +2496,6 @@ private struct MainTabChatBadgeObserver<Content: View>: View {
             print("[ChatTabBadge] unreadCount=\(count)")
             print("[ChatTabBadge] visible=\(!requiresSignIn && count > 0)")
 #endif
-        }
-    }
-}
-
-/// Collapses inactive tab roots only while Direct Chat is open.
-/// Active Chat tab always uses `collapse == false`, so its NavigationStack identity stays stable.
-private struct DirectChatInactiveTabCollapseModifier: ViewModifier {
-    let collapse: Bool
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if collapse {
-            content
-                .frame(maxWidth: 0, maxHeight: 0)
-                .clipped()
-        } else {
-            // No frame/clip — preserves Discover edge-to-edge map rendering.
-            content
         }
     }
 }

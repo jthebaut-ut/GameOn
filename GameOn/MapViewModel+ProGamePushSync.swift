@@ -20,20 +20,19 @@ nonisolated enum FavoriteTeamProGameAlertOverride: String, Codable, Equatable {
 extension MapViewModel {
     func syncProGameFinalScorePreferenceToBackend(reason: String) async {
         guard let userID = currentUserAuthId, isAuthenticatedForSocialFeatures else { return }
+        let pickupChangeEnabled = UserDefaults.standard.object(forKey: "pickupGameChangeNotifications") as? Bool ?? true
         let row = ProGameNotificationPreferenceUpsertRow(
             user_id: userID.uuidString.lowercased(),
             pro_game_reminder_notifications_enabled: notificationSettingsStore.proGameKickoffAlertEnabled,
             pro_game_reminder_timing: notificationSettingsStore.proGameReminderTiming.rawValue,
             pro_game_final_score_alerts_enabled: notificationSettingsStore.proGameFinalScoreNotifications,
             favorite_team_pro_game_alerts_enabled: notificationSettingsStore.favoriteTeamProGameAlertsEnabled,
-            fan_geo_announcement_notifications_enabled: notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled
+            fan_geo_announcement_notifications_enabled: notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled,
+            pickup_game_change_notifications_enabled: pickupChangeEnabled
         )
 
         do {
-            try await supabase
-                .from("user_notification_preferences")
-                .upsert(row, onConflict: "user_id")
-                .execute()
+            try await upsertProGameNotificationPreferences(row)
 #if DEBUG
             print("[RemoteNotificationDebug] proGamePreferenceSyncSucceeded reminders=\(row.pro_game_reminder_notifications_enabled) timing=\(row.pro_game_reminder_timing) final=\(row.pro_game_final_score_alerts_enabled) reason=\(reason)")
 #endif
@@ -54,14 +53,7 @@ extension MapViewModel {
             return
         }
         do {
-            let rows: [ProGameNotificationPreferenceRow] = try await supabase
-                .from("user_notification_preferences")
-                .select("pro_game_reminder_notifications_enabled,pro_game_reminder_timing,pro_game_final_score_alerts_enabled,favorite_team_pro_game_alerts_enabled,fan_geo_announcement_notifications_enabled")
-                .eq("user_id", value: userID.uuidString.lowercased())
-                .limit(1)
-                .execute()
-                .value
-
+            let rows = try await loadProGameNotificationPreferenceRows(userID: userID)
             if let row = rows.first {
                 applyProGameNotificationPreferences(from: row, reason: reason)
                 lastProGameNotificationPreferencesLoadAt = Date()
@@ -82,6 +74,73 @@ extension MapViewModel {
 
     func loadFavoriteTeamProGameAlertsPreferenceFromBackend(reason: String) async {
         await loadProGameNotificationPreferencesFromBackend(reason: reason)
+    }
+
+    private func upsertProGameNotificationPreferences(_ row: ProGameNotificationPreferenceUpsertRow) async throws {
+        do {
+            try await supabase
+                .from("user_notification_preferences")
+                .upsert(row, onConflict: "user_id")
+                .execute()
+        } catch {
+            let message = error.localizedDescription.lowercased()
+            let missingColumn = message.contains("pickup_game_change_notifications_enabled")
+                || (message.contains("column") && message.contains("does not exist"))
+            guard missingColumn else { throw error }
+            // Pre-migration fallback: keep other preference sync working.
+            struct LegacyUpsert: Encodable {
+                let user_id: String
+                let pro_game_reminder_notifications_enabled: Bool
+                let pro_game_reminder_timing: String
+                let pro_game_final_score_alerts_enabled: Bool
+                let favorite_team_pro_game_alerts_enabled: Bool
+                let fan_geo_announcement_notifications_enabled: Bool
+            }
+            let legacy = LegacyUpsert(
+                user_id: row.user_id,
+                pro_game_reminder_notifications_enabled: row.pro_game_reminder_notifications_enabled,
+                pro_game_reminder_timing: row.pro_game_reminder_timing,
+                pro_game_final_score_alerts_enabled: row.pro_game_final_score_alerts_enabled,
+                favorite_team_pro_game_alerts_enabled: row.favorite_team_pro_game_alerts_enabled,
+                fan_geo_announcement_notifications_enabled: row.fan_geo_announcement_notifications_enabled
+            )
+            try await supabase
+                .from("user_notification_preferences")
+                .upsert(legacy, onConflict: "user_id")
+                .execute()
+        }
+    }
+
+    /// Loads preference rows; falls back without pickup-edit column until migration 20260911 is applied.
+    private func loadProGameNotificationPreferenceRows(userID: UUID) async throws -> [ProGameNotificationPreferenceRow] {
+        let withPickupColumn =
+            "pro_game_reminder_notifications_enabled,pro_game_reminder_timing,pro_game_final_score_alerts_enabled,favorite_team_pro_game_alerts_enabled,fan_geo_announcement_notifications_enabled,pickup_game_change_notifications_enabled"
+        let legacyColumns =
+            "pro_game_reminder_notifications_enabled,pro_game_reminder_timing,pro_game_final_score_alerts_enabled,favorite_team_pro_game_alerts_enabled,fan_geo_announcement_notifications_enabled"
+        do {
+            return try await supabase
+                .from("user_notification_preferences")
+                .select(withPickupColumn)
+                .eq("user_id", value: userID.uuidString.lowercased())
+                .limit(1)
+                .execute()
+                .value
+        } catch {
+            let message = error.localizedDescription.lowercased()
+            let missingColumn = message.contains("pickup_game_change_notifications_enabled")
+                || message.contains("column") && message.contains("does not exist")
+            guard missingColumn else { throw error }
+#if DEBUG
+            print("[RemoteNotificationDebug] proGamePreferenceLoad fallback=legacyColumns (pickup change column missing)")
+#endif
+            return try await supabase
+                .from("user_notification_preferences")
+                .select(legacyColumns)
+                .eq("user_id", value: userID.uuidString.lowercased())
+                .limit(1)
+                .execute()
+                .value
+        }
     }
 
     private func applyProGameNotificationPreferences(from row: ProGameNotificationPreferenceRow, reason: String) {
@@ -108,6 +167,9 @@ extension MapViewModel {
         }
         if let announcementAlerts = row.fan_geo_announcement_notifications_enabled {
             notificationSettingsStore.fanGeoAnnouncementNotificationsEnabled = announcementAlerts
+        }
+        if let pickupChange = row.pickup_game_change_notifications_enabled {
+            UserDefaults.standard.set(pickupChange, forKey: "pickupGameChangeNotifications")
         }
 
         objectWillChange.send()
@@ -437,6 +499,7 @@ private struct ProGameNotificationPreferenceUpsertRow: Encodable {
     let pro_game_final_score_alerts_enabled: Bool
     let favorite_team_pro_game_alerts_enabled: Bool
     let fan_geo_announcement_notifications_enabled: Bool
+    let pickup_game_change_notifications_enabled: Bool
 }
 
 private struct ProGameNotificationPreferenceRow: Decodable {
@@ -445,6 +508,7 @@ private struct ProGameNotificationPreferenceRow: Decodable {
     let pro_game_final_score_alerts_enabled: Bool?
     let favorite_team_pro_game_alerts_enabled: Bool?
     let fan_geo_announcement_notifications_enabled: Bool?
+    let pickup_game_change_notifications_enabled: Bool?
 }
 
 private struct SavedProGameScoreAlertPatch: Encodable {

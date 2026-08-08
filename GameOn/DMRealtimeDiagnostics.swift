@@ -37,3 +37,41 @@ enum RealtimeHealthDiagnostics {
 #endif
     }
 }
+
+/// Focused reopen/dismiss race tracing for composer Connecting/Reconnecting audits.
+/// No message bodies, tokens, or location data.
+enum ChatRealtimeAudit {
+    static func log(
+        conversationId: UUID?,
+        generation: Int,
+        event: String,
+        status: String? = nil,
+        extra: String? = nil
+    ) {
+#if DEBUG
+        let conv = conversationId.map { String($0.uuidString.prefix(8)).lowercased() } ?? "nil"
+        var line = "[ChatRealtimeAudit] conv=\(conv) gen=\(generation) event=\(event)"
+        if let status { line += " status=\(status)" }
+        if let extra, !extra.isEmpty { line += " \(extra)" }
+        print(line)
+#endif
+    }
+
+    static func statusTransition(
+        conversationId: UUID?,
+        generation: Int,
+        from old: ChatRealtimeConnectionStatus,
+        to new: ChatRealtimeConnectionStatus,
+        reason: String
+    ) {
+#if DEBUG
+        log(
+            conversationId: conversationId,
+            generation: generation,
+            event: "status",
+            status: String(describing: new),
+            extra: "old=\(String(describing: old)) new=\(String(describing: new)) reason=\(reason)"
+        )
+#endif
+    }
+}

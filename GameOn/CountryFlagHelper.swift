@@ -20,6 +20,14 @@ nonisolated enum CountryFlagHelper {
         (["northern ireland"], "\u{1F1EC}\u{1F1E7}"),
     ]
 
+    /// FIFA/IOC-style short codes for UK subdivisions (not ISO region codes).
+    private static let subdivisionShortCodesByAlias: [String: String] = [
+        "england": "ENG",
+        "scotland": "SCO",
+        "wales": "WAL",
+        "northern ireland": "NIR",
+    ]
+
     private static let entries: [NationalTeamFlagEntry] = [
         // North America
         NationalTeamFlagEntry(code: "US", names: ["United States", "United States of America", "America", "USA"], providerCodes: ["USA"]),
@@ -230,12 +238,50 @@ nonisolated enum CountryFlagHelper {
     static func teamShortCode(for teamName: String) -> String? {
         let trimmed = teamName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let normalized = normalize(trimmed)
+        if let subdivision = subdivisionShortCodesByAlias[normalized] {
+            return subdivision
+        }
         if let regionCode = regionCode(for: trimmed),
            let entry = entries.first(where: { $0.code == regionCode }),
            let providerCode = entry.providerCodes.first {
             return providerCode
         }
         return countryCode(for: trimmed)
+    }
+
+    /// Compact uppercase country abbreviation for Live metadata chips (USA, FRA, ENG…).
+    /// Never returns a long display name that would truncate with ellipsis.
+    static func compactCountryAbbreviation(for countryName: String) -> String {
+        let trimmed = countryName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        if let short = teamShortCode(for: trimmed) {
+            return short.uppercased()
+        }
+
+        let lettersOnly = trimmed.uppercased().filter(\.isLetter)
+        if lettersOnly.count >= 2, lettersOnly.count <= 3 {
+            return lettersOnly
+        }
+
+        // Last resort: initials / first letters — still no ellipsis truncation.
+        let normalized = normalize(trimmed)
+        let parts = normalized.split(separator: " ").map(String.init)
+        if parts.count >= 2 {
+            let initials = parts.prefix(3).compactMap { $0.first.map(String.init) }.joined().uppercased()
+            if initials.count >= 2 { return initials }
+        }
+        return String(lettersOnly.prefix(3))
+    }
+
+    /// Flag + compact abbreviation for Live country chips, e.g. `"🇺🇸 USA"`.
+    static func compactCountryChipText(for countryName: String, source: String? = nil) -> String {
+        let abbreviation = compactCountryAbbreviation(for: countryName)
+        guard !abbreviation.isEmpty else { return "" }
+        let flag = flag(for: countryName, source: source)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return flag.isEmpty ? abbreviation : "\(flag) \(abbreviation)"
     }
 
     static func normalizedTeamName(_ teamName: String) -> String {

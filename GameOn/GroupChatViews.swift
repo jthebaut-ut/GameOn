@@ -1,5 +1,6 @@
 import SwiftUI
 import Supabase
+import UIKit
 
 /// Neutral copy for invite eligibility / authorization failures (never disclose blocks).
 /// Also routes backend age-access denials into the shared age gate (single system).
@@ -204,6 +205,19 @@ struct GroupChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
+    init(
+        conversationId: UUID,
+        chatViewModel: ChatViewModel,
+        pickupContext: PickupGameChatContext? = nil
+    ) {
+#if DEBUG
+        ChatNavDebugCounters.log("destination.init", detail: "kind=group")
+#endif
+        self.conversationId = conversationId
+        self.chatViewModel = chatViewModel
+        self.pickupContext = pickupContext
+    }
+
     @State private var title: String = L10n.t("group_chat_default_title")
     @State private var messages: [GroupMessageRow] = []
     @State private var draft: String = ""
@@ -217,8 +231,14 @@ struct GroupChatView: View {
     @State private var memberPreviews: [UUID: UserPreview] = [:]
     @State private var realtimeChannel: RealtimeChannelV2?
     @State private var realtimeListenTask: Task<Void, Never>?
+    /// Owns subscribe/retry so SwiftUI `.task` cancellation cannot abandon a healthy channel at `.connecting`.
+    @State private var groupRealtimeSubscriptionTask: Task<Void, Never>?
     @State private var subscribedConversationId: UUID?
     @State private var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting
+    @State private var chatRealtimeLifecycleGeneration: Int = 0
+    @State private var ownedGroupChannelGeneration: Int = 0
+    @State private var groupRealtimeStopTask: Task<Void, Never>?
+    @State private var groupHadSuccessfulSubscribe = false
     @State private var seenMessageIds: Set<UUID> = []
     @State private var reportTarget: GroupMessageRow?
     @State private var reportCategory: ModerationReportCategory = .spam
@@ -228,9 +248,18 @@ struct GroupChatView: View {
     @State private var reportedMessageIds: Set<UUID> = []
     @State private var showEmojiQuickTray = false
     @State private var isRefreshingMessages = false
+    @State private var showPollCreateSheet = false
+    @State private var hiddenPollIds: Set<UUID> = []
+    @State private var pendingScrollToMessageId: UUID?
+    @State private var replyDraft: ChatReplyComposerDraft?
+    @State private var highlightedReplyMessageId: UUID?
+    @State private var showConversationSearch = false
     @FocusState private var composerFocused: Bool
+    /// Suppress eligibility/status animations while the first open `.task` hydrates membership.
+    @State private var isThreadOpening = true
 
     private let service = GroupChatService()
+    private let pollService = PickupGamePollService()
     private let identityService = SocialIdentityService()
     private let maxBodyLength = 1000
 
@@ -240,6 +269,55 @@ struct GroupChatView: View {
 
     private var isPickupGameChat: Bool {
         pickupContext != nil || details.first?.isPickupGameChat == true
+    }
+
+    private var effectivePickupGameId: UUID? {
+        pickupContext?.pickupGameId ?? details.first?.pickup_game_id
+    }
+
+    /// Pickup chats assign `admin` to the game creator. Co-organizers are not supported yet.
+    private var viewerIsPickupOrganizer: Bool {
+        guard isPickupGameChat else { return false }
+        return details.first?.viewer_is_admin == true
+    }
+
+    private var pickupPollCreatePermission: PickupPollCreatePermission {
+        guard let id = effectivePickupGameId else { return .organizerOnly }
+        if let row = mapViewModel.resolvedPickupGameRow(for: id) {
+            return row.pollCreatePermission
+        }
+        return .organizerOnly
+    }
+
+    private var canCreatePickupPoll: Bool {
+        PickupGamePollAccess.canCreate(
+            isOrganizer: viewerIsPickupOrganizer,
+            permission: pickupPollCreatePermission,
+            isApprovedParticipant: viewerIsActiveMember && isPickupGameChat
+        )
+            && viewerIsActiveMember
+            && !sendingDisabled
+            && effectivePickupGameId != nil
+    }
+
+    /// Newest open poll message in this thread (for Group Info → scroll-to).
+    private var activePickupPollMessageId: UUID? {
+        guard isPickupGameChat else { return nil }
+        for message in messages.reversed() {
+            guard let payload = PickupGamePollMessage.decode(from: message.body) else { continue }
+            if PickupGamePollLocalHide.isHidden(
+                userId: chatViewModel.currentUserAuthId,
+                pollId: payload.pollId
+            ) {
+                continue
+            }
+            if hiddenPollIds.contains(payload.pollId) { continue }
+            if let snap = PickupGamePollStore.shared.snapshot(for: payload.pollId) {
+                if snap.isClosed || snap.isSoftDeleted { continue }
+            }
+            return message.id
+        }
+        return nil
     }
 
     private var viewerIsActiveMember: Bool {
@@ -353,6 +431,15 @@ struct GroupChatView: View {
 
                     ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
                         groupBubble(message, showsSenderIdentity: showsSenderIdentity(at: index))
+                            .chatReplyHighlight(
+                                isHighlighted: highlightedReplyMessageId == message.id,
+                                colorScheme: colorScheme
+                            )
+                            .contextMenu {
+                                if !message.isSystemMessage {
+                                    groupMessageContextMenu(for: message)
+                                }
+                            }
                             .id(message.id)
                     }
                 }
@@ -362,6 +449,22 @@ struct GroupChatView: View {
                 guard let newId else { return }
                 withAnimation {
                     proxy.scrollTo(newId, anchor: .bottom)
+                }
+            }
+            .onChange(of: pendingScrollToMessageId) { _, messageId in
+                guard let messageId else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(messageId, anchor: .center)
+                    }
+                    highlightedReplyMessageId = messageId
+                    pendingScrollToMessageId = nil
+                    let clearDelay: TimeInterval = UIAccessibility.isReduceMotionEnabled ? 0.15 : 1.1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) {
+                        if highlightedReplyMessageId == messageId {
+                            highlightedReplyMessageId = nil
+                        }
+                    }
                 }
             }
         }
@@ -406,13 +509,31 @@ struct GroupChatView: View {
             }
 
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showInfo = true
-                } label: {
-                    Image(systemName: "info.circle")
+                HStack(spacing: 12) {
+                    Button {
+                        showConversationSearch = true
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                    }
+                    .accessibilityLabel(L10n.t("chat_conversation_search_title", languageCode: languageCode))
+
+                    Button {
+                        showInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .accessibilityLabel(L10n.t("group_chat_info_a11y", languageCode: appLanguageRaw))
                 }
-                .accessibilityLabel(L10n.t("group_chat_info_a11y", languageCode: appLanguageRaw))
             }
+        }
+        .sheet(isPresented: $showConversationSearch) {
+            ChatConversationSearchSheet(
+                conversationId: conversationId,
+                languageCode: languageCode,
+                onSelectMessage: { messageId in
+                    jumpToGroupRepliedMessage(messageId)
+                }
+            )
         }
         .sheet(isPresented: $showInfo) {
             GroupChatInfoView(
@@ -421,7 +542,39 @@ struct GroupChatView: View {
                 memberPreviews: memberPreviews,
                 chatViewModel: chatViewModel,
                 isPickupGameChat: isPickupGameChat,
-                pickupLocationLabel: pickupContext?.locationLabel,
+                pickupContext: pickupContext,
+                pickupGameId: effectivePickupGameId,
+                pollCreatePermission: pickupPollCreatePermission,
+                canEditPollPermission: viewerIsPickupOrganizer && viewerIsActiveMember,
+                isApprovedPickupParticipant: viewerIsActiveMember && isPickupGameChat,
+                activePollMessageId: activePickupPollMessageId,
+                onCreatePoll: {
+                    showInfo = false
+                    showPollCreateSheet = true
+                },
+                onChangePollPermission: { permission in
+                    guard let gameId = effectivePickupGameId else {
+                        return L10n.t("pickup_poll_error_create_not_allowed", languageCode: languageCode)
+                    }
+                    do {
+                        try await mapViewModel.updatePickupGamePollCreatePermission(
+                            id: gameId,
+                            permission: permission
+                        )
+                        return nil
+                    } catch {
+                        return error.localizedDescription
+                    }
+                },
+                onViewActivePoll: { messageId in
+                    showInfo = false
+                    pendingScrollToMessageId = messageId
+                },
+                onViewPickupGame: { gameId in
+                    let snapshot = mapViewModel.resolvedPickupGameRow(for: gameId)
+                    showInfo = false
+                    mapViewModel.openPickupGameFromChatGroupInfo(gameId: gameId, snapshot: snapshot)
+                },
                 onLeft: {
                     showInfo = false
                     dismiss()
@@ -476,34 +629,92 @@ struct GroupChatView: View {
             .presentationDetents([.medium])
         }
         .task {
+#if DEBUG
+            print("[ChatNav] destination.taskBegin kind=group")
+#endif
+            isThreadOpening = true
             await load()
-            await subscribeGroupRealtime(reason: "open")
+            if let highlightId = chatViewModel.pendingOpenHighlightMessageId {
+                chatViewModel.pendingOpenHighlightMessageId = nil
+                jumpToGroupRepliedMessage(highlightId)
+            }
+            PickupGamePollStore.shared.bind(conversationId: conversationId)
+            groupRealtimeStopTask?.cancel()
+            // Fire owned subscribe lifecycle; do not bind subscribeWithError to this SwiftUI `.task`.
+            await subscribeGroupRealtime(reason: "open", beginNewLifecycle: true)
+            isThreadOpening = false
         }
         .onAppear {
-            chatViewModel.hidesFloatingTabBarForDirectChat = true
+#if DEBUG
+            ChatNavDebugCounters.log("directChat.onAppear", detail: "kind=group")
+#endif
+            // Cancel stale stop only — floating-tab chrome is owned by parent route state.
+            // Initial load + realtime owned by `.task`.
+            groupRealtimeStopTask?.cancel()
+            chatViewModel.setActiveVisibleGroupConversationId(conversationId, reason: "group_chat_appear")
+            PickupGamePollStore.shared.bind(conversationId: conversationId)
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "appear",
+                status: String(describing: realtimeConnectionStatus)
+            )
         }
         .onReceive(NotificationCenter.default.publisher(for: FanProfileChangeCenter.avatarDidChangeNotification)) { notification in
             guard let change = FanProfileChangeCenter.avatarChange(from: notification) else { return }
             applyMemberAvatarChange(change)
         }
         .onDisappear {
-            chatViewModel.hidesFloatingTabBarForDirectChat = false
-            Task { await tearDownGroupRealtime(statusAfter: .offline) }
+#if DEBUG
+            ChatNavDebugCounters.log("directChat.onDisappear", detail: "kind=group")
+#endif
+            replyDraft = nil
+            chatViewModel.clearActiveVisibleGroupConversationId(reason: "group_chat_disappear")
+            let disappearGen = chatRealtimeLifecycleGeneration
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: disappearGen,
+                event: "disappear",
+                status: String(describing: realtimeConnectionStatus)
+            )
+            groupRealtimeStopTask?.cancel()
+            groupRealtimeStopTask = Task {
+                await tearDownGroupRealtime(
+                    statusAfter: .connecting,
+                    expectedGeneration: disappearGen
+                )
+                await PickupGamePollStore.shared.stop()
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task {
-                await tearDownGroupRealtime(statusAfter: .connecting)
-                await subscribeGroupRealtime(reason: "foreground")
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: chatRealtimeLifecycleGeneration,
+                    event: "foregroundRepair",
+                    status: String(describing: realtimeConnectionStatus)
+                )
+                await subscribeGroupRealtime(reason: "foreground", beginNewLifecycle: true)
             }
         }
         .onChange(of: chatViewModel.currentUserAuthId) { _, newId in
             Task {
-                await tearDownGroupRealtime(statusAfter: .offline)
                 if newId != nil {
-                    await subscribeGroupRealtime(reason: "accountSwitch")
+                    await subscribeGroupRealtime(reason: "accountSwitch", beginNewLifecycle: true)
+                } else {
+                    await tearDownGroupRealtime(
+                        statusAfter: .offline,
+                        expectedGeneration: chatRealtimeLifecycleGeneration
+                    )
                 }
             }
+        }
+        .onChange(of: chatViewModel.directChatReadVisibilityVersion) { _, _ in
+            chatViewModel.setActiveVisibleGroupConversationId(
+                conversationId,
+                reason: "became_visible"
+            )
         }
     }
 
@@ -533,9 +744,19 @@ struct GroupChatView: View {
             ChatRealtimeConnectionStatusView(status: realtimeConnectionStatus)
                 .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
                 .padding(.bottom, FGSpacing.xs)
-                .transition(.opacity)
-                .animation(.easeInOut(duration: 0.18), value: realtimeConnectionStatus)
 
+            if let reply = validatedGroupReplyDraft() {
+                ChatReplyComposerBanner(
+                    senderDisplayName: reply.targetSenderDisplayName,
+                    previewLine: reply.previewLine,
+                    languageCode: languageCode,
+                    colorScheme: colorScheme,
+                    onCancel: { replyDraft = nil }
+                )
+                .padding(.bottom, FGSpacing.xs)
+            }
+
+            // Always mounted — membership/`sendingDisabled` flips only disable controls.
             ChatMessageComposer(
                 draft: $draft,
                 showEmojiQuickTray: $showEmojiQuickTray,
@@ -566,12 +787,194 @@ struct GroupChatView: View {
                     if draft.count > maxBodyLength {
                         draft = String(draft.prefix(maxBodyLength))
                     }
-                }
+                },
+                attachmentAccessibilityLabel: L10n.t("chat_location_share_location", languageCode: languageCode),
+                // Always reserve the control so membership/enable flips do not rebuild Button identity mid-navigation.
+                showsAttachmentButton: true
             )
         }
         .padding(.horizontal, FGSpacing.lg)
         .padding(.top, FGSpacing.sm)
         .padding(.bottom, 0)
+        .transaction { transaction in
+            if isThreadOpening {
+                transaction.animation = nil
+            }
+        }
+        .onChange(of: sendingDisabled) { _, disabled in
+            guard disabled else { return }
+            Task { @MainActor in
+                await Task.yield()
+                guard sendingDisabled else { return }
+                if composerFocused { composerFocused = false }
+                if showEmojiQuickTray { showEmojiQuickTray = false }
+            }
+        }
+        .chatLocationAttachment(
+            context: groupLocationShareContext,
+            languageCode: languageCode,
+            isEnabled: viewerIsActiveMember && !sendingDisabled,
+            favoriteVenues: mapViewModel.followingTabSavedVenues,
+            recentSharedCoordinate: recentSharedLocationInGroupThread,
+            sendStructuredBody: { body in
+                await sendStructuredBody(body)
+            }
+        )
+        .sheet(isPresented: $showPollCreateSheet) {
+            PickupGamePollCreateSheet(
+                languageCode: languageCode,
+                onCancel: { showPollCreateSheet = false },
+                onCreate: { question, options, allowMultiple, isAnonymous, autoClose in
+                    await createPickupPoll(
+                        question: question,
+                        options: options,
+                        allowMultiple: allowMultiple,
+                        isAnonymous: isAnonymous,
+                        autoCloseAtGameStart: autoClose
+                    )
+                }
+            )
+        }
+    }
+
+    private var groupLocationShareContext: ChatLocationShareContext? {
+        guard let senderId = chatViewModel.currentUserAuthId else { return nil }
+        let senderName = mapViewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let memberCount = max(1, details.count)
+        return ChatLocationShareContext(
+            kind: .group,
+            conversationId: conversationId,
+            audienceLabel: title,
+            memberCount: memberCount,
+            senderDisplayName: senderName.isEmpty ? "Fan" : senderName,
+            senderUserId: senderId,
+            pickupDestinationName: pickupContext?.locationLabel ?? pickupContext?.title,
+            pickupLatitude: pickupContext?.latitude,
+            pickupLongitude: pickupContext?.longitude,
+            pickupGameId: effectivePickupGameId
+        )
+    }
+
+    private var recentSharedLocationInGroupThread: (name: String, lat: Double, lon: Double)? {
+        for message in messages.reversed() {
+            if let payload = ChatLocationShareMessage.decode(from: message.body) {
+                return (
+                    payload.placeLabel ?? L10n.t("chat_location_shared_location_title", languageCode: languageCode),
+                    payload.latitude,
+                    payload.longitude
+                )
+            }
+            if let payload = ChatOnMyWayMessage.decode(from: message.body) {
+                return (payload.destinationName, payload.latitude, payload.longitude)
+            }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func sendStructuredBody(_ rawBody: String) async -> String? {
+        let body = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, body.count <= maxBodyLength, !sendingDisabled else {
+            return L10n.t("chat_location_unavailable", languageCode: languageCode)
+        }
+        isSending = true
+        errorText = nil
+        defer { isSending = false }
+        do {
+            let id = try await service.sendMessage(conversationId: conversationId, body: body)
+            if !seenMessageIds.contains(id) {
+                await refreshAfterGroupSend(body: body)
+            } else {
+                await chatViewModel.refreshInboxSummaries()
+            }
+            return nil
+        } catch {
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
+            errorText = error.localizedDescription
+            return error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func createPickupPoll(
+        question: String,
+        options: [String],
+        allowMultiple: Bool,
+        isAnonymous: Bool,
+        autoCloseAtGameStart: Bool
+    ) async -> String? {
+        guard canCreatePickupPoll else {
+            return L10n.t("pickup_poll_error_create_not_allowed", languageCode: languageCode)
+        }
+        if let issue = PickupGamePollValidation.validate(question: question, options: options) {
+            return PickupGamePollValidation.userMessage(for: issue, languageCode: languageCode)
+        }
+
+        isSending = true
+        errorText = nil
+        defer { isSending = false }
+
+        do {
+            let pollId = try await pollService.createPoll(
+                conversationId: conversationId,
+                question: question,
+                options: options,
+                allowMultiple: allowMultiple,
+                isAnonymous: isAnonymous,
+                autoCloseAtGameStart: autoCloseAtGameStart
+            )
+
+            let senderName = mapViewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let snapshot = try? await pollService.fetchSnapshot(pollId: pollId)
+            let payload = PickupGamePollPayload(
+                pollId: pollId,
+                question: question,
+                allowMultiple: allowMultiple,
+                isAnonymous: isAnonymous,
+                autoCloseAtGameStart: autoCloseAtGameStart,
+                closesAt: snapshot?.closesAtDate,
+                createdByName: senderName.isEmpty ? nil : senderName
+            )
+            let body = PickupGamePollMessage.encodeBody(payload: payload)
+            let messageId = try await service.sendMessage(conversationId: conversationId, body: body)
+            try? await pollService.attachMessage(pollId: pollId, messageId: messageId)
+            await PickupGamePollStore.shared.refresh(pollId)
+
+            if !seenMessageIds.contains(messageId) {
+                await refreshAfterGroupSend(body: body)
+            } else {
+                await chatViewModel.refreshInboxSummaries()
+            }
+            showPollCreateSheet = false
+            return nil
+        } catch {
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
+            return error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func sendOnMyWayArrived(_ payload: ChatOnMyWayPayload) async {
+        let arrived = ChatOnMyWayPayload(
+            v: 1,
+            destinationName: payload.destinationName,
+            latitude: payload.latitude,
+            longitude: payload.longitude,
+            sharedByName: payload.sharedByName,
+            sharedByUserId: payload.sharedByUserId,
+            departedAt: payload.departedAt,
+            estimatedArrivalAt: payload.estimatedArrivalAt,
+            etaMinutes: payload.etaMinutes,
+            distanceMeters: payload.distanceMeters,
+            transportMode: payload.transportMode,
+            etaSource: payload.etaSource,
+            pickupGameId: payload.pickupGameId,
+            venueId: payload.venueId,
+            liveSessionId: payload.liveSessionId,
+            status: "arrived",
+            arrivedAt: ISO8601DateFormatter.chatLocation.string(from: Date())
+        )
+        _ = await sendStructuredBody(ChatOnMyWayMessage.encodeBody(payload: arrived))
     }
 
     private func preview(for userId: UUID) -> UserPreview {
@@ -693,17 +1096,39 @@ struct GroupChatView: View {
                 for: message,
                 languageCode: languageCode
             )
-            Text(eventText)
-                .font(FGTypography.metadata)
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, FGSpacing.md)
-                .padding(.vertical, FGSpacing.xs + 2)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(eventText)
-        } else if let payload = FanProfileShareMessage.decode(from: message.body) {
+            let pickupId = message.system_payload?.pickup_game_id
+                ?? (GroupSystemEventKind.parse(message.system_event) == .pickupGameUpdated
+                    ? (pickupContext?.pickupGameId ?? details.first?.pickup_game_id)
+                    : nil)
+            Group {
+                Text(eventText)
+                    .font(FGTypography.metadata)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.vertical, FGSpacing.xs + 2)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                guard let pickupId else { return }
+                mapViewModel.presentSharedPickupGameDetail(gameId: pickupId)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(eventText)
+            .accessibilityHint(
+                pickupId == nil
+                    ? ""
+                    : L10n.t("pickup_edit_open_game_a11y_hint", languageCode: languageCode)
+            )
+            .accessibilityAddTraits(pickupId == nil ? [] : .isButton)
+        } else {
+            switch ChatMessagePresentation.build(
+                body: message.body,
+                messageType: message.message_type
+            ) {
+            case .profileShare(let payload):
             HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
                 if isMine {
                     Spacer(minLength: 40)
@@ -716,6 +1141,7 @@ struct GroupChatView: View {
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                     }
+                    groupReplyHeader(for: message, isMine: isMine)
                     FanProfileShareChatCardView(
                         payload: payload,
                         isFromCurrentUser: isMine,
@@ -727,7 +1153,7 @@ struct GroupChatView: View {
                 }
                 if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
             }
-        } else {
+            case .pickupShare(let payload):
             HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
                 if isMine {
                     Spacer(minLength: 40)
@@ -740,7 +1166,253 @@ struct GroupChatView: View {
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                     }
-                    Text(message.body)
+                    groupReplyHeader(for: message, isMine: isMine)
+                    PickupGameShareChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        mapViewModel: mapViewModel
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .proShare(let payload):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    ProGameShareChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        mapViewModel: mapViewModel
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .venueShare(let payload):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    VenueShareChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        mapViewModel: mapViewModel
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .locationShare(let payload):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    ChatLocationShareChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        languageCode: languageCode
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .liveLocation(let payload):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    ChatLiveLocationShareChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        languageCode: languageCode,
+                        audienceMemberCount: max(1, details.count),
+                        expectedConversationKind: "group",
+                        expectedConversationId: conversationId,
+                        expectedSenderUserId: message.sender_id,
+                        authoritativeDisplayName: senderName(message.sender_id),
+                        onStopSharing: {
+                            Task { await ChatLiveLocationManager.shared.stopLiveSession(sessionId: payload.sessionId) }
+                        }
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .onMyWay(let payload):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    ChatOnMyWayChatCardView(
+                        payload: payload,
+                        isFromCurrentUser: isMine,
+                        showFriendAvatar: false,
+                        friendPreview: preview(for: message.sender_id),
+                        timestamp: nil,
+                        languageCode: languageCode,
+                        authoritativeDisplayName: senderName(message.sender_id),
+                        onImHere: {
+                            Task { await sendOnMyWayArrived(payload) }
+                        }
+                    )
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .poll(let payload):
+            if hiddenPollIds.contains(payload.pollId)
+                || PickupGamePollLocalHide.isHidden(
+                    userId: chatViewModel.currentUserAuthId,
+                    pollId: payload.pollId
+                )
+            {
+                EmptyView()
+            } else {
+                HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                    if isMine {
+                        Spacer(minLength: 40)
+                    } else {
+                        groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                    }
+                    VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                        if !isMine, showsSenderIdentity {
+                            Text(senderName(message.sender_id))
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        }
+                        PickupGamePollChatCardView(
+                            payload: payload,
+                            message: message,
+                            isFromCurrentUser: isMine,
+                            showFriendAvatar: false,
+                            friendPreview: preview(for: message.sender_id),
+                            timestamp: nil,
+                            languageCode: languageCode,
+                            memberPreviews: memberPreviews,
+                            currentUserId: chatViewModel.currentUserAuthId,
+                            isOrganizer: viewerIsPickupOrganizer,
+                            onReport: {
+                                if reportedMessageIds.contains(message.id) {
+                                    reportBanner = L10n.t(
+                                        "group_chat_report_already_submitted",
+                                        languageCode: appLanguageRaw
+                                    )
+                                } else {
+                                    reportCategory = .spam
+                                    reportTarget = message
+                                }
+                            },
+                            onHide: {
+                                PickupGamePollLocalHide.hide(
+                                    userId: chatViewModel.currentUserAuthId,
+                                    pollId: payload.pollId
+                                )
+                                hiddenPollIds.insert(payload.pollId)
+                            }
+                        )
+                        .onAppear {
+                            PickupGamePollStore.shared.ensureLoaded(payload.pollId)
+                        }
+                    }
+                    if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+                }
+            }
+            case .unavailable(let kind):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    FanGeoStructuredUnavailableCard(
+                        kind: kind,
+                        languageCode: languageCode,
+                        isFromCurrentUser: isMine
+                    )
+                    .onAppear {
+                        kind.logDecodeFailure(category: "decodeNilOrUnsupportedVersion")
+                    }
+                }
+                if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            case .text(let text):
+            HStack(alignment: .bottom, spacing: FGSpacing.xs + 2) {
+                if isMine {
+                    Spacer(minLength: 40)
+                } else {
+                    groupSenderAvatarColumn(for: message, showsSenderIdentity: showsSenderIdentity)
+                }
+                VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+                    if !isMine, showsSenderIdentity {
+                        Text(senderName(message.sender_id))
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    groupReplyHeader(for: message, isMine: isMine)
+                    Text(text)
                         .font(.body)
                         .foregroundStyle(isMine ? Color.white : FGColor.primaryText(colorScheme))
                         .padding(.horizontal, 12)
@@ -749,28 +1421,142 @@ struct GroupChatView: View {
                             RoundedRectangle(cornerRadius: 16, style: .continuous)
                                 .fill(isMine ? FGColor.accentGreen : FGColor.cardBackground(colorScheme))
                         }
-                        .contextMenu {
-                            if !isMine {
-                                if reportedMessageIds.contains(message.id) {
-                                    Label(
-                                        L10n.t("group_chat_report_already_submitted", languageCode: appLanguageRaw),
-                                        systemImage: "flag.fill"
-                                    )
-                                } else {
-                                    Button(role: .destructive) {
-                                        reportCategory = .spam
-                                        reportTarget = message
-                                    } label: {
-                                        Label(
-                                            L10n.t("group_chat_report_message", languageCode: appLanguageRaw),
-                                            systemImage: "flag"
-                                        )
-                                    }
-                                }
-                            }
-                        }
                 }
                 if !isMine { Spacer(minLength: Self.groupIncomingTrailingInset) }
+            }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupReplyHeader(for message: GroupMessageRow, isMine: Bool) -> some View {
+        if let reference = groupReplyReference(for: message) {
+            ChatReplyQuoteHeader(
+                reference: reference,
+                languageCode: languageCode,
+                colorScheme: colorScheme,
+                isFromCurrentUser: isMine,
+                onTap: { jumpToGroupRepliedMessage(reference.originalMessageId) }
+            )
+            .frame(maxWidth: 280, alignment: isMine ? .trailing : .leading)
+        }
+    }
+
+    private func groupReplyReference(for message: GroupMessageRow) -> ChatReplyReference? {
+        guard message.reply_to_message_id != nil else { return nil }
+        return ChatReplyResolution.resolveGroup(
+            replyToMessageId: message.reply_to_message_id,
+            messagesById: ChatReplyResolution.messageMap(messages),
+            displayNameForSender: { senderName($0) },
+            languageCode: languageCode
+        )
+    }
+
+    /// After send: reload latest messages (pre–Phase 1) then refresh inbox summaries.
+    private func refreshAfterGroupSend(body: String) async {
+        if let latest = try? await service.fetchLatestMessages(conversationId: conversationId) {
+            messages = latest
+            seenMessageIds = Set(latest.map(\.id))
+        }
+        await chatViewModel.refreshInboxSummaries()
+    }
+
+    @ViewBuilder
+    private func groupMessageContextMenu(for message: GroupMessageRow) -> some View {
+        let isMine = message.sender_id == chatViewModel.currentUserAuthId
+        if ChatReplyPreviewFormatting.isReplyEligible(
+            body: message.body,
+            messageType: message.message_type,
+            isDeleted: message.is_deleted,
+            deletedAt: message.deleted_at
+        ) {
+            Button {
+                beginGroupReply(to: message)
+            } label: {
+                Label(L10n.t("chat_reply", languageCode: languageCode), systemImage: "arrowshape.turn.up.left")
+            }
+        }
+        if !isMine, !message.isSystemMessage {
+            if reportedMessageIds.contains(message.id) {
+                Label(
+                    L10n.t("group_chat_report_already_submitted", languageCode: appLanguageRaw),
+                    systemImage: "flag.fill"
+                )
+            } else {
+                Button(role: .destructive) {
+                    reportCategory = .spam
+                    reportTarget = message
+                } label: {
+                    Label(
+                        L10n.t("group_chat_report_message", languageCode: appLanguageRaw),
+                        systemImage: "flag"
+                    )
+                }
+            }
+        }
+    }
+
+    private func beginGroupReply(to message: GroupMessageRow) {
+        guard let me = chatViewModel.currentUserAuthId else { return }
+        guard ChatReplyPreviewFormatting.isReplyEligible(
+            body: message.body,
+            messageType: message.message_type,
+            isDeleted: message.is_deleted,
+            deletedAt: message.deleted_at
+        ) else { return }
+        let name = isMineSender(message.sender_id)
+            ? L10n.t("chat_preview_you_prefix", languageCode: languageCode)
+            : senderName(message.sender_id)
+        replyDraft = ChatReplyComposerDraft(
+            conversationId: conversationId,
+            accountUserId: me,
+            targetMessageId: message.id,
+            targetSenderId: message.sender_id,
+            targetSenderDisplayName: name,
+            previewLine: ChatReplyPreviewFormatting.previewLine(
+                body: message.body,
+                messageType: message.message_type,
+                languageCode: languageCode
+            )
+        )
+    }
+
+    private func isMineSender(_ id: UUID) -> Bool {
+        id == chatViewModel.currentUserAuthId
+    }
+
+    private func validatedGroupReplyDraft() -> ChatReplyComposerDraft? {
+        guard let draft = replyDraft,
+              draft.isValid(forConversation: conversationId, accountUserId: chatViewModel.currentUserAuthId)
+        else {
+            replyDraft = nil
+            return nil
+        }
+        return draft
+    }
+
+    private func jumpToGroupRepliedMessage(_ messageId: UUID) {
+        if messages.contains(where: { $0.id == messageId }) {
+            pendingScrollToMessageId = messageId
+            return
+        }
+        Task { @MainActor in
+            var pages = 0
+            while pages < ChatReplyResolution.maxOlderPagesWhenSeeking {
+                if messages.contains(where: { $0.id == messageId }) {
+                    pendingScrollToMessageId = messageId
+                    return
+                }
+                guard canLoadOlder, !isLoadingOlder else { break }
+                let before = messages.count
+                await loadOlder()
+                pages += 1
+                if messages.count <= before { break }
+            }
+            if messages.contains(where: { $0.id == messageId }) {
+                pendingScrollToMessageId = messageId
+            } else {
+                reportBanner = L10n.t("chat_reply_original_not_found", languageCode: languageCode)
             }
         }
     }
@@ -820,6 +1606,8 @@ struct GroupChatView: View {
             }
             let fresh = older.filter { seenMessageIds.insert($0.id).inserted }
             messages.insert(contentsOf: fresh, at: 0)
+            if !fresh.isEmpty {
+            }
             if older.count < 40 {
                 canLoadOlder = false
             }
@@ -829,85 +1617,425 @@ struct GroupChatView: View {
     }
 
     @MainActor
-    private func tearDownGroupRealtime(statusAfter: ChatRealtimeConnectionStatus) async {
-        realtimeListenTask?.cancel()
-        realtimeListenTask = nil
-        let channel = realtimeChannel
-        realtimeChannel = nil
-        subscribedConversationId = nil
-        realtimeConnectionStatus = statusAfter
-        if let channel {
-            await service.removeRealtimeChannel(channel)
-        }
+    private func beginGroupRealtimeLifecycle(reason: String) -> Int {
+        chatRealtimeLifecycleGeneration += 1
+        let gen = chatRealtimeLifecycleGeneration
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "generationStart",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason)"
+        )
+        return gen
     }
 
-    /// Postgres INSERT on `group_messages` (includes system join/leave rows). Edit/delete events are not published.
     @MainActor
-    private func subscribeGroupRealtime(reason: String) async {
-        // Prevent duplicate live channels when reopen / task re-entry races.
-        if realtimeChannel != nil,
-           subscribedConversationId == conversationId,
-           realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
+    private func setGroupRealtimeStatus(
+        _ next: ChatRealtimeConnectionStatus,
+        reason: String,
+        generation: Int? = nil
+    ) {
+        let gen = generation ?? chatRealtimeLifecycleGeneration
+        let old = realtimeConnectionStatus
+        guard old != next else { return }
+        realtimeConnectionStatus = next
+        ChatRealtimeAudit.statusTransition(
+            conversationId: conversationId,
+            generation: gen,
+            from: old,
+            to: next,
+            reason: reason
+        )
+    }
+
+    /// If the channel is already subscribed but UI status is stale, repair without reconnecting.
+    @MainActor
+    private func repairGroupRealtimeStatusFromChannelHealth(reason: String) -> Bool {
+        guard let channel = realtimeChannel,
+              subscribedConversationId == conversationId else {
+            return false
+        }
+        let channelStatus = String(describing: channel.status)
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "channelHealthCheck",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason) channelStatus=\(channelStatus) topic=\(channel.topic)"
+        )
+        guard channel.status == .subscribed else { return false }
+        if realtimeConnectionStatus != .live && realtimeConnectionStatus != .connected {
+            setGroupRealtimeStatus(.live, reason: "repairFromChannelHealth:\(reason)")
+            groupHadSuccessfulSubscribe = true
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "subscribeResult",
+                status: "live",
+                extra: "result=subscribed source=channelHealthRepair topic=\(channel.topic)"
+            )
+        }
+        return true
+    }
+
+    @MainActor
+    private func tearDownGroupRealtime(
+        statusAfter: ChatRealtimeConnectionStatus,
+        expectedGeneration: Int? = nil
+    ) async {
+        let stopGen = expectedGeneration ?? chatRealtimeLifecycleGeneration
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: stopGen,
+            event: "stopBegin",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "currentGen=\(chatRealtimeLifecycleGeneration) next=\(String(describing: statusAfter))"
+        )
+        guard stopGen == chatRealtimeLifecycleGeneration else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: stopGen,
+                event: "stopSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration currentGen=\(chatRealtimeLifecycleGeneration)"
+            )
             return
         }
 
-        await tearDownGroupRealtime(statusAfter: .connecting)
+        groupRealtimeSubscriptionTask?.cancel()
+        groupRealtimeSubscriptionTask = nil
+        realtimeListenTask?.cancel()
+        realtimeListenTask = nil
+        let channel = realtimeChannel
+        let channelGen = ownedGroupChannelGeneration
 
+        if channelGen > stopGen {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: stopGen,
+                event: "teardownSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=channelOwnedByNewerGeneration ownedGen=\(channelGen)"
+            )
+            return
+        }
+
+        realtimeChannel = nil
+        subscribedConversationId = nil
+        setGroupRealtimeStatus(statusAfter, reason: "teardown", generation: stopGen)
+
+        if let channel {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: stopGen,
+                event: "channelRemoved",
+                extra: "topic=\(channel.topic)"
+            )
+            await ChatRealtimeChannelSerializer.shared.removeExclusive(
+                topic: channel.topic,
+                channel: channel
+            ) { [service] ch in
+                await service.removeRealtimeChannel(ch)
+            }
+        }
+
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: stopGen,
+            event: "stopCompleted",
+            status: String(describing: realtimeConnectionStatus)
+        )
+    }
+
+    /// Postgres INSERT on `group_messages` (includes system join/leave rows). Edit/delete events are not published.
+    ///
+    /// Starts an owned subscription task so SwiftUI `.task` / sheet / popover cancellation cannot leave
+    /// a successful channel stuck at `.connecting`.
+    @MainActor
+    private func subscribeGroupRealtime(reason: String, beginNewLifecycle: Bool = false) async {
+        groupRealtimeStopTask?.cancel()
+
+        if !beginNewLifecycle {
+            if chatRealtimeLifecycleGeneration == 0 {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: 0,
+                    event: "ensureSkipped",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=\(reason) detail=lifecycleNotStarted"
+                )
+                return
+            }
+            if repairGroupRealtimeStatusFromChannelHealth(reason: reason) {
+                if realtimeListenTask != nil || groupRealtimeSubscriptionTask != nil {
+                    ChatRealtimeAudit.log(
+                        conversationId: conversationId,
+                        generation: chatRealtimeLifecycleGeneration,
+                        event: "ensureHealthy",
+                        status: String(describing: realtimeConnectionStatus),
+                        extra: "reason=\(reason)"
+                    )
+                    return
+                }
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: chatRealtimeLifecycleGeneration,
+                    event: "listenMissingRepair",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=\(reason)"
+                )
+                // Fall through: rebuild under same generation.
+            } else if groupRealtimeSubscriptionTask != nil {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: chatRealtimeLifecycleGeneration,
+                    event: "ensureInFlight",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=\(reason)"
+                )
+                return
+            } else if realtimeChannel != nil,
+                      subscribedConversationId == conversationId,
+                      realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
+                return
+            }
+        }
+
+        let gen: Int
+        if beginNewLifecycle {
+            let previousGen = chatRealtimeLifecycleGeneration
+            groupRealtimeSubscriptionTask?.cancel()
+            groupRealtimeSubscriptionTask = nil
+            if realtimeChannel != nil || realtimeListenTask != nil {
+                await tearDownGroupRealtime(statusAfter: .connecting, expectedGeneration: previousGen)
+            }
+            gen = beginGroupRealtimeLifecycle(reason: reason)
+            setGroupRealtimeStatus(.connecting, reason: "lifecycleStart:\(reason)", generation: gen)
+        } else {
+            gen = chatRealtimeLifecycleGeneration
+            groupRealtimeSubscriptionTask?.cancel()
+            groupRealtimeSubscriptionTask = nil
+            if realtimeChannel != nil {
+                await tearDownGroupRealtime(statusAfter: .connecting, expectedGeneration: gen)
+            } else {
+                setGroupRealtimeStatus(.connecting, reason: "ensureReconnect:\(reason)", generation: gen)
+            }
+        }
+
+        guard gen == chatRealtimeLifecycleGeneration else { return }
+
+        let topic = "group-thread-\(conversationId.uuidString.lowercased())"
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "ensure",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason) beginNewLifecycle=\(beginNewLifecycle) topic=\(topic)"
+        )
+
+        groupRealtimeSubscriptionTask = Task { @MainActor in
+            await self.runGroupRealtimeSubscribeLoop(generation: gen, reason: reason, topic: topic)
+            if self.chatRealtimeLifecycleGeneration == gen {
+                self.groupRealtimeSubscriptionTask = nil
+            }
+        }
+    }
+
+    @MainActor
+    private func runGroupRealtimeSubscribeLoop(generation gen: Int, reason: String, topic: String) async {
         let delaysNs: [UInt64] = [0, 1_000_000_000, 2_000_000_000, 4_000_000_000]
         var attempt = 0
         while !Task.isCancelled {
-            realtimeConnectionStatus = attempt == 0 ? .connecting : .reconnecting
+            guard gen == chatRealtimeLifecycleGeneration else {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: gen,
+                    event: "callbackIgnored",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=staleGeneration source=groupSubscribeLoop"
+                )
+                return
+            }
+
+            let nextStatus: ChatRealtimeConnectionStatus =
+                (attempt == 0 && !groupHadSuccessfulSubscribe) ? .connecting : .reconnecting
+            setGroupRealtimeStatus(nextStatus, reason: attempt == 0 ? "subscribeBegin" : "retry", generation: gen)
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: attempt == 0 ? "subscribeBegin" : "retry",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "attempt=\(attempt + 1) topic=\(topic) openReason=\(reason)"
+            )
+
+            await ChatRealtimeChannelSerializer.shared.waitForTopicIdle(topic)
+            guard gen == chatRealtimeLifecycleGeneration, !Task.isCancelled else { return }
+
             let (channel, stream) = service.groupMessagesInsertChannel(conversationId: conversationId)
             realtimeChannel = channel
+            ownedGroupChannelGeneration = gen
             subscribedConversationId = conversationId
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: "channelCreated",
+                extra: "topic=\(channel.topic) channelStatus=\(String(describing: channel.status))"
+            )
+
             do {
                 try await channel.subscribeWithError()
-                guard !Task.isCancelled, subscribedConversationId == conversationId else {
-                    if subscribedConversationId == conversationId {
+                let stillCurrent = gen == chatRealtimeLifecycleGeneration
+                    && subscribedConversationId == conversationId
+                let channelSubscribed = channel.status == .subscribed
+
+                if !stillCurrent {
+                    ChatRealtimeAudit.log(
+                        conversationId: conversationId,
+                        generation: gen,
+                        event: "callbackIgnored",
+                        status: String(describing: realtimeConnectionStatus),
+                        extra: "reason=staleGeneration source=subscribeResult channelStatus=\(String(describing: channel.status))"
+                    )
+                    await ChatRealtimeChannelSerializer.shared.removeExclusive(
+                        topic: channel.topic,
+                        channel: channel
+                    ) { [service] ch in
+                        await service.removeRealtimeChannel(ch)
+                    }
+                    if gen == chatRealtimeLifecycleGeneration {
                         realtimeChannel = nil
                         subscribedConversationId = nil
                     }
-                    await service.removeRealtimeChannel(channel)
                     return
                 }
-                realtimeConnectionStatus = .live
-                realtimeListenTask = Task { @MainActor in
-                    for await action in stream {
-                        if Task.isCancelled { break }
-                        guard subscribedConversationId == conversationId else { break }
-                        guard let row = try? action.decodeRecord(as: GroupMessageRow.self, decoder: JSONDecoder()) else {
-                            continue
+
+                // Prefer authoritative channel health over Task.isCancelled (parent lifecycle cancel).
+                if channelSubscribed || stillCurrent {
+                    groupHadSuccessfulSubscribe = true
+                    setGroupRealtimeStatus(.live, reason: "subscribeResult:subscribed", generation: gen)
+                    ChatRealtimeAudit.log(
+                        conversationId: conversationId,
+                        generation: gen,
+                        event: "subscribeResult",
+                        status: "live",
+                        extra: "result=subscribed topic=\(channel.topic) channelStatus=\(String(describing: channel.status))"
+                    )
+                    realtimeListenTask?.cancel()
+                    realtimeListenTask = Task { @MainActor in
+                        ChatRealtimeAudit.log(
+                            conversationId: conversationId,
+                            generation: gen,
+                            event: "listenStart",
+                            status: String(describing: realtimeConnectionStatus),
+                            extra: "topic=\(channel.topic)"
+                        )
+                        for await action in stream {
+                            if Task.isCancelled { break }
+                            guard gen == chatRealtimeLifecycleGeneration else { break }
+                            guard subscribedConversationId == conversationId else { break }
+                            guard let row = try? action.decodeRecord(as: GroupMessageRow.self, decoder: JSONDecoder()) else {
+                                continue
+                            }
+                            if row.message_type != "system",
+                               chatViewModel.isEitherDirectionBlocked(with: row.sender_id) {
+                                continue
+                            }
+                            guard seenMessageIds.insert(row.id).inserted else { continue }
+                            messages.append(row)
+                            try? await service.markRead(conversationId: conversationId)
+                            await chatViewModel.refreshInboxSummaries()
                         }
-                        // Defense in depth: hide blocked senders even if Realtime delivers the row.
-                        if row.message_type != "system",
-                           chatViewModel.isEitherDirectionBlocked(with: row.sender_id) {
-                            continue
+                        ChatRealtimeAudit.log(
+                            conversationId: conversationId,
+                            generation: gen,
+                            event: "listenEnd",
+                            status: String(describing: realtimeConnectionStatus),
+                            extra: "cancelled=\(Task.isCancelled)"
+                        )
+                        guard gen == chatRealtimeLifecycleGeneration else {
+                            ChatRealtimeAudit.log(
+                                conversationId: conversationId,
+                                generation: gen,
+                                event: "callbackIgnored",
+                                status: String(describing: realtimeConnectionStatus),
+                                extra: "reason=staleGeneration source=groupListenEnd"
+                            )
+                            return
                         }
-                        guard seenMessageIds.insert(row.id).inserted else { continue }
-                        messages.append(row)
-                        try? await service.markRead(conversationId: conversationId)
+                        if !Task.isCancelled, subscribedConversationId == conversationId {
+                            setGroupRealtimeStatus(.reconnecting, reason: "streamEnded", generation: gen)
+                            ChatRealtimeAudit.log(
+                                conversationId: conversationId,
+                                generation: gen,
+                                event: "streamEnded",
+                                status: "reconnecting",
+                                extra: "autoResubscribe=true"
+                            )
+                            await subscribeGroupRealtime(reason: "listenEnded", beginNewLifecycle: true)
+                        }
                     }
-                    if !Task.isCancelled, subscribedConversationId == conversationId {
-                        realtimeConnectionStatus = .reconnecting
-                    }
+                    return
+                }
+
+                await ChatRealtimeChannelSerializer.shared.removeExclusive(
+                    topic: channel.topic,
+                    channel: channel
+                ) { [service] ch in
+                    await service.removeRealtimeChannel(ch)
+                }
+                if gen == chatRealtimeLifecycleGeneration {
+                    realtimeChannel = nil
+                    subscribedConversationId = nil
                 }
                 return
             } catch is CancellationError {
-                if subscribedConversationId == conversationId {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: gen,
+                    event: "subscribeCancelled",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "topic=\(channel.topic) channelStatus=\(String(describing: channel.status))"
+                )
+                // Intentional teardown cancels this owned task — do not resurrect `.live`.
+                if gen == chatRealtimeLifecycleGeneration {
                     realtimeChannel = nil
                     subscribedConversationId = nil
                 }
-                await service.removeRealtimeChannel(channel)
+                await ChatRealtimeChannelSerializer.shared.removeExclusive(
+                    topic: channel.topic,
+                    channel: channel
+                ) { [service] ch in
+                    await service.removeRealtimeChannel(ch)
+                }
                 return
             } catch {
-                if subscribedConversationId == conversationId {
+                if gen == chatRealtimeLifecycleGeneration {
                     realtimeChannel = nil
                     subscribedConversationId = nil
                 }
-                await service.removeRealtimeChannel(channel)
+                await ChatRealtimeChannelSerializer.shared.removeExclusive(
+                    topic: channel.topic,
+                    channel: channel
+                ) { [service] ch in
+                    await service.removeRealtimeChannel(ch)
+                }
                 attempt += 1
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: gen,
+                    event: "subscribeResult",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "result=error attempt=\(attempt) error=\(error.localizedDescription)"
+                )
                 if attempt >= delaysNs.count {
-                    realtimeConnectionStatus = .reconnecting
+                    if gen == chatRealtimeLifecycleGeneration {
+                        setGroupRealtimeStatus(
+                            groupHadSuccessfulSubscribe ? .reconnecting : .offline,
+                            reason: "subscribeExhausted",
+                            generation: gen
+                        )
+                    }
                     return
                 }
                 let delay = delaysNs[attempt]
@@ -916,25 +2044,32 @@ struct GroupChatView: View {
                 }
             }
         }
-        _ = reason
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "subscribeLoopCancelled",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "topic=\(topic)"
+        )
     }
 
     @MainActor
     private func send() async {
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, body.count <= maxBodyLength, !sendingDisabled else { return }
+        let activeReply = validatedGroupReplyDraft()
         isSending = true
         errorText = nil
         do {
-            let id = try await service.sendMessage(conversationId: conversationId, body: body)
+            _ = try await service.sendMessage(
+                conversationId: conversationId,
+                body: body,
+                replyToMessageId: activeReply?.targetMessageId
+            )
             draft = ""
+            replyDraft = nil
             showEmojiQuickTray = false
-            if !seenMessageIds.contains(id) {
-                // Optimistic reconcile via refresh if realtime is slow.
-                messages = try await service.fetchLatestMessages(conversationId: conversationId)
-                seenMessageIds = Set(messages.map(\.id))
-            }
-            await chatViewModel.refreshInboxSummaries()
+            await refreshAfterGroupSend(body: body)
         } catch {
             AgeAccessBackendDenial.handle(error, requestUserId: nil)
             errorText = error.localizedDescription
@@ -949,13 +2084,9 @@ struct GroupChatView: View {
         isSending = true
         errorText = nil
         do {
-            let id = try await service.sendMessage(conversationId: conversationId, body: trimmed)
+            _ = try await service.sendMessage(conversationId: conversationId, body: trimmed)
             showEmojiQuickTray = false
-            if seenMessageIds.insert(id).inserted {
-                messages = try await service.fetchLatestMessages(conversationId: conversationId)
-                seenMessageIds = Set(messages.map(\.id))
-            }
-            await chatViewModel.refreshInboxSummaries()
+            await refreshAfterGroupSend(body: trimmed)
         } catch {
             AgeAccessBackendDenial.handle(error, requestUserId: nil)
             errorText = error.localizedDescription
@@ -968,12 +2099,46 @@ struct GroupChatView: View {
         guard !isRefreshingMessages else { return }
         isRefreshingMessages = true
         defer { isRefreshingMessages = false }
+        let wasLive = realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected
+        _ = repairGroupRealtimeStatusFromChannelHealth(reason: "manualRefreshPrecheck")
+        let channelHealthy = realtimeChannel?.status == .subscribed
+            && subscribedConversationId == conversationId
+        let needsRepair = realtimeChannel == nil
+            || subscribedConversationId != conversationId
+            || !(realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected)
+            || !channelHealthy
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "manualRefresh",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "needsRepair=\(needsRepair) channelHealthy=\(channelHealthy)"
+        )
         do {
             let latest = try await service.fetchLatestMessages(conversationId: conversationId)
             messages = latest
             seenMessageIds = Set(latest.map(\.id))
             try? await service.markRead(conversationId: conversationId)
             await chatViewModel.refreshInboxSummaries()
+            if wasLive, realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
+                // Keep healthy live status after REST merge.
+            }
+            if needsRepair {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: chatRealtimeLifecycleGeneration,
+                    event: "refreshRepair",
+                    status: String(describing: realtimeConnectionStatus)
+                )
+                await subscribeGroupRealtime(reason: "manual_refresh_repair", beginNewLifecycle: true)
+            }
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "manualRefreshFinished",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "repaired=\(needsRepair)"
+            )
         } catch {
             errorText = error.localizedDescription
         }
@@ -1014,7 +2179,17 @@ struct GroupChatInfoView: View {
     @ObservedObject var chatViewModel: ChatViewModel
     @EnvironmentObject private var mapViewModel: MapViewModel
     var isPickupGameChat: Bool = false
-    var pickupLocationLabel: String? = nil
+    var pickupContext: PickupGameChatContext? = nil
+    var pickupGameId: UUID? = nil
+    var pollCreatePermission: PickupPollCreatePermission = .organizerOnly
+    var canEditPollPermission: Bool = false
+    var isApprovedPickupParticipant: Bool = false
+    var activePollMessageId: UUID? = nil
+    var onCreatePoll: (() -> Void)? = nil
+    var onChangePollPermission: ((PickupPollCreatePermission) async -> String?)? = nil
+    var onViewActivePoll: ((UUID) -> Void)? = nil
+    /// Dismiss Group Info first, then open Discover + existing pickup detail (owned by caller).
+    var onViewPickupGame: ((UUID) -> Void)? = nil
     var onLeft: () -> Void
     var onDetailsChanged: (([GroupConversationDetailRow], [UUID: UserPreview]) -> Void)? = nil
     @Environment(\.dismiss) private var dismiss
@@ -1041,6 +2216,12 @@ struct GroupChatInfoView: View {
     @State private var hasReportedThisGroupSession = false
     @State private var memberReportTarget: GroupMemberReportTarget?
     @State private var reportedMemberIdsThisSession: Set<UUID> = []
+    @State private var localPollCreatePermission: PickupPollCreatePermission = .organizerOnly
+    @State private var isUpdatingPollPermission = false
+    @State private var showPollPermissionPicker = false
+    @State private var pickupSummaryRow: PickupGameRow?
+    @State private var pickupSummaryLoadCompleted = false
+    @State private var pickupSummaryUnavailable = false
 
     private let service = GroupChatService()
     private let identityService = SocialIdentityService()
@@ -1077,6 +2258,35 @@ struct GroupChatInfoView: View {
         Set(localDetails.map(\.member_user_id))
     }
 
+    private var showsPickupPollsSection: Bool {
+        effectiveIsPickupGameChat && pickupGameId != nil && viewerIsActiveMember
+    }
+
+    private var showsPickupGameSummarySection: Bool {
+        effectiveIsPickupGameChat && pickupGameId != nil
+    }
+
+    private var effectiveCanCreatePoll: Bool {
+        PickupGamePollAccess.canCreate(
+            isOrganizer: canEditPollPermission,
+            permission: localPollCreatePermission,
+            isApprovedParticipant: isApprovedPickupParticipant
+        )
+    }
+
+    private var createPollDisabledReason: String? {
+        guard showsPickupPollsSection, !effectiveCanCreatePoll else { return nil }
+        guard isApprovedPickupParticipant, !canEditPollPermission else { return nil }
+        if localPollCreatePermission == .organizerOnly {
+            return L10n.t("pickup_poll_create_organizer_only_hint", languageCode: languageCode)
+        }
+        return nil
+    }
+
+    private var showsDisabledCreatePollRow: Bool {
+        createPollDisabledReason != nil
+    }
+
     var body: some View {
         NavigationStack {
             List {
@@ -1084,18 +2294,31 @@ struct GroupChatInfoView: View {
                     Text(title)
                         .font(.headline)
                     if effectiveIsPickupGameChat {
-                        Text("Private chat for this pickup game")
+                        Text(L10n.t("group_info_pickup_private_chat_caption", languageCode: languageCode))
                             .font(.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        if let location = pickupLocationLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
-                           !location.isEmpty {
-                            Text(location)
-                                .font(.caption)
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        }
-                        Text("Membership follows approved players for this game.")
+                        Text(L10n.t("group_info_pickup_membership_caption", languageCode: languageCode))
                             .font(.caption)
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                }
+
+                if showsPickupGameSummarySection {
+                    Section {
+                        GroupInfoPickupGameSummaryCard(
+                            gameId: pickupGameId,
+                            row: pickupSummaryRow,
+                            fallbackContext: pickupContext,
+                            loadCompleted: pickupSummaryLoadCompleted,
+                            isUnavailable: pickupSummaryUnavailable || GroupInfoPickupGameSummaryCard.isArchivedOrDeleted(pickupSummaryRow),
+                            mapViewModel: mapViewModel,
+                            languageCode: languageCode,
+                            onViewPickupGame: { id in
+                                onViewPickupGame?(id)
+                            }
+                        )
+                        .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 10, trailing: 16))
+                        .listRowBackground(Color.clear)
                     }
                 }
 
@@ -1113,6 +2336,136 @@ struct GroupChatInfoView: View {
                                 systemImage: "person.badge.plus"
                             )
                         }
+                    }
+                }
+
+                if showsPickupPollsSection {
+                    Section {
+                        if effectiveCanCreatePoll {
+                            Button {
+                                onCreatePoll?()
+                            } label: {
+                                Label {
+                                    Text(L10n.t("pickup_poll_create_row", languageCode: languageCode))
+                                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                                } icon: {
+                                    Image(systemName: "chart.bar.xaxis")
+                                        .foregroundStyle(FGColor.accentGreen)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L10n.t("pickup_poll_create_row", languageCode: languageCode))
+                            .accessibilityHint(L10n.t("pickup_poll_create_row_a11y_hint", languageCode: languageCode))
+                        } else if showsDisabledCreatePollRow, let reason = createPollDisabledReason {
+                            HStack(alignment: .center, spacing: 12) {
+                                Image(systemName: "chart.bar.xaxis")
+                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(L10n.t("pickup_poll_create_row", languageCode: languageCode))
+                                        .font(.body)
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    Text(reason)
+                                        .font(.caption)
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(minHeight: 44)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel(L10n.t("pickup_poll_create_row", languageCode: languageCode))
+                            .accessibilityValue(reason)
+                            .accessibilityHint(reason)
+                        }
+
+                        if canEditPollPermission {
+                            Button {
+                                showPollPermissionPicker = true
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "person.badge.shield.checkmark")
+                                        .foregroundStyle(FGColor.accentGreen)
+                                        .accessibilityHidden(true)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                                            .font(.body)
+                                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                                        Text(localPollCreatePermission.title(languageCode: languageCode))
+                                            .font(.caption)
+                                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    }
+                                    Spacer(minLength: 8)
+                                    if isUpdatingPollPermission {
+                                        ProgressView()
+                                    } else {
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                            .accessibilityHidden(true)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(isUpdatingPollPermission)
+                            .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                            .accessibilityValue(localPollCreatePermission.title(languageCode: languageCode))
+                            .accessibilityHint(L10n.t("pickup_poll_permission_edit_a11y_hint", languageCode: languageCode))
+                        } else {
+                            HStack(spacing: 12) {
+                                Image(systemName: "person.badge.shield.checkmark")
+                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                                        .font(.body)
+                                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                                    Text(localPollCreatePermission.title(languageCode: languageCode))
+                                        .font(.caption)
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(minHeight: 44)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                            .accessibilityValue(localPollCreatePermission.title(languageCode: languageCode))
+                        }
+
+                        if let activePollMessageId {
+                            Button {
+                                onViewActivePoll?(activePollMessageId)
+                            } label: {
+                                Label {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(L10n.t("pickup_poll_active_row", languageCode: languageCode))
+                                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                                        Text(L10n.t("pickup_poll_view_active", languageCode: languageCode))
+                                            .font(.caption)
+                                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                    }
+                                } icon: {
+                                    Image(systemName: "chart.bar.fill")
+                                        .foregroundStyle(FGColor.accentGreen)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(minHeight: 44)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L10n.t("pickup_poll_active_row", languageCode: languageCode))
+                            .accessibilityHint(L10n.t("pickup_poll_view_active", languageCode: languageCode))
+                        }
+                    } header: {
+                        Text(L10n.t("pickup_polls_section", languageCode: languageCode))
                     }
                 }
 
@@ -1261,11 +2614,75 @@ struct GroupChatInfoView: View {
                 localDetails = details
                 localPreviews = memberPreviews
                 isMuted = details.first?.viewer_is_muted == true
+                localPollCreatePermission = pollCreatePermission
+            }
+            .onChange(of: pollCreatePermission) { _, newValue in
+                localPollCreatePermission = newValue
+            }
+            .confirmationDialog(
+                L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode),
+                isPresented: $showPollPermissionPicker,
+                titleVisibility: .visible
+            ) {
+                ForEach(PickupPollCreatePermission.allCases) { option in
+                    Button(option.title(languageCode: languageCode)) {
+                        Task { await commitPollCreatePermission(option) }
+                    }
+                }
+                Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
             }
             .task(id: conversationId) {
                 await hydrateAuthoritativeMuteState()
                 await refreshPendingInvitesIfAdmin()
             }
+            .task(id: pickupGameId) {
+                await loadPickupGameSummaryIfNeeded()
+            }
+        }
+    }
+
+    @MainActor
+    private func loadPickupGameSummaryIfNeeded() async {
+        guard showsPickupGameSummarySection, let id = pickupGameId else {
+            pickupSummaryRow = nil
+            pickupSummaryLoadCompleted = true
+            pickupSummaryUnavailable = false
+            return
+        }
+        pickupSummaryLoadCompleted = false
+        pickupSummaryUnavailable = false
+        if let cached = mapViewModel.resolvedPickupGameRow(for: id) {
+            pickupSummaryRow = cached
+            pickupSummaryLoadCompleted = true
+            pickupSummaryUnavailable = GroupInfoPickupGameSummaryCard.isArchivedOrDeleted(cached)
+            await mapViewModel.loadPickupCreatorDisplayNameIfNeeded(creatorUserId: cached.creator_user_id)
+            return
+        }
+        let row = await mapViewModel.loadPickupGameRowForDetailIfNeeded(id: id)
+        guard !Task.isCancelled, pickupGameId == id else { return }
+        if let row {
+            pickupSummaryRow = row
+            pickupSummaryUnavailable = GroupInfoPickupGameSummaryCard.isArchivedOrDeleted(row)
+            await mapViewModel.loadPickupCreatorDisplayNameIfNeeded(creatorUserId: row.creator_user_id)
+        } else {
+            pickupSummaryRow = nil
+            pickupSummaryUnavailable = true
+        }
+        pickupSummaryLoadCompleted = true
+    }
+
+    @MainActor
+    private func commitPollCreatePermission(_ permission: PickupPollCreatePermission) async {
+        guard canEditPollPermission, permission != localPollCreatePermission else { return }
+        guard let onChangePollPermission else { return }
+        isUpdatingPollPermission = true
+        errorText = nil
+        defer { isUpdatingPollPermission = false }
+        let previous = localPollCreatePermission
+        localPollCreatePermission = permission
+        if let err = await onChangePollPermission(permission) {
+            localPollCreatePermission = previous
+            errorText = err
         }
     }
 
@@ -1739,6 +3156,367 @@ struct GroupChatInfoView: View {
         } catch {
             errorText = error.localizedDescription
         }
+    }
+}
+
+// MARK: - Pickup game summary (Group Info)
+
+/// Compact pickup identity card for Group Info. Loads once via MapViewModel cache/select.
+private struct GroupInfoPickupGameSummaryCard: View {
+    let gameId: UUID?
+    let row: PickupGameRow?
+    let fallbackContext: PickupGameChatContext?
+    let loadCompleted: Bool
+    let isUnavailable: Bool
+    @ObservedObject var mapViewModel: MapViewModel
+    let languageCode: String
+    let onViewPickupGame: (UUID) -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private enum StatusKind {
+        case upcoming
+        case today
+        case inProgress
+        case finished
+        case cancelled
+        case unavailable
+    }
+
+    static func isArchivedOrDeleted(_ row: PickupGameRow?) -> Bool {
+        guard let row else { return false }
+        switch row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "removed", "deleted", "expired", "archived":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private var statusKind: StatusKind {
+        if isUnavailable { return .unavailable }
+        guard let row else { return loadCompleted ? .unavailable : .upcoming }
+        let raw = row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if raw == "cancelled" || raw == "canceled" { return .cancelled }
+        if Self.isArchivedOrDeleted(row) { return .unavailable }
+
+        let now = Date()
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else {
+            return .upcoming
+        }
+        let end: Date = {
+            if let rawEnd = row.end_time, let parsed = PickupGameModels.parseSupabaseTimestamptz(rawEnd) {
+                return parsed
+            }
+            return start.addingTimeInterval(2 * 3600)
+        }()
+        if now >= end { return .finished }
+        if row.hasPickupGameStarted(now: now) { return .inProgress }
+        if Calendar.current.isDate(start, inSameDayAs: now) { return .today }
+        return .upcoming
+    }
+
+    private var statusLabel: String {
+        switch statusKind {
+        case .upcoming: return L10n.t("group_info_pickup_status_upcoming", languageCode: languageCode)
+        case .today: return L10n.t("group_info_pickup_status_today", languageCode: languageCode)
+        case .inProgress: return L10n.t("group_info_pickup_status_in_progress", languageCode: languageCode)
+        case .finished: return L10n.t("group_info_pickup_status_finished", languageCode: languageCode)
+        case .cancelled: return L10n.t("group_info_pickup_status_cancelled", languageCode: languageCode)
+        case .unavailable: return L10n.t("group_info_pickup_unavailable_title", languageCode: languageCode)
+        }
+    }
+
+    private var statusColor: Color {
+        switch statusKind {
+        case .inProgress: return FGColor.dangerRed
+        case .cancelled, .unavailable, .finished: return FGColor.secondaryText(colorScheme)
+        case .today: return FGColor.intentPlay
+        case .upcoming: return FGColor.intentPlay.opacity(0.85)
+        }
+    }
+
+    private var canOpenDetail: Bool {
+        guard gameId != nil, row != nil, !isUnavailable else { return false }
+        switch statusKind {
+        case .unavailable: return false
+        case .upcoming, .today, .inProgress, .finished, .cancelled: return true
+        }
+    }
+
+    private var sportLabel: String {
+        if let row {
+            return AppSportCatalog.displayLabel(forSportToken: row.sport)
+        }
+        return fallbackContext?.sportLabel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var titleText: String {
+        if let row {
+            let t = row.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        let fallback = fallbackContext?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return fallback.isEmpty
+            ? L10n.t("group_info_pickup_section_label", languageCode: languageCode)
+            : fallback
+    }
+
+    private var whenLine: String? {
+        if let row, let line = row.pickupDateWithCompactTimeRange(languageCode: languageCode), !line.isEmpty {
+            return line
+        }
+        let fallback = fallbackContext?.whenLabel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return fallback.isEmpty ? nil : fallback
+    }
+
+    private var venueLine: String? {
+        if let row {
+            let address = row.address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return address.isEmpty ? nil : address
+        }
+        let fallback = fallbackContext?.locationLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return fallback.isEmpty ? nil : fallback
+    }
+
+    private var cityRegionLine: String? {
+        guard let row else { return nil }
+        let cityRegion = [row.city, row.state]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
+        guard !cityRegion.isEmpty else { return nil }
+        if let venue = venueLine, venue.localizedCaseInsensitiveContains(cityRegion) {
+            return nil
+        }
+        return cityRegion
+    }
+
+    private var organizerName: String? {
+        guard let row else { return nil }
+        let label = mapViewModel.pickupCreatorDisplayLabel(for: row.creator_user_id)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !label.isEmpty { return label }
+        return L10n.t("share_pickup_organizer_fallback", languageCode: languageCode)
+    }
+
+    private var participantsLine: String? {
+        if let row, row.approved_join_count != nil {
+            // Joiners + organizer (creator is separate from approved_join_count).
+            let playerCount = max(1, row.approvedJoinCount + 1)
+            let playersKey = playerCount == 1
+                ? "group_info_pickup_players_one_format"
+                : "group_info_pickup_players_other_format"
+            let players = String(
+                format: L10n.t(playersKey, languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                Int64(playerCount)
+            )
+            if row.isPickupFullForDiscover {
+                return "\(players) · \(L10n.t("pickup_status_full", languageCode: languageCode))"
+            }
+            let open = row.pickupOpenSlotsRemaining
+            if open > 0 {
+                return "\(players) · \(pickupLocalizedSpotsLeft(open, languageCode: languageCode))"
+            }
+            return players
+        }
+        if let count = fallbackContext?.approvedParticipantCount, count > 0 {
+            let key = count == 1
+                ? "group_info_pickup_players_one_format"
+                : "group_info_pickup_players_other_format"
+            return String(
+                format: L10n.t(key, languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                Int64(count)
+            )
+        }
+        return nil
+    }
+
+    private var accessibilitySummary: String {
+        if isUnavailable || (loadCompleted && row == nil && fallbackContext == nil) {
+            return L10n.t("group_info_pickup_unavailable_title", languageCode: languageCode)
+        }
+        var parts: [String] = []
+        let sport = sportLabel
+        if !sport.isEmpty {
+            parts.append(
+                String(
+                    format: L10n.t("group_info_pickup_a11y_sport_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    sport
+                )
+            )
+        } else {
+            parts.append(titleText)
+        }
+        if !titleText.isEmpty, sportLabel.isEmpty == false {
+            parts.append(titleText)
+        }
+        if let whenLine { parts.append(whenLine) }
+        if let venueLine { parts.append(venueLine) }
+        if let cityRegionLine { parts.append(cityRegionLine) }
+        if let participantsLine { parts.append(participantsLine) }
+        parts.append(statusLabel)
+        return parts.joined(separator: ". ")
+    }
+
+    @ViewBuilder
+    private var cardMainBlock: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(L10n.t("group_info_pickup_section_label", languageCode: languageCode))
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(FGColor.intentPlay)
+                    .textCase(.uppercase)
+                    .tracking(0.4)
+                Spacer(minLength: 0)
+                Text(statusLabel)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(statusColor.opacity(colorScheme == .dark ? 0.22 : 0.12), in: Capsule())
+            }
+
+            if isUnavailable && loadCompleted {
+                unavailableContent
+            } else if !loadCompleted && row == nil && fallbackContext == nil {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text(L10n.t("group_info_pickup_loading", languageCode: languageCode))
+                        .font(.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+            } else {
+                summaryContent
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            cardMainBlock
+            if canOpenDetail, let gameId {
+                Button {
+                    onViewPickupGame(gameId)
+                } label: {
+                    Text(L10n.t("group_info_view_pickup_game", languageCode: languageCode))
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                        .background(FGColor.intentPlay, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("group_info_view_pickup_game", languageCode: languageCode))
+                .accessibilityHint(L10n.t("pickup_edit_open_game_a11y_hint", languageCode: languageCode))
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.16 : 0.10))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.38 : 0.28), lineWidth: 1)
+        }
+    }
+
+    private var unavailableContent: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.t("group_info_pickup_unavailable_title", languageCode: languageCode))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+            Text(L10n.t("group_info_pickup_unavailable_body", languageCode: languageCode))
+                .font(.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private var summaryContent: some View {
+        HStack(alignment: .top, spacing: 12) {
+            if let row {
+                SportArtworkIconView(sport: row.sport, diameter: 44)
+                    .accessibilityHidden(true)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.28 : 0.18))
+                    Image(systemName: "figure.run")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                }
+                .frame(width: 44, height: 44)
+                .accessibilityHidden(true)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                if !sportLabel.isEmpty {
+                    Text(sportLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .lineLimit(1)
+                }
+                Text(titleText)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let whenLine {
+                    Label(whenLine, systemImage: "calendar")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                }
+                if let venueLine {
+                    Label(venueLine, systemImage: "mappin.and.ellipse")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                }
+                if let cityRegionLine {
+                    Text(cityRegionLine)
+                        .font(.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(1)
+                }
+                if let organizerName {
+                    Label(
+                        String(
+                            format: L10n.t("group_info_pickup_organizer_format", languageCode: languageCode),
+                            locale: Locale(identifier: languageCode),
+                            organizerName
+                        ),
+                        systemImage: "person.fill"
+                    )
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+                }
+                if let participantsLine {
+                    Label(participantsLine, systemImage: "person.3")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityHidden(true)
     }
 }
 

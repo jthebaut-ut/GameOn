@@ -1410,7 +1410,17 @@ extension MapViewModel {
         refreshKey: String
     ) async {
         do {
-            let matches = try await LiveSportsService.shared.fetchLiveMatches(windowDays: windowDays)
+            let matches: [LiveMatch]
+            if let shared = sharedLiveMatchesSuitableForFavoriteTeamWindow(days: windowDays) {
+#if DEBUG
+                TabPerfDebug.log(
+                    "[TabPerfDebug] usedSharedLiveMatches=true tab=going source=favoriteTeamProGames rows=\(shared.count)"
+                )
+#endif
+                matches = shared
+            } else {
+                matches = try await LiveSportsService.shared.fetchLiveMatches(windowDays: windowDays)
+            }
             let previous = favoriteTeamProGames
             let autoFollowMatches = Self.favoriteTeamProGames(from: matches, favoriteTeams: favoriteTeams)
             favoriteTeamProGames = autoFollowMatches
@@ -2254,18 +2264,63 @@ extension MapViewModel {
         from matches: [LiveMatch],
         favoriteTeams: [FavoriteTeam]
     ) -> [FavoriteTeamProGame] {
-        var seen = Set<String>()
-        return matches.compactMap { match -> FavoriteTeamProGame? in
-            guard let team = favoriteTeams.first(where: {
-                FavoriteTeamLiveMatcher.matchesLiveMatch($0, homeTeam: match.homeTeam, awayTeam: match.awayTeam)
-            }) else {
-                return nil
-            }
-            let game = SavedProGame(match: match)
-            guard seen.insert(game.stableKey).inserted else { return nil }
-            return FavoriteTeamProGame(game: game, favoriteTeamID: team.id, favoriteTeamName: team.name)
+        guard !matches.isEmpty, !favoriteTeams.isEmpty else { return [] }
+        let identities = FavoriteTeamMatchIdentityResolver.resolve(from: favoriteTeams)
+        guard !identities.isEmpty else { return [] }
+        let index = FavoriteTeamLiveSnapshotIndex.build(from: matches)
+        // Match against deduplicated team identities; attribute back to source favorite.
+        let teamsWithAliases: [(team: FavoriteTeam, aliases: [String], source: FavoriteTeam)] = identities.map {
+            (
+                team: $0.matchTeam,
+                aliases: FavoriteTeamLiveMatcher.matchAliases(for: $0.matchTeam),
+                source: $0.sourceFavorite
+            )
         }
-        .sorted { SavedProGame.displaySort($0.game, $1.game) }
+#if DEBUG
+        LiveApplyPerf.favoriteIndexBuild(
+            rows: matches.count,
+            favorites: favoriteTeams.count,
+            buildMs: index.buildMs,
+            reason: "favoriteTeamProGames"
+        )
+#endif
+        var seen = Set<String>()
+        var results: [FavoriteTeamProGame] = []
+        results.reserveCapacity(min(matches.count, 64))
+        for matchIndex in matches.indices {
+            guard let matched = firstMatchingFavoriteIdentity(
+                in: teamsWithAliases,
+                at: matchIndex,
+                index: index
+            ) else {
+                continue
+            }
+            let game = SavedProGame(match: matches[matchIndex])
+            guard seen.insert(game.stableKey).inserted else { continue }
+            results.append(
+                FavoriteTeamProGame(
+                    game: game,
+                    favoriteTeamID: matched.source.id,
+                    favoriteTeamName: matched.source.name
+                )
+            )
+        }
+        return results.sorted { SavedProGame.displaySort($0.game, $1.game) }
+    }
+
+    private static func firstMatchingFavoriteIdentity(
+        in entries: [(team: FavoriteTeam, aliases: [String], source: FavoriteTeam)],
+        at matchIndex: Int,
+        index: FavoriteTeamLiveSnapshotIndex
+    ) -> (matchTeam: FavoriteTeam, source: FavoriteTeam)? {
+        let matchEntries = entries.map { (team: $0.team, aliases: $0.aliases) }
+        guard let matchedTeam = index.firstMatchingTeam(in: matchEntries, at: matchIndex) else {
+            return nil
+        }
+        guard let entry = entries.first(where: { $0.team.id == matchedTeam.id }) else {
+            return (matchedTeam, matchedTeam)
+        }
+        return (entry.team, entry.source)
     }
 
     private func mergeFavoriteTeamWindowMatchesIntoLiveMatches(_ matches: [LiveMatch]) {
@@ -2278,8 +2333,37 @@ extension MapViewModel {
             if $0.startTime == $1.startTime { return $0.id < $1.id }
             return $0.startTime < $1.startTime
         }
+        guard merged != liveMatches else {
+            // Window merge is a no-op against current Live — skip hydration + publish.
+            return
+        }
         handleSavedProGameStatusUpdates(from: matches, reason: "favoriteTeamWindowMerge")
         liveMatches = merged
+    }
+
+    /// Live tab default forward coverage is ~7 days; reuse that snapshot for Going auto-follow
+    /// when it is still fresh and the requested window fits.
+    static let favoriteTeamProGamesSharedLiveForwardCoverageDays = 7
+    static let favoriteTeamProGamesSharedLiveFreshnessInterval: TimeInterval = 60
+
+    func sharedLiveMatchesSuitableForFavoriteTeamWindow(days: Int) -> [LiveMatch]? {
+        let clampedDays = min(max(days, 7), 90)
+        guard clampedDays <= Self.favoriteTeamProGamesSharedLiveForwardCoverageDays else {
+            return nil
+        }
+        guard !liveMatches.isEmpty,
+              let last = lastLiveMatchesRefreshAt,
+              Date().timeIntervalSince(last) < Self.favoriteTeamProGamesSharedLiveFreshnessInterval else {
+            return nil
+        }
+        let calendar = Calendar.current
+        let now = Date()
+        let windowStart = calendar.startOfDay(for: now)
+        let windowEnd = calendar.date(byAdding: .day, value: clampedDays, to: windowStart)
+            ?? now.addingTimeInterval(TimeInterval(clampedDays * 24 * 60 * 60))
+        return liveMatches.filter { match in
+            match.startTime >= windowStart && match.startTime < windowEnd
+        }
     }
 
     private func mergeGoingProRefreshMatchesIntoLiveMatches(_ matches: [LiveMatch]) {

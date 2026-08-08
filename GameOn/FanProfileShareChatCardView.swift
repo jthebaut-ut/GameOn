@@ -11,13 +11,10 @@ struct FanProfileShareChatCardView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
-    @State private var refreshedProfile: PublicUserProfileData?
-    @State private var didAttemptRefresh = false
-
     private var displayPayload: FanProfileShareDisplayModel {
         FanProfileShareDisplayModel(
             payload: payload,
-            refreshedProfile: refreshedProfile,
+            refreshedProfile: nil,
             languageCode: appLanguageRaw
         )
     }
@@ -65,22 +62,14 @@ struct FanProfileShareChatCardView: View {
             }
         }
         .onAppear {
-            print("[ProfileShareDebug] renderedDisplayName=\(displayPayload.displayName)")
-        }
-        .task(id: payload.profileUserId) {
-            guard !didAttemptRefresh else { return }
-            didAttemptRefresh = true
-            let loaded = await PublicUserProfileService.load(userId: payload.profileUserId)
-            await MainActor.run {
-                if loaded.isPubliclyVisible,
-                   loaded.hasResolvedIdentity,
-                   !FanProfileShareMessage.isGenericDisplayName(loaded.displayName) {
-                    refreshedProfile = loaded
-                } else {
-                    refreshedProfile = nil
-                }
+#if DEBUG
+            if DirectChatInvestigation.quietConsole == false {
+                print("[ProfileShareDebug] renderedDisplayName=\(displayPayload.displayName)")
             }
+#endif
         }
+        // Encoded payload is enough for first paint. Full public-profile network load
+        // runs only when the user taps View Profile (presentPublicProfile).
     }
 
     private var cardContent: some View {

@@ -15,6 +15,87 @@ nonisolated enum PickupGameAutoRemoval {
     static let hoursAfterGameStart: Int = 12
 }
 
+/// Going → Hosting auto-clear: one SoT for deadline, eligibility, and countdown copy.
+nonisolated enum PickupHostingAutoClear {
+    static func deadline(for row: PickupGameRow) -> Date? {
+        row.pickupHistoryClientCleanupDeadline()
+    }
+
+    static func isPastDeadline(row: PickupGameRow, now: Date) -> Bool {
+        guard let deadline = deadline(for: row) else { return false }
+        return now >= deadline
+    }
+
+    /// Live countdown / clearing status for Hosting cards (never a stable "past" label).
+    static func statusLabel(
+        row: PickupGameRow,
+        now: Date,
+        languageCode: String,
+        isClearing: Bool = false,
+        clearFailed: Bool = false
+    ) -> String {
+        if clearFailed {
+            return L10n.t("pickup_auto_clear_failed_hint", languageCode: languageCode)
+        }
+        if isClearing {
+            return L10n.t("pickup_auto_clearing_now", languageCode: languageCode)
+        }
+        guard let deadline = deadline(for: row) else {
+            return String(
+                format: L10n.t("pickup_auto_clears_after_start_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                PickupGameAutoRemoval.hoursAfterGameStart
+            )
+        }
+        if now >= deadline {
+            // Avoid a stable "Past auto-clear time" label; Going passes `isClearing` while removing.
+            return L10n.t("pickup_auto_clears_soon", languageCode: languageCode)
+        }
+        if let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at), now < start {
+            return String(
+                format: L10n.t("pickup_auto_clears_after_start_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                PickupGameAutoRemoval.hoursAfterGameStart
+            )
+        }
+        return countdownLabel(until: deadline, now: now, languageCode: languageCode)
+    }
+
+    static func countdownLabel(until deadline: Date, now: Date, languageCode: String) -> String {
+        let remaining = deadline.timeIntervalSince(now)
+        if remaining <= 0 {
+            return L10n.t("pickup_auto_clearing_now", languageCode: languageCode)
+        }
+        if remaining < 15 * 60 {
+            return L10n.t("pickup_auto_clears_soon", languageCode: languageCode)
+        }
+        if remaining < 3600 {
+            let minutes = max(1, Int(ceil(remaining / 60)))
+            return String(
+                format: L10n.t("pickup_auto_clears_in_m_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                minutes
+            )
+        }
+        let totalMinutes = Int(remaining / 60)
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if minutes == 0 {
+            return String(
+                format: L10n.t("pickup_auto_clears_in_h_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                hours
+            )
+        }
+        return String(
+            format: L10n.t("pickup_auto_clears_in_hm_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            hours,
+            minutes
+        )
+    }
+}
+
 /// DEBUG: pickup expiration fields immediately before Supabase insert/update (edit + roster sync).
 enum PickupExpirationEditDebug {
     static func log(oldGameStartAt: String?, newGameStartAt: String, cleanupDelayHours: Int, computedRemoveAfterAt: String) {
@@ -88,6 +169,78 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
     let remove_after_at: String?
     let created_at: String?
     let updated_at: String?
+    /// `organizer_only` (default) | `approved_players`. Nil/unknown → organizer only.
+    let poll_create_permission: String?
+
+    var pollCreatePermission: PickupPollCreatePermission {
+        PickupPollCreatePermission.resolved(poll_create_permission)
+    }
+
+    init(
+        id: UUID,
+        creator_user_id: UUID,
+        creator_email: String?,
+        title: String,
+        sport: String,
+        description: String?,
+        game_format: String,
+        skill_level: String,
+        game_start_at: String,
+        end_time: String?,
+        address: String?,
+        city: String?,
+        state: String?,
+        latitude: Double?,
+        longitude: Double?,
+        is_visible: Bool,
+        players_needed: Int,
+        play_environment: String,
+        participant_preference: String,
+        age_min: Int?,
+        age_max: Int?,
+        is_free: Bool,
+        entry_fee_amount: Double?,
+        max_players: Int?,
+        status: String,
+        approved_join_count: Int?,
+        cleanup_delay_hours: Int,
+        remove_after_at: String?,
+        created_at: String?,
+        updated_at: String?,
+        poll_create_permission: String? = nil
+    ) {
+        self.id = id
+        self.creator_user_id = creator_user_id
+        self.creator_email = creator_email
+        self.title = title
+        self.sport = sport
+        self.description = description
+        self.game_format = game_format
+        self.skill_level = skill_level
+        self.game_start_at = game_start_at
+        self.end_time = end_time
+        self.address = address
+        self.city = city
+        self.state = state
+        self.latitude = latitude
+        self.longitude = longitude
+        self.is_visible = is_visible
+        self.players_needed = players_needed
+        self.play_environment = play_environment
+        self.participant_preference = participant_preference
+        self.age_min = age_min
+        self.age_max = age_max
+        self.is_free = is_free
+        self.entry_fee_amount = entry_fee_amount
+        self.max_players = max_players
+        self.status = status
+        self.approved_join_count = approved_join_count
+        self.cleanup_delay_hours = cleanup_delay_hours
+        self.remove_after_at = remove_after_at
+        self.created_at = created_at
+        self.updated_at = updated_at
+        self.poll_create_permission = poll_create_permission
+    }
 }
 
 // MARK: - `public.pickup_game_invites`
@@ -176,13 +329,15 @@ extension PickupGameRow {
             cleanup_delay_hours: cleanup_delay_hours,
             remove_after_at: remove_after_at,
             created_at: created_at,
-            updated_at: updated_at
+            updated_at: updated_at,
+            poll_create_permission: poll_create_permission
         )
     }
 
     /// When this row should disappear from **Settings → My pickup games → History** (and matches organizer History footer math).
     /// Prefers `remove_after_at` from the server; otherwise `game_start_at` + retention hours.
-    func pickupHistoryClientCleanupDeadline() -> Date? {
+    /// Pure date arithmetic — safely callable from nonisolated helpers such as ``PickupHostingAutoClear``.
+    nonisolated func pickupHistoryClientCleanupDeadline() -> Date? {
         if let rem = remove_after_at, let d = PickupGameModels.parseSupabaseTimestamptz(rem) {
             return d
         }
@@ -289,6 +444,7 @@ struct PickupGameInsert: Encodable {
     let cleanup_delay_hours: Int
     /// Always `game_start_at` + 12h; sent on every write so `remove_after_at` never lags behind an edited start time.
     let remove_after_at: String
+    let poll_create_permission: String
 
     /// Write payload with canonical 12h pickup retention and forced Discover visibility.
     func withCanonicalPickupCleanupDelay() -> PickupGameInsert {
@@ -318,7 +474,8 @@ struct PickupGameInsert: Encodable {
             entry_fee_amount: entry_fee_amount,
             max_players: max_players,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
-            remove_after_at: remove
+            remove_after_at: remove,
+            poll_create_permission: poll_create_permission
         )
     }
 }
@@ -348,6 +505,7 @@ struct PickupGameFullUpdate: Encodable {
     let cleanup_delay_hours: Int
     /// Always `game_start_at` + 12h; sent on full edit so expiration tracks the edited start instant.
     let remove_after_at: String
+    let poll_create_permission: String
 
     /// Write payload with canonical 12h pickup retention and forced Discover visibility.
     func withCanonicalPickupCleanupDelay() -> PickupGameFullUpdate {
@@ -375,7 +533,8 @@ struct PickupGameFullUpdate: Encodable {
             entry_fee_amount: entry_fee_amount,
             max_players: max_players,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
-            remove_after_at: remove
+            remove_after_at: remove,
+            poll_create_permission: poll_create_permission
         )
     }
 }
@@ -920,8 +1079,13 @@ extension PickupGameRow {
         approvedJoinCount >= playersNeededClamped
     }
 
+    /// Pure clamp used by UI and nonisolated diff/signature helpers. Bounds: 1...20.
+    nonisolated static func clampPlayersNeeded(_ value: Int) -> Int {
+        min(20, max(1, value))
+    }
+
     var playersNeededClamped: Int {
-        min(20, max(1, players_needed))
+        Self.clampPlayersNeeded(players_needed)
     }
 
     var lookingForPlayersLine: String {

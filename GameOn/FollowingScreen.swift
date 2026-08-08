@@ -53,13 +53,19 @@ struct FollowingScreen: View {
     @State private var followingPendingPostCreateInviteGame: PickupGameRow?
     @State private var pickupInviteResponseInFlightId: UUID?
     @State private var followingMyPickupBanner: String?
-    @State private var followingMyPickupDidScheduleExpiryRefresh = false
     @State private var selectedGoingMode: GoingParticipationMode = .venueGames
     @State private var selectedGoingVenueTab: GoingVenueTab = .games
     @State private var selectedGoingGamesTab: GoingGamesTab = .playing
     @State private var selectedBusinessProGameFilter: BusinessProGameFilter = .all
     /// Ephemeral Discover Today dashboard day scope (not persisted).
     @State private var goingDayScope: GoingDayScope = .all
+    /// Debounce / in-flight guard for Going activity-banner navigation.
+    @State private var goingActivityBannerNavigationGeneration: UInt64 = 0
+    @State private var goingActivityBannerNavigationInFlight = false
+    /// Scroll/highlight target after tapping the Going activity banner.
+    @State private var pendingGoingActivityBannerScrollGameId: UUID?
+    /// Set when the user enters Play → Playing; consumed once authoritative cards are ready.
+    @State private var pendingPlayingActivityAcknowledgement = false
     @State private var cachedGoingVenueGameItems: [FollowingGoingDisplayItem] = []
     @State private var cachedPlayingGameCards: [PickupGameJoinRequestCardDisplay] = []
     @State private var goingTabPerf = GoingTabPerfState()
@@ -358,6 +364,7 @@ struct FollowingScreen: View {
         Task {
             await viewModel.loadMyPickupGameJoinRequestsForFollowing(reason: "foreground")
             await viewModel.loadIncomingPickupGameInvites()
+            await viewModel.clearExpiredHostedPickupGamesIfNeeded(now: Date(), reason: "followingForeground")
         }
     }
 
@@ -776,6 +783,9 @@ struct FollowingScreen: View {
         }) { token in
             DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
                 .environmentObject(chatViewModel)
+                .onAppear {
+                    viewModel.acknowledgePickupFollowingActivity(for: token.id)
+                }
         }
         .alert(item: $followingPickupWithdrawConfirm) { state in
             Alert(
@@ -899,7 +909,8 @@ struct FollowingScreen: View {
             ProGamePredictionSheet(viewModel: viewModel, game: context.game)
         }
         .sheet(item: $proGameMatchDetailSelection) { match in
-            LiveMatchDetailSheet(match: match)
+            LiveMatchDetailSheet(match: match, viewModel: viewModel)
+                .environmentObject(chatViewModel)
         }
         .sheet(item: $goingAddToVenueChooser) { context in
             CalendarAddToVenueChooserSheet(
@@ -1068,12 +1079,12 @@ struct FollowingScreen: View {
     // MARK: - Logged in
 
     private var loggedInContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            goingHubHeader
-            .padding(.horizontal, FGSpacing.md)
-            .padding(.bottom, 8)
+        ScrollViewReader { proxy in
+            VStack(alignment: .leading, spacing: 0) {
+                goingHubHeader(scrollProxy: proxy)
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.bottom, 8)
 
-            ScrollViewReader { proxy in
                 ScrollView {
                     goingHubContent
                         .padding(.horizontal, FGSpacing.md)
@@ -1101,7 +1112,7 @@ struct FollowingScreen: View {
                 }
                 .onReceive(followingMyPickupMinuteTicker) { date in
                     followingMyPickupClockTick = date
-                    scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: date)
+                    runFollowingHostedPickupAutoClearIfNeeded(now: date, reason: "followingMinuteTick")
                     guard isFollowingTabSelected else { return }
                     rebuildFollowingDisplayCaches(reason: "goingCompletedVisibilityTick", prefetchAvatars: false)
                     scheduleGoingProGamesDisplayCacheRebuild(reason: "goingCompletedVisibilityTick")
@@ -1113,10 +1124,23 @@ struct FollowingScreen: View {
                         scrollProxy: proxy
                     )
                 }
+                .onChange(of: pendingGoingActivityBannerScrollGameId) { _, gameId in
+                    guard let gameId else { return }
+                    fulfillGoingActivityBannerScrollIfNeeded(
+                        pickupGameId: gameId,
+                        scrollProxy: proxy
+                    )
+                }
                 .onAppear {
                     if let request = viewModel.pendingPickupCreatorRatingNotificationDeepLink {
                         fulfillPickupCreatorRatingNotificationDeepLink(
                             pickupGameId: request.pickupGameId,
+                            scrollProxy: proxy
+                        )
+                    }
+                    if let gameId = pendingGoingActivityBannerScrollGameId {
+                        fulfillGoingActivityBannerScrollIfNeeded(
+                            pickupGameId: gameId,
                             scrollProxy: proxy
                         )
                     }
@@ -1128,7 +1152,7 @@ struct FollowingScreen: View {
         }
     }
 
-    private var goingHubHeader: some View {
+    private func goingHubHeader(scrollProxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
                 FanGeoPagePurposeHeader(
@@ -1157,7 +1181,7 @@ struct FollowingScreen: View {
             }
 
             if !isBusinessProGamesOnly && goingHubShouldShowActivityStrip {
-                goingHubActivityStrip
+                goingHubActivityStrip(scrollProxy: scrollProxy)
             }
         }
     }
@@ -2487,34 +2511,8 @@ struct FollowingScreen: View {
             ZStack(alignment: .trailing) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        ForEach(Array(teams.prefix(3))) { team in
+                        ForEach(teams) { team in
                             goingFavoriteTeamChip(team)
-                        }
-                        if teams.count > 3 {
-                            Text(
-                                String(
-                                    format: L10n.t("going_favorite_teams_more_format", languageCode: languageCode),
-                                    locale: Locale(identifier: languageCode),
-                                    teams.count - 3
-                                )
-                            )
-                            .font(FGTypography.metadata.weight(.bold))
-                            .foregroundStyle(FGColor.secondaryText(followingColorScheme))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background {
-                                Capsule(style: .continuous)
-                                    .fill(FGColor.mutedText(followingColorScheme).opacity(followingColorScheme == .dark ? 0.18 : 0.10))
-                            }
-                            .accessibilityLabel(
-                                String(
-                                    format: L10n.t("going_favorite_teams_more_a11y_format", languageCode: languageCode),
-                                    locale: Locale(identifier: languageCode),
-                                    teams.count - 3
-                                )
-                            )
                         }
                     }
                     .padding(.vertical, 1)
@@ -2562,6 +2560,8 @@ struct FollowingScreen: View {
                 .foregroundStyle(FGColor.primaryText(followingColorScheme))
                 .lineLimit(1)
                 .minimumScaleFactor(0.78)
+                .truncationMode(.tail)
+                .frame(maxWidth: 148, alignment: .leading)
         }
         .padding(.leading, 4)
         .padding(.trailing, 10)
@@ -2708,9 +2708,35 @@ struct FollowingScreen: View {
         }
         .padding(.top, 6)
         .onAppear {
-            guard viewModel.canFanUsePickupGamesUI else { return }
-            viewModel.acknowledgePickupFollowingGamesToPlayActivity()
+            // Entering Playing arms a one-shot ack; later realtime refreshes while staying here do not.
+            pendingPlayingActivityAcknowledgement = true
+            acknowledgePlayingPickupActivityIfReady(reason: "playingAppear")
         }
+        .onChange(of: shouldShowPlayingPickupLoadingState) { _, isLoading in
+            guard !isLoading else { return }
+            acknowledgePlayingPickupActivityIfReady(reason: "playingLoadReady")
+        }
+        .onChange(of: viewModel.isPickupFollowingJoinListRefreshing) { _, refreshing in
+            guard !refreshing else { return }
+            acknowledgePlayingPickupActivityIfReady(reason: "playingRefreshSettled")
+        }
+        .onDisappear {
+            pendingPlayingActivityAcknowledgement = false
+        }
+    }
+
+    private func acknowledgePlayingPickupActivityIfReady(reason: String) {
+        guard pendingPlayingActivityAcknowledgement else { return }
+        guard viewModel.canFanUsePickupGamesUI else { return }
+        guard selectedGoingMode == .pickupGames, selectedGoingGamesTab == .playing else { return }
+        guard !shouldShowPlayingPickupLoadingState else { return }
+        guard !viewModel.isPickupFollowingJoinListRefreshing else { return }
+        guard !viewModel.myPickupGameJoinRequestCards.isEmpty else { return }
+        viewModel.acknowledgePickupFollowingGamesToPlayActivity()
+        pendingPlayingActivityAcknowledgement = false
+#if DEBUG
+        print("[PickupFollowingActivity] uiAck reason=\(reason)")
+#endif
     }
 
     private var hostingGamesContent: some View {
@@ -2774,7 +2800,7 @@ struct FollowingScreen: View {
                     await loadHostingPickupGamesAfterAppear()
                 }
             }
-            scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: Date())
+            runFollowingHostedPickupAutoClearIfNeeded(now: Date(), reason: "followingHostingAppear")
         }
     }
 
@@ -2784,6 +2810,7 @@ struct FollowingScreen: View {
         if let uid = viewModel.currentUserAuthId {
             await viewModel.refreshPickupCreatorPublicRatingStats(creatorUserIds: [uid])
         }
+        await viewModel.clearExpiredHostedPickupGamesIfNeeded(now: Date(), reason: "followingHostingAppearLoaded")
         logFollowingMyPickupGames(action: "gamesListAppear")
     }
 
@@ -3142,36 +3169,153 @@ struct FollowingScreen: View {
         goingHubActivityBadgeState != "none"
     }
 
-    private var goingHubActivityStrip: some View {
-        HStack(spacing: 9) {
-            Circle()
-                .fill(Color.orange.opacity(0.92))
-                .frame(width: 7, height: 7)
+    private func goingHubActivityStrip(scrollProxy: ScrollViewProxy) -> some View {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return Button {
+            handleGoingActivityBannerTap(scrollProxy: scrollProxy)
+        } label: {
+            HStack(spacing: 9) {
+                Circle()
+                    .fill(Color.orange.opacity(0.92))
+                    .frame(width: 7, height: 7)
 
-            Text(goingHubActivityText)
-                .font(FGTypography.caption.weight(.semibold))
-                .foregroundStyle(FGColor.primaryText(followingColorScheme))
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(goingHubActivityText)
+                    .font(FGTypography.caption.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text("Pickup")
-                .font(.system(size: 10, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.orange.opacity(0.95))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.orange.opacity(followingColorScheme == .dark ? 0.16 : 0.11), in: Capsule())
-                .layoutPriority(1)
+                Text("Pickup")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.orange.opacity(0.95))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.orange.opacity(followingColorScheme == .dark ? 0.16 : 0.11), in: Capsule())
+                    .layoutPriority(1)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.ultraThinMaterial)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .modifier(FollowingCardChromeModifier(colorScheme: followingColorScheme, cornerRadius: 16))
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(.ultraThinMaterial)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .modifier(FollowingCardChromeModifier(colorScheme: followingColorScheme, cornerRadius: 16))
+        .buttonStyle(.plain)
+        .disabled(goingActivityBannerNavigationInFlight)
+        .accessibilityAddTraits(.isButton)
         .accessibilityLabel(goingHubActivityText)
+        .accessibilityHint(L10n.t("going_activity_banner_a11y_hint", languageCode: languageCode))
+    }
+
+    private func handleGoingActivityBannerTap(scrollProxy: ScrollViewProxy) {
+        guard !goingActivityBannerNavigationInFlight else { return }
+        goingActivityBannerNavigationInFlight = true
+        goingActivityBannerNavigationGeneration &+= 1
+        let generation = goingActivityBannerNavigationGeneration
+
+        selectedGoingMode = .pickupGames
+        let destination = preferredGoingGamesTabForActivityBanner()
+        selectedGoingGamesTab = destination
+        goingDayScope = .all
+        sanitizeBusinessGoingModeIfNeeded()
+        if destination == .playing {
+            pendingPlayingActivityAcknowledgement = true
+        }
+
+        let scrollTarget = firstUnreadPickupGameId(for: destination)
+        if let scrollTarget {
+            viewModel.pendingPickupPlayingHighlightGameID = scrollTarget
+            pendingGoingActivityBannerScrollGameId = scrollTarget
+        }
+
+        Task { @MainActor in
+            await viewModel.loadMyPickupGameJoinRequestsForFollowing(
+                forceRefresh: false,
+                reason: "goingActivityBannerTap"
+            )
+            // Yield so Play subsection content can mount before scroll / ack.
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 160_000_000)
+            guard generation == goingActivityBannerNavigationGeneration else { return }
+            let refreshedScrollTarget = firstUnreadPickupGameId(for: destination) ?? scrollTarget
+            if let refreshedScrollTarget {
+                viewModel.pendingPickupPlayingHighlightGameID = refreshedScrollTarget
+                pendingGoingActivityBannerScrollGameId = refreshedScrollTarget
+                fulfillGoingActivityBannerScrollIfNeeded(
+                    pickupGameId: refreshedScrollTarget,
+                    scrollProxy: scrollProxy
+                )
+            }
+            if destination == .playing {
+                pendingPlayingActivityAcknowledgement = true
+                acknowledgePlayingPickupActivityIfReady(reason: "goingActivityBannerTap")
+            }
+            goingActivityBannerNavigationInFlight = false
+        }
+    }
+
+    private func preferredGoingGamesTabForActivityBanner() -> GoingGamesTab {
+        // Pending organizer responses take banner priority in copy — route to Hosting.
+        if viewModel.pendingPickupGameJoinRequestCount > 0 {
+            return .hosting
+        }
+        let unread = viewModel.pickupFollowingUnreadActivityGameIds
+        if viewModel.myPickupGameJoinRequestCards.contains(where: { unread.contains($0.pickupGameId) }) {
+            return .playing
+        }
+        if viewModel.myPickupGamesForSettings.contains(where: { unread.contains($0.id) }) {
+            return .hosting
+        }
+        if !viewModel.incomingPickupGameInvites.isEmpty,
+           viewModel.incomingPickupGameInvites.contains(where: { unread.contains($0.game.id) }) {
+            return .invites
+        }
+        // Default for “pickup games have new activity” is Playing.
+        if !unread.isEmpty || viewModel.hasUnreadPickupActivity || viewModel.pickupActivityCount > 0 {
+            return .playing
+        }
+        if !viewModel.incomingPickupGameInvites.isEmpty {
+            return .invites
+        }
+        return .playing
+    }
+
+    private func firstUnreadPickupGameId(for tab: GoingGamesTab) -> UUID? {
+        let unread = viewModel.pickupFollowingUnreadActivityGameIds
+        switch tab {
+        case .playing:
+            return playingGameCards.first(where: { unread.contains($0.pickupGameId) })?.pickupGameId
+                ?? viewModel.myPickupGameJoinRequestCards.first(where: { unread.contains($0.pickupGameId) })?.pickupGameId
+                ?? unread.sorted(by: { $0.uuidString < $1.uuidString }).first
+        case .hosting:
+            return goingPickupHostingGamesForDisplay.first(where: { unread.contains($0.id) })?.id
+                ?? viewModel.myPickupGamesForSettings.first(where: { unread.contains($0.id) })?.id
+        case .invites:
+            return viewModel.incomingPickupGameInvites.first(where: { unread.contains($0.game.id) })?.game.id
+        }
+    }
+
+    private func fulfillGoingActivityBannerScrollIfNeeded(
+        pickupGameId: UUID,
+        scrollProxy: ScrollViewProxy
+    ) {
+        guard pendingGoingActivityBannerScrollGameId == pickupGameId
+                || viewModel.pendingPickupPlayingHighlightGameID == pickupGameId else { return }
+        withAnimation(.easeInOut(duration: 0.35)) {
+            scrollProxy.scrollTo(pickupGameId, anchor: .center)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_400_000_000)
+            if pendingGoingActivityBannerScrollGameId == pickupGameId {
+                pendingGoingActivityBannerScrollGameId = nil
+            }
+            if viewModel.pendingPickupPlayingHighlightGameID == pickupGameId {
+                viewModel.clearPendingPickupPlayingHighlightGameID()
+            }
+        }
     }
 
     private var goingHubActivityText: String {
@@ -3383,23 +3527,11 @@ struct FollowingScreen: View {
                 )
 
                 VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    ProGameLeagueChip(
-                        sportType: sportType,
-                        featuredEvent: featuredEvent,
-                        league: displayGame.league
-                    )
-
-                    Text(savedProGameStatusText(displayGame))
-                        .font(displayGame.isFinal ? .caption.weight(.heavy) : .caption2.weight(.bold))
-                        .foregroundStyle(statusTint(for: displayGame, fallback: cardAccent))
-                        .padding(.horizontal, displayGame.isFinal ? 10 : 8)
-                        .padding(.vertical, displayGame.isFinal ? 5 : 3)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(statusTint(for: displayGame, fallback: cardAccent).opacity(displayGame.isFinal ? (followingColorScheme == .dark ? 0.20 : 0.12) : (followingColorScheme == .dark ? 0.18 : 0.10)))
-                        )
-                }
+                ProGameLeagueChip(
+                    sportType: sportType,
+                    featuredEvent: featuredEvent,
+                    league: displayGame.league
+                )
 
                 if !badges.isEmpty {
                     savedProGameStatusBadges(badges, accent: cardAccent, isFinal: displayGame.isFinal)
@@ -3438,11 +3570,12 @@ struct FollowingScreen: View {
                 }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.trailing, savedProGameCardClearControlReservedWidth)
+                .padding(.trailing, savedProGameCardTrailingControlsReservedWidth)
             }
             .overlay(alignment: .topTrailing) {
-                savedProGameCardClearControls(
+                savedProGameCardTrailingControls(
                     displayGame: displayGame,
+                    cardAccent: cardAccent,
                     showsUnsaveButton: showsUnsaveButton,
                     onClearCompleted: onClearCompleted
                 )
@@ -3711,55 +3844,118 @@ struct FollowingScreen: View {
         return followingColorScheme == .dark ? 0.38 : 0.22
     }
 
-    private var savedProGameCardClearControlReservedWidth: CGFloat { 72 }
+    /// Room for status chip + Share (44) + Clear / Unsave in the top-trailing cluster.
+    private var savedProGameCardTrailingControlsReservedWidth: CGFloat { 168 }
+
+    /// Shared height so status / Share / Clear visually center on one row.
+    private var savedProGameTrailingControlHeight: CGFloat { 44 }
 
     @ViewBuilder
-    private func savedProGameCardClearControls(
+    private func savedProGameCardTrailingControls(
         displayGame: SavedProGame,
+        cardAccent: Color,
         showsUnsaveButton: Bool,
         onClearCompleted: (() -> Void)?
     ) -> some View {
-        if showsUnsaveButton {
-            savedProGameClearControl(displayGame)
-                .zIndex(2)
-        } else if displayGame.isFinal, let onClearCompleted {
-            completedFavoriteTeamProGameClearControl(onClearCompleted)
-                .zIndex(2)
+        HStack(alignment: .center, spacing: 6) {
+            savedProGameTrailingStatusChip(displayGame, cardAccent: cardAccent)
+
+            ProGameShareActionButton(game: displayGame, mapViewModel: viewModel) {
+                followingProGameShareIconControl()
+            }
+            .environmentObject(chatViewModel)
+            .fixedSize()
+            .frame(height: savedProGameTrailingControlHeight)
+            .zIndex(2)
+
+            if showsUnsaveButton {
+                savedProGameClearControl(displayGame)
+                    .frame(height: savedProGameTrailingControlHeight)
+                    .zIndex(2)
+            } else if displayGame.isFinal, let onClearCompleted {
+                completedFavoriteTeamProGameClearControl(onClearCompleted)
+                    .frame(height: savedProGameTrailingControlHeight)
+                    .zIndex(2)
+            }
         }
+        .accessibilityElement(children: .contain)
     }
 
+    private func savedProGameTrailingStatusChip(_ game: SavedProGame, cardAccent: Color) -> some View {
+        Text(savedProGameStatusText(game))
+            .font(game.isFinal ? .caption.weight(.heavy) : .caption2.weight(.bold))
+            .foregroundStyle(statusTint(for: game, fallback: cardAccent))
+            .padding(.horizontal, game.isFinal ? 10 : 8)
+            .padding(.vertical, game.isFinal ? 5 : 3)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(
+                        statusTint(for: game, fallback: cardAccent)
+                            .opacity(
+                                game.isFinal
+                                    ? (followingColorScheme == .dark ? 0.20 : 0.12)
+                                    : (followingColorScheme == .dark ? 0.18 : 0.10)
+                            )
+                    )
+            )
+            .frame(height: savedProGameTrailingControlHeight)
+            .accessibilityLabel(savedProGameStatusText(game))
+    }
+
+    private func followingProGameShareIconControl() -> some View {
+        let iconColor = followingColorScheme == .dark
+            ? Color.white.opacity(0.78)
+            : Color.secondary
+        return ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 36, height: 36)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(followingColorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(iconColor)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
     private func savedProGameClearControl(_ game: SavedProGame) -> some View {
-        VStack(spacing: 7) {
-            if game.isFinal {
-                Button("Clear") {
-                    clearSavedProGame(game)
-                }
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(FGColor.mutedText(followingColorScheme))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(FGColor.mutedText(followingColorScheme).opacity(followingColorScheme == .dark ? 0.14 : 0.08))
-                )
-                .buttonStyle(.plain)
-                .contentShape(Capsule(style: .continuous))
-                .accessibilityLabel("Clear completed pro sports game")
-            } else {
-                Button {
-                    clearSavedProGame(game)
-                } label: {
-                    Image(systemName: "heart.fill")
-                        .font(.system(size: 14, weight: .bold))
-                        .foregroundStyle(Color.red.opacity(0.95))
-                        .frame(width: 32, height: 32)
-                        .background(Color.red.opacity(followingColorScheme == .dark ? 0.18 : 0.10), in: Circle())
-                        .overlay(Circle().strokeBorder(Color.red.opacity(followingColorScheme == .dark ? 0.38 : 0.24), lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-                .contentShape(Circle())
-                .accessibilityLabel(L10n.t("unsave_pro_sports_game_a11y", languageCode: appLanguageRaw))
+        if game.isFinal {
+            Button("Clear") {
+                clearSavedProGame(game)
             }
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(FGColor.mutedText(followingColorScheme))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(FGColor.mutedText(followingColorScheme).opacity(followingColorScheme == .dark ? 0.14 : 0.08))
+            )
+            .buttonStyle(.plain)
+            .contentShape(Capsule(style: .continuous))
+            .accessibilityLabel("Clear completed pro sports game")
+        } else {
+            Button {
+                clearSavedProGame(game)
+            } label: {
+                Image(systemName: "heart.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Color.red.opacity(0.95))
+                    .frame(width: 32, height: 32)
+                    .background(Color.red.opacity(followingColorScheme == .dark ? 0.18 : 0.10), in: Circle())
+                    .overlay(Circle().strokeBorder(Color.red.opacity(followingColorScheme == .dark ? 0.38 : 0.24), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .contentShape(Circle())
+            .accessibilityLabel(L10n.t("unsave_pro_sports_game_a11y", languageCode: appLanguageRaw))
         }
     }
 
@@ -4816,25 +5012,20 @@ struct FollowingScreen: View {
         return sections
     }
 
-    private func scheduleFollowingMyPickupExpiryRefreshIfNeeded(now: Date) {
-        guard !followingMyPickupDidScheduleExpiryRefresh else { return }
-        let rows = viewModel.myPickupGamesForSettings + viewModel.myRemovedPickupGamesForSettings
-        let anyPast = rows.contains { row in
-            guard let deadline = row.pickupHistoryClientCleanupDeadline() else { return false }
-            return now >= deadline
+    private func runFollowingHostedPickupAutoClearIfNeeded(now: Date, reason: String) {
+        let anyPast = viewModel.myPickupGamesForSettings.contains {
+            PickupHostingAutoClear.isPastDeadline(row: $0, now: now)
         }
         guard anyPast else { return }
-        followingMyPickupDidScheduleExpiryRefresh = true
         Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            await viewModel.loadMyPickupGamesForSettings(forceRefresh: true, reason: "followingPostCleanupDeadline")
-            logFollowingMyPickupGames(action: "postCleanupDeadlineRefresh")
+            await viewModel.clearExpiredHostedPickupGamesIfNeeded(now: now, reason: reason)
+            logFollowingMyPickupGames(action: "hostedAutoClearPass")
         }
     }
 
     private func performFollowingMyPickupDelete(_ row: PickupGameRow) async {
         do {
-            try await viewModel.deletePickupGame(id: row.id)
+            try await viewModel.clearHostedPickupGame(id: row.id, reason: "followingManualClear")
             followingMyPickupBanner = nil
             await viewModel.loadMyPickupGamesForSettings(forceRefresh: true, reason: "followingDeleteSuccess")
             await viewModel.refreshPickupGamesForDiscoverMap(force: true)
@@ -5200,58 +5391,81 @@ struct FollowingScreen: View {
             ?? false
         let isOrganizerCanceled = card.pill == .canceledByOrganizer
         let isRejected = card.pill == .declined
+        let isApprovedCompleted = card.pill == .approved && (resolvedGame.map {
+            GoingTabCompletedGameVisibility.isPickupGameCompleted($0, now: now)
+        } ?? false)
+        /// Approved Playing card that still shows withdraw ("Can't make it") + View Details.
+        let showsCantMakeItWithDetails = card.pill == .approved && !isApprovedCompleted && !isOrganizerCanceled
+        let shareGame: PickupGameRow? = {
+            guard let game = resolvedGame, game.isEligibleForInAppShare() else { return nil }
+            return game
+        }()
         let openMap = {
             openPlayingPickupGameOnDiscoverMap(card)
         }
+        let shareIconColor = followingColorScheme == .dark
+            ? Color.white.opacity(0.78)
+            : Color.secondary
 
         return VStack(alignment: .leading, spacing: FGSpacing.sm) {
             HStack(alignment: .top, spacing: FGSpacing.sm) {
-                PickupGameStartedSportGlyphFrame(showStarted: pickupStarted) {
-                    Image(systemName: sportVisual.systemImage)
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(sportVisual.accent)
-                        .frame(width: 40, height: 40)
-                        .background(sportVisual.accent.opacity(0.14), in: Circle())
-                }
+                HStack(alignment: .top, spacing: FGSpacing.sm) {
+                    PickupGameStartedSportGlyphFrame(showStarted: pickupStarted) {
+                        Image(systemName: sportVisual.systemImage)
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(sportVisual.accent)
+                            .frame(width: 40, height: 40)
+                            .background(sportVisual.accent.opacity(0.14), in: Circle())
+                    }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(card.title)
-                        .font(FGTypography.cardTitle)
-                        .foregroundStyle(FGColor.primaryText(followingColorScheme))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(alignment: .center, spacing: 7) {
-                        GameFormatBadgeView(
-                            format: resolvedGame?.gameFormat ?? .pickup,
-                            colorScheme: followingColorScheme
-                        )
-                        pickupJoinStatusPill(card.pill)
-                    }
-                    if isOrganizerCanceled {
-                        Text("Canceled by organizer")
-                            .font(FGTypography.caption.weight(.semibold))
-                            .foregroundStyle(Color.red.opacity(followingColorScheme == .dark ? 0.9 : 0.78))
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(card.title)
+                            .font(FGTypography.cardTitle)
+                            .foregroundStyle(FGColor.primaryText(followingColorScheme))
+                            .multilineTextAlignment(.leading)
                             .fixedSize(horizontal: false, vertical: true)
-                        Text(
-                            viewModel.pickupHistoryAutoClearCaption(
-                                forPickupGameId: card.pickupGameId,
-                                languageCode: appLanguageRaw
+                        HStack(alignment: .center, spacing: 7) {
+                            GameFormatBadgeView(
+                                format: resolvedGame?.gameFormat ?? .pickup,
+                                colorScheme: followingColorScheme
                             )
-                        )
-                            .font(FGTypography.caption)
-                            .foregroundStyle(FGColor.secondaryText(followingColorScheme))
-                            .fixedSize(horizontal: false, vertical: true)
-                    } else if isRejected {
-                        Text("The organizer declined this request. You can clear it from your Playing list.")
-                            .font(FGTypography.caption)
-                            .foregroundStyle(FGColor.secondaryText(followingColorScheme))
-                            .fixedSize(horizontal: false, vertical: true)
+                            pickupJoinStatusPill(card.pill)
+                        }
+                        if isOrganizerCanceled {
+                            Text("Canceled by organizer")
+                                .font(FGTypography.caption.weight(.semibold))
+                                .foregroundStyle(Color.red.opacity(followingColorScheme == .dark ? 0.9 : 0.78))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(
+                                viewModel.pickupHistoryAutoClearCaption(
+                                    forPickupGameId: card.pickupGameId,
+                                    languageCode: appLanguageRaw
+                                )
+                            )
+                                .font(FGTypography.caption)
+                                .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else if isRejected {
+                            Text("The organizer declined this request. You can clear it from your Playing list.")
+                                .font(FGTypography.caption)
+                                .foregroundStyle(FGColor.secondaryText(followingColorScheme))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture(perform: openMap)
+
+                if let shareGame {
+                    PickupGameShareActionButton(game: shareGame, mapViewModel: viewModel) {
+                        followingPickupPlayingShareIconControl(iconColor: shareIconColor)
+                    }
+                    // Counteract Share control's full-width frame used on action rows.
+                    .fixedSize()
+                }
             }
-            .contentShape(Rectangle())
-            .onTapGesture(perform: openMap)
 
             let localizedDateTimeLine = resolvedGame?
                 .pickupDateWithCompactTimeRange(languageCode: appLanguageRaw)
@@ -5322,7 +5536,8 @@ struct FollowingScreen: View {
                     .onTapGesture(perform: openMap)
             }
 
-            if card.pill == .pending || card.pill == .approved || isRejected {
+            // Active approved withdraw lives in the bottom 50/50 row with View Details.
+            if card.pill == .pending || isApprovedCompleted || isRejected {
                 Group {
                     if card.pill == .pending {
                         Button(role: .destructive) {
@@ -5345,71 +5560,45 @@ struct FollowingScreen: View {
                         .buttonStyle(.bordered)
                         .tint(Color.red.opacity(0.92))
                         .disabled(followingPickupWithdrawInFlight)
-                    } else if card.pill == .approved {
-                        let isCompleted = resolvedGame.map {
-                            GoingTabCompletedGameVisibility.isPickupGameCompleted($0, now: now)
-                        } ?? false
-                        if isCompleted {
-                            let clearWarnUnrated = !(resolvedGame.map {
-                                viewModel.hasSubmittedPickupCreatorRating(for: $0.id)
-                            } ?? false)
-                            let clearLang = L10n.normalizedLanguageCode(appLanguageRaw)
-                            VStack(spacing: FGSpacing.sm) {
-                                Button(action: {}) {
-                                    Text(L10n.t("Completed", languageCode: clearLang))
-                                        .font(FGTypography.metadata.weight(.semibold))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 10)
-                                }
-                                .buttonStyle(.bordered)
-                                .tint(Color.gray.opacity(0.75))
-                                .disabled(true)
-                                .accessibilityLabel(L10n.t("Completed", languageCode: clearLang))
-
-                                Button {
-                                    followingPickupPlayingClearConfirm = PickupPlayingClearConfirmState(
-                                        pickupGameId: card.pickupGameId,
-                                        warnUnrated: clearWarnUnrated
-                                    )
-                                } label: {
-                                    Text(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
-                                        .font(FGTypography.caption.weight(.semibold))
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 8)
-                                }
-                                .buttonStyle(.bordered)
-                                .tint(Color.primary.opacity(followingColorScheme == .dark ? 0.55 : 0.45))
-                                .accessibilityLabel(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
-                                .accessibilityHint(
-                                    L10n.t(
-                                        clearWarnUnrated
-                                            ? "pickup_playing_clear_confirm_unrated_message"
-                                            : "pickup_playing_clear_confirm_rated_message",
-                                        languageCode: clearLang
-                                    )
-                                )
-                            }
-                        } else {
-                            Button(role: .destructive) {
-                                let rid = viewModel.pickupJoinRequestLatestByPickupGameIdForFan[card.pickupGameId]?.id ?? card.id
-#if DEBUG
-                                print("[PickupJoinWithdraw] tapped gameId=\(card.pickupGameId.uuidString.lowercased())")
-                                print("[PickupJoinWithdraw] requestId=\(rid.uuidString.lowercased())")
-#endif
-                                followingPickupWithdrawConfirm = PickupJoinWithdrawConfirmState(
-                                    requestId: rid,
-                                    pickupGameId: card.pickupGameId,
-                                    intent: .approved
-                                )
-                            } label: {
-                                Text("Can’t make it")
+                    } else if isApprovedCompleted {
+                        let clearWarnUnrated = !(resolvedGame.map {
+                            viewModel.hasSubmittedPickupCreatorRating(for: $0.id)
+                        } ?? false)
+                        let clearLang = L10n.normalizedLanguageCode(appLanguageRaw)
+                        VStack(spacing: FGSpacing.sm) {
+                            Button(action: {}) {
+                                Text(L10n.t("Completed", languageCode: clearLang))
                                     .font(FGTypography.metadata.weight(.semibold))
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 10)
                             }
                             .buttonStyle(.bordered)
-                            .tint(Color.red.opacity(0.92))
-                            .disabled(followingPickupWithdrawInFlight)
+                            .tint(Color.gray.opacity(0.75))
+                            .disabled(true)
+                            .accessibilityLabel(L10n.t("Completed", languageCode: clearLang))
+
+                            Button {
+                                followingPickupPlayingClearConfirm = PickupPlayingClearConfirmState(
+                                    pickupGameId: card.pickupGameId,
+                                    warnUnrated: clearWarnUnrated
+                                )
+                            } label: {
+                                Text(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
+                                    .font(FGTypography.caption.weight(.semibold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(Color.primary.opacity(followingColorScheme == .dark ? 0.55 : 0.45))
+                            .accessibilityLabel(L10n.t("pickup_playing_clear_from_going", languageCode: clearLang))
+                            .accessibilityHint(
+                                L10n.t(
+                                    clearWarnUnrated
+                                        ? "pickup_playing_clear_confirm_unrated_message"
+                                        : "pickup_playing_clear_confirm_rated_message",
+                                    languageCode: clearLang
+                                )
+                            )
                         }
                     } else {
                         Button {
@@ -5494,6 +5683,7 @@ struct FollowingScreen: View {
                 }
             }
             .padding(.top, 2)
+            .padding(.bottom, -2)
 
             if isOrganizerCanceled {
                 HStack(spacing: FGSpacing.sm) {
@@ -5519,21 +5709,67 @@ struct FollowingScreen: View {
                     .buttonStyle(.bordered)
                     .tint(FGColor.accentBlue)
                 }
+            } else if showsCantMakeItWithDetails {
+                HStack(spacing: FGSpacing.sm) {
+                    Button(role: .destructive) {
+                        let rid = viewModel.pickupJoinRequestLatestByPickupGameIdForFan[card.pickupGameId]?.id ?? card.id
+#if DEBUG
+                        print("[PickupJoinWithdraw] tapped gameId=\(card.pickupGameId.uuidString.lowercased())")
+                        print("[PickupJoinWithdraw] requestId=\(rid.uuidString.lowercased())")
+#endif
+                        followingPickupWithdrawConfirm = PickupJoinWithdrawConfirmState(
+                            requestId: rid,
+                            pickupGameId: card.pickupGameId,
+                            intent: .approved
+                        )
+                    } label: {
+                        Text("Can’t make it")
+                            .font(FGTypography.caption.weight(.bold))
+                            .foregroundStyle(Color.red.opacity(followingColorScheme == .dark ? 0.95 : 0.88))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                            .multilineTextAlignment(.center)
+                            .pickupCardTintedActionChrome(tint: Color.red, colorScheme: followingColorScheme)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .layoutPriority(1)
+                    .disabled(followingPickupWithdrawInFlight)
+
+                    Button {
+                        pickupDetailNav = PickupDetailNavigationToken(id: card.pickupGameId)
+                    } label: {
+                        Text("View Details")
+                            .font(FGTypography.caption.weight(.bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                            .multilineTextAlignment(.center)
+                            .pickupCardFilledActionChrome(fill: FGColor.accentBlue)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .layoutPriority(1)
+                }
             } else {
                 Button {
                     pickupDetailNav = PickupDetailNavigationToken(id: card.pickupGameId)
                 } label: {
                     Text("View Details")
-                        .font(FGTypography.caption)
-                        .fontWeight(.bold)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .font(FGTypography.caption.weight(.bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .multilineTextAlignment(.center)
+                        .pickupCardFilledActionChrome(fill: FGColor.accentBlue)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(FGColor.accentBlue)
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity)
             }
         }
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             ZStack {
@@ -5586,6 +5822,27 @@ struct FollowingScreen: View {
                 )
             }
         }
+    }
+
+    /// Compact top-trailing Share control for Going → Playing pickup cards (icon only).
+    private func followingPickupPlayingShareIconControl(iconColor: Color) -> some View {
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 38, height: 38)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(followingColorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(iconColor)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
@@ -6214,7 +6471,8 @@ struct FollowingScreen: View {
                             .foregroundStyle(FGColor.primaryText(followingColorScheme))
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.trailing, 36)
+                            // Room for top-trailing [ Share ] [ Heart ] cluster.
+                            .padding(.trailing, 96)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(
@@ -6265,29 +6523,39 @@ struct FollowingScreen: View {
             }
             .padding(14)
 
-            Button {
-                Task { await toggleSavedVenueHeart(bar: bar, currentlySaved: isFavorite) }
-            } label: {
-                Image(systemName: isFavorite ? "heart.fill" : "heart")
-                    .font(.title3)
-                    .foregroundStyle(isFavorite ? Color.red : Color.secondary)
-                    .padding(10)
-                    .contentShape(Rectangle())
+            HStack(alignment: .top, spacing: 4) {
+                VenueShareActionButton(venue: bar, mapViewModel: viewModel) {
+                    followingFavoriteSpotShareIconControl()
+                }
+                .environmentObject(chatViewModel)
+                .fixedSize()
+
+                Button {
+                    Task { await toggleSavedVenueHeart(bar: bar, currentlySaved: isFavorite) }
+                } label: {
+                    Image(systemName: isFavorite ? "heart.fill" : "heart")
+                        .font(.title3)
+                        .foregroundStyle(isFavorite ? Color.red : Color.secondary)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    isFavorite
+                        ? String(
+                            format: L10n.t("favorite_spot_remove_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            bar.name
+                        )
+                        : String(
+                            format: L10n.t("favorite_spot_add_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                            bar.name
+                        )
+                )
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(
-                isFavorite
-                    ? String(
-                        format: L10n.t("favorite_spot_remove_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
-                        locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
-                        bar.name
-                    )
-                    : String(
-                        format: L10n.t("favorite_spot_add_a11y_format", languageCode: L10n.normalizedLanguageCode(appLanguageRaw)),
-                        locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
-                        bar.name
-                    )
-            )
+            .padding(.top, 4)
+            .padding(.trailing, 4)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
@@ -6296,6 +6564,29 @@ struct FollowingScreen: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .modifier(FollowingCardChromeModifier(colorScheme: followingColorScheme, cornerRadius: 22))
+    }
+
+    private func followingFavoriteSpotShareIconControl() -> some View {
+        let iconColor = followingColorScheme == .dark
+            ? Color.white.opacity(0.78)
+            : Color.secondary
+        return ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 36, height: 36)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(followingColorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(iconColor)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
     }
 
     // MARK: - Maps / Discover (Following tab)
@@ -6736,6 +7027,10 @@ private struct FollowingMyPickupHostedGameDetailSheet: View {
     let onManageRequests: () -> Void
     let onInvite: () -> Void
 
+    private var shareIconColor: Color {
+        colorScheme == .dark ? Color.white.opacity(0.78) : Color.secondary
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -6749,6 +7044,7 @@ private struct FollowingMyPickupHostedGameDetailSheet: View {
                     onEdit: onEdit,
                     onDelete: onDelete,
                     onManageRequests: onManageRequests,
+                    displayStyle: .hostingDetail,
                     onInvite: onInvite
                 )
                 .environmentObject(chatViewModel)
@@ -6761,7 +7057,37 @@ private struct FollowingMyPickupHostedGameDetailSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done", action: onDone)
                 }
+                if game.isEligibleForInAppShare() {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        PickupGameShareActionButton(game: game, mapViewModel: viewModel) {
+                            hostedDetailShareIconControl
+                        }
+                        .environmentObject(chatViewModel)
+                        .fixedSize()
+                    }
+                }
             }
         }
+    }
+
+    /// Compact Share control matching Discover / Going card trailing share (38pt material, 44pt hit).
+    private var hostedDetailShareIconControl: some View {
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 38, height: 38)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(shareIconColor)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
     }
 }

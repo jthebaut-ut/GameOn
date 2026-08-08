@@ -118,7 +118,17 @@ extension MapViewModel {
         refreshKey: String
     ) async {
         do {
-            let matches = try await LiveSportsService.shared.fetchLiveMatches(windowDays: windowDays)
+            let matches: [LiveMatch]
+            if let shared = sharedLiveMatchesSuitableForFavoriteTeamWindow(days: windowDays) {
+#if DEBUG
+                TabPerfDebug.log(
+                    "[TabPerfDebug] usedSharedLiveMatches=true tab=going source=businessFavoriteTeamProGames rows=\(shared.count)"
+                )
+#endif
+                matches = shared
+            } else {
+                matches = try await LiveSportsService.shared.fetchLiveMatches(windowDays: windowDays)
+            }
             let previous = businessFavoriteTeamProGames
             let autoFollowMatches = Self.favoriteTeamProGames(from: matches, favoriteTeams: teams)
             businessFavoriteTeamProGames = autoFollowMatches
@@ -164,6 +174,7 @@ extension MapViewModel {
             if $0.startTime == $1.startTime { return $0.id < $1.id }
             return $0.startTime < $1.startTime
         }
+        guard merged != liveMatches else { return }
         handleSavedProGameStatusUpdates(from: matches, reason: "businessFavoriteTeamWindowMerge")
         liveMatches = merged
     }

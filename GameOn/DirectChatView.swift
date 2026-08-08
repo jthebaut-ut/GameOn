@@ -85,16 +85,6 @@ private enum DirectChatTimeGrouping {
     }
 }
 
-// MARK: - Toolbar overflow anchor (global frame for iMessage-style menu placement)
-
-private struct ChatOverflowAnchorKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
-        let next = nextValue()
-        if next != .zero { value = next }
-    }
-}
-
 @MainActor
 private final class DirectChatPresenter: ObservableObject {
 
@@ -124,6 +114,8 @@ private final class DirectChatPresenter: ObservableObject {
     /// Kept in lockstep with ``messages`` so the chat list body never calls ``DirectChatTimeGrouping/buildTimeline(from:)``.
     private var displayTimeline: [DirectChatTimelineEntry] = []
     @Published private(set) var conversationId: UUID?
+    /// Viewer-local history clear watermark; messages at/before this are hidden for this user only.
+    @Published private(set) var historyClearedAt: Date?
     @Published private(set) var isLoadingInitial = true
     /// More history may exist before the oldest loaded row (keyset pagination).
     @Published private(set) var hasOlderMessages = false
@@ -131,13 +123,24 @@ private final class DirectChatPresenter: ObservableObject {
     @Published private(set) var loadError: String?
     @Published var sendError: String?
     @Published var draft: String = ""
+    /// Active reply target for the composer (conversation + account scoped).
+    @Published var replyDraft: ChatReplyComposerDraft?
     @Published var menuBanner: String?
     @Published private(set) var isManuallyRefreshingMessages = false
     @Published private(set) var peerIsDeleted: Bool
     @Published private(set) var headerConnectionStatusText: String = "Syncing messages"
-    @Published private(set) var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .reconnecting
+    @Published private(set) var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting
+    /// Monotonic open/ensure generation. Stale stop/watchdog/subscribe callbacks must not mutate state.
+    private(set) var chatRealtimeLifecycleGeneration: Int = 0
+    /// Alias used by DEBUG audit call sites.
+    var chatRealtimeAuditGeneration: Int { chatRealtimeLifecycleGeneration }
 
     private(set) var currentUserId: UUID?
+    private var subscriptionLoopGeneration: Int = 0
+    private var watchdogGeneration: Int = 0
+    private var fallbackPollingGeneration: Int = 0
+    private var ownedRealtimeChannelGeneration: Int = 0
+    private var realtimeStopTask: Task<Void, Never>?
 
     private let maxBodyLength = 1000
 
@@ -193,6 +196,14 @@ private final class DirectChatPresenter: ObservableObject {
     private var threadRealtimeSubscriptionLoopActive = false
     private var forceThreadRealtimeReconnectRequested = false
     private var realtimeWatchdogTask: Task<Void, Never>?
+    /// When the current subscribe attempt began — watchdog must not reconnect during this grace.
+    private var realtimeSubscribeAttemptStartedAt: Date?
+    /// Coalesce initial open fetch with immediate post-subscribe backfill.
+    private var initialLatestFetchInFlight = false
+    private var initialLatestFetchCompletedAt: Date?
+    private var initialLatestFetchConversationId: UUID?
+    private static let initialFetchBackfillCoalesceWindow: TimeInterval = 2.5
+    private static let watchdogSubscribeGrace: TimeInterval = 3.0
     private var threadRealtimeChannelName: String?
     private var threadRealtimeChannelStatus: String = "none"
     private var lastThreadRealtimeSubscribeAt: Date?
@@ -222,9 +233,24 @@ private final class DirectChatPresenter: ObservableObject {
     weak var chatViewModel: ChatViewModel?
 
     init(friend: UserPreview) {
+#if DEBUG
+        DirectChatInvestigation.setPhase(.initPhase)
+        DirectChatInvestigation.trace(source: "DirectChatPresenter.init", property: "peerIsDeleted")
+#endif
         self.friend = friend
         self.peerIsDeleted = friend.isBusinessVenueConversation ? false : friend.isDeleted
+#if DEBUG
+        DirectChatOpenPerf.presenterCreated(ObjectIdentifier(self))
+#endif
     }
+
+#if DEBUG
+    deinit {
+        let hex = String(UInt(bitPattern: ObjectIdentifier(self)), radix: 16, uppercase: false)
+        let short = String(hex.suffix(6))
+        print("[DirectChatOpenPerf] presenter.deinit id=\(short)")
+    }
+#endif
 
     private func dmDebugMilliseconds(from start: CFAbsoluteTime?, to end: CFAbsoluteTime? = nil) -> String {
         guard let start else { return "nil" }
@@ -309,6 +335,10 @@ private final class DirectChatPresenter: ObservableObject {
     }
 
     func updatePeerDeletedState(_ isDeleted: Bool) {
+        guard peerIsDeleted != isDeleted else { return }
+#if DEBUG
+        DirectChatInvestigation.trace(source: "updatePeerDeletedState", property: "peerIsDeleted")
+#endif
         peerIsDeleted = isDeleted
     }
 
@@ -366,15 +396,50 @@ private final class DirectChatPresenter: ObservableObject {
 
             guard let conversationId else { return }
 
-            let rows = try await service.fetchLatestMessages(conversationId: conversationId, limit: 50)
+            // Resolve watermark BEFORE publishing any messages (no flash of cleared history).
+            let watermark: Date?
+            do {
+                watermark = try await service.fetchHistoryClearedAt(conversationId: conversationId)
+            } catch {
+                // Prefer auth-scoped cache over unfiltered history when server read fails.
+                watermark = currentUserId.flatMap {
+                    DmConversationClearStore.clearedAt(conversationId: conversationId, authId: $0)
+                }
+            }
+            historyClearedAt = watermark
+#if DEBUG
+            DirectChatOpenPerf.messageFetchStart()
+#endif
+            initialLatestFetchInFlight = true
+            let rows: [DirectMessageRow]
+            do {
+                rows = try await service.fetchLatestMessages(
+                    conversationId: conversationId,
+                    limit: 50,
+                    clearedAfter: watermark
+                )
+            } catch {
+                initialLatestFetchInFlight = false
+                throw error
+            }
             messages = rows
             rebuildDisplayTimelineFromMessages()
             hasOlderMessages = rows.count >= 50
+            initialLatestFetchConversationId = conversationId
+            initialLatestFetchCompletedAt = Date()
+            initialLatestFetchInFlight = false
+#if DEBUG
+            DirectChatOpenPerf.messageFetchEnd(publishedCount: rows.count)
+#endif
         } catch {
+            initialLatestFetchInFlight = false
             loadError = error.localizedDescription
             messages = []
             displayTimeline = []
             hasOlderMessages = false
+#if DEBUG
+            DirectChatOpenPerf.messageFetchEnd(publishedCount: 0)
+#endif
         }
         isLoadingInitial = false
     }
@@ -383,6 +448,7 @@ private final class DirectChatPresenter: ObservableObject {
         messages = []
         displayTimeline = []
         conversationId = nil
+        historyClearedAt = nil
         isLoadingInitial = false
         hasOlderMessages = false
         isLoadingOlderMessages = false
@@ -390,6 +456,7 @@ private final class DirectChatPresenter: ObservableObject {
         sendError = nil
         currentUserId = nil
         draft = ""
+        replyDraft = nil
         menuBanner = nil
         pendingOptimisticMessages.removeAll()
         dmRealtimeFallbackTasks.values.forEach { $0.cancel() }
@@ -420,38 +487,110 @@ private final class DirectChatPresenter: ObservableObject {
     }
 
     /// Removes this thread’s Postgres INSERT listener only (does not touch inbox / friendship listeners).
-    private func tearDownRealtimeChannelIfNeeded() async {
+    /// When `expectedGeneration` is set and no longer current, skips mutating live state / removing the newer channel.
+    private func tearDownRealtimeChannelIfNeeded(
+        expectedGeneration: Int? = nil,
+        statusAfter: ChatRealtimeConnectionStatus? = .connecting
+    ) async {
+        if let expectedGeneration, expectedGeneration != chatRealtimeLifecycleGeneration {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: expectedGeneration,
+                event: "teardownSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration currentGen=\(chatRealtimeLifecycleGeneration)"
+            )
+            return
+        }
+
+        let gen = expectedGeneration ?? chatRealtimeLifecycleGeneration
+        // A newer generation already owns channels — do not remove them.
+        if ownedRealtimeChannelGeneration > gen {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: "teardownSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=channelOwnedByNewerGeneration ownedGen=\(ownedRealtimeChannelGeneration)"
+            )
+            return
+        }
+
+        let pending = establishingRealtimeChannel
+        let active = messagesRealtimeChannel
+        let pendingTopic = pending?.topic
+        let activeTopic = active?.topic
+
+        establishingRealtimeChannel = nil
+        messagesRealtimeChannel = nil
         activeRealtimeThreadConversationId = nil
         threadRealtimeChannelStatus = "none"
         threadRealtimeChannelName = nil
         isThreadRealtimeSubscribing = false
         isThreadRealtimeSubscribed = false
-        realtimeConnectionStatus = .reconnecting
-        if let pending = establishingRealtimeChannel {
-            establishingRealtimeChannel = nil
-            let tid = conversationId?.uuidString.lowercased() ?? "?"
+        if let statusAfter, gen == chatRealtimeLifecycleGeneration {
+            realtimeConnectionStatus = statusAfter
+        }
+
+        if let pending {
             unregisterThreadRealtimeChannelRemoved(
                 pending,
                 reason: "removeEstablishing",
                 status: String(describing: pending.status)
             )
-#if DEBUG
-            print("[DirectChatRealtime] remove establishing channel thread=\(tid)")
-#endif
-            await service.removeRealtimeChannel(pending)
+            let topic = pendingTopic ?? pending.topic
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: "channelRemoved",
+                extra: "topic=\(topic) kind=establishing"
+            )
+            await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: topic, channel: pending) { [service] channel in
+                await service.removeRealtimeChannel(channel)
+            }
         }
-        guard let ch = messagesRealtimeChannel else { return }
-        let tid = conversationId?.uuidString.lowercased() ?? "?"
-        unregisterThreadRealtimeChannelRemoved(
-            ch,
-            reason: "tearDownRealtimeChannelIfNeeded",
-            status: String(describing: ch.status)
+        if let ch = active {
+            unregisterThreadRealtimeChannelRemoved(
+                ch,
+                reason: "tearDownRealtimeChannelIfNeeded",
+                status: String(describing: ch.status)
+            )
+            let topic = activeTopic ?? ch.topic
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: "channelRemoved",
+                extra: "topic=\(topic) kind=active"
+            )
+            await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: topic, channel: ch) { [service] channel in
+                await service.removeRealtimeChannel(channel)
+            }
+        }
+
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "teardownCompleted",
+            status: String(describing: realtimeConnectionStatus)
         )
-#if DEBUG
-        print("[DirectChatRealtime] unsubscribe thread=\(tid)")
-#endif
-        messagesRealtimeChannel = nil
-        await service.removeRealtimeChannel(ch)
+    }
+
+    @discardableResult
+    func beginRealtimeLifecycle(reason: String) -> Int {
+        chatRealtimeLifecycleGeneration += 1
+        let gen = chatRealtimeLifecycleGeneration
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "generationStart",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason)"
+        )
+        return gen
+    }
+
+    private func isCurrentRealtimeGeneration(_ generation: Int) -> Bool {
+        generation == chatRealtimeLifecycleGeneration
     }
 
     private func threadRealtimeChannelObjectId(_ channel: RealtimeChannelV2) -> String {
@@ -500,7 +639,12 @@ private final class DirectChatPresenter: ObservableObject {
         DMRealtimeDiagnostics.debug("staleChannelReferenceCleared=true reason=\(reason)")
         DMRealtimeDiagnostics.debug("channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=\(reason)")
         DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
-        await service.removeRealtimeChannel(channel)
+        await ChatRealtimeChannelSerializer.shared.removeExclusive(
+            topic: channel.topic,
+            channel: channel
+        ) { [service] ch in
+            await service.removeRealtimeChannel(ch)
+        }
     }
 
     private func logThreadRealtimeHeartbeat(reason: String, status: String) {
@@ -562,6 +706,14 @@ private final class DirectChatPresenter: ObservableObject {
 
     private func startRealtimeWatchdogIfNeeded() {
         guard realtimeWatchdogTask == nil else { return }
+        let gen = chatRealtimeLifecycleGeneration
+        watchdogGeneration = gen
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "watchdogStart",
+            status: String(describing: realtimeConnectionStatus)
+        )
         realtimeWatchdogTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 do {
@@ -569,7 +721,18 @@ private final class DirectChatPresenter: ObservableObject {
                 } catch {
                     return
                 }
-                await self?.runRealtimeWatchdogCheck(reason: "timer")
+                guard let self else { return }
+                guard self.isCurrentRealtimeGeneration(gen) else {
+                    ChatRealtimeAudit.log(
+                        conversationId: self.conversationId,
+                        generation: gen,
+                        event: "callbackIgnored",
+                        status: String(describing: self.realtimeConnectionStatus),
+                        extra: "reason=staleGeneration source=watchdog currentGen=\(self.chatRealtimeLifecycleGeneration)"
+                    )
+                    return
+                }
+                await self.runRealtimeWatchdogCheck(reason: "timer")
             }
         }
     }
@@ -580,13 +743,23 @@ private final class DirectChatPresenter: ObservableObject {
             DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
             return
         }
+        let gen = chatRealtimeLifecycleGeneration
+        subscriptionLoopGeneration = gen
         threadRealtimeSubscriptionStartReason = reason
+        realtimeSubscribeAttemptStartedAt = Date()
         DMRealtimeDiagnostics.debug("resubscribeStarted=true reason=\(reason)")
         let taskId = UUID()
         threadRealtimeSubscriptionTaskId = taskId
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "subscribeLoopStart",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason)"
+        )
         threadRealtimeSubscriptionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.runRealtimeSubscription(subscriptionReason: reason)
+            await self.runRealtimeSubscription(subscriptionReason: reason, lifecycleGeneration: gen)
             if self.threadRealtimeSubscriptionTaskId == taskId {
                 self.threadRealtimeSubscriptionTask = nil
                 self.threadRealtimeSubscriptionTaskId = nil
@@ -605,6 +778,8 @@ private final class DirectChatPresenter: ObservableObject {
     private func startThreadFallbackPollingIfNeeded(reason: String) {
         guard threadFallbackPollingTask == nil else { return }
         let taskId = UUID()
+        let gen = chatRealtimeLifecycleGeneration
+        fallbackPollingGeneration = gen
         threadFallbackPollingTaskId = taskId
         DMRealtimeDiagnostics.debug("fallbackPollingScheduled=true reason=\(reason)")
         threadFallbackPollingTask = Task { @MainActor [weak self] in
@@ -619,19 +794,32 @@ private final class DirectChatPresenter: ObservableObject {
                 guard self.threadFallbackPollingTaskId == taskId else { return }
                 guard self.shouldRunThreadFallbackPolling() else { break }
 
+                guard self.isCurrentRealtimeGeneration(self.fallbackPollingGeneration) else {
+                    ChatRealtimeAudit.log(
+                        conversationId: self.conversationId,
+                        generation: self.fallbackPollingGeneration,
+                        event: "callbackIgnored",
+                        status: String(describing: self.realtimeConnectionStatus),
+                        extra: "reason=staleGeneration source=fallbackPoll"
+                    )
+                    break
+                }
+
                 if !self.isThreadFallbackPollingActive {
                     self.isThreadFallbackPollingActive = true
                     self.lastThreadFallbackPollSucceeded = nil
                     self.refreshHeaderConnectionStatus()
                     DMRealtimeDiagnostics.debug("fallbackPollingActive=true reason=\(reason)")
-                    self.realtimeConnectionStatus = .connecting
+                    if !self.isThreadRealtimeSubscribed {
+                        self.realtimeConnectionStatus = .connecting
+                    }
                 }
 
                 let result = await self.refreshMessagesForCurrentThreadResult(reason: "thread_fallback_poll")
                 self.lastThreadFallbackPollSucceeded = result.didFetch
                 self.refreshHeaderConnectionStatus()
                 DMRealtimeDiagnostics.debug("fallbackPollingMergedCount=\(result.mergedCount)")
-                if result.didFetch {
+                if result.didFetch, !self.isThreadRealtimeSubscribed {
                     self.realtimeConnectionStatus = .connecting
                 }
 
@@ -675,6 +863,16 @@ private final class DirectChatPresenter: ObservableObject {
             return (true, "activeConversationChanged")
         }
         if messagesRealtimeChannel == nil, establishingRealtimeChannel == nil {
+            if isThreadRealtimeSubscribing {
+                return (false, "subscribeInFlight")
+            }
+            if threadRealtimeSubscriptionTask != nil || threadRealtimeSubscriptionLoopActive {
+                return (false, "subscribeTaskActive")
+            }
+            if let started = realtimeSubscribeAttemptStartedAt,
+               Date().timeIntervalSince(started) < Self.watchdogSubscribeGrace {
+                return (false, "subscribeGrace")
+            }
             return (true, "noActiveChannel")
         }
         let status = threadRealtimeChannelStatusDescription()
@@ -713,15 +911,53 @@ private final class DirectChatPresenter: ObservableObject {
     }
 
     private func reconnectRealtimeFromWatchdog(reason: String) async {
+        let gen = chatRealtimeLifecycleGeneration
+        guard isCurrentRealtimeGeneration(gen) else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: gen,
+                event: "callbackIgnored",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration source=watchdogReconnect"
+            )
+            return
+        }
         DMRealtimeDiagnostics.debug("reconnectReason=\(reason)")
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "watchdogReconnect",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason)"
+        )
         forceThreadRealtimeReconnectRequested = true
-        await tearDownRealtimeChannelIfNeeded()
+        await tearDownRealtimeChannelIfNeeded(expectedGeneration: gen, statusAfter: .reconnecting)
+        guard isCurrentRealtimeGeneration(gen) else { return }
         startThreadFallbackPollingIfNeeded(reason: reason)
         startRealtimeSubscriptionLoopIfNeeded(reason: reason)
     }
 
     private func backfillAfterRealtimeResubscribe(conversationId cid: UUID, reason: String) async {
         DMRealtimeDiagnostics.debug("backfillStarted=true conversationId=\(cid.uuidString.lowercased()) reason=\(reason)")
+        if initialLatestFetchInFlight {
+            DMRealtimeDiagnostics.debug("backfillSkipped=true reason=initialFetchInFlight")
+            // Wait briefly for the in-flight open fetch to publish, then skip a duplicate latest page.
+            for _ in 0..<20 {
+                if !initialLatestFetchInFlight { break }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            if initialLatestFetchConversationId == cid, !messages.isEmpty {
+                DMRealtimeDiagnostics.debug("backfillSkipped=true reason=coalescedWithInitialFetch")
+                return
+            }
+        }
+        if initialLatestFetchConversationId == cid,
+           let completed = initialLatestFetchCompletedAt,
+           Date().timeIntervalSince(completed) < Self.initialFetchBackfillCoalesceWindow,
+           !messages.isEmpty {
+            DMRealtimeDiagnostics.debug("backfillSkipped=true reason=recentInitialFetch")
+            return
+        }
         let result = await refreshMessagesForCurrentThreadResult(reason: reason)
         DMRealtimeDiagnostics.debug("backfillMergedCount=\(result.mergedCount) conversationId=\(cid.uuidString.lowercased()) reason=\(reason)")
         if result.didFetch {
@@ -730,64 +966,104 @@ private final class DirectChatPresenter: ObservableObject {
     }
 
     func forceRebuildRealtimeAfterForeground() async {
-        guard loadError == nil, let cid = conversationId, currentUserId != nil else { return }
-        startRealtimeWatchdogIfNeeded()
-        DMRealtimeDiagnostics.debug("foregroundForceRebuild=true conversationId=\(cid.uuidString.lowercased())")
-        DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(cid.uuidString.lowercased())")
-
+        guard loadError == nil, conversationId != nil, currentUserId != nil else { return }
         guard chatViewModel?.canMarkActiveDirectThreadRead(
-            conversationId: cid,
+            conversationId: conversationId!,
             reason: "foreground_force_rebuild"
         ) == true else {
             DebugLogGate.debug("[DMRealtimeStability] skipped foreground force rebuild offscreen")
             return
         }
-
-        let hadSubscriptionTask = threadRealtimeSubscriptionTask != nil || threadRealtimeSubscriptionLoopActive
-        threadRealtimeSubscriptionTask?.cancel()
-        threadRealtimeSubscriptionTask = nil
-        threadRealtimeSubscriptionTaskId = nil
-        threadRealtimeSubscriptionStartReason = nil
-        threadRealtimeSubscriptionLoopActive = false
-        DMRealtimeDiagnostics.debug("subscriptionTaskCleared=\(hadSubscriptionTask)")
-
-        let hadOldChannel = messagesRealtimeChannel != nil || establishingRealtimeChannel != nil
-        await tearDownRealtimeChannelIfNeeded()
-        DMRealtimeDiagnostics.debug("oldChannelRemoved=\(hadOldChannel)")
-
-        messagesRealtimeChannel = nil
-        establishingRealtimeChannel = nil
-        activeRealtimeThreadConversationId = nil
-        threadRealtimeChannelName = nil
-        threadRealtimeChannelStatus = "none"
-        isThreadRealtimeSubscribing = false
-        isThreadRealtimeSubscribed = false
-        DMRealtimeDiagnostics.debug("staleChannelReferenceCleared=\(messagesRealtimeChannel == nil && establishingRealtimeChannel == nil)")
-
-        startThreadFallbackPollingIfNeeded(reason: "foregroundForceRebuild")
-        startRealtimeSubscriptionLoopIfNeeded(reason: "foregroundForceRebuild")
-        await Task.yield()
-
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "foregroundRepair",
+            status: String(describing: realtimeConnectionStatus)
+        )
+        await ensureRealtimeSubscriptionIfReady(reason: "foregroundForceRebuild", beginNewLifecycle: true)
         let result = await refreshMessagesForCurrentThreadResult(reason: "foreground_force_rebuild")
         DMRealtimeDiagnostics.debug("backfillAfterForegroundMergedCount=\(result.mergedCount)")
-        if result.didFetch {
-            realtimeConnectionStatus = isThreadRealtimeSubscribed ? .connected : .connecting
+        if result.didFetch, isThreadRealtimeSubscribed {
+            realtimeConnectionStatus = .connected
         }
-        DMRealtimeDiagnostics.debug("reconnectBannerHidden=\(result.didFetch)")
     }
 
     /// Called from the view when the thread UI disappears so Realtime unsubscribes exactly once.
-    func stopDirectMessageRealtime() async {
-        realtimeWatchdogTask?.cancel()
-        realtimeWatchdogTask = nil
-        threadRealtimeSubscriptionTask?.cancel()
-        threadRealtimeSubscriptionTask = nil
-        threadRealtimeSubscriptionTaskId = nil
-        threadRealtimeSubscriptionStartReason = nil
-        stopThreadFallbackPolling(reason: "threadClosed")
-        activeRealtimeThreadConversationId = nil
-        await tearDownRealtimeChannelIfNeeded()
+    /// Stale disappear generations are skipped so they cannot kill a newer reopen subscription.
+    func stopDirectMessageRealtime(expectedGeneration: Int? = nil) async {
+        let stopGen = expectedGeneration ?? chatRealtimeLifecycleGeneration
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: stopGen,
+            event: "stopBegin",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "currentGen=\(chatRealtimeLifecycleGeneration)"
+        )
+        guard isCurrentRealtimeGeneration(stopGen) else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: stopGen,
+                event: "stopSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration currentGen=\(chatRealtimeLifecycleGeneration)"
+            )
+            return
+        }
+
+        if watchdogGeneration == stopGen {
+            realtimeWatchdogTask?.cancel()
+            realtimeWatchdogTask = nil
+        }
+        if subscriptionLoopGeneration == stopGen {
+            threadRealtimeSubscriptionTask?.cancel()
+            threadRealtimeSubscriptionTask = nil
+            threadRealtimeSubscriptionTaskId = nil
+            threadRealtimeSubscriptionStartReason = nil
+            threadRealtimeSubscriptionLoopActive = false
+        }
+        if fallbackPollingGeneration == stopGen {
+            stopThreadFallbackPolling(reason: "threadClosed")
+        }
+
+        guard isCurrentRealtimeGeneration(stopGen) else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: stopGen,
+                event: "stopSkipped",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGenerationAfterCancel currentGen=\(chatRealtimeLifecycleGeneration)"
+            )
+            return
+        }
+
+        await tearDownRealtimeChannelIfNeeded(expectedGeneration: stopGen, statusAfter: .connecting)
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: stopGen,
+            event: "stopCompleted",
+            status: String(describing: realtimeConnectionStatus)
+        )
     }
+
+    /// Cancels any in-flight disappear stop Task (used when reopening quickly).
+    func cancelPendingRealtimeStopTask() {
+        realtimeStopTask?.cancel()
+        realtimeStopTask = nil
+    }
+
+    func scheduleRealtimeStop(expectedGeneration: Int) {
+        realtimeStopTask?.cancel()
+        realtimeStopTask = Task { @MainActor [weak self] in
+            await self?.stopDirectMessageRealtime(expectedGeneration: expectedGeneration)
+        }
+    }
+
+#if DEBUG
+    @discardableResult
+    func bumpChatRealtimeAuditGeneration(event: String) -> Int {
+        beginRealtimeLifecycle(reason: event)
+    }
+#endif
 
     /// Prepends older pages (keyset on `created_at` + `id`); keeps realtime/new sends unchanged.
     func loadOlderMessages() async {
@@ -807,7 +1083,8 @@ private final class DirectChatPresenter: ObservableObject {
                 conversationId: cid,
                 beforeCreatedAt: oldestDate,
                 beforeMessageId: oldest.id,
-                limit: 50
+                limit: 50,
+                clearedAfter: historyClearedAt
             )
             if page.isEmpty {
                 hasOlderMessages = false
@@ -820,6 +1097,9 @@ private final class DirectChatPresenter: ObservableObject {
                 return
             }
             messages = mergedPrefix + messages
+            if let historyClearedAt {
+                messages = DirectChatService.applyClearWatermark(messages, clearedAfter: historyClearedAt)
+            }
             rebuildDisplayTimelineFromMessages()
             if page.count < 50 {
                 hasOlderMessages = false
@@ -861,9 +1141,20 @@ private final class DirectChatPresenter: ObservableObject {
     private func runRealtimeSubscriptionAttempt(
         conversationId cid: UUID,
         currentUserId me: UUID,
-        subscriptionReason: String?
+        subscriptionReason: String?,
+        lifecycleGeneration gen: Int
     ) async throws {
         guard loadError == nil, conversationId == cid, currentUserId == me else { return }
+        guard isCurrentRealtimeGeneration(gen) else {
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "callbackIgnored",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration source=subscribeAttempt"
+            )
+            return
+        }
         activeRealtimeThreadConversationId = cid
         if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
             DMRealtimeDiagnostics.debug(
@@ -874,8 +1165,17 @@ private final class DirectChatPresenter: ObservableObject {
         }
 
         let tid = cid.uuidString.lowercased()
+        let topic = "dm-thread-\(tid)"
         let identity = chatViewModel?.dmRealtimeIdentitySnapshot(fallbackAuthUserId: me)
-        realtimeConnectionStatus = .reconnecting
+        let hadSuccessfulSubscribeBefore = lastThreadRealtimeSubscribeAt != nil
+        realtimeConnectionStatus = hadSuccessfulSubscribeBefore ? .reconnecting : .connecting
+        ChatRealtimeAudit.log(
+            conversationId: cid,
+            generation: gen,
+            event: "subscribeBegin",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "topic=\(topic) reason=\(subscriptionReason ?? "nil")"
+        )
 #if DEBUG
         print("[DirectChatRealtime] subscribe start thread=\(tid)")
         print("[DirectChatRealtime] subscribing conversationId=\(tid)")
@@ -884,23 +1184,45 @@ private final class DirectChatPresenter: ObservableObject {
         let healthSubscribeStartedAt = CFAbsoluteTimeGetCurrent()
 #if DEBUG
         DMRealtimeDiagnostics.log("phase=thread_realtime_subscribe_attempt conversation=\(tid)")
-        RealtimeHealthDiagnostics.log("channelName=dm-thread-\(tid)")
-        RealtimeHealthDiagnostics.log("subscribeStart=true channelName=dm-thread-\(tid)")
+        RealtimeHealthDiagnostics.log("channelName=\(topic)")
+        RealtimeHealthDiagnostics.log("subscribeStart=true channelName=\(topic)")
 #endif
         DMRealtimeDiagnostics.debug("subscribeStarted=true accountType=\(identity?.accountType ?? "user")")
         DMRealtimeDiagnostics.debug("authUserId=\(identity?.authUserIdLogValue ?? me.uuidString.lowercased())")
         DMRealtimeDiagnostics.debug("businessId=\(identity?.businessIdLogValue ?? "nil")")
-        DMRealtimeDiagnostics.debug("channelName=dm-thread-\(tid)")
+        DMRealtimeDiagnostics.debug("channelName=\(topic)")
         DMRealtimeDiagnostics.debug("listeningForSender=\(identity?.listeningLogValue ?? me.uuidString.lowercased())")
         DMRealtimeDiagnostics.debug("listeningForRecipient=\(identity?.listeningLogValue ?? me.uuidString.lowercased())")
+
+        await ChatRealtimeChannelSerializer.shared.waitForTopicIdle(topic)
+        guard isCurrentRealtimeGeneration(gen) else {
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "callbackIgnored",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration source=afterTopicIdle"
+            )
+            return
+        }
 
         let (channel, stream) = service.directMessagesInsertChannel(conversationId: cid)
         registerThreadRealtimeChannelCreated(channel, conversationId: cid)
         establishingRealtimeChannel = channel
+        ownedRealtimeChannelGeneration = gen
         threadRealtimeChannelName = channel.topic
         threadRealtimeChannelStatus = "subscribing"
         isThreadRealtimeSubscribing = true
         isThreadRealtimeSubscribed = false
+        if realtimeSubscribeAttemptStartedAt == nil {
+            realtimeSubscribeAttemptStartedAt = Date()
+        }
+        ChatRealtimeAudit.log(
+            conversationId: cid,
+            generation: gen,
+            event: "channelCreated",
+            extra: "topic=\(channel.topic)"
+        )
         if subscriptionReason == "foregroundForceRebuild" {
             DMRealtimeDiagnostics.debug("freshChannelCreated=true channelObjectId=\(threadRealtimeChannelObjectId(channel)) channelName=\(channel.topic)")
         }
@@ -923,9 +1245,29 @@ private final class DirectChatPresenter: ObservableObject {
             )
 #endif
             try await subscribeThreadChannelWithTimeout(channel)
+            guard isCurrentRealtimeGeneration(gen) else {
+                ChatRealtimeAudit.log(
+                    conversationId: cid,
+                    generation: gen,
+                    event: "callbackIgnored",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=staleGeneration source=subscribeSuccess"
+                )
+                await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: channel.topic, channel: channel) { [service] ch in
+                    await service.removeRealtimeChannel(ch)
+                }
+                return
+            }
             threadRealtimeChannelStatus = String(describing: channel.status)
             DMRealtimeDiagnostics.debug("subscribeCallbackStatus=\(threadRealtimeChannelStatus) channelObjectId=\(threadRealtimeChannelObjectId(channel)) authReady=\(currentUserId == me) conversationReady=\(conversationId == cid)")
             DMRealtimeDiagnostics.debug("channelStatus=\(threadRealtimeChannelStatus) channelName=\(channel.topic)")
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "subscribeResult",
+                status: "connected",
+                extra: "topic=\(channel.topic) ok=true"
+            )
 #if DEBUG
             DMRealtimeDiagnostics.log(
                 "phase=thread_realtime_subscribe_call_returned topic=\(channel.topic) conversation=\(tid)"
@@ -936,6 +1278,16 @@ private final class DirectChatPresenter: ObservableObject {
             RealtimeHealthDiagnostics.log("subscribeReady elapsedMs=\(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - healthSubscribeStartedAt) * 1000)) channelName=\(channel.topic)")
 #endif
         } catch {
+            guard isCurrentRealtimeGeneration(gen) else {
+                ChatRealtimeAudit.log(
+                    conversationId: cid,
+                    generation: gen,
+                    event: "callbackIgnored",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=staleGeneration source=subscribeFailure"
+                )
+                throw CancellationError()
+            }
             establishingRealtimeChannel = nil
             isThreadRealtimeSubscribing = false
             isThreadRealtimeSubscribed = false
@@ -957,7 +1309,14 @@ private final class DirectChatPresenter: ObservableObject {
 #if DEBUG
             print("[DirectChatRealtime] subscribe failed thread=\(tid) error=\(errLabel)")
 #endif
-            realtimeConnectionStatus = .reconnecting
+            realtimeConnectionStatus = hadSuccessfulSubscribeBefore ? .reconnecting : .connecting
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "subscribeResult",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "ok=false error=\(errLabel)"
+            )
 #if DEBUG
             DMRealtimeDiagnostics.log("phase=thread_realtime_subscribe_failed conversation=\(tid) error=\(errLabel)")
             RealtimeHealthDiagnostics.log("subscribeError=\(errLabel) channelName=\(channel.topic)")
@@ -971,6 +1330,7 @@ private final class DirectChatPresenter: ObservableObject {
         lastThreadFallbackPollSucceeded = nil
         refreshHeaderConnectionStatus()
 #if DEBUG
+        DirectChatOpenPerf.realtimeSubscribeReady()
         print("[DirectChatRealtime] subscribe success thread=\(tid)")
 #endif
 #if DEBUG
@@ -978,6 +1338,7 @@ private final class DirectChatPresenter: ObservableObject {
         print("[DMRealtimeLatencyDebug] realtimeSubscribed conversationId=\(tid) channel=\(channel.topic)")
 #endif
         messagesRealtimeChannel = channel
+        ownedRealtimeChannelGeneration = gen
         activeRealtimeThreadConversationId = cid
         lastRealtimeStreamInsertAt = Date()
         lastThreadRealtimeSubscribeAt = Date()
@@ -993,6 +1354,7 @@ private final class DirectChatPresenter: ObservableObject {
         let decoder = JSONDecoder()
         for await insertion in stream {
             if Task.isCancelled { break }
+            guard isCurrentRealtimeGeneration(gen) else { break }
             do {
                 try Task.checkCancellation()
             } catch {
@@ -1013,6 +1375,17 @@ private final class DirectChatPresenter: ObservableObject {
             applyIncomingDirectMessageRow(row, threadConversationId: cid, me: me)
         }
 
+        guard isCurrentRealtimeGeneration(gen) else {
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "callbackIgnored",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration source=streamEnded"
+            )
+            return
+        }
+
         activeRealtimeThreadConversationId = nil
         isThreadRealtimeSubscribed = false
         refreshHeaderConnectionStatus()
@@ -1029,13 +1402,56 @@ private final class DirectChatPresenter: ObservableObject {
             messagesRealtimeChannel = nil
             threadRealtimeChannelStatus = "streamEnded"
             realtimeConnectionStatus = .reconnecting
-            await service.removeRealtimeChannel(channel)
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "streamEnded",
+                status: "reconnecting",
+                extra: "topic=\(channel.topic)"
+            )
+            await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: channel.topic, channel: channel) { [service] ch in
+                await service.removeRealtimeChannel(ch)
+            }
         }
     }
 
     /// Single Postgres INSERT listener for this thread; recovers timed-out/ended subscriptions with bounded backoff.
     /// Typing indicator / broadcast is intentionally disabled until DM realtime is proven stable.
-    func ensureRealtimeSubscriptionIfReady(reason: String) async {
+    func ensureRealtimeSubscriptionIfReady(reason: String, beginNewLifecycle: Bool = false) async {
+#if DEBUG
+        DirectChatOpenPerf.realtimeSubscribeStart()
+#endif
+        cancelPendingRealtimeStopTask()
+        let gen: Int
+        if beginNewLifecycle {
+            let previousGen = chatRealtimeLifecycleGeneration
+            if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
+                await tearDownRealtimeChannelIfNeeded(
+                    expectedGeneration: previousGen,
+                    statusAfter: .connecting
+                )
+            }
+            gen = beginRealtimeLifecycle(reason: "ensure:\(reason)")
+            // Restart watchdog/subscription under the new generation.
+            realtimeWatchdogTask?.cancel()
+            realtimeWatchdogTask = nil
+            threadRealtimeSubscriptionTask?.cancel()
+            threadRealtimeSubscriptionTask = nil
+            threadRealtimeSubscriptionTaskId = nil
+            threadRealtimeSubscriptionStartReason = nil
+            threadRealtimeSubscriptionLoopActive = false
+            stopThreadFallbackPolling(reason: "newLifecycle")
+            realtimeConnectionStatus = .connecting
+        } else {
+            gen = chatRealtimeLifecycleGeneration
+        }
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "ensure",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason) beginNewLifecycle=\(beginNewLifecycle)"
+        )
         startRealtimeWatchdogIfNeeded()
         logRealtimeReadiness(reason: reason)
         guard loadError == nil else {
@@ -1050,8 +1466,12 @@ private final class DirectChatPresenter: ObservableObject {
             DMRealtimeDiagnostics.debug("ignoredReason=conversationNotReady reason=\(reason)")
             return
         }
+        if beginNewLifecycle || (!isThreadRealtimeSubscribed && threadRealtimeSubscriptionTask == nil) {
+            startRealtimeSubscriptionLoopIfNeeded(reason: reason)
+        }
         startThreadFallbackPollingIfNeeded(reason: reason)
-        await runRealtimeWatchdogCheck(reason: reason)
+        // Do not run the watchdog synchronously here — it races channel creation and
+        // previously forced reconnectReason=noActiveChannel during the open grace window.
     }
 
     private func forceRealtimeReconnect(reason: String) async {
@@ -1059,14 +1479,38 @@ private final class DirectChatPresenter: ObservableObject {
         await reconnectRealtimeFromWatchdog(reason: reason)
     }
 
-    func runRealtimeSubscription(subscriptionReason: String? = nil) async {
+    func runRealtimeSubscription(
+        subscriptionReason: String? = nil,
+        lifecycleGeneration gen: Int? = nil
+    ) async {
+        let loopGen = gen ?? chatRealtimeLifecycleGeneration
         guard loadError == nil, let cid = conversationId, let me = currentUserId else { return }
+        guard isCurrentRealtimeGeneration(loopGen) else {
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: loopGen,
+                event: "callbackIgnored",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=staleGeneration source=subscriptionLoop"
+            )
+            return
+        }
         startRealtimeWatchdogIfNeeded()
         threadRealtimeSubscriptionLoopActive = true
         defer { threadRealtimeSubscriptionLoopActive = false }
         var attempt = 0
 
         while !Task.isCancelled, conversationId == cid {
+            guard isCurrentRealtimeGeneration(loopGen) else {
+                ChatRealtimeAudit.log(
+                    conversationId: cid,
+                    generation: loopGen,
+                    event: "callbackIgnored",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=staleGeneration source=subscriptionLoopIter"
+                )
+                break
+            }
             let delayNs = directMessageReconnectDelaysNs[min(attempt, directMessageReconnectDelaysNs.count - 1)]
             if delayNs > 0 {
                 do {
@@ -1077,13 +1521,24 @@ private final class DirectChatPresenter: ObservableObject {
             }
 
             if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
-                await tearDownRealtimeChannelIfNeeded()
+                await tearDownRealtimeChannelIfNeeded(
+                    expectedGeneration: loopGen,
+                    statusAfter: attempt == 0 ? .connecting : .reconnecting
+                )
             }
             if forceThreadRealtimeReconnectRequested {
                 forceThreadRealtimeReconnectRequested = false
             }
 
-            realtimeConnectionStatus = .reconnecting
+            let hadLiveBefore = lastThreadRealtimeSubscribeAt != nil
+            realtimeConnectionStatus = (attempt == 0 && !hadLiveBefore) ? .connecting : .reconnecting
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: loopGen,
+                event: "retry",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "attempt=\(attempt + 1)"
+            )
 #if DEBUG
             RealtimeHealthDiagnostics.log("reconnectDetected=direct_thread attempt=\(attempt + 1) channelName=dm-thread-\(cid.uuidString.lowercased())")
 #endif
@@ -1092,7 +1547,8 @@ private final class DirectChatPresenter: ObservableObject {
                 try await runRealtimeSubscriptionAttempt(
                     conversationId: cid,
                     currentUserId: me,
-                    subscriptionReason: subscriptionReason
+                    subscriptionReason: subscriptionReason,
+                    lifecycleGeneration: loopGen
                 )
                 attempt = 0
                 if Task.isCancelled || conversationId != cid { break }
@@ -1155,20 +1611,45 @@ private final class DirectChatPresenter: ObservableObject {
         guard loadError == nil, let cid = conversationId, let me = currentUserId else { return (0, false) }
         let tid = cid.uuidString.lowercased()
         let svc = service
+        let knownClearedAt = historyClearedAt
         do {
+            // Re-resolve watermark so login/reopen/refresh never merges pre-clear history.
+            let watermark: Date? = try await Task.detached(priority: .utility) { () -> Date? in
+                if let knownClearedAt { return knownClearedAt }
+                return try await svc.fetchHistoryClearedAt(conversationId: cid)
+            }.value
+            if historyClearedAt != watermark {
+                historyClearedAt = watermark
+            }
             let rows = try await Task.detached(priority: .utility) {
-                try await svc.fetchLatestMessages(conversationId: cid, limit: 50)
+                try await svc.fetchLatestMessages(conversationId: cid, limit: 50, clearedAfter: watermark)
             }.value
             let existing = Set(messages.map(\.id))
-            let tailNew = rows.filter { !existing.contains($0.id) }.sorted(by: Self.messageTimelineSort)
-            guard !tailNew.isEmpty else { return (0, true) }
+            let tailNew = rows
+                .filter { !existing.contains($0.id) }
+                .filter { DirectChatService.isVisibleAfterClear(createdAtRaw: $0.created_at, clearedAfter: watermark) }
+                .sorted(by: Self.messageTimelineSort)
+            guard !tailNew.isEmpty else {
+                // Drop any stale pre-clear rows that somehow remain in memory.
+                if let watermark {
+                    let before = messages.count
+                    messages = DirectChatService.applyClearWatermark(messages, clearedAfter: watermark)
+                    if messages.count != before {
+                        rebuildDisplayTimelineFromMessages()
+                    }
+                }
+                return (0, true)
+            }
             let fallbackReceivedAt = Date()
             tailNew.forEach {
                 dmDebugFallbackMessageIDs.insert($0.id)
                 dmDebugReceivedDatesByServerID[$0.id] = fallbackReceivedAt
                 logDMEndToEnd(row: $0, conversationId: cid, fallbackUsed: true, receivedAt: fallbackReceivedAt)
             }
-            realtimeConnectionStatus = .connecting
+            // REST merge must not demote a healthy live subscription.
+            if !isThreadRealtimeSubscribed {
+                realtimeConnectionStatus = .connecting
+            }
 #if DEBUG
             print("[DirectChatRealtime] refresh merged newCount=\(tailNew.count) thread=\(tid) reason=\(reason)")
 #endif
@@ -1185,6 +1666,9 @@ private final class DirectChatPresenter: ObservableObject {
                 if !messages.contains(where: { $0.id == row.id }) {
                     messages.append(row)
                 }
+            }
+            if let watermark {
+                messages = DirectChatService.applyClearWatermark(messages, clearedAfter: watermark)
             }
             if messages.count >= 2 {
                 let prev = messages[messages.count - 2]
@@ -1207,6 +1691,14 @@ private final class DirectChatPresenter: ObservableObject {
         guard !isManuallyRefreshingMessages else { return }
         guard let cid = conversationId else { return }
         let tid = cid.uuidString.lowercased()
+        let decision = realtimeWatchdogDecision(reason: "manual_refresh")
+        ChatRealtimeAudit.log(
+            conversationId: cid,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "manualRefresh",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "needsReconnect=\(decision.needsReconnect) subscribed=\(isThreadRealtimeSubscribed)"
+        )
 #if DEBUG
         print("[DMManualRefreshDebug] tapped conversationId=\(tid)")
         print("[DMManualRefreshDebug] started conversationId=\(tid)")
@@ -1221,9 +1713,29 @@ private final class DirectChatPresenter: ObservableObject {
 
         let merged = await refreshMessagesForCurrentThread(reason: "manual_refresh")
         _ = await flushMarkReadNow(reason: "manual_refresh")
+
+        let unhealthy = decision.needsReconnect || !isThreadRealtimeSubscribed
+        if unhealthy {
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "refreshRepair",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "startingNewLifecycle=true"
+            )
+            await ensureRealtimeSubscriptionIfReady(reason: "manual_refresh_repair", beginNewLifecycle: true)
+        }
+
 #if DEBUG
         print("[DMManualRefreshDebug] merged count=\(merged)")
 #endif
+        ChatRealtimeAudit.log(
+            conversationId: cid,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "manualRefreshFinished",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "merged=\(merged) repaired=\(unhealthy)"
+        )
     }
 
     func pullRefreshCurrentThread() async {
@@ -1356,6 +1868,11 @@ private final class DirectChatPresenter: ObservableObject {
             DMRealtimeDiagnostics.debug("appendDecision=ignored messageId=\(rowIdLow)")
             return
         }
+        if !DirectChatService.isVisibleAfterClear(createdAtRaw: row.created_at, clearedAfter: historyClearedAt) {
+            DMRealtimeDiagnostics.debug("insertMatchedThread=true messageId=\(rowIdLow) ignoredReason=clearedHistory")
+            DMRealtimeDiagnostics.debug("appendDecision=ignored messageId=\(rowIdLow)")
+            return
+        }
         dmDebugReceivedDatesByServerID[row.id] = realtimeReceivedWall
 #if DEBUG
         let mainActorApplyStartedAt = CFAbsoluteTimeGetCurrent()
@@ -1446,7 +1963,9 @@ private final class DirectChatPresenter: ObservableObject {
         conversationId: UUID,
         me: UUID,
         trimmed: String,
-        correlationId: UUID
+        correlationId: UUID,
+        replyToMessageId: UUID? = nil,
+        clearReplyDraftOnSuccess: Bool = false
     ) async {
         do {
 #if DEBUG
@@ -1457,10 +1976,14 @@ private final class DirectChatPresenter: ObservableObject {
                 conversationId: conversationId,
                 senderId: me,
                 body: trimmed,
+                replyToMessageId: replyToMessageId,
                 diagnosticCorrelationId: correlationId
             )
             RateLimitService.recordDirectChatSend(conversationId: conversationId, body: trimmed)
             FanGeoAnalyticsService.recordDMSent(conversationId: conversationId)
+            if clearReplyDraftOnSuccess {
+                replyDraft = nil
+            }
 #if DEBUG
             if let sendStartedAt = dmLatencySendTimesByLocalID[localId] {
                 dmLatencySendTimesByServerID[row.id] = sendStartedAt
@@ -1491,6 +2014,23 @@ private final class DirectChatPresenter: ObservableObject {
             print("[DirectChatSend] inserted conversationId=\(insCid)")
             print("[DirectChatSend] insert success serverId=\(row.id.uuidString.lowercased())")
 #endif
+            // Match share path: outbound send restores sender soft-delete / local hide so Recent updates.
+            if let chatViewModel {
+                await chatViewModel.restoreInboxVisibilityAfterOutboundSend(
+                    serverKind: "direct",
+                    conversationId: conversationId,
+                    peerUserId: friend.id,
+                    reason: "messageSent"
+                )
+                await MainActor.run {
+                    chatViewModel.upsertInboxDisplayAfterOutboundShare(
+                        conversationId: conversationId,
+                        peerUserId: friend.id,
+                        body: trimmed,
+                        inboxKind: .direct
+                    )
+                }
+            }
             chatViewModel?.requestBadgeRecalculation(reason: "messageSent", includeInboxSummaries: true)
             scheduleDirectMessageRealtimeFallback(conversationId: conversationId, expectedMessageID: row.id)
 #if DEBUG
@@ -1503,9 +2043,12 @@ private final class DirectChatPresenter: ObservableObject {
             logDMEndToEnd(row: row, conversationId: conversationId, fallbackUsed: false)
         } catch {
 #if DEBUG
-            print("[DirectChatSend] insert failed localId=\(localId.uuidString.lowercased()) err=\(error.localizedDescription)")
-#endif
-#if DEBUG
+            // Concise PostgREST failure log BEFORE user-facing mapping (no message body).
+            if let pe = error as? PostgrestError {
+                print("[DirectChatSend] failure PostgrestError.code=\(pe.code ?? "nil") message=\(pe.message) details=\(pe.detail ?? "nil") hint=\(pe.hint ?? "nil")")
+            } else {
+                print("[DirectChatSend] insert failed localId=\(localId.uuidString.lowercased()) err=\(error.localizedDescription)")
+            }
             print("[DMRealtimeLatencyDebug] insertFailure conversationId=\(conversationId.uuidString.lowercased()) elapsedMs=\(DMRealtimePerfLog.elapsedMs(since: dmLatencyInsertStartTimesByLocalID[localId])) error=\(error.localizedDescription)")
 #endif
             pendingOptimisticMessages.removeValue(forKey: localId)
@@ -1514,6 +2057,9 @@ private final class DirectChatPresenter: ObservableObject {
             draft = trimmed
             // Backend age denial opens the shared age gate; banner copy stays neutral.
             AgeAccessBackendDenial.handle(error, requestUserId: currentUserId)
+            // NOTE: SQLSTATE 42501 infrastructure/function errors should eventually map to a
+            // service-error message rather than “You can’t send messages in this conversation.”
+            // Current mapping preserved for now.
             sendError = Self.userFacingSendFailureMessage(for: error)
         }
     }
@@ -1559,24 +2105,111 @@ private final class DirectChatPresenter: ObservableObject {
     func sendDraft() async {
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard trimmed.count <= maxBodyLength else { return }
+        await sendStructuredBody(trimmed, clearDraft: true)
+    }
+
+    func beginReply(to row: DirectMessageRow, displayName: String, languageCode: String? = nil) {
         guard let conversationId, let me = currentUserId else { return }
+        guard ChatReplyPreviewFormatting.isReplyEligible(
+            body: row.body,
+            messageType: nil,
+            isDeleted: row.is_deleted,
+            deletedAt: row.deleted_at
+        ) else { return }
+        let preview = ChatReplyPreviewFormatting.previewLine(body: row.body, languageCode: languageCode)
+        replyDraft = ChatReplyComposerDraft(
+            conversationId: conversationId,
+            accountUserId: me,
+            targetMessageId: row.id,
+            targetSenderId: row.sender_id,
+            targetSenderDisplayName: displayName,
+            previewLine: preview
+        )
+    }
+
+    func cancelReply() {
+        guard replyDraft != nil else { return }
+#if DEBUG
+        DirectChatInvestigation.trace(source: "cancelReply", property: "replyDraft")
+#endif
+        replyDraft = nil
+    }
+
+    func validatedReplyDraft() -> ChatReplyComposerDraft? {
+        // READ-ONLY during view construction. Never assign ``replyDraft`` here —
+        // composer body / safeAreaInset evaluation must not publish.
+        guard let conversationId else { return nil }
+        guard let draft = replyDraft,
+              draft.isValid(forConversation: conversationId, accountUserId: currentUserId)
+        else {
+            return nil
+        }
+        return draft
+    }
+
+    /// Clears an invalid reply draft from lifecycle / send paths only (never from body).
+    func clearInvalidReplyDraftIfNeeded(source: String = #function) {
+        guard let conversationId else {
+            if replyDraft != nil {
+#if DEBUG
+                DirectChatInvestigation.trace(source: source, property: "replyDraft")
+#endif
+                replyDraft = nil
+            }
+            return
+        }
+        guard let draft = replyDraft else { return }
+        if !draft.isValid(forConversation: conversationId, accountUserId: currentUserId) {
+#if DEBUG
+            DirectChatInvestigation.trace(source: source, property: "replyDraft")
+#endif
+            replyDraft = nil
+        }
+    }
+
+    func replyReference(for row: DirectMessageRow, languageCode: String? = nil) -> ChatReplyReference? {
+        guard row.reply_to_message_id != nil else { return nil }
+        return ChatReplyResolution.resolveDirect(
+            replyToMessageId: row.reply_to_message_id,
+            messagesById: ChatReplyResolution.messageMap(messages),
+            displayNameForSender: { [weak self] senderId in
+                guard let self else { return "" }
+                if senderId == currentUserId {
+                    return L10n.t("chat_preview_you_prefix", languageCode: languageCode)
+                }
+                if senderId == friend.id {
+                    return friend.displayName
+                }
+                return friend.displayName
+            },
+            languageCode: languageCode
+        )
+    }
+
+    /// Sends a prebuilt structured/share body through the same optimistic DM path.
+    /// Returns a localized error string on failure, otherwise `nil`.
+    @discardableResult
+    func sendStructuredBody(_ rawBody: String, clearDraft: Bool = false) async -> String? {
+        let trimmed = rawBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return L10n.t("chat_location_unavailable") }
+        guard trimmed.count <= maxBodyLength else { return L10n.t("chat_location_unavailable") }
+        guard let conversationId, let me = currentUserId else { return L10n.t("chat_location_unavailable") }
 
         if peerIsDeleted, !friend.isBusinessVenueConversation {
             sendError = DirectChatView.deletedPeerNoticeText
-            return
+            return DirectChatView.deletedPeerNoticeText
         }
         if isMessagingBlocked() {
             sendError = "You can’t message this user."
-            return
+            return sendError
         }
         if !friendshipAllowsSending() {
             sendError = "You’re no longer friends. Add them again to continue messaging."
-            return
+            return sendError
         }
         if let blocked = validateDMText(trimmed) {
             sendError = blocked
-            return
+            return blocked
         }
 
         if let limited = RateLimitService.checkDirectChatSend(conversationId: conversationId, body: trimmed) {
@@ -1584,13 +2217,13 @@ private final class DirectChatPresenter: ObservableObject {
 #if DEBUG
                 print("[DirectChatSend] duplicate blocked without user toast conversationId=\(conversationId.uuidString.lowercased())")
 #endif
-                return
+                return nil
             }
             sendError = limited
-            return
+            return limited
         }
 
-        guard !sendDraftInFlight else { return }
+        guard !sendDraftInFlight else { return nil }
         sendDraftInFlight = true
         defer { sendDraftInFlight = false }
 
@@ -1609,6 +2242,10 @@ private final class DirectChatPresenter: ObservableObject {
 #endif
 
         let created = Self.optimisticCreatedAtFormatter.string(from: Date())
+        let activeReply = validatedReplyDraft()
+        if activeReply == nil {
+            clearInvalidReplyDraftIfNeeded(source: "sendDraft")
+        }
         let optimistic = DirectMessageRow(
             id: localId,
             conversation_id: conversationId,
@@ -1617,7 +2254,8 @@ private final class DirectChatPresenter: ObservableObject {
             created_at: created,
             deleted_at: nil,
             report_count: nil,
-            is_deleted: false
+            is_deleted: false,
+            reply_to_message_id: activeReply?.targetMessageId
         )
         pendingOptimisticMessages[localId] = PendingOptimisticSend(body: trimmed, senderId: me, correlationId: correlationId)
         var appendTxn = Transaction()
@@ -1633,18 +2271,20 @@ private final class DirectChatPresenter: ObservableObject {
         print("[DMRealtimeLatencyDebug] optimisticAppend conversationId=\(conversationId.uuidString.lowercased()) tempId=\(localId.uuidString.lowercased()) localTime=\(DMRealtimePerfLog.stamp())")
         print("[DMRealtimeLatencyDebug] uiMessageListUpdated conversationId=\(conversationId.uuidString.lowercased()) count=\(messages.count) elapsedMs=\(DMRealtimePerfLog.elapsedMs(since: dmLatencySendTimesByLocalID[localId]))")
 #endif
-        draft = ""
-
-        Task { [weak self] in
-            guard let self else { return }
-            await self.completeOptimisticSend(
-                localId: localId,
-                conversationId: conversationId,
-                me: me,
-                trimmed: trimmed,
-                correlationId: correlationId
-            )
+        if clearDraft {
+            draft = ""
         }
+
+        await completeOptimisticSend(
+            localId: localId,
+            conversationId: conversationId,
+            me: me,
+            trimmed: trimmed,
+            correlationId: correlationId,
+            replyToMessageId: activeReply?.targetMessageId,
+            clearReplyDraftOnSuccess: activeReply != nil
+        )
+        return sendError
     }
 
     /// Sends a single emoji (or short reaction) without using the draft field; same server path as `sendDraft`.
@@ -1704,7 +2344,8 @@ private final class DirectChatPresenter: ObservableObject {
             created_at: created,
             deleted_at: nil,
             report_count: nil,
-            is_deleted: false
+            is_deleted: false,
+            reply_to_message_id: nil
         )
         pendingOptimisticMessages[localId] = PendingOptimisticSend(body: trimmed, senderId: me, correlationId: correlationId)
         var appendTxn = Transaction()
@@ -1748,7 +2389,8 @@ private final class DirectChatPresenter: ObservableObject {
         messages.last?.id
     }
 
-    /// Clears visible history locally and requests server-side clear when the `clear_direct_conversation` RPC is deployed.
+    /// Clears visible history for the current user only (`clear_direct_conversation`).
+    /// Shared message rows are preserved for the peer; inbox soft-hides until a newer message.
     func clearChatHistory() async {
         menuBanner = nil
         guard let conversationId else {
@@ -1756,16 +2398,13 @@ private final class DirectChatPresenter: ObservableObject {
             return
         }
         do {
-            struct Params: Encodable {
-                let p_conversation_id: UUID
-            }
-            try await supabase
-                .rpc("clear_direct_conversation", params: Params(p_conversation_id: conversationId))
-                .execute()
+            let clearedAt = try await service.clearDirectConversation(conversationId: conversationId)
+            historyClearedAt = clearedAt
             pendingOptimisticMessages.removeAll()
             messages = []
             displayTimeline = []
             hasOlderMessages = false
+            replyDraft = nil
         } catch {
             menuBanner = "Couldn’t clear chat on the server. Nothing was removed.\n\(error.localizedDescription)"
         }
@@ -1799,7 +2438,6 @@ struct DirectChatView: View {
     @StateObject private var presenter: DirectChatPresenter
     @FocusState private var composerFocused: Bool
 
-    @State private var overflowAnchorGlobal: CGRect = .zero
     @State private var scrollToBottomCoalesceTask: Task<Void, Never>?
     /// One-shot initial pin to newest content after the first usable message snapshot exists.
     @State private var didCompleteInitialScrollToBottom = false
@@ -1822,6 +2460,9 @@ struct DirectChatView: View {
     /// Quick emoji strip above composer; off by default, toggled by smiley (does not use the system emoji keyboard).
     @State private var showEmojiQuickTray = false
     @State private var reportSheet: DirectChatReportSheetKind?
+    @State private var pendingScrollToReplyTargetId: UUID?
+    @State private var highlightedReplyMessageId: UUID?
+    @State private var showConversationSearch = false
     /// `nil` until the reporter picks a category (required before submit).
     @State private var reportCategory: ModerationReportCategory?
     @State private var reportDetails: String = ""
@@ -1833,6 +2474,10 @@ struct DirectChatView: View {
     @State private var resolvedFriendOverride: UserPreview?
     @State private var directChatPresenceLoaded = false
     @State private var directChatPresenceRefreshTask: Task<Void, Never>?
+    /// True while the first open-hydration task runs — suppress eligibility-driven animations.
+    @State private var isThreadOpening = true
+    /// Snapshot of send eligibility after first hydration (DEBUG proof / stable labels).
+    @State private var openedSendEligibilitySnapshot: Bool?
 
     private static let reportSubmittedBannerText = "Report submitted. FanGeo moderation will review it."
     private static let duplicateConversationReportBannerText =
@@ -1919,6 +2564,66 @@ struct DirectChatView: View {
             ?? presenter.friend
     }
 
+    private var directChatLocationShareContext: ChatLocationShareContext? {
+        guard let conversationId = presenter.conversationId,
+              let senderId = presenter.currentUserId ?? chatViewModel.currentUserAuthId else {
+            return nil
+        }
+        let senderName = mapViewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ChatLocationShareContext(
+            kind: .direct,
+            conversationId: conversationId,
+            audienceLabel: resolvedFriendPreview.displayName,
+            memberCount: 1,
+            senderDisplayName: senderName.isEmpty ? "Fan" : senderName,
+            senderUserId: senderId,
+            pickupDestinationName: nil,
+            pickupLatitude: nil,
+            pickupLongitude: nil,
+            pickupGameId: nil
+        )
+    }
+
+    private var recentSharedLocationInThread: (name: String, lat: Double, lon: Double)? {
+        for row in presenter.messages.reversed() {
+            if let payload = ChatLocationShareMessage.decode(from: row.body) {
+                return (
+                    payload.placeLabel ?? L10n.t("chat_location_shared_location_title", languageCode: appLanguageRaw),
+                    payload.latitude,
+                    payload.longitude
+                )
+            }
+            if let payload = ChatOnMyWayMessage.decode(from: row.body) {
+                return (payload.destinationName, payload.latitude, payload.longitude)
+            }
+        }
+        return nil
+    }
+
+    private func markOnMyWayArrived(payload: ChatOnMyWayPayload, messageId: UUID) async {
+        _ = messageId
+        let arrived = ChatOnMyWayPayload(
+            v: 1,
+            destinationName: payload.destinationName,
+            latitude: payload.latitude,
+            longitude: payload.longitude,
+            sharedByName: payload.sharedByName,
+            sharedByUserId: payload.sharedByUserId,
+            departedAt: payload.departedAt,
+            estimatedArrivalAt: payload.estimatedArrivalAt,
+            etaMinutes: payload.etaMinutes,
+            distanceMeters: payload.distanceMeters,
+            transportMode: payload.transportMode,
+            etaSource: payload.etaSource,
+            pickupGameId: payload.pickupGameId,
+            venueId: payload.venueId,
+            liveSessionId: payload.liveSessionId,
+            status: "arrived",
+            arrivedAt: ISO8601DateFormatter.chatLocation.string(from: Date())
+        )
+        _ = await presenter.sendStructuredBody(ChatOnMyWayMessage.encodeBody(payload: arrived))
+    }
+
     private var directChatPresenceText: String {
         guard !presenter.friend.isBusinessVenueConversation,
               !resolvedFriendPreview.isBusinessAccount,
@@ -1938,15 +2643,164 @@ struct DirectChatView: View {
     }
 
     init(friend: UserPreview) {
+#if DEBUG
+        DirectChatInvestigation.setPhase(.initPhase)
+        DirectChatOpenPerf.destinationInitialized(routeKey: friend.dmConversationId.map { "dm-c-\($0.uuidString.lowercased())" } ?? "dm-p-\(friend.id.uuidString.lowercased())")
+        ChatNavDebugCounters.log(
+            "destination.init",
+            detail: "kind=dm stage=\(DirectChatInvestigation.bodyStage)"
+        )
+#endif
         _presenter = StateObject(wrappedValue: DirectChatPresenter(friend: friend))
+#if DEBUG
+        DirectChatInvestigation.setPhase(.body)
+#endif
     }
 
+    @ViewBuilder
     var body: some View {
+#if DEBUG
+        let _ = {
+            DirectChatInvestigation.setPhase(.body)
+            DirectChatOpenPerf.bodyEvaluated()
+        }()
+        switch DirectChatInvestigation.bodyStage {
+        case .aProofText:
+            Text("DirectChat body proof")
+        case .bNavTitle:
+            Text("DirectChat body proof")
+                .navigationTitle("Direct Chat")
+                .navigationBarTitleDisplayMode(.inline)
+        case .cStaticLayout:
+            bisectStaticOuterLayout {
+                Text("DirectChat body proof")
+            }
+        case .dHeader:
+            bisectStaticOuterLayout {
+                bisectHeaderOnly
+            }
+        case .eTimelineEmpty:
+            bisectStaticOuterLayout {
+                VStack(spacing: 0) {
+                    bisectHeaderOnly
+                    bisectEmptyTimeline
+                }
+            }
+        case .fComposerShell:
+            bisectStaticOuterLayout {
+                VStack(spacing: 0) {
+                    bisectHeaderOnly
+                    bisectEmptyTimeline
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 8) {
+                Text("Composer shell (no controls)")
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(FGColor.cardBackground(colorScheme))
+            }
+        case .gRealMessageRows:
+            bisectStaticOuterLayout {
+                VStack(spacing: 0) {
+                    bisectHeaderOnly
+                    chatPrimaryContent
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .task(id: directChatThreadTaskIdentity) {
+                await bisectMinimalHydrationTask()
+            }
+        case .hRealComposer:
+            // Real outer layout + real composer. No .task / onAppear hydration:
+            // message fetch, realtime, and mark-read stay off for this bisect stage.
+            directChatInteractiveRoot
+                .safeAreaInset(edge: .bottom, spacing: 8) {
+                    composer
+                        .onAppear {
+                            DirectChatOpenPerf.composerMounted()
+                        }
+                }
+                .onAppear {
+                    DirectChatOpenPerf.firstVisibleFrame()
+                }
+        case .iToolbarMenus:
+            directChatInteractiveRoot
+                .safeAreaInset(edge: .bottom, spacing: 8) {
+                    composer
+                        .onAppear {
+                            DirectChatOpenPerf.composerMounted()
+                        }
+                }
+                .onAppear {
+                    DirectChatOpenPerf.firstVisibleFrame()
+                }
+                .task(id: directChatThreadTaskIdentity) {
+                    await bisectMinimalHydrationTask()
+                }
+        case .jLifecycle, .full:
+            fullDirectChatBody
+        }
+#else
+        fullDirectChatBody
+#endif
+    }
+
+#if DEBUG
+    private func bisectStaticOuterLayout<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background {
+                FGColor.screenGradient(colorScheme)
+                    .ignoresSafeArea()
+            }
+    }
+
+    private var bisectHeaderOnly: some View {
+        HStack(spacing: FGSpacing.sm) {
+            Text(presenter.friend.displayName)
+                .font(FGTypography.cardTitle)
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, FGSpacing.lg)
+        .padding(.vertical, FGSpacing.sm)
+    }
+
+    private var bisectEmptyTimeline: some View {
+        ScrollView {
+            Color.clear.frame(height: 1)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Hydration only — used by mid bisect stages that need rows without full lifecycle spam.
+    private func bisectMinimalHydrationTask() async {
+        DirectChatInvestigation.setPhase(.task)
+        print("[ChatNav] destination.taskBegin kind=dm bisect=\(DirectChatInvestigation.bodyStage)")
+        presenter.bindChatViewModel(chatViewModel)
+        await presenter.onAppear()
+        presenter.clearInvalidReplyDraftIfNeeded(source: "bisectMinimalHydrationTask")
+        DirectChatInvestigation.setPhase(.body)
+    }
+#endif
+
+    @ViewBuilder
+    private var fullDirectChatBody: some View {
         directChatInteractiveRoot
             // Composer must attach to the topmost interactive chat container so SwiftUI's
             // keyboard safe area can lift it. Do not ignore keyboard anywhere above this.
             .safeAreaInset(edge: .bottom, spacing: 8) {
                 composer
+#if DEBUG
+                    .onAppear {
+                        DirectChatOpenPerf.composerMounted()
+                    }
+#endif
+            }
+            .onAppear {
+#if DEBUG
+                DirectChatOpenPerf.firstVisibleFrame()
+#endif
             }
             .onChange(of: composerFocused) { _, focused in
                 if focused {
@@ -1954,20 +2808,39 @@ struct DirectChatView: View {
                 }
             }
             .task(id: directChatThreadTaskIdentity) {
+#if DEBUG
+            DirectChatInvestigation.setPhase(.task)
+            DirectChatOpenPerf.taskBegin(
+                presenterId: ObjectIdentifier(presenter),
+                generation: presenter.chatRealtimeLifecycleGeneration
+            )
+            print("[ChatNav] destination.taskBegin kind=dm")
+#endif
+            isThreadOpening = true
             presenter.bindChatViewModel(chatViewModel)
-            await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
+            // Ordered open path: shell is already on screen.
+            // 1) Seeded conversation + first message page (critical path).
+            await presenter.onAppear()
+            presenter.clearInvalidReplyDraftIfNeeded(source: "thread_task_after_onAppear")
+
+            // 2) Peer header hydration after first message publish (non-blocking for timeline).
             resolvedFriendOverride = await chatViewModel.resolveDmParticipantPreview(
                 userId: presenter.friend.id,
                 fallback: presenter.friend,
                 surface: "dm_thread_header",
-                conversationId: presenter.friend.dmConversationId
+                conversationId: presenter.conversationId ?? presenter.friend.dmConversationId
             )
             directChatPresenceLoaded = true
             if !presenter.friend.isBusinessVenueConversation {
                 presenter.updatePeerDeletedState(resolvedFriendOverride?.isDeleted == true)
             }
-            await presenter.onAppear()
 
+            if let highlightId = chatViewModel.pendingOpenHighlightMessageId {
+                chatViewModel.pendingOpenHighlightMessageId = nil
+                jumpToRepliedMessage(highlightId)
+            }
+
+            // 3) Mark read + 4) single realtime subscribe — only after messages exist.
             if presenter.loadError == nil {
                 chatViewModel.setActiveVisibleConversationIdIfAllowed(
                     presenter.conversationId,
@@ -1980,42 +2853,72 @@ struct DirectChatView: View {
                         reason: "thread_open"
                     )
                 }
-                await presenter.ensureRealtimeSubscriptionIfReady(reason: "thread_task_loaded")
-            } else {
-                await chatViewModel.refreshInboxSummariesIfNeeded()
+                await presenter.ensureRealtimeSubscriptionIfReady(
+                    reason: "thread_task_loaded",
+                    beginNewLifecycle: true
+                )
             }
+            // Inbox reconcile is off the opening critical path (deferred).
+            Task { @MainActor in
+                await Task.yield()
+                await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
+                if presenter.loadError != nil {
+                    await chatViewModel.refreshInboxSummariesIfNeeded()
+                }
+            }
+            openedSendEligibilitySnapshot = !sendingDisabled
+            isThreadOpening = false
+#if DEBUG
+            DirectChatInvestigation.setPhase(.body)
+#endif
         }
         .onAppear {
 #if DEBUG
-            print("[DirectChatNav] directChatAppear")
+            DirectChatInvestigation.setPhase(.appear)
+            DirectChatOpenPerf.onAppear(
+                presenterId: ObjectIdentifier(presenter),
+                generation: presenter.chatRealtimeLifecycleGeneration
+            )
+            ChatNavDebugCounters.log("directChat.onAppear")
             print(
-                "[DirectChatNav] setActive peerPresent=true conversationPresent=\(presenter.conversationId != nil || presenter.friend.dmConversationId != nil)"
+                "[DirectChatNav] setActive peerPresent=true conversationPresent=\(presenter.conversationId != nil || presenter.friend.dmConversationId != nil) presenterConversationReady=\(presenter.conversationId != nil)"
             )
 #endif
-            chatViewModel.hidesFloatingTabBarForDirectChat = true
+            // Stop-task / presence bookkeeping only — load + mark-read + realtime owned by `.task`.
             DMRealtimeDiagnostics.debug("scenePhase=directChatAppear")
             DMRealtimeDiagnostics.debug("activeConversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") scenePhase=directChatAppear")
             startDirectChatPresenceRefreshLoop(reason: "directChatAppear")
             presenter.logRealtimeReadiness(reason: "direct_chat_appear", chatAppear: true)
-            chatViewModel.setActiveVisibleConversationIdIfAllowed(
-                presenter.conversationId,
-                reason: "direct_chat_appear"
-            )
-            Task {
-                await presenter.ensureRealtimeSubscriptionIfReady(reason: "direct_chat_appear")
-                if let conversationId = presenter.conversationId {
-                    await chatViewModel.markDirectThreadRead(
-                        conversationId: conversationId,
-                        peerUserId: presenter.friend.id,
-                        reason: "direct_chat_appear"
-                    )
-                }
+            // Do not publish missing_conversation while presenter.conversationId is still nil.
+            if let conversationId = presenter.conversationId {
+                chatViewModel.setActiveVisibleConversationIdIfAllowed(
+                    conversationId,
+                    reason: "direct_chat_appear"
+                )
             }
+            presenter.cancelPendingRealtimeStopTask()
+#if DEBUG
+            DirectChatInvestigation.setPhase(.body)
+#endif
         }
+        .chatLocationAttachment(
+            context: directChatLocationShareContext,
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+            isEnabled: !sendingDisabled && presenter.conversationId != nil,
+            favoriteVenues: mapViewModel.followingTabSavedVenues,
+            recentSharedCoordinate: recentSharedLocationInThread,
+            sendStructuredBody: { body in
+                await presenter.sendStructuredBody(body)
+            }
+        )
         .onChange(of: presenter.conversationId) { _, cid in
             chatViewModel.setActiveVisibleConversationIdIfAllowed(cid, reason: "conversation_id_changed")
+            presenter.clearInvalidReplyDraftIfNeeded(source: "conversationId_onChange")
             Task {
-                await presenter.ensureRealtimeSubscriptionIfReady(reason: "conversation_id_changed")
+                await presenter.ensureRealtimeSubscriptionIfReady(
+                    reason: "conversation_id_changed",
+                    beginNewLifecycle: true
+                )
             }
         }
         .onChange(of: chatViewModel.directChatReadVisibilityVersion) { _, _ in
@@ -2033,16 +2936,30 @@ struct DirectChatView: View {
         }
         .onDisappear {
 #if DEBUG
-            print("[DirectChatNav] directChatDisappear reason=viewOnDisappear")
+            DirectChatInvestigation.setPhase(.disappear)
+            DirectChatOpenPerf.onDisappear(
+                presenterId: ObjectIdentifier(presenter),
+                generation: presenter.chatRealtimeLifecycleGeneration
+            )
+            ChatNavDebugCounters.log("directChat.onDisappear")
 #endif
-            chatViewModel.hidesFloatingTabBarForDirectChat = false
+            presenter.cancelReply()
+            // Capture open generation; do not bump. A later reopen bumps and stale stop is skipped.
+            let disappearGen = presenter.chatRealtimeLifecycleGeneration
+            ChatRealtimeAudit.log(
+                conversationId: presenter.conversationId,
+                generation: disappearGen,
+                event: "disappear",
+                status: String(describing: presenter.realtimeConnectionStatus)
+            )
             chatOverflowPhase = .hidden
             DMRealtimeDiagnostics.debug("scenePhase=directChatDisappear")
             DMRealtimeDiagnostics.debug("activeConversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") scenePhase=directChatDisappear")
             stopDirectChatPresenceRefreshLoop()
             let conversationId = presenter.conversationId
             let peerUserId = presenter.friend.id
-            Task {
+            presenter.scheduleRealtimeStop(expectedGeneration: disappearGen)
+            Task { @MainActor in
                 if let conversationId {
                     await chatViewModel.markDirectThreadRead(
                         conversationId: conversationId,
@@ -2051,8 +2968,18 @@ struct DirectChatView: View {
                         requireActiveVisibleThread: false
                     )
                 }
-                await presenter.stopDirectMessageRealtime()
-                chatViewModel.clearActiveVisibleConversationId(reason: "direct_chat_disappear")
+                // Only clear visibility if this disappear generation is still current
+                // (a rapid reopen bumps lifecycle and must keep the thread active).
+                if presenter.chatRealtimeLifecycleGeneration == disappearGen {
+                    chatViewModel.clearActiveVisibleConversationId(reason: "direct_chat_disappear")
+                } else {
+                    ChatRealtimeAudit.log(
+                        conversationId: conversationId,
+                        generation: disappearGen,
+                        event: "callbackIgnored",
+                        extra: "reason=staleGeneration source=clearActiveVisible currentGen=\(presenter.chatRealtimeLifecycleGeneration)"
+                    )
+                }
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -2090,6 +3017,17 @@ struct DirectChatView: View {
         }
         .sheet(item: $reportSheet) { kind in
             directChatReportSheet(kind: kind)
+        }
+        .sheet(isPresented: $showConversationSearch) {
+            if let conversationId = presenter.conversationId {
+                ChatConversationSearchSheet(
+                    conversationId: conversationId,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    onSelectMessage: { messageId in
+                        jumpToRepliedMessage(messageId)
+                    }
+                )
+            }
         }
         .onChange(of: reportSheet) { _, newValue in
             if newValue != nil {
@@ -2196,18 +3134,7 @@ struct DirectChatView: View {
                         .accessibilityLabel("Chat options")
                 }
                 .buttonStyle(.plain)
-                .background(
-                    GeometryReader { geo in
-                        Color.clear.preference(
-                            key: ChatOverflowAnchorKey.self,
-                            value: geo.frame(in: .global)
-                        )
-                    }
-                )
             }
-        }
-        .onPreferenceChange(ChatOverflowAnchorKey.self) { rect in
-            overflowAnchorGlobal = rect
         }
         .overlay(alignment: .topTrailing) {
             if chatOverflowPhase != .hidden {
@@ -2418,8 +3345,17 @@ struct DirectChatView: View {
     }
 
     private func runClearHistoryConfirmed() async {
+        let cid = presenter.conversationId
+        let peerId = presenter.friend.id
         await presenter.clearChatHistory()
+        if let cid {
+            await chatViewModel.noteDirectConversationClearedForCurrentUser(
+                conversationId: cid,
+                peerUserId: peerId
+            )
+        }
         await chatViewModel.refreshInboxSummaries()
+        await chatViewModel.refreshUnreadDirectMessageCount(force: true)
     }
 
     private func runRemoveFriendConfirmed() async {
@@ -2904,7 +3840,7 @@ struct DirectChatView: View {
                 case .confirmClearHistory:
                     chatOverflowConfirmCard(
                         title: "Clear chat history?",
-                        message: "This clears the conversation history for both of you.",
+                        message: "This clears the conversation history only for you. The other person keeps their messages.",
                         confirmTitle: "Clear chat history",
                         onConfirm: {
                             Task {
@@ -2946,6 +3882,13 @@ struct DirectChatView: View {
 
     private func chatOverflowActionsCard() -> some View {
         VStack(alignment: .leading, spacing: 0) {
+            overflowMenuActionRow(
+                title: L10n.t("chat_conversation_search_title", languageCode: appLanguageRaw),
+                systemImage: "magnifyingglass"
+            ) {
+                chatOverflowPhase = .hidden
+                showConversationSearch = true
+            }
             overflowMenuActionRow(title: "Block user", systemImage: "hand.raised.fill") {
                 withAnimation(.spring(response: 0.4, dampingFraction: 0.9)) {
                     chatOverflowPhase = .confirmBlockUser
@@ -2971,7 +3914,7 @@ struct DirectChatView: View {
             }
         }
         .padding(.vertical, 0)
-        .frame(width: Self.overflowMenuWidth, height: Self.overflowMenuHeight, alignment: .top)
+        .frame(width: Self.overflowMenuWidth, height: Self.overflowMenuHeight + Self.overflowMenuRowHeight, alignment: .top)
         .background {
             liquidGlassBackground(cornerRadius: Self.overflowMenuCornerRadius)
         }
@@ -3142,15 +4085,21 @@ struct DirectChatView: View {
                 geometry.contentSize.height
             } action: { oldHeight, newHeight in
                 guard didCompleteInitialScrollToBottom else {
-                    lastScrollContentHeight = newHeight
+                    if lastScrollContentHeight != newHeight {
+                        lastScrollContentHeight = newHeight
+                    }
                     return
                 }
                 guard shouldStickToNewestMessages, newHeight > oldHeight + 1 else {
-                    lastScrollContentHeight = newHeight
+                    if lastScrollContentHeight != newHeight {
+                        lastScrollContentHeight = newHeight
+                    }
                     return
                 }
                 // Shared-profile cards / images can expand after first layout; keep newest pinned.
-                lastScrollContentHeight = newHeight
+                if lastScrollContentHeight != newHeight {
+                    lastScrollContentHeight = newHeight
+                }
                 scrollChatToBottom(proxy: proxy, animated: false)
 #if DEBUG
                 print("[DMScrollDebug] contentSizeGrewWhileNearBottom old=\(Int(oldHeight)) new=\(Int(newHeight))")
@@ -3173,6 +4122,24 @@ struct DirectChatView: View {
             }
             .onChange(of: presenter.conversationId) { _, _ in
                 resetDirectChatScrollSession(reason: "conversationIdChanged")
+                presenter.cancelReply()
+            }
+            .onChange(of: pendingScrollToReplyTargetId) { _, messageId in
+                guard let messageId else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        proxy.scrollTo(messageId, anchor: .center)
+                    }
+                    highlightedReplyMessageId = messageId
+                    pendingScrollToReplyTargetId = nil
+                    let reduceMotion = UIAccessibility.isReduceMotionEnabled
+                    let clearDelay: TimeInterval = reduceMotion ? 0.15 : 1.1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) {
+                        if highlightedReplyMessageId == messageId {
+                            highlightedReplyMessageId = nil
+                        }
+                    }
+                }
             }
             .onChange(of: presenter.lastMessageId) { oldId, newId in
                 guard let newId, newId != oldId else { return }
@@ -3226,17 +4193,25 @@ struct DirectChatView: View {
 
     private func updateNearBottomFromScrollDistance(_ distanceFromBottom: CGFloat) {
         if distanceFromBottom <= Self.dmNearBottomEnterDistance {
-            isNearBottom = true
-            stickToBottomThroughKeyboardLift = true
+            if !isNearBottom {
+                isNearBottom = true
+            }
+            if !stickToBottomThroughKeyboardLift {
+                stickToBottomThroughKeyboardLift = true
+            }
             return
         }
         if distanceFromBottom > Self.dmNearBottomLeaveDistance {
-            isNearBottom = false
+            if isNearBottom {
+                isNearBottom = false
+            }
             // During keyboard lift, inset thrash can briefly report a large distance even
             // when the user is still at the newest end. Keep the pre-lift stick preference
             // unless they clearly scrolled far upward.
             if !isKeyboardLiftActive || distanceFromBottom > Self.dmNearBottomLeaveDistance * 2 {
-                stickToBottomThroughKeyboardLift = false
+                if stickToBottomThroughKeyboardLift {
+                    stickToBottomThroughKeyboardLift = false
+                }
             }
         }
     }
@@ -3343,39 +4318,195 @@ struct DirectChatView: View {
     private func messageRow(for row: DirectMessageRow) -> some View {
         let isMine = row.sender_id == presenter.currentUserId
         let time = DirectChatTimeGrouping.shortTimeString(forCreatedAt: row.created_at)
-        if let payload = FanProfileShareMessage.decode(from: row.body) {
-            FanProfileShareChatCardView(
-                payload: payload,
-                isFromCurrentUser: isMine,
-                showFriendAvatar: !isMine,
-                friendPreview: resolvedFriendPreview,
-                timestamp: time,
-                mapViewModel: mapViewModel
-            )
-            .contextMenu {
-                if !isMine {
-                    Button("Report message") {
-                        reportSheet = .message(row)
+        let presentation = ChatMessagePresentation.build(body: row.body)
+        dmDecoratedMessage(row: row, isMine: isMine) {
+            switch presentation {
+            case .profileShare(let payload):
+                FanProfileShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    mapViewModel: mapViewModel
+                )
+            case .pickupShare(let payload):
+                PickupGameShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    mapViewModel: mapViewModel
+                )
+            case .proShare(let payload):
+                ProGameShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    mapViewModel: mapViewModel
+                )
+            case .venueShare(let payload):
+                VenueShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    mapViewModel: mapViewModel
+                )
+            case .locationShare(let payload):
+                ChatLocationShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                )
+            case .liveLocation(let payload):
+                ChatLiveLocationShareChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    audienceMemberCount: 1,
+                    expectedConversationKind: "direct",
+                    expectedConversationId: presenter.conversationId,
+                    expectedSenderUserId: row.sender_id,
+                    authoritativeDisplayName: resolvedFriendPreview.displayName,
+                    onStopSharing: {
+                        Task { await ChatLiveLocationManager.shared.stopLiveSession(sessionId: payload.sessionId) }
                     }
-                }
-            }
-            .id(row.id)
-        } else {
-            DirectMessageBubbleView(
-                text: row.body,
-                isFromCurrentUser: isMine,
-                showFriendAvatar: !isMine,
-                friendPreview: resolvedFriendPreview,
-                timestamp: time
-            )
-            .contextMenu {
-                if !isMine {
-                    Button("Report message") {
-                        reportSheet = .message(row)
+                )
+            case .onMyWay(let payload):
+                ChatOnMyWayChatCardView(
+                    payload: payload,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    authoritativeDisplayName: resolvedFriendPreview.displayName,
+                    onImHere: {
+                        Task { await markOnMyWayArrived(payload: payload, messageId: row.id) }
                     }
+                )
+            case .poll:
+                // Polls are group/pickup only; treat unexpected DM poll payloads as unavailable.
+                FanGeoStructuredUnavailableCard(
+                    kind: .poll,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    isFromCurrentUser: isMine
+                )
+            case .unavailable(let kind):
+                FanGeoStructuredUnavailableCard(
+                    kind: kind,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    isFromCurrentUser: isMine
+                )
+                .onAppear {
+                    kind.logDecodeFailure(category: "decodeNilOrUnsupportedVersion")
                 }
+            case .text(let text):
+                DirectMessageBubbleView(
+                    text: text,
+                    isFromCurrentUser: isMine,
+                    showFriendAvatar: !isMine,
+                    friendPreview: resolvedFriendPreview,
+                    timestamp: time
+                )
             }
-            .id(row.id)
+        }
+    }
+
+    @ViewBuilder
+    private func dmDecoratedMessage<Content: View>(
+        row: DirectMessageRow,
+        isMine: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        VStack(alignment: isMine ? .trailing : .leading, spacing: 4) {
+            if let reference = presenter.replyReference(for: row, languageCode: lang) {
+                ChatReplyQuoteHeader(
+                    reference: reference,
+                    languageCode: lang,
+                    colorScheme: colorScheme,
+                    isFromCurrentUser: isMine,
+                    onTap: { jumpToRepliedMessage(reference.originalMessageId) }
+                )
+                .frame(maxWidth: 280, alignment: isMine ? .trailing : .leading)
+            }
+            content()
+        }
+        .chatReplyHighlight(
+            isHighlighted: highlightedReplyMessageId == row.id,
+            colorScheme: colorScheme
+        )
+        .contextMenu {
+            dmMessageContextMenu(for: row)
+        }
+        .id(row.id)
+    }
+
+    @ViewBuilder
+    private func dmMessageContextMenu(for row: DirectMessageRow) -> some View {
+        let isMine = row.sender_id == presenter.currentUserId
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        if ChatReplyPreviewFormatting.isReplyEligible(
+            body: row.body,
+            messageType: nil,
+            isDeleted: row.is_deleted,
+            deletedAt: row.deleted_at
+        ) {
+            Button {
+                let name: String
+                if isMine {
+                    name = L10n.t("chat_preview_you_prefix", languageCode: lang)
+                } else {
+                    name = resolvedFriendPreview.displayName
+                }
+                presenter.beginReply(to: row, displayName: name, languageCode: lang)
+            } label: {
+                Label(L10n.t("chat_reply", languageCode: lang), systemImage: "arrowshape.turn.up.left")
+            }
+        }
+        if !isMine {
+            Button(L10n.t("group_chat_report_message", languageCode: lang)) {
+                reportSheet = .message(row)
+            }
+        }
+    }
+
+    private func jumpToRepliedMessage(_ messageId: UUID) {
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        if presenter.messages.contains(where: { $0.id == messageId }) {
+            pendingScrollToReplyTargetId = messageId
+            return
+        }
+        Task { @MainActor in
+            var pages = 0
+            while pages < ChatReplyResolution.maxOlderPagesWhenSeeking {
+                if presenter.messages.contains(where: { $0.id == messageId }) {
+                    pendingScrollToReplyTargetId = messageId
+                    return
+                }
+                guard presenter.hasOlderMessages, !presenter.isLoadingOlderMessages else { break }
+                let beforeCount = presenter.messages.count
+                await presenter.loadOlderMessages()
+                pages += 1
+                if presenter.messages.count <= beforeCount { break }
+            }
+            if presenter.messages.contains(where: { $0.id == messageId }) {
+                pendingScrollToReplyTargetId = messageId
+            } else {
+                presenter.menuBanner = L10n.t("chat_reply_original_not_found", languageCode: lang)
+            }
         }
     }
 
@@ -3421,82 +4552,99 @@ struct DirectChatView: View {
     /// Bottom input: optional slim emoji strip above composer; moves with keyboard via `safeAreaInset`.
     private var composer: some View {
         VStack(spacing: showEmojiQuickTray ? FGSpacing.sm : 0) {
-            if messagingBlocked {
-                threadStatusBanner(
-                    text: L10n.t("dm_messaging_unavailable", languageCode: appLanguageRaw),
-                    systemImage: "lock.fill",
-                    tint: FGColor.accentYellow
-                )
-            } else if isDeletedPeer {
-                threadStatusBanner(
-                    text: Self.deletedPeerNoticeText,
-                    systemImage: "person.crop.circle.badge.xmark",
-                    tint: FGColor.secondaryText(colorScheme)
-                )
-            } else if requiresAcceptedFriendshipToSend, !friendshipAllowsSending {
-                threadStatusBanner(
-                    text: L10n.t("dm_no_longer_friends_notice", languageCode: appLanguageRaw),
-                    systemImage: "person.2.slash",
-                    tint: FGColor.secondaryText(colorScheme)
-                )
-                dmFriendshipActionRow
-            }
+            composerEligibilityBanners
+
             if presenter.loadError == nil, presenter.conversationId != nil {
                 ChatRealtimeConnectionStatusView(status: presenter.realtimeConnectionStatus)
                     .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
                     .padding(.bottom, FGSpacing.xs)
-                    .transition(.opacity)
             }
-            if !sendingDisabled {
-                ChatMessageComposer(
-                    draft: $presenter.draft,
-                    showEmojiQuickTray: $showEmojiQuickTray,
-                    composerFocused: $composerFocused,
-                    canSend: presenter.canSend,
-                    sendingDisabled: sendingDisabled,
-                    isRefreshing: presenter.isManuallyRefreshingMessages,
-                    showsRefreshButton: true,
-                    refreshEnabled: presenter.conversationId != nil,
-                    placeholder: "Message",
-                    maxBodyLength: 1000,
+
+            if let reply = presenter.validatedReplyDraft() {
+                ChatReplyComposerBanner(
+                    senderDisplayName: reply.targetSenderDisplayName,
+                    previewLine: reply.previewLine,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
                     colorScheme: colorScheme,
-                    emojis: DirectChatQuickReactions.emojis,
-                    refreshAccessibilityLabel: "Refresh private chat",
-                    emojiToggleAccessibilityLabel: "Toggle emoji reactions",
-                    sendAccessibilityLabel: "Send",
-                    emojiReactionAccessibilityFormat: "Send %@ reaction",
-                    onSend: { sendDraftIfBusinessAllowed() },
-                    onQuickEmoji: { sendQuickReactionIfBusinessAllowed($0) },
-                    onRefresh: {
-                        Task { await presenter.manualRefreshCurrentThread() }
-                    },
-                    onTrimDraft: { presenter.trimDraftIfNeeded() }
+                    onCancel: { presenter.cancelReply() }
                 )
-            } else if messagingBlocked || isDeletedPeer || (requiresAcceptedFriendshipToSend && !friendshipAllowsSending) {
-                // Refresh-only strip so history can still be reloaded while send is disabled.
-                HStack {
-                    Spacer(minLength: 0)
-                    Button {
-                        Task { await presenter.manualRefreshCurrentThread() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .padding(10)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(presenter.isManuallyRefreshingMessages || presenter.conversationId == nil)
-                    .accessibilityLabel("Refresh private chat")
-                }
+                .padding(.bottom, FGSpacing.xs)
             }
+
+            // Permanent composer hierarchy — never swap for a refresh-only strip when
+            // `sendingDisabled` flips during friendship/block/peer hydration mid-push.
+            ChatMessageComposer(
+                draft: $presenter.draft,
+                showEmojiQuickTray: $showEmojiQuickTray,
+                composerFocused: $composerFocused,
+                canSend: presenter.canSend,
+                sendingDisabled: sendingDisabled,
+                isRefreshing: presenter.isManuallyRefreshingMessages,
+                showsRefreshButton: true,
+                refreshEnabled: presenter.conversationId != nil,
+                placeholder: "Message",
+                maxBodyLength: 1000,
+                colorScheme: colorScheme,
+                emojis: DirectChatQuickReactions.emojis,
+                refreshAccessibilityLabel: "Refresh private chat",
+                emojiToggleAccessibilityLabel: "Toggle emoji reactions",
+                sendAccessibilityLabel: "Send",
+                emojiReactionAccessibilityFormat: "Send %@ reaction",
+                onSend: { sendDraftIfBusinessAllowed() },
+                onQuickEmoji: { sendQuickReactionIfBusinessAllowed($0) },
+                onRefresh: {
+                    Task { await presenter.manualRefreshCurrentThread() }
+                },
+                onTrimDraft: { presenter.trimDraftIfNeeded() },
+                attachmentAccessibilityLabel: L10n.t(
+                    "chat_location_share_location",
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                ),
+                showsAttachmentButton: true
+            )
         }
         .padding(.horizontal, FGSpacing.lg)
         .padding(.top, FGSpacing.sm)
         .padding(.bottom, 0)
-        .animation(.spring(response: 0.34, dampingFraction: 0.92), value: showEmojiQuickTray)
-#if DEBUG
-        .animation(.easeInOut(duration: 0.18), value: presenter.realtimeConnectionStatus)
-#endif
+        .animation(isThreadOpening ? nil : .spring(response: 0.34, dampingFraction: 0.92), value: showEmojiQuickTray)
+        .transaction { transaction in
+            if isThreadOpening {
+                transaction.animation = nil
+            }
+        }
+        .onChange(of: sendingDisabled) { _, disabled in
+            guard disabled else { return }
+            Task { @MainActor in
+                await Task.yield()
+                guard sendingDisabled else { return }
+                if composerFocused { composerFocused = false }
+                if showEmojiQuickTray { showEmojiQuickTray = false }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var composerEligibilityBanners: some View {
+        if messagingBlocked {
+            threadStatusBanner(
+                text: L10n.t("dm_messaging_unavailable", languageCode: appLanguageRaw),
+                systemImage: "lock.fill",
+                tint: FGColor.accentYellow
+            )
+        } else if isDeletedPeer {
+            threadStatusBanner(
+                text: Self.deletedPeerNoticeText,
+                systemImage: "person.crop.circle.badge.xmark",
+                tint: FGColor.secondaryText(colorScheme)
+            )
+        } else if requiresAcceptedFriendshipToSend, !friendshipAllowsSending {
+            threadStatusBanner(
+                text: L10n.t("dm_no_longer_friends_notice", languageCode: appLanguageRaw),
+                systemImage: "person.2.slash",
+                tint: FGColor.secondaryText(colorScheme)
+            )
+            dmFriendshipActionRow
+        }
     }
 
     @ViewBuilder

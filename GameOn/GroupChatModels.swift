@@ -141,12 +141,26 @@ nonisolated enum GroupInboxAvatarMembership {
     }
 }
 
-/// Structured metadata for `group_messages.system_payload` (membership activity).
+/// Structured metadata for `group_messages.system_payload` (membership + pickup edit activity).
 struct GroupSystemEventPayload: Codable, Equatable, Sendable {
     let event: String?
     let affected_user_id: UUID?
     let affected_display_name: String?
     let actor_user_id: UUID?
+    /// Pickup edit system messages (migration 20260911+).
+    let pickup_game_id: UUID?
+    let update_event_id: UUID?
+    let change_kinds: [String]?
+    let summary_lines: [String]?
+    let title: String?
+    let before_start: String?
+    let after_start: String?
+    let before_location: String?
+    let after_location: String?
+    let before_players_needed: Int?
+    let after_players_needed: Int?
+    let before_status: String?
+    let after_status: String?
 
     var trimmedDisplayName: String? {
         let name = affected_display_name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -160,6 +174,7 @@ enum GroupSystemEventKind: String, Sendable {
     case memberJoined = "member_joined"
     case memberRemoved = "member_removed"
     case groupRenamed = "group_renamed"
+    case pickupGameUpdated = "pickup_game_updated"
 
     static func parse(_ raw: String?) -> GroupSystemEventKind? {
         guard let raw, let kind = GroupSystemEventKind(rawValue: raw) else { return nil }
@@ -191,6 +206,19 @@ enum GroupSystemEventFormatting {
             return trimmed.isEmpty
                 ? L10n.t("group_chat_system_group_created", languageCode: languageCode)
                 : trimmed
+        case .pickupGameUpdated:
+            if let localized = localizedPickupGameUpdatedLines(payload: payload, languageCode: languageCode),
+               !localized.isEmpty {
+                return localized.joined(separator: "\n")
+            }
+            if let lines = payload?.summary_lines?.filter({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
+               !lines.isEmpty {
+                return lines.joined(separator: "\n")
+            }
+            let trimmed = fallbackBody.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty
+                ? L10n.t("pickup_edit_chat_headline", languageCode: languageCode)
+                : trimmed
         case .memberJoined, .memberRemoved, .groupRenamed, .none:
             let trimmed = fallbackBody.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty
@@ -208,8 +236,37 @@ enum GroupSystemEventFormatting {
         )
     }
 
-    static func isSystemMessage(messageType: String?) -> Bool {
+    /// Pure classification from the wire `message_type` token — safe off the MainActor.
+    nonisolated static func isSystemMessage(messageType: String?) -> Bool {
         (messageType ?? "text") == "system"
+    }
+
+    /// Rebuild localized chat lines from structured change metadata when present.
+    private static func localizedPickupGameUpdatedLines(
+        payload: GroupSystemEventPayload?,
+        languageCode: String?
+    ) -> [String]? {
+        guard let payload else { return nil }
+        let kinds = (payload.change_kinds ?? []).compactMap {
+            PickupGameMeaningfulChangeKind(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }
+        let beforeStatus = (payload.before_status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let afterStatus = (payload.after_status ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isCancellation = beforeStatus != "removed" && afterStatus == "removed"
+        guard !kinds.isEmpty || isCancellation else { return nil }
+
+        let changes = PickupGameMeaningfulChangeSet(
+            kinds: isCancellation && !kinds.contains(.status) ? kinds + [.status] : kinds,
+            beforeLocationLabel: payload.before_location ?? "",
+            afterLocationLabel: payload.after_location ?? "",
+            beforeStartRaw: payload.before_start ?? "",
+            afterStartRaw: payload.after_start ?? "",
+            beforePlayersNeeded: payload.before_players_needed ?? 0,
+            afterPlayersNeeded: payload.after_players_needed ?? 0,
+            title: payload.title ?? "",
+            isCancellation: isCancellation
+        )
+        return PickupGameMeaningfulChange.chatBodyLines(for: changes, languageCode: languageCode ?? L10n.defaultLanguageCode)
     }
 }
 
@@ -225,6 +282,8 @@ struct GroupMessageRow: Decodable, Identifiable, Equatable, Sendable {
     let deleted_at: String?
     let report_count: Int?
     let is_deleted: Bool?
+    /// Same-conversation parent message id (migration `20260917_0001`). Nil on older rows.
+    let reply_to_message_id: UUID?
 
     var isSystemMessage: Bool {
         GroupSystemEventFormatting.isSystemMessage(messageType: message_type)
@@ -278,6 +337,29 @@ struct PickupGameChatContext: Equatable, Sendable {
     let whenLabel: String
     let locationLabel: String?
     let approvedParticipantCount: Int
+    /// Authoritative pickup pin when available (for On My Way prefill).
+    let latitude: Double?
+    let longitude: Double?
+
+    init(
+        pickupGameId: UUID,
+        title: String,
+        sportLabel: String,
+        whenLabel: String,
+        locationLabel: String?,
+        approvedParticipantCount: Int,
+        latitude: Double? = nil,
+        longitude: Double? = nil
+    ) {
+        self.pickupGameId = pickupGameId
+        self.title = title
+        self.sportLabel = sportLabel
+        self.whenLabel = whenLabel
+        self.locationLabel = locationLabel
+        self.approvedParticipantCount = approvedParticipantCount
+        self.latitude = latitude
+        self.longitude = longitude
+    }
 
     var headerSubtitle: String {
         var parts: [String] = []

@@ -9,13 +9,24 @@ import Foundation
 @MainActor
 enum UserInteractionPriorityGate {
     /// How long after a tab tap warm work should stay out of the way.
-    static let quietWindow: TimeInterval = 0.28
+    private static let defaultQuietWindow: TimeInterval = 0.28
+    /// Longer quiet window after opening a conversation so warm tiers do not
+    /// compete with the Direct Chat first frame.
+    private static let conversationOpenQuietWindow: TimeInterval = 0.75
     /// Upper bound on deferral for a single warm task, so repeated tapping cannot starve it.
-    private static let maxDeferral: TimeInterval = 0.9
+    private static let maxDeferral: TimeInterval = 1.0
     private static let pollInterval: UInt64 = 60_000_000
 
     private static var lastInteractionAt: Date?
+    private static var conversationOpenBoostUntil: Date?
     private static var activeWarmTaskNames: Set<String> = []
+
+    private static var quietWindow: TimeInterval {
+        if let until = conversationOpenBoostUntil, Date() < until {
+            return conversationOpenQuietWindow
+        }
+        return defaultQuietWindow
+    }
 
     /// Called from the tab button action path.
     static func noteUserTabInteraction(_ tab: String) {
@@ -25,6 +36,16 @@ enum UserInteractionPriorityGate {
             TabTapPerf.activeWarmTasks(Array(activeWarmTaskNames))
         }
         StartupPerf.phase("userTabInteraction", details: "tab=\(tab)")
+#endif
+    }
+
+    /// Called when a DM/group conversation route is published.
+    static func noteConversationOpen() {
+        let now = Date()
+        lastInteractionAt = now
+        conversationOpenBoostUntil = now.addingTimeInterval(1.0)
+#if DEBUG
+        StartupPerf.phase("userConversationOpen", details: "quietMs=750")
 #endif
     }
 
@@ -44,8 +65,9 @@ enum UserInteractionPriorityGate {
     /// Returns the number of milliseconds spent waiting (0 when no tap was in flight).
     @discardableResult
     static func awaitInteractionQuietWindow(stage: String) async -> Int {
+        let window = quietWindow
         guard let last = lastInteractionAt,
-              Date().timeIntervalSince(last) < quietWindow else {
+              Date().timeIntervalSince(last) < window else {
             return 0
         }
         let deferralStartedAt = Date()
@@ -66,6 +88,7 @@ enum UserInteractionPriorityGate {
     /// Test hook: resets process state between validation runs.
     static func resetForTesting() {
         lastInteractionAt = nil
+        conversationOpenBoostUntil = nil
         activeWarmTaskNames.removeAll()
     }
 }

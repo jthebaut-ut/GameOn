@@ -150,7 +150,7 @@ struct FanGeoZoomableImageFullscreenViewer: View {
     }
 }
 
-private struct FanGeoZoomableImageScrollView: UIViewRepresentable {
+struct FanGeoZoomableImageScrollView: UIViewRepresentable {
     let image: UIImage
     @Binding var isZoomed: Bool
 

@@ -3241,6 +3241,7 @@ struct DiscoverScreen: View {
             }
             TabPerf.selectedTab("discover")
             AppPerfDebug.screenLoadStart(tab: "discover", source: "tabVisible")
+            viewModel.noteDiscoverTabBecameVisibleForMapSnapshot()
             presentStartupGuideIfNeeded()
             Task { @MainActor in
                 await viewModel.refreshDiscoverBannerAnnouncementForDiscoverTabVisible()
@@ -5642,11 +5643,17 @@ struct DiscoverScreen: View {
             if isDiscoverTabSelected, FanGeoAdPolicy.shouldMountAdViews() {
                 discoverBottomAdStrip(layoutWidth: layoutWidth)
                     .padding(.top, discoverBottomAdLoaded ? 6 : 0)
-                    .padding(.bottom, discoverBottomAdLoaded ? 8 : 0)
+                // Single layout gap: AdMob bottom → floating tab bar top (do not also pad the ad).
+                if discoverBottomAdLoaded {
+                    Color.clear
+                        .frame(height: MainTabViewFloatingTabBarMetrics.discoverAdToBarGap)
+                        .allowsHitTesting(false)
+                }
             }
 
+            // Reserve only the visual tab-bar footprint (not list breathing-room 108).
             Color.clear
-                .frame(height: 78)
+                .frame(height: MainTabViewFloatingTabBarMetrics.overlayHeight)
                 .allowsHitTesting(false)
         }
         .frame(maxWidth: .infinity)
@@ -9073,19 +9080,37 @@ struct DiscoverScreen: View {
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.trailing, 4)
                 }
                 .buttonStyle(.plain)
 
-                Button {
-                    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                        viewModel.clearPickupMapSelection()
+                // Top-trailing: Share then Close (dismiss stays at the far trailing edge).
+                HStack(spacing: 6) {
+                    if !guestMapsActionsToLogin, row.isEligibleForInAppShare() {
+                        PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
+                            discoverPickupPreviewTrailingControl(
+                                systemImage: "square.and.arrow.up",
+                                icon: dismissIcon
+                            )
+                        }
+                        .environmentObject(chatViewModel)
+                        // Counteract Share control's full-width frame used on action rows.
+                        .fixedSize()
                     }
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(dismissIcon)
+
+                    Button {
+                        withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                            viewModel.clearPickupMapSelection()
+                        }
+                    } label: {
+                        discoverPickupPreviewTrailingControl(
+                            systemImage: "xmark",
+                            icon: dismissIcon
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss pickup preview")
                 }
-                .buttonStyle(.plain)
             }
 
             if !guestMapsActionsToLogin {
@@ -9179,6 +9204,30 @@ struct DiscoverScreen: View {
         print("[GuestPickupAuthDebug] presentAuth source=pickupPreview")
 #endif
         viewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
+    }
+
+    /// Shared 38pt material circle + 44pt hit target for preview trailing Share / Close.
+    private func discoverPickupPreviewTrailingControl(
+        systemImage: String,
+        icon: Color
+    ) -> some View {
+        ZStack {
+            Circle()
+                .fill(.ultraThinMaterial)
+                .frame(width: 38, height: 38)
+                .overlay {
+                    Circle()
+                        .strokeBorder(
+                            Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.12),
+                            lineWidth: 1
+                        )
+                }
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(icon)
+        }
+        .frame(width: 44, height: 44)
+        .contentShape(Rectangle())
     }
 
     private var discoverPickupPinsInBounds: Int {

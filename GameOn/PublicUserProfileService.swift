@@ -1,6 +1,75 @@
 import Foundation
 import Supabase
 
+/// Short-lived in-memory cache for assembled public profiles (reopen within ~90s).
+/// Not persisted. Invalidated on avatar / friend / poke / profile-edit signals.
+enum PublicUserProfileProcessCache {
+    static let ttlSeconds: TimeInterval = 90
+    /// Keep an expired snapshot briefly so reopen can still paint immediately while refreshing.
+    private static let staleGraceSeconds: TimeInterval = 300
+    private static let maxEntries = 24
+    private static let lock = NSLock()
+    private static var entries: [UUID: (loadedAt: Date, data: PublicUserProfileData)] = [:]
+
+    struct Lookup {
+        let data: PublicUserProfileData
+        let isFresh: Bool
+    }
+
+    static func lookup(for userId: UUID) -> Lookup? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = entries[userId] else { return nil }
+        let age = Date().timeIntervalSince(entry.loadedAt)
+        if age < ttlSeconds {
+            return Lookup(data: entry.data, isFresh: true)
+        }
+        if age < staleGraceSeconds {
+            return Lookup(data: entry.data, isFresh: false)
+        }
+        entries.removeValue(forKey: userId)
+        return nil
+    }
+
+    static func snapshot(for userId: UUID) -> PublicUserProfileData? {
+        lookup(for: userId)?.data
+    }
+
+    static func store(_ data: PublicUserProfileData) {
+        guard data.isPubliclyVisible, data.hasResolvedIdentity else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        entries[data.userId] = (Date(), data)
+        if entries.count > maxEntries {
+            let oldest = entries.min { $0.value.loadedAt < $1.value.loadedAt }?.key
+            if let oldest { entries.removeValue(forKey: oldest) }
+        }
+#if DEBUG
+        print("[PublicProfileCache] stored userId=\(data.userId.uuidString.lowercased()) ttl=\(Int(ttlSeconds))s entries=\(entries.count)")
+#endif
+    }
+
+    static func invalidate(userId: UUID, reason: String = "ordinary") {
+        lock.lock()
+        let removed = entries.removeValue(forKey: userId) != nil
+        lock.unlock()
+#if DEBUG
+        if removed {
+            print("[PublicProfileCache] invalidated userId=\(userId.uuidString.lowercased()) reason=\(reason)")
+        }
+#endif
+    }
+
+    static func clearAll(reason: String = "ordinary") {
+        lock.lock()
+        entries.removeAll()
+        lock.unlock()
+#if DEBUG
+        print("[PublicProfileCache] cleared reason=\(reason)")
+#endif
+    }
+}
+
 /// Friend CTA state for ``PublicUserProfilePreviewView`` (derived from ``ChatViewModel/FriendshipChipKind``).
 enum PublicProfileFriendButtonState: Equatable {
     case hidden
@@ -254,6 +323,7 @@ enum PublicUserProfileService {
             SuggestedFanProfileOpenDebug.rpcReceived(visible: identity.visible)
             if identity.visible {
                 let assembled = await assembleFromIdentityRPC(identity, userId: userId, cachedProfile: cachedProfile)
+                PublicUserProfileProcessCache.store(assembled)
 #if DEBUG
                 print("[PublicProfilePreview] loaded success=true")
 #endif
@@ -381,6 +451,7 @@ enum PublicUserProfileService {
         print("[PublicProfilePreview] loaded success=true")
 #endif
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
+        PublicUserProfileProcessCache.store(built)
         return built
     }
 
@@ -1155,6 +1226,7 @@ enum PublicUserProfileService {
 #if DEBUG
         print("[PublicProfilePreview] loaded success=true")
 #endif
+        PublicUserProfileProcessCache.store(built)
         return built
     }
 

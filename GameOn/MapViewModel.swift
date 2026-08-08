@@ -834,6 +834,10 @@ final class MapViewModel: ObservableObject {
     /// Last known GPS fix for the signed-in user (Discover weather, “my location”, startup centering).
     @Published var currentUserLocation: CLLocationCoordinate2D?
     @Published var calendarSyncMessage: String = ""
+    /// Settings → Notifications manual "Sync Calendar" — survives leaving/returning to the card.
+    @Published var appleCalendarSettingsManualSyncInFlight: Bool = false
+    /// Settings → disable Apple Calendar sync with event removal (session overlay phase).
+    @Published var appleCalendarRemovalPhase: AppleCalendarRemovalPhase = .idle
     @Published var venueEventRows: [VenueEventRow] = [] {
         didSet {
             scheduleFanChatAppLevelRealtimeForLoadedVenueEvents()
@@ -1034,7 +1038,15 @@ final class MapViewModel: ObservableObject {
     @Published var pendingPickupCreatorRatingNotificationDeepLink: PickupCreatorRatingNotificationDeepLinkRequest?
     /// Briefly highlights the Playing card targeted by a pickup rating notification deep link.
     @Published var pendingPickupPlayingHighlightGameID: UUID?
+    /// Opens canonical pickup detail from an in-app chat share card (any tab).
+    @Published var pendingSharedPickupGameDetailToken: PickupDetailNavigationToken?
+    /// Chat → open shared professional game detail (`LiveMatchDetailSheet`).
+    @Published var pendingSharedProGameDetailMatch: LiveMatch?
     @Published var pendingSupportReplyNotificationDeepLink: SupportReplyNotificationDeepLinkRequest?
+    /// Remote poke APNs tap → open sender Fan Profile after auth/bootstrap.
+    @Published var pendingPokeNotificationDeepLink: PokeNotificationDeepLinkRequest?
+    /// Gate so cold-start taps wait for splash/bootstrap before presenting a profile.
+    var pokeNotificationDeepLinkDeliveryAllowed = false
     /// Discover Activity Panel → Going / Account focus (consumed once by destination screens).
     @Published var pendingDiscoverTodayDashboardNav: DiscoverTodayDashboardNavIntent?
     /// Discover match-detail → Schedule Pro Games handoff (consumed once by CalendarScreen).
@@ -1080,6 +1092,8 @@ final class MapViewModel: ObservableObject {
     @Published var pendingFollowingMapPickupGameID: UUID?
     /// Pickup row snapshot from Following so navigation works before the Discover pickup map has refreshed.
     @Published var pendingFollowingMapPickupGameSnapshot: PickupGameRow?
+    /// Gates rapid “View Pickup Game” taps from Group Info (non-published; navigation-only).
+    var isRoutingPickupGameFromChatGroupInfo = false
     /// Brief user-visible hint when opening a saved venue on the map fails (geocode / missing row).
     @Published var followingMapNavigationMessage: String?
     /// Per-venue-event interest avatars (Discover game rows). See ``loadGoingUserProfiles(for:)``.
@@ -1154,6 +1168,10 @@ final class MapViewModel: ObservableObject {
     @Published var myPickupGamesForSettings: [PickupGameRow] = []
     /// Organizer soft-deleted games (`status = removed`), shown under History in Settings.
     @Published var myRemovedPickupGamesForSettings: [PickupGameRow] = []
+    /// Going → Hosting: soft-delete in flight for past auto-clear deadline (idempotent).
+    @Published var pickupHostingAutoClearInFlightIds: Set<UUID> = []
+    /// Going → Hosting: auto-clear failed; show manual Clear expired fallback.
+    @Published var pickupHostingAutoClearFailedIds: Set<UUID> = []
     @Published var isLoadingPickupGamesForMap: Bool = false
     /// Phase 2: pending / approved join request counts per game (organizer only; keyed by `pickup_games.id`).
     @Published var pickupOrganizerJoinStatsByGameId: [UUID: PickupOrganizerJoinStats] = [:]
@@ -1389,7 +1407,8 @@ final class MapViewModel: ObservableObject {
     var pickupFollowingRealtimeDebounceTask: Task<Void, Never>?
     /// First successful Games-to-Play load completed; suppresses marking everything unread on cold start.
     var pickupFollowingActivityPrimed: Bool = false
-    /// Per-game signature last acknowledged by the user (Games to Play visible or per-card refresh).
+    /// Per-game signature last acknowledged by the user (Play → Playing visible, detail open, or per-card refresh).
+    /// Backed by UserDefaults (`gameon.following.pickupSeenActivitySignatures.<userId>`).
     var pickupFollowingSeenActivitySignatureByGameId: [UUID: String] = [:]
     /// User’s 1–5 star rating per venue (local mirror of server `venue_ratings`).
     @Published var venueUserStarRatings: [UUID: Int] = [:]
@@ -1491,11 +1510,21 @@ final class MapViewModel: ObservableObject {
 
     /// Set when ``renderCachedDiscoverCore()`` (async) applied a disk snapshot this launch; suppresses empty-state loading chrome until fresh fetches finish.
     var discoverSnapshotRestoredThisLaunch = false
+    /// Decoded Discover disk snapshot awaiting geo-validation against the startup camera.
+    var pendingDiscoverCoreSnapshot: DiscoverCoreDiskSnapshot?
+    /// When true, offscreen Discover skipped a snapshot publish; republish when the tab becomes visible.
+    var discoverMapRenderSnapshotNeedsPublishWhenVisible = false
 
     /// Startup Discover: one-shot location + local region; ``defer`` arms preload completion logging even if the task is cancelled mid-await.
     var didFinishStartupDiscoverPrepare = false
     /// When false, startup must not overwrite the camera (user already panned/searched).
     var discoverStartupCameraOverrideEnabled = true
+    /// Why the startup camera currently points where it does (GPS / locale / world / user).
+    var discoverStartupCameraBasis: DiscoverStartupCameraBasis = .world
+    /// Startup location timed out while the system permission dialog was still unanswered.
+    var startupAwaitingLateLocationAuthorization = false
+    /// Retains the late-auth Core Location observer for the duration of a pending grant.
+    var lateStartupLocationAuthObserver: AnyObject?
     /// Suppresses treating map camera callbacks as user intent after a programmatic write.
     var discoverProgrammaticCameraWritePending = true
     /// Bumps on each programmatic camera write so delayed pending-clears stay ordered.

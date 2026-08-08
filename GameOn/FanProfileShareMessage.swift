@@ -1,7 +1,7 @@
 import Foundation
 
 /// Internal FanGeo chat profile share payload (encoded in `direct_messages.body` — no migration).
-struct FanProfileSharePayload: Codable, Equatable, Sendable {
+nonisolated struct FanProfileSharePayload: Codable, Equatable, Sendable {
     let v: Int
     let profileUserId: UUID
     let displayName: String
@@ -55,7 +55,7 @@ struct FanProfileSharePayload: Codable, Equatable, Sendable {
 }
 
 enum FanProfileShareMessage {
-    static let sentinel = "__FG_PROFILE_SHARE_V1__"
+    nonisolated static let sentinel = "__FG_PROFILE_SHARE_V1__"
 
     static func payload(
         from profile: PublicUserProfileData,
@@ -107,7 +107,8 @@ enum FanProfileShareMessage {
         return "\(preview)\n\(sentinel)\(json)"
     }
 
-    static func decode(from body: String) -> FanProfileSharePayload? {
+    /// Pure sentinel + JSON decode — no MainActor state.
+    nonisolated static func decode(from body: String) -> FanProfileSharePayload? {
         guard let range = body.range(of: sentinel) else { return nil }
         let jsonPart = body[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = jsonPart.data(using: .utf8),

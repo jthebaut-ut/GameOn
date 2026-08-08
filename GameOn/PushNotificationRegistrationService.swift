@@ -140,7 +140,7 @@ final class PushNotificationRegistrationService {
         )
 
         let outcome = await upsertCoalescer.run(identity: identity) {
-            await Self.performTokenUpsert(identity: identity, reason: reason)
+            await Self.performTokenClaim(identity: identity, reason: reason)
         }
 
         switch outcome {
@@ -153,7 +153,45 @@ final class PushNotificationRegistrationService {
         }
     }
 
-    private static func performTokenUpsert(
+    /// Claims the installation token exclusively for `auth.uid()` via SECURITY DEFINER RPC.
+    private static func performTokenClaim(
+        identity: PushTokenUpsertIdentity,
+        reason: String
+    ) async -> Bool {
+        struct Params: Encodable {
+            let p_token: String
+            let p_environment: String
+            let p_platform: String
+        }
+
+        do {
+            let rowId: UUID = try await supabase
+                .rpc(
+                    "claim_push_token",
+                    params: Params(
+                        p_token: identity.token,
+                        p_environment: identity.environment,
+                        p_platform: "ios"
+                    )
+                )
+                .execute()
+                .value
+            pushTokenDebugLog(
+                "[PushTokenDebug] claimSucceeded userId=\(identity.userID) environment=\(identity.environment) " +
+                "tokenPrefix=\(String(identity.token.prefix(12))) rowId=\(rowId.uuidString.lowercased()) reason=\(reason)"
+            )
+            return true
+        } catch {
+            // Fallback for environments that have not applied the claim RPC yet.
+            pushTokenDebugLog(
+                "[PushTokenDebug] claimRpcFailed fallingBackToLegacyUpsert reason=\(reason) error=\(error.localizedDescription)"
+            )
+            return await performLegacyTokenUpsert(identity: identity, reason: reason)
+        }
+    }
+
+    /// Legacy path: upsert own row only (cannot steal other users' rows under RLS).
+    private static func performLegacyTokenUpsert(
         identity: PushTokenUpsertIdentity,
         reason: String
     ) async -> Bool {
@@ -189,8 +227,8 @@ final class PushNotificationRegistrationService {
                 .eq("environment", value: identity.environment)
                 .execute()
             pushTokenDebugLog(
-                "[PushTokenDebug] upsertSucceeded userId=\(row.user_id) environment=\(row.environment) " +
-                "tokenPrefix=\(String(identity.token.prefix(12))) reactivated=true reason=\(reason)"
+                "[PushTokenDebug] legacyUpsertSucceeded userId=\(row.user_id) environment=\(row.environment) " +
+                "tokenPrefix=\(String(identity.token.prefix(12))) reason=\(reason)"
             )
             return true
         } catch {
@@ -199,13 +237,44 @@ final class PushNotificationRegistrationService {
         }
     }
 
+    /// Deactivates only this installation's token for the outgoing session (multi-device safe).
+    /// Prefer calling while JWT is still valid so `deactivate_current_push_token` can run.
     func deleteCurrentTokenForCurrentSession(reason: String, knownUserId: UUID? = nil) async {
+        await deactivateCurrentTokenForCurrentSession(reason: reason, knownUserId: knownUserId)
+    }
+
+    func deactivateCurrentTokenForCurrentSession(reason: String, knownUserId: UUID? = nil) async {
         didCompleteLifecyclePushTokenRefresh = false
         await upsertCoalescer.invalidateFreshness()
         guard let token = Self.storedToken, !token.isEmpty else { return }
 
-        // Prefer the caller-supplied auth id so logout never blocks on `auth.session`
-        // (token refresh can hang indefinitely on poor networks).
+        let environment = Self.storedEnvironment
+
+        struct DeactivateParams: Encodable {
+            let p_token: String
+            let p_environment: String
+        }
+
+        do {
+            let deactivated: Bool = try await supabase
+                .rpc(
+                    "deactivate_current_push_token",
+                    params: DeactivateParams(p_token: token, p_environment: environment)
+                )
+                .execute()
+                .value
+            pushTokenDebugLog(
+                "[PushTokenDebug] deactivateSucceeded viaRpc=\(deactivated) reason=\(reason) " +
+                "tokenPrefix=\(String(token.prefix(12)))"
+            )
+            return
+        } catch {
+            pushTokenDebugLog(
+                "[PushTokenDebug] deactivateRpcFailed fallingBack reason=\(reason) error=\(error.localizedDescription)"
+            )
+        }
+
+        // Fallback under RLS: deactivate own row only (requires live session matching knownUserId).
         let userID: UUID
         if let knownUserId {
             userID = knownUserId
@@ -218,14 +287,22 @@ final class PushNotificationRegistrationService {
         do {
             try await supabase
                 .from("user_push_tokens")
-                .delete()
+                .update(
+                    PushTokenInvalidationPatch(
+                        is_active: false,
+                        invalidated_at: SupabaseTimestampParsing.encodeTimestamptz(Date())
+                    )
+                )
                 .eq("user_id", value: userID.uuidString.lowercased())
                 .eq("token", value: token)
-                .eq("environment", value: Self.storedEnvironment)
+                .eq("environment", value: environment)
+                .eq("is_active", value: true)
                 .execute()
-            pushTokenDebugLog("[PushTokenDebug] deleteSucceeded userId=\(userID.uuidString.lowercased()) reason=\(reason)")
+            pushTokenDebugLog(
+                "[PushTokenDebug] deactivateSucceeded viaUpdate userId=\(userID.uuidString.lowercased()) reason=\(reason)"
+            )
         } catch {
-            pushTokenDebugLog("[PushTokenDebug] deleteFailed reason=\(reason) error=\(error.localizedDescription)")
+            pushTokenDebugLog("[PushTokenDebug] deactivateFailed reason=\(reason) error=\(error.localizedDescription)")
         }
     }
 

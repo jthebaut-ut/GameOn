@@ -34,7 +34,11 @@ enum FanOpenToCatalog {
     ]
 
     static var sportActivities: [FanOpenToActivityDefinition] {
-        pickupSportTokens.map { token in
+        let tokens = pickupSportTokens
+        #if DEBUG
+        FanOpenToCatalogSelfTests.assertUniqueOpenToSports(tokens)
+        #endif
+        return tokens.map { token in
             let visual = SportFilterCatalog.resolve(token)
             return FanOpenToActivityDefinition(
                 id: token,

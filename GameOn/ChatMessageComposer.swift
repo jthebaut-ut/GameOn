@@ -25,6 +25,12 @@ struct ChatMessageComposer: View {
     var onQuickEmoji: (String) -> Void
     var onRefresh: (() -> Void)?
     var onTrimDraft: () -> Void
+    /// Optional chat attachment entry (location / On My Way). Nil hides the control.
+    var onAttachmentTap: (() -> Void)? = nil
+    var attachmentAccessibilityLabel: String = "Share location"
+    var showsAttachmentButton: Bool = false
+
+    @Environment(\.chatLocationAttachmentPresenter) private var locationAttachmentPresenter
 
     var body: some View {
         VStack(spacing: showEmojiQuickTray ? FGSpacing.sm : 0) {
@@ -51,9 +57,39 @@ struct ChatMessageComposer: View {
                     .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.58 : 0.94))
                     .clipShape(Circle())
             }
-            .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+            .buttonStyle(.plain)
             .accessibilityLabel(emojiToggleAccessibilityLabel)
             .disabled(sendingDisabled)
+            .opacity(sendingDisabled ? 0.55 : 1)
+
+            if showsAttachmentButton {
+                Button {
+                    FGInteractionHaptics.selection()
+                    if let onAttachmentTap {
+                        onAttachmentTap()
+                    } else {
+                        locationAttachmentPresenter.present()
+                    }
+                } label: {
+                    Image(systemName: "location.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(
+                            (sendingDisabled || !locationAttachmentPresenter.isEnabled)
+                                ? FGColor.secondaryText(colorScheme)
+                                : FGColor.accentGreen
+                        )
+                        .frame(width: 38, height: 38)
+                        .background(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.58 : 0.94))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(attachmentAccessibilityLabel)
+                .accessibilityHint("Opens location sharing options")
+                // Keep one stable Button; only inert enabled/disabled state changes.
+                .disabled(sendingDisabled || !locationAttachmentPresenter.isEnabled)
+                .opacity(sendingDisabled || !locationAttachmentPresenter.isEnabled ? 0.55 : 1)
+            }
 
             TextField(placeholder, text: $draft)
                 .textFieldStyle(.plain)
@@ -91,6 +127,7 @@ struct ChatMessageComposer: View {
                 .frame(minHeight: 38, alignment: .center)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .disabled(sendingDisabled)
+                .opacity(sendingDisabled ? 0.72 : 1)
 
             if showsRefreshButton {
                 refreshButton
@@ -114,9 +151,10 @@ struct ChatMessageComposer: View {
                     )
             }
             .disabled(!canSend || sendingDisabled)
-            .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.94, hapticOnPress: false))
+            .buttonStyle(.plain)
             .contentShape(Rectangle())
             .accessibilityLabel(sendAccessibilityLabel)
+            .opacity(sendingDisabled ? 0.55 : 1)
         }
         .padding(.horizontal, FGSpacing.sm)
         .padding(.vertical, FGSpacing.sm)
@@ -154,7 +192,7 @@ struct ChatMessageComposer: View {
                 )
                 .contentShape(Circle())
         }
-        .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.94, hapticOnPress: false))
+        .buttonStyle(.plain)
         .disabled(!refreshEnabled || isRefreshing)
         .opacity(isRefreshing ? 0.62 : 1.0)
         .accessibilityLabel(refreshAccessibilityLabel)

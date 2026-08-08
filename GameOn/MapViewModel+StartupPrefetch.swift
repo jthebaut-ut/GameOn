@@ -209,11 +209,15 @@ extension MapViewModel {
 
     func warmPreloadRegionalDiscoverCaches(chatViewModel: ChatViewModel) async {
         let startedAt = Date()
-        print("[StartupWarmCache] regionalWarmStart mode=\(discoverMapContentMode.rawValue) sport=\(selectedSport)")
+        print("[StartupWarmCache] regionalWarmStart mode=\(discoverMapContentMode.rawValue) sport=\(selectedSport) basis=\(discoverStartupCameraBasis.rawValue)")
 
         await withTaskGroup(of: Void.self) { group in
             group.addTask { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.discoverGeographicNetworkFetchAllowed() else {
+                    print("[StartupWarmCache] task=nearbyVenues deferred reason=viewportTooBroad basis=\(self.discoverStartupCameraBasis.rawValue)")
+                    return
+                }
                 if self.bars.isEmpty {
                     print("[StartupWarmCache] task=nearbyVenues cacheHit=false")
                     await self.refreshDiscoverCoreInBackground()
@@ -231,11 +235,28 @@ extension MapViewModel {
                     print("[StartupWarmCache] task=pickupGames skipped reason=featureUnavailable")
                     return
                 }
+                guard self.discoverMapContentMode == .pickupGames else {
+                    print("[StartupWarmCache] task=pickupGames deferred reason=notPickupMode")
+                    return
+                }
+                guard self.discoverGeographicNetworkFetchAllowed() else {
+                    print("[StartupWarmCache] task=pickupGames deferred reason=viewportTooBroad")
+                    return
+                }
                 await self.warmPreloadPickupGamesForCurrentContext()
             }
 
             group.addTask { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.discoverMapContentMode == .pickupGames,
+                      self.discoverPickupSubMode == .places else {
+                    print("[StartupWarmCache] task=pickupPlaces deferred reason=notPickupPlacesMode")
+                    return
+                }
+                guard self.discoverGeographicNetworkFetchAllowed() else {
+                    print("[StartupWarmCache] task=pickupPlaces deferred reason=viewportTooBroad")
+                    return
+                }
                 await self.warmPreloadPickupPlacesForCurrentRegion()
             }
 
@@ -254,7 +275,7 @@ extension MapViewModel {
                     return
                 }
                 let chatResult = await chatViewModel.prefetchLightweightStartupChatData()
-                if self.canFanUsePickupGamesUI {
+                if self.canFanUsePickupGamesUI, self.discoverMapContentMode == .pickupGames {
                     await self.loadIncomingPickupGameInvites()
                 }
                 print("[StartupWarmCache] task=notificationBadges skippedReason=\(chatResult.skippedReason ?? "none")")

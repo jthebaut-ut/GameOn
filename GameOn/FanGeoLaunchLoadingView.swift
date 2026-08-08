@@ -1,11 +1,25 @@
 import SwiftUI
 
+/// Bubbles to the app root so window chrome (status bar) can prefer light while any splash
+/// is mounted, without writing `FanGeoAppearancePreference` / UserDefaults.
+enum FanGeoSplashForcesLightAppearanceKey: PreferenceKey {
+    static var defaultValue: Bool { false }
+
+    static func reduce(value: inout Bool, nextValue: () -> Bool) {
+        value = value || nextValue()
+    }
+}
+
 /// Full-screen static splash shown immediately after the static `LaunchScreen` storyboard.
 /// Also reused while authenticated age eligibility is resolving (no blank compliance screen).
+///
+/// Always presents in **light** appearance (white canvas, dark status text) regardless of the
+/// user's System/Light/Dark preference. Preference is not written — only this view forces light
+/// via ``preferredColorScheme(_:)`` while mounted; the rest of FanGeo resumes the user's scheme
+/// as soon as the splash is removed.
 struct FanGeoSplashView: View {
     let statusMessage: String
     var showsTagline: Bool = true
-    @Environment(\.colorScheme) private var colorScheme
     @State private var contentOpacity = 0.0
 
     init(
@@ -16,23 +30,12 @@ struct FanGeoSplashView: View {
         self.showsTagline = showsTagline
     }
 
-    private var background: Color {
-        colorScheme == .dark
-            ? Color(red: 0.03, green: 0.05, blue: 0.08)
-            : Color.white
-    }
+    /// Splash is intentionally always the light treatment from the white launch artwork.
+    private var background: Color { Color.white }
 
-    private var statusColor: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.72)
-            : Color.black.opacity(0.68)
-    }
+    private var statusColor: Color { Color.black.opacity(0.68) }
 
-    private var taglineColor: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.55)
-            : Color.black.opacity(0.45)
-    }
+    private var taglineColor: Color { Color.black.opacity(0.45) }
 
     var body: some View {
         GeometryReader { proxy in
@@ -75,6 +78,10 @@ struct FanGeoSplashView: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .ignoresSafeArea()
+        // Narrowest boundary: force light only while this splash is in the hierarchy.
+        // Does not mutate UserDefaults / FanGeoAppearancePreference.
+        .preferredColorScheme(.light)
+        .preference(key: FanGeoSplashForcesLightAppearanceKey.self, value: true)
         .onAppear {
             withAnimation(.easeOut(duration: 0.28)) {
                 contentOpacity = 1
@@ -83,6 +90,7 @@ struct FanGeoSplashView: View {
             print("[FanGeoLoadingDebug] splashDisplayed")
             print("[FanGeoLoadingDebug] stableImageLayout=true")
             print("[FanGeoLoadingDebug] loadingStatus=\(statusMessage)")
+            print("[FanGeoLoadingDebug] forcedLightAppearance=true")
             print("[FanGeoLoadingBrandingDebug] premiumSplashLoaded=true")
             print("[FanGeoLoadingBrandingDebug] launchAndSwiftUIMatch=true")
             print("[LaunchScreenDebug] launchBackgroundApplied=true")

@@ -45,12 +45,41 @@ private struct BusinessProfileVenueHydrationState: Equatable {
 enum SettingsAboutFanGeoMetadata {
     static let supportEmail = "support@fangeosports.com"
 
+    /// Marketing release month/year for this App Store version/build.
+    /// Update these together when shipping a new marketing release (not the device clock).
+    static let releaseYear = 2026
+    /// Gregorian month (1 = January … 12 = December). Current: August 2026.
+    static let releaseMonth = 8
+
     static var version: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "-"
     }
 
     static var build: String {
         Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "-"
+    }
+
+    /// Localized "Month Year" for ``releaseMonth`` / ``releaseYear`` in the active FanGeo language.
+    static func localizedReleaseMonthYear(languageCode: String) -> String {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.year = releaseYear
+        components.month = releaseMonth
+        components.day = 1
+        guard let date = components.date else {
+            return "\(releaseMonth)/\(releaseYear)"
+        }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: code)
+        // Standalone month + year (e.g. "August 2026" / "août 2026") — nominative forms.
+        formatter.setLocalizedDateFormatFromTemplate("MMMM yyyy")
+        return formatter.string(from: date)
+    }
+
+    /// About row: `Build <CFBundleVersion> (<Month Year>)`.
+    static func buildDisplayLine(languageCode: String) -> String {
+        "Build \(build) (\(localizedReleaseMonthYear(languageCode: languageCode)))"
     }
 }
 
@@ -919,9 +948,11 @@ struct SettingsScreen: View {
                 AccountActivationPerf.log("activationStarted cachedContentShown=\(viewModel.currentUserAuthId != nil)")
                 Task {
                     await Task.yield()
-                    await viewModel.loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: true)
+                    await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: "accountPickupBadge")
+                    // Remount-safe: reuse freshness TTL + live subscription when already attached.
+                    await viewModel.loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: false)
                     if viewModel.canFanUsePickupGamesUI {
-                        await viewModel.loadMyPickupGamesForSettings()
+                        await viewModel.loadMyPickupGamesForSettings(reason: "accountTabAppear")
                     }
                 }
             }
@@ -1222,7 +1253,8 @@ struct SettingsScreen: View {
             notificationSettingsStore: notificationSettingsStore,
             isPresented: $showProfileSettingsSheet,
             loginEmail: $email,
-            isCloseDisabled: viewModel.isSafeLogoutBlockingUI,
+            isCloseDisabled: viewModel.isSafeLogoutBlockingUI
+                || viewModel.appleCalendarRemovalPhase != .idle,
             navigationTitle: L10n.t("settings", languageCode: appLanguageRaw),
             closeTitle: L10n.t("close", languageCode: appLanguageRaw),
             onRequestFanSignIn: {
@@ -1240,7 +1272,10 @@ struct SettingsScreen: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationBackground(SettingsPremiumChrome.presentationBackground(colorScheme))
-        .interactiveDismissDisabled(viewModel.isSafeLogoutBlockingUI)
+        .interactiveDismissDisabled(
+            viewModel.isSafeLogoutBlockingUI
+                || viewModel.appleCalendarRemovalPhase != .idle
+        )
     }
 
     private var profileSettingsSheetRoot: some View {
@@ -1254,6 +1289,7 @@ struct SettingsScreen: View {
             profileSettingsExperienceSection()
             profileSettingsProGamesSection()
             profileSettingsHelpSafetySection()
+            profileSettingsTrustSafetySection()
             profileSettingsLegalSection()
             profileSettingsAccountSection()
             ProfileSettingsAboutSection()

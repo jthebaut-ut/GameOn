@@ -257,7 +257,6 @@ struct PublicProfileRedesignHero: View {
     let isSelfPreview: Bool
     let friendState: PublicProfileFriendButtonState
     let isFriendActionInFlight: Bool
-    let canShowSafetyActions: Bool
     let canPoke: Bool
     let pokeTitle: String
     let isPokeDisabled: Bool
@@ -265,17 +264,22 @@ struct PublicProfileRedesignHero: View {
     let onAddFriend: () -> Void
     let onCancelRequest: () -> Void
     let onMessage: () -> Void
-    let onEditProfile: () -> Void
-    let onShare: () -> Void
-    let onReport: () -> Void
-    let onBlock: () -> Void
     let onPoke: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+    @Namespace private var avatarZoomNamespace
 
     private var avatarDiameter: CGFloat {
         ProfileHeroMetrics.avatarDiameter
+    }
+
+    private var avatarRefreshToken: UUID {
+        UserAvatarView.stableRefreshToken(
+            userId: data.userId,
+            thumbnailURL: data.avatarThumbnailURL,
+            avatarURL: data.avatarURL
+        )
     }
 
     private var trimmedBio: String {
@@ -368,7 +372,6 @@ struct PublicProfileRedesignHero: View {
                 isSelfPreview: isSelfPreview,
                 friendState: friendState,
                 isFriendActionInFlight: isFriendActionInFlight,
-                canShowSafetyActions: canShowSafetyActions,
                 canPoke: canPoke,
                 pokeTitle: pokeTitle,
                 isPokeDisabled: isPokeDisabled,
@@ -377,10 +380,6 @@ struct PublicProfileRedesignHero: View {
                 onAddFriend: onAddFriend,
                 onCancelRequest: onCancelRequest,
                 onMessage: onMessage,
-                onEditProfile: onEditProfile,
-                onShare: onShare,
-                onReport: onReport,
-                onBlock: onBlock,
                 onPoke: onPoke
             )
             .padding(.horizontal, ProfileHeroMetrics.heroContentHorizontalPadding)
@@ -428,31 +427,36 @@ struct PublicProfileRedesignHero: View {
     }
 
     private var avatar: some View {
-        UserAvatarView(
-            avatarThumbnailURL: data.avatarThumbnailURL,
-            avatarURL: data.avatarURL ?? "",
-            avatarDisplayRefreshToken: UserAvatarView.stableRefreshToken(
-                userId: data.userId,
-                thumbnailURL: data.avatarThumbnailURL,
-                avatarURL: data.avatarURL
-            ),
+        PublicProfileTappableAvatar(
             displayName: data.displayName,
-            email: "",
-            size: avatarDiameter,
-            fallbackStyle: .lightOnWhiteChrome,
-            imagePlaceholderTint: FGColor.accentBlue
-        )
-        .overlay {
-            Circle()
-                .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.40 : 1), lineWidth: 2.5)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if !data.isBusinessAccount {
-                ActivityStatusCompactPill(lastSeenAtRaw: data.lastSeenAtRaw)
-                    .offset(x: 4, y: 2)
+            avatarURL: data.avatarURL,
+            avatarThumbnailURL: data.avatarThumbnailURL,
+            avatarDisplayRefreshToken: avatarRefreshToken,
+            zoomNamespace: avatarZoomNamespace,
+            transitionID: "public-profile-avatar-\(data.userId.uuidString.lowercased())"
+        ) {
+            UserAvatarView(
+                avatarThumbnailURL: data.avatarThumbnailURL,
+                avatarURL: data.avatarURL ?? "",
+                avatarDisplayRefreshToken: avatarRefreshToken,
+                displayName: data.displayName,
+                email: "",
+                size: avatarDiameter,
+                fallbackStyle: .lightOnWhiteChrome,
+                imagePlaceholderTint: FGColor.accentBlue
+            )
+            .overlay {
+                Circle()
+                    .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.40 : 1), lineWidth: 2.5)
             }
+            .overlay(alignment: .bottomTrailing) {
+                if !data.isBusinessAccount {
+                    ActivityStatusCompactPill(lastSeenAtRaw: data.lastSeenAtRaw)
+                        .offset(x: 4, y: 2)
+                }
+            }
+            .shadow(color: Color.black.opacity(0.10), radius: 6, y: 2)
         }
-        .shadow(color: Color.black.opacity(0.10), radius: 6, y: 2)
     }
 }
 
@@ -462,7 +466,6 @@ struct PublicProfileHeroActionRow: View {
     let isSelfPreview: Bool
     let friendState: PublicProfileFriendButtonState
     let isFriendActionInFlight: Bool
-    let canShowSafetyActions: Bool
     let canPoke: Bool
     let pokeTitle: String
     let isPokeDisabled: Bool
@@ -471,10 +474,6 @@ struct PublicProfileHeroActionRow: View {
     let onAddFriend: () -> Void
     let onCancelRequest: () -> Void
     let onMessage: () -> Void
-    let onEditProfile: () -> Void
-    let onShare: () -> Void
-    let onReport: () -> Void
-    let onBlock: () -> Void
     let onPoke: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -510,7 +509,6 @@ struct PublicProfileHeroActionRow: View {
             if presentedCanPoke {
                 pokeAction
             }
-            moreMenu
         }
         // Keep stranger-facing visuals fully opaque in self-preview; block all hits instead of dimming.
         .allowsHitTesting(!isSelfPreview)
@@ -538,6 +536,7 @@ struct PublicProfileHeroActionRow: View {
             )
             .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
         case .messageFriend:
+            // Status chip only — Remove Friend lives in the nav-bar overflow menu.
             secondaryButton(
                 title: L10n.t("friends", languageCode: appLanguageRaw),
                 icon: "person.2.fill",
@@ -602,60 +601,6 @@ struct PublicProfileHeroActionRow: View {
                 format: L10n.t("public_profile_poke_a11y_format", languageCode: appLanguageRaw),
                 displayName
             )
-        )
-        .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
-    }
-
-    private var moreMenu: some View {
-        Menu {
-            Button {
-                onShare()
-            } label: {
-                Label(L10n.t("share_profile", languageCode: appLanguageRaw), systemImage: "square.and.arrow.up")
-            }
-
-            if friendState == .friendshipRequested {
-                Button(role: .destructive) {
-                    onCancelRequest()
-                } label: {
-                    Label(L10n.t("cancel_friend_request", languageCode: appLanguageRaw), systemImage: "person.badge.minus")
-                }
-            }
-
-            if canShowSafetyActions {
-                Button {
-                    onReport()
-                } label: {
-                    Label(L10n.t("report_fan", languageCode: appLanguageRaw), systemImage: "flag.fill")
-                }
-
-                Button(role: .destructive) {
-                    onBlock()
-                } label: {
-                    Label(L10n.t("block_fan", languageCode: appLanguageRaw), systemImage: "nosign")
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(FGColor.accentBlue)
-                .frame(width: 38, height: 38)
-                .background {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color.white.opacity(colorScheme == .dark ? 0.12 : 1))
-                }
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(FGColor.accentBlue.opacity(0.55), lineWidth: 1.2)
-                }
-        }
-        .accessibilityLabel(
-            displayName.isEmpty
-                ? L10n.t("public_profile_more_options_a11y", languageCode: appLanguageRaw)
-                : String(
-                    format: L10n.t("public_profile_more_actions_a11y_format", languageCode: appLanguageRaw),
-                    displayName
-                )
         )
         .accessibilityHint(isSelfPreview ? previewOnlyAccessibilitySuffix : "")
     }

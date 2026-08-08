@@ -12,7 +12,11 @@ final class DirectChatService {
 
     /// Minimal columns for list/decoding (avoid `select()` wildcard at scale).
     private static let directMessageListColumns =
+        "id,conversation_id,sender_id,body,created_at,deleted_at,report_count,is_deleted,reply_to_message_id"
+    private static let directMessageListColumnsWithoutReply =
         "id,conversation_id,sender_id,body,created_at,deleted_at,report_count,is_deleted"
+    private static let directMessageListColumnsLegacyDeletedAtOnly =
+        "id,conversation_id,sender_id,body,created_at,deleted_at,report_count"
 
     init(client: SupabaseClient = supabase) {
         self.client = client
@@ -99,36 +103,136 @@ final class DirectChatService {
         return rows.first?.id
     }
 
-    /// Clears/hides conversation history for participants (same RPC as in-app “Clear chat history”). Server defines semantics.
-    func clearDirectConversation(conversationId: UUID) async throws {
+    /// Clears/hides conversation history for the **current user only** (`clear_direct_conversation`).
+    /// Shared `direct_messages` rows are never deleted; peer history is unchanged.
+    @discardableResult
+    func clearDirectConversation(conversationId: UUID) async throws -> Date {
         struct Params: Encodable {
             let p_conversation_id: UUID
         }
         try await client
             .rpc("clear_direct_conversation", params: Params(p_conversation_id: conversationId))
             .execute()
+        let me = try await currentUserId()
+        // Prefer authoritative server watermark (not device clock).
+        if let server = try await fetchHistoryClearedAt(conversationId: conversationId, authId: me) {
+            return server
+        }
+        let fallback = Date()
+        DmConversationClearStore.setClearedAt(fallback, conversationId: conversationId, authId: me)
+        return fallback
     }
 
-    /// Latest `limit` messages, oldest-first for natural scrolling (key-ordered by `created_at`, `id` DESC server-side).
-    func fetchLatestMessages(conversationId: UUID, limit: Int = 50) async throws -> [DirectMessageRow] {
+    /// Hydrate all clear watermarks for the signed-in user from the server (call after login).
+    func hydrateHistoryClearsFromServer() async {
+        struct Row: Decodable {
+            let conversation_id: UUID
+            let cleared_at: String
+        }
+        do {
+            let me = try await currentUserId()
+            let rows: [Row] = try await client
+                .from("user_direct_conversation_clear")
+                .select("conversation_id,cleared_at")
+                .eq("user_id", value: me)
+                .execute()
+                .value
+            var map: [UUID: Date] = [:]
+            for row in rows {
+                if let date = SupabaseTimestampParsing.parseTimestamptz(row.cleared_at) {
+                    map[row.conversation_id] = date
+                }
+            }
+            DmConversationClearStore.replaceAll(clearedAtByConversationId: map, authId: me)
+#if DEBUG
+            print("[DMClear] hydrated clears count=\(map.count) user=\(me.uuidString.lowercased())")
+#endif
+        } catch {
+#if DEBUG
+            print("[DMClear] hydrate failed error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
+    /// Authoritative viewer-local clear watermark. `nil` means no clear row (full history).
+    /// Never treats a fetch failure as "no clear" when a local auth-scoped cache exists.
+    func fetchHistoryClearedAt(conversationId: UUID) async throws -> Date? {
+        let me = try await currentUserId()
+        return try await fetchHistoryClearedAt(conversationId: conversationId, authId: me)
+    }
+
+    private func fetchHistoryClearedAt(conversationId: UUID, authId: UUID) async throws -> Date? {
+        struct Row: Decodable {
+            let cleared_at: String
+        }
+        let cached = DmConversationClearStore.clearedAt(conversationId: conversationId, authId: authId)
+        do {
+            let rows: [Row] = try await client
+                .from("user_direct_conversation_clear")
+                .select("cleared_at")
+                .eq("conversation_id", value: conversationId)
+                .eq("user_id", value: authId)
+                .limit(1)
+                .execute()
+                .value
+            guard let raw = rows.first?.cleared_at else {
+                // Authoritative miss: no clear row for this user/conversation.
+                return nil
+            }
+            guard let date = SupabaseTimestampParsing.parseTimestamptz(raw) else {
+                return cached
+            }
+            DmConversationClearStore.setClearedAt(date, conversationId: conversationId, authId: authId)
+            return date
+        } catch {
+            // Table may be missing from schema cache briefly — never drop a known local watermark.
+            if let cached { return cached }
+            throw error
+        }
+    }
+
+    /// Latest `limit` messages, oldest-first. Always enforces `created_at > clearedAfter` when provided,
+    /// and resolves the watermark from the server/cache when `clearedAfter` is omitted.
+    func fetchLatestMessages(
+        conversationId: UUID,
+        limit: Int = 50,
+        clearedAfter: Date? = nil
+    ) async throws -> [DirectMessageRow] {
         #if DEBUG
         let t0 = CFAbsoluteTimeGetCurrent()
         #endif
+        let watermark = try await resolvedClearedAfter(conversationId: conversationId, clearedAfter: clearedAfter)
         let rows: [DirectMessageRow]
         do {
-            rows = try await fetchLatestMessagesWithIsDeletedFilter(conversationId: conversationId, limit: limit)
+            rows = try await fetchLatestMessagesWithIsDeletedFilter(
+                conversationId: conversationId,
+                limit: limit,
+                clearedAfter: watermark
+            )
         } catch {
-            if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
-                rows = try await fetchLatestMessagesDeletedAtOnly(conversationId: conversationId, limit: limit)
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                rows = try await fetchLatestMessagesWithIsDeletedFilter(
+                    conversationId: conversationId,
+                    limit: limit,
+                    clearedAfter: watermark,
+                    columns: Self.directMessageListColumnsWithoutReply
+                )
+            } else if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
+                rows = try await fetchLatestMessagesDeletedAtOnly(
+                    conversationId: conversationId,
+                    limit: limit,
+                    clearedAfter: watermark
+                )
             } else {
                 throw error
             }
         }
+        let filtered = Self.applyClearWatermark(rows, clearedAfter: watermark)
         #if DEBUG
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-        print("[DMPagination] initial load: \(String(format: "%.1f", ms))ms rows=\(rows.count) limit=\(limit)")
+        print("[DMPagination] initial load: \(String(format: "%.1f", ms))ms rows=\(filtered.count) limit=\(limit) cleared=\(watermark != nil)")
         #endif
-        return rows
+        return filtered
     }
 
     /// Older messages strictly before `(beforeCreatedAt, beforeMessageId)` in `(created_at DESC, id DESC)` order.
@@ -137,36 +241,54 @@ final class DirectChatService {
         conversationId: UUID,
         beforeCreatedAt: Date,
         beforeMessageId: UUID,
-        limit: Int = 50
+        limit: Int = 50,
+        clearedAfter: Date? = nil
     ) async throws -> [DirectMessageRow] {
         #if DEBUG
         let t0 = CFAbsoluteTimeGetCurrent()
         #endif
+        let watermark = try await resolvedClearedAfter(conversationId: conversationId, clearedAfter: clearedAfter)
+        // Nothing older than the watermark can be visible.
+        if let watermark, beforeCreatedAt <= watermark {
+            return []
+        }
         let rows: [DirectMessageRow]
         do {
             rows = try await fetchOlderMessagesWithIsDeletedFilter(
                 conversationId: conversationId,
                 beforeCreatedAt: beforeCreatedAt,
                 beforeMessageId: beforeMessageId,
-                limit: limit
+                limit: limit,
+                clearedAfter: watermark
             )
         } catch {
-            if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                rows = try await fetchOlderMessagesWithIsDeletedFilter(
+                    conversationId: conversationId,
+                    beforeCreatedAt: beforeCreatedAt,
+                    beforeMessageId: beforeMessageId,
+                    limit: limit,
+                    clearedAfter: watermark,
+                    columns: Self.directMessageListColumnsWithoutReply
+                )
+            } else if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
                 rows = try await fetchOlderMessagesDeletedAtOnly(
                     conversationId: conversationId,
                     beforeCreatedAt: beforeCreatedAt,
                     beforeMessageId: beforeMessageId,
-                    limit: limit
+                    limit: limit,
+                    clearedAfter: watermark
                 )
             } else {
                 throw error
             }
         }
+        let filtered = Self.applyClearWatermark(rows, clearedAfter: watermark)
         #if DEBUG
         let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000
-        print("[DMPagination] older page: \(String(format: "%.1f", ms))ms rows=\(rows.count) limit=\(limit)")
+        print("[DMPagination] older page: \(String(format: "%.1f", ms))ms rows=\(filtered.count) limit=\(limit)")
         #endif
-        return rows
+        return filtered
     }
 
     /// Messages strictly after `(afterCreatedAt, afterMessageId)` in chronological order (oldest-first).
@@ -175,29 +297,66 @@ final class DirectChatService {
         conversationId: UUID,
         afterCreatedAt: Date,
         afterMessageId: UUID,
-        limit: Int = 50
+        limit: Int = 50,
+        clearedAfter: Date? = nil
     ) async throws -> [DirectMessageRow] {
+        let watermark = try await resolvedClearedAfter(conversationId: conversationId, clearedAfter: clearedAfter)
         let rows: [DirectMessageRow]
         do {
             rows = try await fetchNewerMessagesWithIsDeletedFilter(
                 conversationId: conversationId,
                 afterCreatedAt: afterCreatedAt,
                 afterMessageId: afterMessageId,
-                limit: limit
+                limit: limit,
+                clearedAfter: watermark
             )
         } catch {
-            if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                rows = try await fetchNewerMessagesWithIsDeletedFilter(
+                    conversationId: conversationId,
+                    afterCreatedAt: afterCreatedAt,
+                    afterMessageId: afterMessageId,
+                    limit: limit,
+                    clearedAfter: watermark,
+                    columns: Self.directMessageListColumnsWithoutReply
+                )
+            } else if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
                 rows = try await fetchNewerMessagesDeletedAtOnly(
                     conversationId: conversationId,
                     afterCreatedAt: afterCreatedAt,
                     afterMessageId: afterMessageId,
-                    limit: limit
+                    limit: limit,
+                    clearedAfter: watermark
                 )
             } else {
                 throw error
             }
         }
-        return rows
+        return Self.applyClearWatermark(rows, clearedAfter: watermark)
+    }
+
+    private func resolvedClearedAfter(conversationId: UUID, clearedAfter: Date?) async throws -> Date? {
+        if let clearedAfter { return clearedAfter }
+        return try await fetchHistoryClearedAt(conversationId: conversationId)
+    }
+
+    /// Belt-and-suspenders: never surface rows at/before the viewer watermark even if a query filter was dropped.
+    static func applyClearWatermark(_ rows: [DirectMessageRow], clearedAfter: Date?) -> [DirectMessageRow] {
+        guard let clearedAfter else { return rows }
+        return rows.filter { row in
+            guard let created = SupabaseTimestampParsing.parseTimestamptz(row.created_at ?? "") else {
+                return false
+            }
+            return created > clearedAfter
+        }
+    }
+
+    static func isVisibleAfterClear(createdAtRaw: String?, clearedAfter: Date?) -> Bool {
+        guard let clearedAfter else { return true }
+        guard let created = SupabaseTimestampParsing.parseTimestamptz(createdAtRaw ?? "") else {
+            return false
+        }
+        return created > clearedAfter
     }
 
     /// Fetches only the user-selected moderation review window for a private conversation report.
@@ -224,6 +383,7 @@ final class DirectChatService {
         conversationId: UUID,
         senderId: UUID,
         body: String,
+        replyToMessageId: UUID? = nil,
         diagnosticCorrelationId: UUID? = nil
     ) async throws -> DirectMessageRow {
 #if DEBUG
@@ -233,26 +393,102 @@ final class DirectChatService {
             )
         }
 #endif
-        let insert = DirectMessageInsert(
-            conversation_id: conversationId,
-            sender_id: senderId,
-            body: body
-        )
-        let row: DirectMessageRow = try await client
-            .from("direct_messages")
-            .insert(insert)
-            .select()
-            .single()
-            .execute()
-            .value
-#if DEBUG
-        if let c = diagnosticCorrelationId {
-            DMRealtimeDiagnostics.log(
-                "phase=db_insert_completed correlation=\(c.uuidString.lowercased()) messageId=\(row.id.uuidString.lowercased()) serverCreatedAt=\(row.created_at ?? "nil")"
-            )
+        // Preferred send path: rate-limited SECURITY DEFINER RPC
+        // (migration 20260915_0005a; reply arg from 20260917_0001). Phase B (0005b) later revokes direct INSERT.
+        // senderId is unused server-side; auth.uid() is authoritative.
+        // Legacy PostgREST INSERT remains a supported DB path for old clients once
+        // 20260919_0001 grants EXECUTE on chat_search_safe_message_preview(text)
+        // (required by expression index direct_messages_safe_preview_trgm_idx).
+        _ = senderId
+        struct SendParams: Encodable {
+            let p_conversation_id: UUID
+            let p_body: String
+            let p_reply_to_message_id: UUID?
+
+            enum CodingKeys: String, CodingKey {
+                case p_conversation_id
+                case p_body
+                case p_reply_to_message_id
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.container(keyedBy: CodingKeys.self)
+                try c.encode(p_conversation_id, forKey: .p_conversation_id)
+                try c.encode(p_body, forKey: .p_body)
+                try c.encodeIfPresent(p_reply_to_message_id, forKey: .p_reply_to_message_id)
+            }
         }
+        do {
+            let messageId: UUID = try await client
+                .rpc(
+                    "send_direct_message",
+                    params: SendParams(
+                        p_conversation_id: conversationId,
+                        p_body: body,
+                        p_reply_to_message_id: replyToMessageId
+                    )
+                )
+                .execute()
+                .value
+            let row = try await fetchMessageRow(id: messageId)
+#if DEBUG
+            if let c = diagnosticCorrelationId {
+                DMRealtimeDiagnostics.log(
+                    "phase=db_insert_completed correlation=\(c.uuidString.lowercased()) messageId=\(row.id.uuidString.lowercased()) serverCreatedAt=\(row.created_at ?? "nil")"
+                )
+            }
 #endif
-        return row
+            return row
+        } catch {
+#if DEBUG
+            Self.logDirectMessageSendFailure(error, conversationId: conversationId)
+#endif
+            throw error
+        }
+    }
+
+#if DEBUG
+    /// Concise send-failure logging (no message body / no full insert payload).
+    private static func logDirectMessageSendFailure(_ error: Error, conversationId: UUID) {
+        print("[DirectChatSend] failure conversationId=\(conversationId.uuidString.lowercased()) errorType=\(String(describing: type(of: error)))")
+        if let pe = error as? PostgrestError {
+            print("[DirectChatSend] PostgrestError.code=\(pe.code ?? "nil") message=\(pe.message) details=\(pe.detail ?? "nil") hint=\(pe.hint ?? "nil")")
+        } else {
+            print("[DirectChatSend] localizedDescription=\(error.localizedDescription)")
+        }
+    }
+#endif
+
+    private func fetchMessageRow(id: UUID) async throws -> DirectMessageRow {
+        do {
+            return try await client
+                .from("direct_messages")
+                .select(Self.directMessageListColumns)
+                .eq("id", value: id)
+                .single()
+                .execute()
+                .value
+        } catch {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                return try await client
+                    .from("direct_messages")
+                    .select(Self.directMessageListColumnsWithoutReply)
+                    .eq("id", value: id)
+                    .single()
+                    .execute()
+                    .value
+            }
+            if Self.shouldFallbackToLegacyDirectMessagesQuery(error) {
+                return try await client
+                    .from("direct_messages")
+                    .select(Self.directMessageListColumnsLegacyDeletedAtOnly)
+                    .eq("id", value: id)
+                    .single()
+                    .execute()
+                    .value
+            }
+            throw error
+        }
     }
 
     func currentUserId() async throws -> UUID {
@@ -384,13 +620,22 @@ final class DirectChatService {
         return "created_at.gt.\(iso),and(created_at.eq.\(iso),id.gt.\(uid))"
     }
 
-    private func fetchLatestMessagesWithIsDeletedFilter(conversationId: UUID, limit: Int) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+    private func fetchLatestMessagesWithIsDeletedFilter(
+        conversationId: UUID,
+        limit: Int,
+        clearedAfter: Date?,
+        columns: String = "id,conversation_id,sender_id,body,created_at,deleted_at,report_count,is_deleted,reply_to_message_id"
+    ) async throws -> [DirectMessageRow] {
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or("is_deleted.is.null,is_deleted.eq.false")
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: false)
             .order("id", ascending: false)
             .limit(limit)
@@ -399,12 +644,20 @@ final class DirectChatService {
         return rows.reversed()
     }
 
-    private func fetchLatestMessagesDeletedAtOnly(conversationId: UUID, limit: Int) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+    private func fetchLatestMessagesDeletedAtOnly(
+        conversationId: UUID,
+        limit: Int,
+        clearedAfter: Date?
+    ) async throws -> [DirectMessageRow] {
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(Self.directMessageListColumnsLegacyDeletedAtOnly)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: false)
             .order("id", ascending: false)
             .limit(limit)
@@ -417,15 +670,21 @@ final class DirectChatService {
         conversationId: UUID,
         beforeCreatedAt: Date,
         beforeMessageId: UUID,
-        limit: Int
+        limit: Int,
+        clearedAfter: Date?,
+        columns: String = "id,conversation_id,sender_id,body,created_at,deleted_at,report_count,is_deleted,reply_to_message_id"
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or("is_deleted.is.null,is_deleted.eq.false")
             .or(Self.keysetOlderThanOrFilter(createdAt: beforeCreatedAt, messageId: beforeMessageId))
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: false)
             .order("id", ascending: false)
             .limit(limit)
@@ -438,14 +697,19 @@ final class DirectChatService {
         conversationId: UUID,
         beforeCreatedAt: Date,
         beforeMessageId: UUID,
-        limit: Int
+        limit: Int,
+        clearedAfter: Date?
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(Self.directMessageListColumnsLegacyDeletedAtOnly)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or(Self.keysetOlderThanOrFilter(createdAt: beforeCreatedAt, messageId: beforeMessageId))
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: false)
             .order("id", ascending: false)
             .limit(limit)
@@ -458,15 +722,21 @@ final class DirectChatService {
         conversationId: UUID,
         afterCreatedAt: Date,
         afterMessageId: UUID,
-        limit: Int
+        limit: Int,
+        clearedAfter: Date?,
+        columns: String = "id,conversation_id,sender_id,body,created_at,deleted_at,report_count,is_deleted,reply_to_message_id"
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or("is_deleted.is.null,is_deleted.eq.false")
             .or(Self.keysetNewerThanOrFilter(createdAt: afterCreatedAt, messageId: afterMessageId))
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: true)
             .order("id", ascending: true)
             .limit(limit)
@@ -479,14 +749,19 @@ final class DirectChatService {
         conversationId: UUID,
         afterCreatedAt: Date,
         afterMessageId: UUID,
-        limit: Int
+        limit: Int,
+        clearedAfter: Date?
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(Self.directMessageListColumnsLegacyDeletedAtOnly)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
             .or(Self.keysetNewerThanOrFilter(createdAt: afterCreatedAt, messageId: afterMessageId))
+        if let clearedAfter {
+            query = query.gt("created_at", value: Self.isoTimestamp(clearedAfter))
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: true)
             .order("id", ascending: true)
             .limit(limit)
@@ -500,14 +775,46 @@ final class DirectChatService {
         from start: Date,
         to end: Date
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
+        do {
+            return try await fetchMessagesForReportSnapshot(
+                conversationId: conversationId,
+                from: start,
+                to: end,
+                columns: Self.directMessageListColumns,
+                filterIsDeleted: true
+            )
+        } catch {
+            if Self.shouldFallbackWithoutReplyColumn(error) {
+                return try await fetchMessagesForReportSnapshot(
+                    conversationId: conversationId,
+                    from: start,
+                    to: end,
+                    columns: Self.directMessageListColumnsWithoutReply,
+                    filterIsDeleted: true
+                )
+            }
+            throw error
+        }
+    }
+
+    private func fetchMessagesForReportSnapshot(
+        conversationId: UUID,
+        from start: Date,
+        to end: Date,
+        columns: String,
+        filterIsDeleted: Bool
+    ) async throws -> [DirectMessageRow] {
+        var query = client
             .from("direct_messages")
-            .select(Self.directMessageListColumns)
+            .select(columns)
             .eq("conversation_id", value: conversationId)
             .is("deleted_at", value: nil)
-            .or("is_deleted.is.null,is_deleted.eq.false")
             .gte("created_at", value: Self.isoTimestamp(start))
             .lte("created_at", value: Self.isoTimestamp(end))
+        if filterIsDeleted {
+            query = query.or("is_deleted.is.null,is_deleted.eq.false")
+        }
+        let rows: [DirectMessageRow] = try await query
             .order("created_at", ascending: true)
             .order("id", ascending: true)
             .execute()
@@ -520,18 +827,13 @@ final class DirectChatService {
         from start: Date,
         to end: Date
     ) async throws -> [DirectMessageRow] {
-        let rows: [DirectMessageRow] = try await client
-            .from("direct_messages")
-            .select(Self.directMessageListColumns)
-            .eq("conversation_id", value: conversationId)
-            .is("deleted_at", value: nil)
-            .gte("created_at", value: Self.isoTimestamp(start))
-            .lte("created_at", value: Self.isoTimestamp(end))
-            .order("created_at", ascending: true)
-            .order("id", ascending: true)
-            .execute()
-            .value
-        return rows
+        try await fetchMessagesForReportSnapshot(
+            conversationId: conversationId,
+            from: start,
+            to: end,
+            columns: Self.directMessageListColumnsLegacyDeletedAtOnly,
+            filterIsDeleted: false
+        )
     }
 
     /// Postgres / PostgREST errors when `is_deleted` has not been migrated yet.
@@ -543,6 +845,14 @@ final class DirectChatService {
             if text.contains("42703") { return true } // undefined_column
         }
         return false
+    }
+
+    private static func shouldFallbackWithoutReplyColumn(_ error: Error) -> Bool {
+        let text = error.localizedDescription.lowercased()
+        guard text.contains("reply_to_message_id") else { return false }
+        return text.contains("does not exist")
+            || text.contains("undefined column")
+            || text.contains("42703")
     }
 
     private static func countUnreadPeerMessagesWithFallback(

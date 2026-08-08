@@ -1016,6 +1016,38 @@ private enum LiveSportsServiceError: LocalizedError {
 private nonisolated enum LiveRowDecodeDebug {
     static let enabled = false
 }
+
+/// Caps repeated SCHEDULED→LIVE baseball upgrades to once per match id + new status.
+/// Explicitly nonisolated: module default is MainActor, but decode runs off the main actor.
+private nonisolated enum LiveStatusAuditLog {
+    private static let lock = NSLock()
+    /// Lock-guarded dedupe set; `nonisolated(unsafe)` is required for mutable static storage
+    /// outside an actor — access only while `lock` is held.
+    nonisolated(unsafe) private static var loggedKeys: Set<String> = []
+
+    nonisolated static func logTransition(
+        id: String,
+        externalId: String?,
+        rawStatus: String?,
+        rawProgress: String?,
+        previous: MatchStatus,
+        new: MatchStatus
+    ) {
+        let key = "\(id)|\(previous.rawValue)|\(new.rawValue)"
+        lock.lock()
+        let shouldLog = loggedKeys.insert(key).inserted
+        lock.unlock()
+        guard shouldLog else { return }
+        let sectionBefore = previous.isHappeningNow ? "liveNow" : "todayUpcoming"
+        let sectionAfter = new.isHappeningNow ? "liveNow" : (new == .fullTime ? "todayUpcoming" : "todayUpcoming")
+        print(
+            "[LiveStatusAudit] transition id=\(id) externalId=\(externalId ?? "nil") " +
+            "rawStatus=\(rawStatus ?? "nil") rawProgress=\(rawProgress ?? "nil") " +
+            "previous=\(previous.rawValue) new=\(new.rawValue) " +
+            "sectionBefore=\(sectionBefore) sectionAfter=\(sectionAfter)"
+        )
+    }
+}
 #endif
 
 private nonisolated struct LiveMatchRow: Decodable {
@@ -1110,8 +1142,27 @@ private nonisolated struct LiveMatchRow: Decodable {
         let decodedCity = venueCity
         let payloadLeague = Self.firstString(in: payload, keys: ["strLeague", "league"])
         let payloadSport = Self.firstString(in: payload, keys: ["strSport", "sport"])
-        let normalizedStatus = MatchStatus.normalized(from: match_status)
+        let payloadStatusHint = Self.firstString(in: payload, keys: ["strStatus", "status"])
+        let payloadProgressHint = Self.firstString(
+            in: payload,
+            keys: [
+                "strProgress",
+                "strClock",
+                "clock",
+                "gameClock",
+                "periodClock",
+                "displayClock",
+                "strCurrentPeriod",
+                "currentPeriod",
+                "period"
+            ]
+        )
+        let normalizedStatus = MatchStatus.normalized(
+            from: match_status,
+            progressHint: payloadProgressHint ?? payloadStatusHint
+        )
 #if DEBUG
+        let dbNormalized = MatchStatus.normalized(from: match_status)
         if LiveRowDecodeDebug.enabled {
             print("[LiveSportNormalization] id=\(id) raw=\(rawSport ?? "nil") normalized=\(normalizedSport)")
             print("[LiveSportDetected] id=\(id) sportType=\(visualType.rawValue) label=\(normalizedSport)")
@@ -1128,21 +1179,32 @@ private nonisolated struct LiveMatchRow: Decodable {
             print("[LiveVenueDebug] longitude=\(venueLongitude.map(String.init(describing:)) ?? "nil")")
             print("[LiveVenueDebug] rawVenuePayload=\(rawVenuePayloadDebugDescription)")
         }
+        if dbNormalized != normalizedStatus {
+            LiveStatusAuditLog.logTransition(
+                id: id,
+                externalId: Self.clean(external_id),
+                rawStatus: match_status,
+                rawProgress: payloadProgressHint ?? payloadStatusHint,
+                previous: dbNormalized,
+                new: normalizedStatus
+            )
+        } else if normalizedStatus == .scheduled {
+            let scoreHomeValue = score_home ?? 0
+            let scoreAwayValue = score_away ?? 0
+            let hasNonzeroScore = scoreHomeValue > 0 || scoreAwayValue > 0
+            let startIsPast = start.timeIntervalSinceNow < 0
+            if hasNonzeroScore || startIsPast {
+                print(
+                    "[LiveStatusAudit] id=\(id) externalId=\(Self.clean(external_id) ?? "nil") " +
+                    "source=\(Self.clean(source) ?? "nil") teams=\(awayTeam)@\(homeTeam) " +
+                    "dbStatus=\(match_status ?? "nil") normalized=\(normalizedStatus.rawValue) " +
+                    "payloadStrStatus=\(payloadStatusHint ?? "nil") payloadProgress=\(payloadProgressHint ?? "nil") " +
+                    "score=\(scoreAwayValue)-\(scoreHomeValue) startIsPast=\(startIsPast)"
+                )
+            }
+        }
 #endif
-        let providerClockText = Self.firstString(
-            in: payload,
-            keys: [
-                "strProgress",
-                "strClock",
-                "clock",
-                "gameClock",
-                "periodClock",
-                "displayClock",
-                "strCurrentPeriod",
-                "currentPeriod",
-                "period"
-            ]
-        )
+        let providerClockText = payloadProgressHint
 
         return LiveMatch(
             id: id,

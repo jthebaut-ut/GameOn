@@ -764,6 +764,15 @@ extension MapViewModel {
             }
             self.activeDiscoverSnapshotTask = nil
 
+            // Avoid MainActor-heavy snapshot publish while Discover is offscreen.
+            if !self.isDiscoverTabSelectedForEnrichment {
+                self.discoverMapRenderSnapshotNeedsPublishWhenVisible = true
+                #if DEBUG
+                print("[DiscoverMapSnapshotDebug] publishDeferred reason=discoverOffscreen trigger=\(reason)")
+                #endif
+                return
+            }
+
             let key = DiscoverMapRenderSnapshotKey(
                 selectedDay: selectedDayString,
                 selectedSport: capturedSelectedSport,

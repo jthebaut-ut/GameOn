@@ -170,7 +170,9 @@ extension MapViewModel {
         date: Date,
         location: String,
         fanGeoIdentifier: String? = nil,
-        forceBypassSyncSetting: Bool = false
+        forceBypassSyncSetting: Bool = false,
+        structuredLocation: EKStructuredLocation? = nil,
+        locationComponents: PickupGameAppleCalendarLocation? = nil
     ) async -> FanGeoAppleCalendarMutationResult {
         var result = FanGeoAppleCalendarMutationResult()
         let isProGame = calendarSyncEventKind(fanGeoIdentifier: fanGeoIdentifier) == .pro
@@ -258,7 +260,6 @@ extension MapViewModel {
             existingEvent.title = displayTitle
             existingEvent.startDate = date
             existingEvent.endDate = date.addingTimeInterval(2 * 60 * 60)
-            existingEvent.location = calendarSyncCleanLocation(location)
             existingEvent.notes = calendarSyncNotes(
                 title: title,
                 date: date,
@@ -266,8 +267,23 @@ extension MapViewModel {
                 fanGeoIdentifier: fanGeoIdentifier
             )
             existingEvent.calendar = calendar
+            // Clear disallowed metadata first, then assign final location (never wipe after).
             calendarSyncCleanRestrictedFields(existingEvent)
+            calendarSyncApplyEventLocation(
+                to: existingEvent,
+                location: location,
+                structuredLocation: structuredLocation
+            )
             calendarSyncApplyAlarmPreference(to: existingEvent, fanGeoIdentifier: fanGeoIdentifier)
+#if DEBUG
+            calendarSyncDebugLogLocationBeforeSave(
+                phase: "update",
+                raw: location,
+                structured: structuredLocation,
+                event: existingEvent,
+                components: locationComponents
+            )
+#endif
             do {
                 try eventStore.save(existingEvent, span: .thisEvent)
                 calendarSyncStoreEventIdentifier(existingEvent.eventIdentifier, fanGeoIdentifier: fanGeoIdentifier)
@@ -307,16 +323,30 @@ extension MapViewModel {
         event.title = displayTitle
         event.startDate = date
         event.endDate = date.addingTimeInterval(2 * 60 * 60)
-        event.location = calendarSyncCleanLocation(location)
         event.notes = calendarSyncNotes(
             title: title,
             date: date,
             location: location,
             fanGeoIdentifier: fanGeoIdentifier
         )
+        // Clear disallowed metadata first, then assign final location (never wipe after).
         calendarSyncCleanRestrictedFields(event)
+        calendarSyncApplyEventLocation(
+            to: event,
+            location: location,
+            structuredLocation: structuredLocation
+        )
         calendarSyncApplyAlarmPreference(to: event, fanGeoIdentifier: fanGeoIdentifier)
         event.calendar = calendar
+#if DEBUG
+        calendarSyncDebugLogLocationBeforeSave(
+            phase: "create",
+            raw: location,
+            structured: structuredLocation,
+            event: event,
+            components: locationComponents
+        )
+#endif
 
         do {
             try eventStore.save(event, span: .thisEvent)
@@ -630,6 +660,15 @@ extension MapViewModel {
         print("[CalendarSyncDebug] settingsSyncButtonTapped=true")
         print("[CalendarSyncDebug] eventStoreAuthStatus=\(calendarSyncAuthorizationStatusDescription())")
         print("[CalendarSyncDebug] proGameCount=\(savedProGames.count)")
+        if appleCalendarSettingsManualSyncInFlight {
+#if DEBUG
+            print("[CalendarSyncDebug] settingsManualSync ignored reason=alreadyInFlight")
+#endif
+            return "Calendar sync already running"
+        }
+        appleCalendarSettingsManualSyncInFlight = true
+        defer { appleCalendarSettingsManualSyncInFlight = false }
+
         guard notificationSettingsStore.syncGoingGamesToAppleCalendar else {
             let message = "Calendar sync is off"
             calendarSyncMessage = message
@@ -643,12 +682,16 @@ extension MapViewModel {
             return message
         }
 
+        // Let the Settings button paint its in-progress state before EventKit work.
+        await Task.yield()
+
         if notificationSettingsStore.syncVenueGamesToAppleCalendar
             || notificationSettingsStore.syncPickupGamesToAppleCalendar {
             await syncFanGeoAttendingEventsToAppleCalendar(
                 reason: "settingsManualSync",
                 forceBypassFreshness: true
             )
+            await Task.yield()
         }
         var proSummary = FanGeoAppleCalendarSyncSummary()
         if notificationSettingsStore.syncSavedProGamesToAppleCalendar {
@@ -663,6 +706,11 @@ extension MapViewModel {
             : "Calendar synced"
         calendarSyncMessage = message
         print("[CalendarSyncDebug] syncResult=\(message)")
+#if DEBUG
+        if let err = proSummary.firstError {
+            print("[CalendarSyncDebug] settingsManualSyncError=\(err)")
+        }
+#endif
         return message
     }
 
@@ -671,8 +719,16 @@ extension MapViewModel {
             return "Calendar permission needed"
         }
 
+        // Let the Settings removal overlay paint before EventKit work blocks the main actor.
+        await Task.yield()
+#if DEBUG
+        AppleCalendarRemovalUIDebug.log("eventKitDeletionStarted")
+#endif
+
         var removedCount = 0
+        var failedCount = 0
         var seenEventIdentifiers = Set<String>()
+        var operationsSinceYield = 0
 
         for fanGeoIdentifier in calendarSyncStoredEventIdentifiers().keys {
             guard let event = calendarSyncEventForRemoval(fanGeoIdentifier: fanGeoIdentifier),
@@ -686,7 +742,13 @@ extension MapViewModel {
                 calendarSyncRemoveStoredEventIdentifier(fanGeoIdentifier: fanGeoIdentifier)
                 removedCount += 1
             } catch {
+                failedCount += 1
                 print("[CalendarSyncDebug] bulkRemoveFailed identifier=\(fanGeoIdentifier) error=\(error.localizedDescription)")
+            }
+            operationsSinceYield += 1
+            if operationsSinceYield >= 6 {
+                operationsSinceYield = 0
+                await Task.yield()
             }
         }
 
@@ -705,12 +767,25 @@ extension MapViewModel {
                 try eventStore.remove(event, span: .thisEvent)
                 removedCount += 1
             } catch {
+                failedCount += 1
                 print("[CalendarSyncDebug] bulkRemoveScanFailed error=\(error.localizedDescription)")
+            }
+            operationsSinceYield += 1
+            if operationsSinceYield >= 6 {
+                operationsSinceYield = 0
+                await Task.yield()
             }
         }
 
         UserDefaults.standard.removeObject(forKey: FanGeoCalendarEventStore.eventIdentifierMapKey)
-        let message = removedCount > 0 ? "Removed FanGeo calendar events" : "No FanGeo calendar events found"
+        let message: String
+        if failedCount > 0 {
+            message = "Some events could not be removed"
+        } else if removedCount > 0 {
+            message = "Removed FanGeo calendar events"
+        } else {
+            message = "No FanGeo calendar events found"
+        }
         calendarSyncMessage = message
         print("[CalendarSyncDebug] bulkRemoveFinished count=\(removedCount)")
         return message
@@ -1169,14 +1244,30 @@ extension MapViewModel {
         guard let start = PickupGameModels.parseSupabaseTimestamptz(game.game_start_at) else { return }
         let key = "pickup|\(game.id.uuidString.lowercased())"
         guard seen.insert(key).inserted else { return }
+        let built = PickupGameAppleCalendarLocation.build(from: game)
+        let locationText = built.displayAddress.isEmpty
+            ? pickupGameCalendarAddressLine(game)
+            : built.displayAddress
+        let structured = built.makeStructuredLocation()
         await addGameToCalendar(
             title: game.title,
             date: start,
-            location: pickupGameCalendarAddressLine(game),
-            fanGeoIdentifier: key
+            location: locationText,
+            fanGeoIdentifier: key,
+            structuredLocation: structured,
+            locationComponents: built
         )
 #if DEBUG
         print("[CalendarSyncDebug] pickupSynced source=\(source) id=\(game.id.uuidString.lowercased())")
+        print("[CalendarSyncDebug] pickupPlace=\(built.placeName ?? "nil")")
+        print("[CalendarSyncDebug] pickupStreet=\(built.street ?? "nil")")
+        print("[CalendarSyncDebug] pickupCity=\(built.city ?? "nil")")
+        print("[CalendarSyncDebug] pickupRegion=\(built.region ?? "nil")")
+        print("[CalendarSyncDebug] pickupPostal=\(built.postalCode ?? "nil")")
+        print("[CalendarSyncDebug] pickupCountry=\(built.country ?? "nil")")
+        print("[CalendarSyncDebug] pickupCoordsPresent=\(built.hasUsableCoordinates)")
+        print("[CalendarSyncDebug] pickupLocationTitle=\(built.structuredTitle.replacingOccurrences(of: "\n", with: "\\n"))")
+        print("[CalendarSyncDebug] pickupStructuredGeoAssigned=\(structured?.geoLocation != nil)")
 #endif
     }
 
@@ -1254,8 +1345,10 @@ extension MapViewModel {
         }
         if let title = event.title?.trimmingCharacters(in: .whitespacesAndNewlines),
            !title.isEmpty {
-            if calendarSyncTitle(title, hasCaseInsensitivePrefix: "FanGeo:") { return true }
-            if calendarSyncTitle(title, hasCaseInsensitivePrefix: "FanGeo Pickup:") { return true }
+            var stripped = title
+            calendarSyncStripLeadingDecorativePrefix(from: &stripped)
+            if calendarSyncTitle(stripped, hasCaseInsensitivePrefix: "FanGeo:") { return true }
+            if calendarSyncTitle(stripped, hasCaseInsensitivePrefix: "FanGeo Pickup:") { return true }
             if title.localizedCaseInsensitiveContains("FanGeo •") { return true }
         }
         return calendarSyncFanGeoIdentifier(from: event) != nil
@@ -1322,16 +1415,17 @@ extension MapViewModel {
             baseTitle,
             source: "AppleCalendar"
         )
-        guard !calendarSyncTitle(flaggedTitle, hasCaseInsensitivePrefix: "FanGeo:"),
-              !calendarSyncTitle(flaggedTitle, hasCaseInsensitivePrefix: "FanGeo Pickup:")
-        else {
-            return flaggedTitle
-        }
 
         switch calendarSyncEventKind(fanGeoIdentifier: fanGeoIdentifier) {
         case .pickup:
-            return "FanGeo Pickup: \(flaggedTitle)"
+            return calendarSyncPickupDisplayTitle(
+                flaggedTitle,
+                fanGeoIdentifier: fanGeoIdentifier
+            )
         case .venue:
+            guard !calendarSyncTitle(flaggedTitle, hasCaseInsensitivePrefix: "FanGeo:") else {
+                return flaggedTitle
+            }
             let venueName = calendarSyncCleanLocation(location) ?? ""
             if venueName.isEmpty || venueName.localizedCaseInsensitiveCompare("Venue") == .orderedSame {
                 return "FanGeo: \(flaggedTitle)"
@@ -1340,8 +1434,55 @@ extension MapViewModel {
         case .pro:
             return calendarSyncProGameDisplayTitle(title: flaggedTitle, competition: location)
         case .general:
+            guard !calendarSyncTitle(flaggedTitle, hasCaseInsensitivePrefix: "FanGeo:") else {
+                return flaggedTitle
+            }
             return "FanGeo: \(flaggedTitle)"
         }
+    }
+
+    /// `{sportEmoji} FanGeo Pickup: {title}` using ``emojiForSport`` / ``SportFilterCatalog``.
+    private func calendarSyncPickupDisplayTitle(
+        _ rawTitle: String,
+        fanGeoIdentifier: String?
+    ) -> String {
+        // Normalize so resync rebuilds a single emoji + FanGeo Pickup prefix (no duplicates).
+        // Pickup titles often contain " at " (venue), which skips decorative stripping in the
+        // shared FanGeo-prefix helper — strip leading icons explicitly here.
+        var body = calendarSyncTitleRemovingFanGeoPrefix(rawTitle)
+        calendarSyncStripLeadingDecorativePrefix(from: &body)
+        if body.isEmpty { body = "Game" }
+
+        let core = "FanGeo Pickup: \(body)"
+        let icon = calendarSyncPickupSportEmoji(
+            fanGeoIdentifier: fanGeoIdentifier,
+            titleHint: body
+        )
+        guard !icon.isEmpty else { return core }
+        return "\(icon) \(core)"
+    }
+
+    /// Prefer the pickup game’s sport token; fall back to title text, then catalog generic.
+    private func calendarSyncPickupSportEmoji(
+        fanGeoIdentifier: String?,
+        titleHint: String
+    ) -> String {
+        if let gameId = calendarSyncPickupGameId(from: fanGeoIdentifier),
+           let game = resolvedPickupGameRow(for: gameId) {
+            let fromGame = emojiForSport(game.sport)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !fromGame.isEmpty { return fromGame }
+        }
+
+        let fromTitle = emojiForSport(titleHint)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fromTitle.isEmpty { return fromTitle }
+
+        // Known sports with empty chip emoji are rare for pickup; keep title without inventing.
+        if !SportFilterCatalog.isFallbackSport(titleHint) {
+            return ""
+        }
+        return SportFilterCatalog.fallbackEmoji
     }
 
     private func calendarSyncNotes(
@@ -1373,12 +1514,11 @@ extension MapViewModel {
                 lines.append("Venue: \(cleanLocation)")
             }
         case .pickup:
-            if !cleanTitle.isEmpty {
-                lines.append("Pickup Game: \(cleanTitle)")
-            }
-            if !cleanLocation.isEmpty {
-                lines.append("Location: \(cleanLocation)")
-            }
+            lines.append(contentsOf: calendarSyncPickupNotesLines(
+                title: cleanTitle,
+                location: cleanLocation,
+                fanGeoIdentifier: fanGeoIdentifier
+            ))
         case .general:
             if !cleanTitle.isEmpty {
                 lines.append("Event: \(cleanTitle)")
@@ -1389,11 +1529,69 @@ extension MapViewModel {
         }
 
         lines.append("Start: \(calendarSyncNotesDateFormatter.string(from: date))")
-        if let fanGeoIdentifier = fanGeoIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !fanGeoIdentifier.isEmpty {
-            lines.append(calendarSyncIdentifierLine(fanGeoIdentifier: fanGeoIdentifier))
-        }
+        // Internal ids stay in UserDefaults ↔ EKEvent.eventIdentifier — never in Notes.
         return lines.joined(separator: "\n")
+    }
+
+    /// Clean pickup Notes: sport + short venue only. Full address lives on `EKEvent` Location / structuredLocation.
+    private func calendarSyncPickupNotesLines(
+        title: String,
+        location: String,
+        fanGeoIdentifier: String?
+    ) -> [String] {
+        var lines: [String] = []
+        if let gameId = calendarSyncPickupGameId(from: fanGeoIdentifier),
+           let game = resolvedPickupGameRow(for: gameId) {
+            let sport = AppSportCatalog.displayLabel(forSportToken: game.sport)
+            let built = PickupGameAppleCalendarLocation.build(from: game)
+            let venue = built.notesVenueLabel
+            if !venue.isEmpty {
+                lines.append("Pickup Game: \(sport) at \(venue)")
+                lines.append("Location: \(venue)")
+            } else {
+                lines.append("Pickup Game: \(sport)")
+            }
+            return lines
+        }
+
+        let venue = calendarSyncPickupVenueLabelFromLocationString(location)
+        let headline = title.isEmpty ? "Pickup" : title
+        if !venue.isEmpty {
+            lines.append("Pickup Game: \(headline) at \(venue)")
+            lines.append("Location: \(venue)")
+        } else if !headline.isEmpty {
+            lines.append("Pickup Game: \(headline)")
+        }
+        return lines
+    }
+
+    private func calendarSyncPickupGameId(from fanGeoIdentifier: String?) -> UUID? {
+        guard let raw = fanGeoIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              raw.hasPrefix("pickup|") else { return nil }
+        let idPart = String(raw.dropFirst("pickup|".count))
+        return UUID(uuidString: idPart)
+    }
+
+    private func calendarSyncPickupVenueLabelFromLocationString(_ location: String) -> String {
+        let trimmed = location.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if let firstLine = trimmed.split(whereSeparator: \.isNewline).first {
+            let line = String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.contains("·") {
+                let parts = line
+                    .split(separator: "·", maxSplits: 1, omittingEmptySubsequences: true)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                if parts.count >= 2 { return parts[1] }
+                if let only = parts.first { return only }
+            }
+            if let beforeComma = line.split(separator: ",", maxSplits: 1).first {
+                let segment = String(beforeComma).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !segment.isEmpty { return segment }
+            }
+            return line
+        }
+        return trimmed
     }
 
     private func calendarSyncProGameNotes(title: String, date: Date, competition: String) -> String {
@@ -1411,14 +1609,62 @@ extension MapViewModel {
         return lines.joined(separator: "\n")
     }
 
+    /// Legacy Notes marker used only to *find* older events; never written into new Notes.
     private func calendarSyncIdentifierLine(fanGeoIdentifier: String) -> String {
         "FanGeo ID: \(fanGeoIdentifier)"
     }
 
+    /// Only clears disallowed metadata. Never touches location / structuredLocation —
+    /// callers assign the final EventKit location *after* this runs.
     private func calendarSyncCleanRestrictedFields(_ event: EKEvent) {
         event.url = nil
-        event.structuredLocation = nil
     }
+
+    private func calendarSyncApplyEventLocation(
+        to event: EKEvent,
+        location: String,
+        structuredLocation: EKStructuredLocation?
+    ) {
+        if let structuredLocation {
+            event.structuredLocation = structuredLocation
+            return
+        }
+        event.location = calendarSyncCleanLocation(location)
+    }
+
+#if DEBUG
+    private func calendarSyncDebugLogLocationBeforeSave(
+        phase: String,
+        raw: String,
+        structured: EKStructuredLocation?,
+        event: EKEvent,
+        components: PickupGameAppleCalendarLocation?
+    ) {
+        let rawPreview = raw.replacingOccurrences(of: "\n", with: "\\n")
+        let title = structured?.title ?? event.location ?? "nil"
+        let hasGeo = structured?.geoLocation != nil
+        let lat = structured?.geoLocation?.coordinate.latitude
+        let lon = structured?.geoLocation?.coordinate.longitude
+        print("[CalendarSyncDebug] locationPhase=\(phase)")
+        if let components {
+            print("[CalendarSyncDebug] placeName=\(components.placeName ?? "nil")")
+            print("[CalendarSyncDebug] street=\(components.street ?? "nil")")
+            print("[CalendarSyncDebug] city=\(components.city ?? "nil")")
+            print("[CalendarSyncDebug] region=\(components.region ?? "nil")")
+            print("[CalendarSyncDebug] postalCode=\(components.postalCode ?? "nil")")
+            print("[CalendarSyncDebug] country=\(components.country ?? "nil")")
+            print("[CalendarSyncDebug] coordinatesPresent=\(components.hasUsableCoordinates)")
+        }
+        print("[CalendarSyncDebug] locationRaw=\(rawPreview)")
+        print("[CalendarSyncDebug] locationTitle=\(title.replacingOccurrences(of: "\n", with: "\\n"))")
+        print("[CalendarSyncDebug] locationEvent=\((event.location ?? "nil").replacingOccurrences(of: "\n", with: "\\n"))")
+        print("[CalendarSyncDebug] structuredAssigned=\(structured != nil)")
+        print("[CalendarSyncDebug] structuredGeoAssigned=\(hasGeo)")
+        if let lat, let lon {
+            print("[CalendarSyncDebug] coordinates=\(lat),\(lon)")
+        }
+    }
+#endif
 
     private func calendarSyncProGameDisplayTitle(title: String, competition: String) -> String {
         let cleanTitle = calendarSyncTitleRemovingFanGeoPrefix(title)

@@ -220,12 +220,11 @@ final class BootstrapLoadingCoordinator: ObservableObject {
 
     /// Critical launch path only — must stay fast enough for splash dismiss.
     ///
-    /// Blocking work (A): cached Discover restore + auth session bootstrap.
-    /// When no usable Discover cache exists, also wait for initial region prepare + fresh Discover
-    /// so the first interactive screen is not empty/broken.
+    /// Blocking work (A): decode Discover disk snapshot (no geo paint yet) + auth session bootstrap
+    /// + age eligibility.
     ///
-    /// Non-blocking (B): GPS refine (when cache/default already usable), fresh Discover refresh
-    /// (when cache usable), unread DM badge — all still start promptly and complete via existing paths.
+    /// Non-blocking (B): GPS/region prepare, geo-gated cache apply, Discover venue refresh,
+    /// unread DM badge — never required before MainTab is interactive.
     private static func performCriticalBootstrap(
         viewModel: MapViewModel,
         chatViewModel: ChatViewModel,
@@ -241,7 +240,7 @@ final class BootstrapLoadingCoordinator: ObservableObject {
             onStage?(.preparing)
         }
 
-        // Start location early so it overlaps cache decode + auth; only await when needed.
+        // Start location early so it overlaps cache decode + auth; never await on critical path.
         let locationTask = Task { @MainActor in
             StartupPerf.phase("locationRequestStart")
             let regionStart = Date()
@@ -255,27 +254,19 @@ final class BootstrapLoadingCoordinator: ObservableObject {
         StartupPerf.phase("cachedDiscoverRestoreStart")
         await viewModel.renderCachedDiscoverCore()
         let cacheMs = Int(Date().timeIntervalSince(cacheStart) * 1000)
-        let hasUsableCachedDiscover = await MainActor.run {
-            viewModel.discoverSnapshotRestoredThisLaunch && !viewModel.bars.isEmpty
-        }
+        // Geographic pins are applied only after region prepare (post-critical).
         StartupPerf.phase(
             "cachedDiscoverRendered",
             ms: cacheMs,
-            details: "usable=\(hasUsableCachedDiscover)"
+            details: "usable=false pendingGeoValidation=true"
         )
-        if hasUsableCachedDiscover {
-            StartupPerf.phase("cachedDiscoverUsable", ms: cacheMs)
-        }
+        StartupPerf.phase(
+            "locationDeferredOffCriticalPath",
+            details: "venueFetchDeferred=true"
+        )
 
         await MainActor.run {
             onStage?(.findingNearbyVenues)
-        }
-
-        if hasUsableCachedDiscover {
-            StartupPerf.phase(
-                "locationDeferredOffCriticalPath",
-                details: "usableCachedDiscover=true"
-            )
         }
 
         if shouldShowLoadingFavoritesSplashStage {
@@ -301,33 +292,14 @@ final class BootstrapLoadingCoordinator: ObservableObject {
             LaunchBootstrapState.markLaunchDiscoverCoreRefreshStarted()
         }
 
-        if hasUsableCachedDiscover {
-            // Cache already paints Discover — refine location then refresh; do not block splash.
-            schedulePostCriticalDiscoverPipeline(
-                viewModel: viewModel,
-                locationTask: locationTask,
-                shouldRefreshDiscoverCore: shouldRefreshDiscoverCore,
-                generation: generation,
-                onStage: onStage
-            )
-        } else {
-            // No safe Discover surface yet — finish region prepare, then network core, before splash dismiss.
-            await locationTask.value
-            if shouldRefreshDiscoverCore {
-                await MainActor.run {
-                    onStage?(.checkingLiveGames)
-                }
-                let discoverStart = Date()
-                StartupPerf.phase("freshDiscoverRefreshStart", details: "blocksSplash=true reason=noUsableCache")
-                await viewModel.refreshDiscoverCoreInBackground()
-                let discoverMs = Int(Date().timeIntervalSince(discoverStart) * 1000)
-                StartupPerf.phase("freshDiscoverRefreshEnd", ms: discoverMs)
-                StartupPerf.phase("discoverCoreRefreshed", ms: discoverMs)
-            } else {
-                print("[LaunchPerf] duplicateSkipped reason=launchDiscoverCoreRefresh")
-                StartupPerf.duplicateSkipped(reason: "launchDiscoverCoreRefresh")
-            }
-        }
+        // Always refine location + Discover off the splash critical path.
+        schedulePostCriticalDiscoverPipeline(
+            viewModel: viewModel,
+            locationTask: locationTask,
+            shouldRefreshDiscoverCore: shouldRefreshDiscoverCore,
+            generation: generation,
+            onStage: onStage
+        )
 
         await MainActor.run {
             onStage?(.gettingFanGeoReady)
@@ -347,7 +319,7 @@ final class BootstrapLoadingCoordinator: ObservableObject {
         StartupPerf.phase(
             "criticalEnd",
             ms: criticalMs,
-            details: "usableCachedDiscover=\(hasUsableCachedDiscover)"
+            details: "usableCachedDiscover=deferredGeoValidation"
         )
         StartupTaskTracker.exit("criticalBootstrap")
     }
@@ -411,7 +383,8 @@ final class BootstrapLoadingCoordinator: ObservableObject {
 #endif
     }
 
-    /// Location refine (if still running) → fresh Discover network refresh. Does not block splash when cache is usable.
+    /// Location refine → geo-gated cache apply → Discover network refresh (skipped when viewport too broad).
+    /// Does not block splash.
     private static func schedulePostCriticalDiscoverPipeline(
         viewModel: MapViewModel,
         locationTask: Task<Void, Never>,
@@ -433,6 +406,11 @@ final class BootstrapLoadingCoordinator: ObservableObject {
                 return
             }
 
+            let appliedCache = viewModel.applyPendingDiscoverCoreSnapshotIfGeographicallyRelevant()
+#if DEBUG
+            print("[StartupDiscover] postCriticalCacheApplied=\(appliedCache) basis=\(viewModel.discoverStartupCameraBasis.rawValue)")
+#endif
+
             guard shouldRefreshDiscoverCore else {
                 print("[LaunchPerf] duplicateSkipped reason=launchDiscoverCoreRefresh")
                 StartupPerf.duplicateSkipped(reason: "launchDiscoverCoreRefresh")
@@ -441,7 +419,11 @@ final class BootstrapLoadingCoordinator: ObservableObject {
 
             onStage?(.checkingLiveGames)
             let discoverStart = Date()
-            StartupPerf.phase("freshDiscoverRefreshStart", details: "blocksSplash=false")
+            let fetchAllowed = viewModel.discoverGeographicNetworkFetchAllowed()
+            StartupPerf.phase(
+                "freshDiscoverRefreshStart",
+                details: "blocksSplash=false fetchAllowed=\(fetchAllowed) basis=\(viewModel.discoverStartupCameraBasis.rawValue)"
+            )
             await viewModel.refreshDiscoverCoreInBackground()
             let discoverMs = Int(Date().timeIntervalSince(discoverStart) * 1000)
             StartupPerf.phase("freshDiscoverRefreshEnd", ms: discoverMs)

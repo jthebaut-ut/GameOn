@@ -276,9 +276,17 @@ struct WowMomentToastHost: View {
 
 /// Isolated so ``MainTabView`` can keep a single source of truth for floating-tab inset without circular type access issues.
 enum MainTabViewFloatingTabBarMetrics {
+    /// Visual height of the floating capsule + its bottom inset (`FloatingTabBarLayout`:
+    /// avatarOuter 52 + barVerticalPadding 10×2 + screenBottomInset 6).
+    /// Use this for Discover content clearance under the bar — not ``MainTabView/floatingTabBarStackHeight``.
+    static let overlayHeight: CGFloat = 78
+
+    /// Sole vertical gap between Discover AdMob strip bottom and floating tab bar top.
+    static let discoverAdToBarGap: CGFloat = 10
+
     /// Matches ``MainTabView/floatingTabBarStackHeight`` with a little air above the capsule.
-    /// Keep toast clear of the ~92pt floating tab bar so taps land on tabs, not the toast.
-    static let wowMomentBottomInset: CGFloat = 118
+    /// Keep toast clear of the ~108pt floating tab bar so taps land on tabs, not the toast.
+    static let wowMomentBottomInset: CGFloat = 134
 }
 
 private struct WowMomentToastCard: View {
