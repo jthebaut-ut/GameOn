@@ -35,14 +35,18 @@ struct ChatInboxGlobalSearchBar: View {
                 .focused(isFocused)
                 .submitLabel(.search)
                 .accessibilityLabel(L10n.t("chat_global_search_placeholder", languageCode: languageCode))
+                // Only while THIS field is focused. An always-registered `.keyboard` toolbar
+                // can leak into Team Detail Chat sheets (floating "Done" over the composer).
                 .toolbar {
-                    ToolbarItemGroup(placement: .keyboard) {
-                        Spacer()
-                        Button(L10n.t("done", languageCode: languageCode)) {
-                            // Dismiss keyboard only — keep query, results, and search mode.
-                            isFocused.wrappedValue = false
+                    if isFocused.wrappedValue {
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button(L10n.t("done", languageCode: languageCode)) {
+                                // Dismiss keyboard only — keep query, results, and search mode.
+                                isFocused.wrappedValue = false
+                            }
+                            .fontWeight(.semibold)
                         }
-                        .fontWeight(.semibold)
                     }
                 }
 
@@ -105,16 +109,11 @@ struct ChatGlobalSearchMessageResultRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: iconName)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(FGColor.accentBlue)
-                .frame(width: 36, height: 36)
-                .background(FGColor.cardBackground(colorScheme))
-                .clipShape(Circle())
+            messageRowAvatar
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
-                    Text(hit.conversationTitle)
+                    Text(resolvedConversationTitle)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(1)
@@ -131,7 +130,42 @@ struct ChatGlobalSearchMessageResultRow: View {
         }
         .padding(.vertical, 6)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(hit.conversationTitle). \(hit.safePreview)")
+        .accessibilityLabel("\(resolvedConversationTitle). \(hit.safePreview)")
+    }
+
+    private var resolvedConversationTitle: String {
+        guard hit.kind == .team else { return hit.conversationTitle }
+        let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+            teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                forConversationId: hit.conversationId
+            ),
+            conversationId: hit.conversationId
+        )?.name
+        return ChatInboxFanTeamRowIdentity.preferredTitle(
+            teamName: teamName,
+            fallbackConversationTitle: hit.conversationTitle
+        )
+    }
+
+    @ViewBuilder
+    private var messageRowAvatar: some View {
+        if hit.kind == .team {
+            ChatInboxFanTeamConversationAvatar(
+                teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                    forConversationId: hit.conversationId
+                ),
+                conversationId: hit.conversationId,
+                size: 36,
+                languageCode: languageCode
+            )
+        } else {
+            Image(systemName: iconName)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(FGColor.accentBlue)
+                .frame(width: 36, height: 36)
+                .background(FGColor.cardBackground(colorScheme))
+                .clipShape(Circle())
+        }
     }
 
     private var iconName: String {
@@ -139,6 +173,7 @@ struct ChatGlobalSearchMessageResultRow: View {
         case .direct: return "person.fill"
         case .business: return "building.2.fill"
         case .group: return "person.3.fill"
+        case .team: return "shield.fill"
         case .pickup: return "figure.run"
         }
     }

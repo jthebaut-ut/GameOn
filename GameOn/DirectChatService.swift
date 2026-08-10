@@ -531,8 +531,20 @@ final class DirectChatService {
         return (channel, stream)
     }
 
+    /// Removes a thread channel. Bounded so a dying Phoenix socket cannot hang chat forever
+    /// (logout already fire-and-forgets `removeChannel` for the same reason).
     func removeRealtimeChannel(_ channel: RealtimeChannelV2) async {
-        await client.removeChannel(channel)
+        let timeoutNs = ChatRealtimeChannelSerializer.defaultTimeoutNs
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await self.client.removeChannel(channel)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     /// Total unread peer messages for the signed-in user. Prefers single RPC ``get_dm_unread_total`` (50k-scale);

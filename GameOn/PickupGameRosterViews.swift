@@ -10,16 +10,20 @@ struct PickupPlayingAvatarStack: View {
     var diameter: CGFloat = 22
     @Environment(\.colorScheme) private var colorScheme
 
+    private var uniqueMembers: [PickupGameRosterMember] {
+        PickupGameRosterPresentation.uniqueMembersByUserId(members)
+    }
+
     private var visible: [PickupGameRosterMember] {
-        Array(members.prefix(maxVisible))
+        Array(uniqueMembers.prefix(maxVisible))
     }
 
     private var overflow: Int {
-        PickupGameRosterPresentation.overflowCount(total: members.count, maxVisible: maxVisible)
+        PickupGameRosterPresentation.overflowCount(total: uniqueMembers.count, maxVisible: maxVisible)
     }
 
     var body: some View {
-        if !members.isEmpty {
+        if !uniqueMembers.isEmpty {
             HStack(spacing: -diameter * 0.36) {
                 ForEach(Array(visible.enumerated()), id: \.element.id) { _, member in
                     UserAvatarView(

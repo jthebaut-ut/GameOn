@@ -5,7 +5,7 @@ import Supabase
 
 extension MapViewModel {
 
-    private static let storageDeletionBuckets: Set<String> = ["user-avatars", "venue-photos"]
+    private static let storageDeletionBuckets: Set<String> = ["user-avatars", "venue-photos", "fan-team-logos"]
 
     /// Extracts the object key after `/storage/v1/object/public/{bucket}/` for `remove` API calls.
     func storagePath(fromPublicURL publicURL: String, bucket: String) -> String? {

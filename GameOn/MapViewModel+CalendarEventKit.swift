@@ -1,5 +1,6 @@
 import Foundation
 import EventKit
+import Supabase
 
 nonisolated enum FanGeoCalendarEventStore {
     static let eventIdentifierMapKey = "gameon.appleCalendar.eventIdentifiers.v1"
@@ -172,7 +173,8 @@ extension MapViewModel {
         fanGeoIdentifier: String? = nil,
         forceBypassSyncSetting: Bool = false,
         structuredLocation: EKStructuredLocation? = nil,
-        locationComponents: PickupGameAppleCalendarLocation? = nil
+        locationComponents: PickupGameAppleCalendarLocation? = nil,
+        endDate: Date? = nil
     ) async -> FanGeoAppleCalendarMutationResult {
         var result = FanGeoAppleCalendarMutationResult()
         let isProGame = calendarSyncEventKind(fanGeoIdentifier: fanGeoIdentifier) == .pro
@@ -251,6 +253,8 @@ extension MapViewModel {
         calendarSyncDebugLogEventKitContext("save")
 #endif
 
+        let resolvedEndDate = calendarSyncResolvedEndDate(start: date, endDate: endDate)
+
         if let existingEvent = calendarSyncExistingEvent(
             title: title,
             date: date,
@@ -259,7 +263,7 @@ extension MapViewModel {
         ) {
             existingEvent.title = displayTitle
             existingEvent.startDate = date
-            existingEvent.endDate = date.addingTimeInterval(2 * 60 * 60)
+            existingEvent.endDate = resolvedEndDate
             existingEvent.notes = calendarSyncNotes(
                 title: title,
                 date: date,
@@ -322,7 +326,7 @@ extension MapViewModel {
         let event = EKEvent(eventStore: eventStore)
         event.title = displayTitle
         event.startDate = date
-        event.endDate = date.addingTimeInterval(2 * 60 * 60)
+        event.endDate = resolvedEndDate
         event.notes = calendarSyncNotes(
             title: title,
             date: date,
@@ -958,14 +962,40 @@ extension MapViewModel {
         print("[CalendarSyncDebug] pickupSyncStarted reason=\(reason)")
 #endif
         var seen = Set<String>()
+
+        // 1) Hosted / organizer — all formats (pickup, practice, league_game, …). Active only.
         for game in myPickupGamesForSettings {
+            guard PickupGameAppleCalendarEligibility.shouldSyncHostedGame(status: game.status) else { continue }
             await syncPickupGameToAppleCalendarIfNeeded(game, seen: &seen, source: "hosted")
         }
-        for card in myPickupGameJoinRequestCards where card.pill == .approved {
+
+        // Batch Team-link lookup for pending join cards + latest request cache (no N+1).
+        var pendingCandidateIds = Set(
+            myPickupGameJoinRequestCards
+                .filter { $0.pill == .pending }
+                .map(\.pickupGameId)
+        )
+        for (gameId, request) in pickupMyLatestJoinRequestByGameId {
+            let st = request.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if st == "pending" { pendingCandidateIds.insert(gameId) }
+        }
+        let teamLinkedIds = await pickupGameIdsLinkedToFanTeams(among: Array(pendingCandidateIds))
+
+        // 2) Going (approved) + Team Maybe (pending on team-linked pickup_games).
+        for card in myPickupGameJoinRequestCards {
+            let isTeamLinked = teamLinkedIds.contains(card.pickupGameId)
+            guard PickupGameAppleCalendarEligibility.shouldSyncJoinPill(card.pill, isTeamLinked: isTeamLinked) else {
+                continue
+            }
             if let row = resolvedPickupGameRow(for: card.pickupGameId) {
-                await syncPickupGameToAppleCalendarIfNeeded(row, seen: &seen, source: "joined")
+                guard PickupGameAppleCalendarEligibility.shouldSyncHostedGame(status: row.status) else { continue }
+                await syncPickupGameToAppleCalendarIfNeeded(
+                    row,
+                    seen: &seen,
+                    source: isTeamLinked && card.pill == .pending ? "teamMaybe" : "joined"
+                )
             } else if let start = PickupGameModels.parseSupabaseTimestamptz(card.game_start_at) {
-                let key = "pickup|\(card.pickupGameId.uuidString.lowercased())"
+                let key = PickupGameAppleCalendarEligibility.fanGeoIdentifier(forPickupGameId: card.pickupGameId)
                 guard seen.insert(key).inserted else { continue }
                 await addGameToCalendar(
                     title: card.title,
@@ -975,9 +1005,126 @@ extension MapViewModel {
                 )
             }
         }
+
+        // 3) Latest join-request cache (covers RSVP changes before Going cards rebuild).
+        for (gameId, request) in pickupMyLatestJoinRequestByGameId {
+            let isTeamLinked = teamLinkedIds.contains(gameId)
+            guard PickupGameAppleCalendarEligibility.shouldSyncRequestStatus(
+                request.status,
+                isTeamLinked: isTeamLinked
+            ) else { continue }
+            if let row = resolvedPickupGameRow(for: gameId),
+               PickupGameAppleCalendarEligibility.shouldSyncHostedGame(status: row.status) {
+                await syncPickupGameToAppleCalendarIfNeeded(row, seen: &seen, source: "latestRequest")
+            }
+        }
+
+        // 4) Invite accepted/maybe (accepted also creates approved request; maybe may not).
+        await syncEligiblePickupInviteesToAppleCalendar(seen: &seen)
+
+        // 5) Remove stale FanGeo pickup|* events that are no longer eligible.
+        await reconcileStalePickupAppleCalendarEvents(eligibleIdentifiers: seen)
+
 #if DEBUG
         print("[CalendarSyncDebug] pickupSyncFinished reason=\(reason) count=\(seen.count)")
 #endif
+    }
+
+    /// One-shot Team-link membership among candidate pickup ids (RLS-scoped).
+    private func pickupGameIdsLinkedToFanTeams(among ids: [UUID]) async -> Set<UUID> {
+        let unique = Array(Set(ids))
+        guard !unique.isEmpty else { return [] }
+        struct LinkRow: Decodable {
+            let pickup_game_id: UUID
+        }
+        do {
+            let links: [LinkRow] = try await supabase
+                .from("fan_team_game_links")
+                .select("pickup_game_id")
+                .in("pickup_game_id", values: unique.map { $0.uuidString.lowercased() })
+                .limit(400)
+                .execute()
+                .value
+            return Set(links.map(\.pickup_game_id))
+        } catch {
+#if DEBUG
+            print("[CalendarSyncDebug] teamLinkBatchFailed error=\(error.localizedDescription)")
+#endif
+            return []
+        }
+    }
+
+    private func syncEligiblePickupInviteesToAppleCalendar(seen: inout Set<String>) async {
+        guard let uid = currentUserAuthId else { return }
+        struct InviteRow: Decodable {
+            let pickup_game_id: UUID
+            let status: String
+        }
+        do {
+            let invites: [InviteRow] = try await supabase
+                .from("pickup_game_invites")
+                .select("pickup_game_id,status")
+                .eq("invitee_user_id", value: uid.uuidString.lowercased())
+                .in("status", values: ["accepted", "maybe"])
+                .limit(100)
+                .execute()
+                .value
+            let eligibleIds = invites
+                .filter { PickupGameAppleCalendarEligibility.shouldSyncInviteStatus($0.status) }
+                .map(\.pickup_game_id)
+            let missingIds = eligibleIds.filter {
+                !seen.contains(PickupGameAppleCalendarEligibility.fanGeoIdentifier(forPickupGameId: $0))
+            }
+            guard !missingIds.isEmpty else { return }
+
+            var gameById: [UUID: PickupGameRow] = [:]
+            for id in missingIds {
+                if let row = resolvedPickupGameRow(for: id) {
+                    gameById[id] = row
+                }
+            }
+            let needFetch = missingIds.filter { gameById[$0] == nil }
+            if !needFetch.isEmpty {
+                let rows: [PickupGameRow] = try await supabase
+                    .from("pickup_games")
+                    .select(pickupGamesSelectColumns)
+                    .in("id", values: needFetch.map { $0.uuidString.lowercased() })
+                    .limit(100)
+                    .execute()
+                    .value
+                for row in rows { gameById[row.id] = row }
+            }
+            for id in missingIds {
+                guard let row = gameById[id],
+                      PickupGameAppleCalendarEligibility.shouldSyncHostedGame(status: row.status) else {
+                    continue
+                }
+                await syncPickupGameToAppleCalendarIfNeeded(row, seen: &seen, source: "invite")
+            }
+        } catch {
+#if DEBUG
+            print("[CalendarSyncDebug] inviteCalendarSyncFailed error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
+    private func reconcileStalePickupAppleCalendarEvents(eligibleIdentifiers: Set<String>) async {
+        let storedPickupKeys = calendarSyncStoredEventIdentifiers().keys.filter {
+            $0.hasPrefix(PickupGameAppleCalendarEligibility.fanGeoIdentifierPrefix)
+        }
+        for key in storedPickupKeys where !eligibleIdentifiers.contains(key) {
+            await removeGameFromAppleCalendar(fanGeoIdentifier: key)
+#if DEBUG
+            print("[CalendarSyncDebug] pickupStaleRemoved id=\(key)")
+#endif
+        }
+    }
+
+    private func calendarSyncResolvedEndDate(start: Date, endDate: Date?) -> Date {
+        if let endDate, endDate > start {
+            return endDate
+        }
+        return start.addingTimeInterval(2 * 60 * 60)
     }
 
     func syncFanGeoAttendingEventsToAppleCalendar(reason: String, forceBypassFreshness: Bool = false) async {
@@ -1241,21 +1388,24 @@ extension MapViewModel {
         seen: inout Set<String>,
         source: String
     ) async {
+        guard PickupGameAppleCalendarEligibility.shouldSyncHostedGame(status: game.status) else { return }
         guard let start = PickupGameModels.parseSupabaseTimestamptz(game.game_start_at) else { return }
-        let key = "pickup|\(game.id.uuidString.lowercased())"
+        let key = PickupGameAppleCalendarEligibility.fanGeoIdentifier(forPickupGameId: game.id)
         guard seen.insert(key).inserted else { return }
         let built = PickupGameAppleCalendarLocation.build(from: game)
         let locationText = built.displayAddress.isEmpty
             ? pickupGameCalendarAddressLine(game)
             : built.displayAddress
         let structured = built.makeStructuredLocation()
+        let end = game.end_time.flatMap { PickupGameModels.parseSupabaseTimestamptz($0) }
         await addGameToCalendar(
             title: game.title,
             date: start,
             location: locationText,
             fanGeoIdentifier: key,
             structuredLocation: structured,
-            locationComponents: built
+            locationComponents: built,
+            endDate: end
         )
 #if DEBUG
         print("[CalendarSyncDebug] pickupSynced source=\(source) id=\(game.id.uuidString.lowercased())")

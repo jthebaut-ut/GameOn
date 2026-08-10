@@ -1,11 +1,13 @@
 import Foundation
 
 /// Presentation-only Chat inbox conversation-type filter.
-/// Classification uses existing inbox metadata only (`inboxKind` + `pickupGameId` + `unreadCount`).
+/// Classification uses existing inbox metadata only
+/// (`inboxKind` + `pickupGameId` + `fanTeamId` + `unreadCount`).
 enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable {
     case all
     case unread
     case fans
+    case teams
     case businesses
     case groups
     case pickup
@@ -17,6 +19,7 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
         case .all: return "globe"
         case .unread: return "envelope.badge"
         case .fans: return "person.fill"
+        case .teams: return "shield.fill"
         case .businesses: return "building.2.fill"
         case .groups: return "person.3.fill"
         case .pickup: return "figure.run"
@@ -31,6 +34,8 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
             return L10n.t("chat_inbox_filter_unread", languageCode: languageCode)
         case .fans:
             return L10n.t("chat_inbox_filter_fans", languageCode: languageCode)
+        case .teams:
+            return L10n.t("chat_inbox_filter_teams", languageCode: languageCode)
         case .businesses:
             return L10n.t("chat_inbox_filter_businesses", languageCode: languageCode)
         case .groups:
@@ -48,6 +53,8 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
             return L10n.t("chat_inbox_filter_empty_unread", languageCode: languageCode)
         case .fans:
             return L10n.t("chat_inbox_filter_empty_fans", languageCode: languageCode)
+        case .teams:
+            return L10n.t("chat_inbox_filter_empty_teams", languageCode: languageCode)
         case .businesses:
             return L10n.t("chat_inbox_filter_empty_businesses", languageCode: languageCode)
         case .groups:
@@ -66,10 +73,14 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
             return conversation.unreadCount > 0
         case .fans:
             return conversation.inboxKind == .direct && !conversation.isPickupGameChat
+        case .teams:
+            return conversation.isFanTeamChat
         case .businesses:
             return conversation.inboxKind == .business
         case .groups:
-            return conversation.inboxKind == .group && !conversation.isPickupGameChat
+            return conversation.inboxKind == .group
+                && !conversation.isPickupGameChat
+                && !conversation.isFanTeamChat
         case .pickup:
             return conversation.isPickupGameChat
         }
@@ -92,6 +103,7 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
             .all: conversations.count,
             .unread: 0,
             .fans: 0,
+            .teams: 0,
             .businesses: 0,
             .groups: 0,
             .pickup: 0
@@ -102,6 +114,8 @@ enum ChatInboxTypeFilter: String, CaseIterable, Identifiable, Hashable, Sendable
             }
             if conversation.isPickupGameChat {
                 counts[.pickup, default: 0] += 1
+            } else if conversation.isFanTeamChat {
+                counts[.teams, default: 0] += 1
             } else {
                 switch conversation.inboxKind {
                 case .direct:

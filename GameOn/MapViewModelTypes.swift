@@ -122,6 +122,47 @@ enum DiscoverPickupSubMode: String, CaseIterable, Identifiable, Equatable {
     }
 }
 
+/// Discover Play → Games membership scope (orthogonal to sport + date).
+enum DiscoverPickupTeamScope: String, CaseIterable, Identifiable, Equatable {
+    /// All Discover-visible pickup games (existing behavior).
+    case all
+    /// Only games linked to Fan Teams the viewer actively belongs to.
+    case myTeams
+
+    var id: String { rawValue }
+}
+
+/// Centralized My Teams map-scope predicate (not sport, not privacy alone).
+enum DiscoverPickupTeamScopeFilter {
+    static func includes(
+        gameId: UUID,
+        scope: DiscoverPickupTeamScope,
+        myActiveTeamIds: Set<UUID>,
+        teamIdentityByGameId: [UUID: PickupDiscoverTeamIdentity]
+    ) -> Bool {
+        guard scope == .myTeams else { return true }
+        guard let teamId = teamIdentityByGameId[gameId]?.teamId else { return false }
+        return myActiveTeamIds.contains(teamId)
+    }
+
+    static func apply(
+        rows: [PickupGameRow],
+        scope: DiscoverPickupTeamScope,
+        myActiveTeamIds: Set<UUID>,
+        teamIdentityByGameId: [UUID: PickupDiscoverTeamIdentity]
+    ) -> [PickupGameRow] {
+        guard scope == .myTeams else { return rows }
+        return rows.filter {
+            includes(
+                gameId: $0.id,
+                scope: scope,
+                myActiveTeamIds: myActiveTeamIds,
+                teamIdentityByGameId: teamIdentityByGameId
+            )
+        }
+    }
+}
+
 /// Discover/Calendar day markers: green (venue games), orange (pickup games), red (pro games).
 enum DiscoverCalendarDotPalette: Equatable {
     case venueGames
@@ -1323,6 +1364,8 @@ struct UserProfileRow: Decodable {
     let show_home_city: Bool?
     /// Curated background catalog key (`fangeo`, `soccer`, …). Nil/unknown → FanGeo default.
     let profile_background_key: String?
+    /// Self-declared gender (`male` / `female` / `non_binary` / `other` / `prefer_not_to_say`).
+    let gender: String?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -1353,6 +1396,7 @@ struct UserProfileRow: Decodable {
         case home_country
         case show_home_city
         case profile_background_key
+        case gender
     }
 
     init(
@@ -1383,7 +1427,8 @@ struct UserProfileRow: Decodable {
         home_region: String? = nil,
         home_country: String? = nil,
         show_home_city: Bool? = nil,
-        profile_background_key: String? = nil
+        profile_background_key: String? = nil,
+        gender: String? = nil
     ) {
         self.id = id
         self.email = email
@@ -1413,6 +1458,7 @@ struct UserProfileRow: Decodable {
         self.home_country = home_country
         self.show_home_city = show_home_city
         self.profile_background_key = profile_background_key
+        self.gender = gender
     }
 
     init(from decoder: Decoder) throws {
@@ -1444,6 +1490,7 @@ struct UserProfileRow: Decodable {
         home_country = try c.decodeIfPresent(String.self, forKey: .home_country)
         show_home_city = try c.decodeIfPresent(Bool.self, forKey: .show_home_city)
         profile_background_key = try c.decodeIfPresent(String.self, forKey: .profile_background_key)
+        gender = try c.decodeIfPresent(String.self, forKey: .gender)
 
         if let ids = try? c.decodeIfPresent([UUID].self, forKey: .selected_live_visibility_friend_ids) {
             selected_live_visibility_friend_ids = ids
@@ -1715,6 +1762,10 @@ struct UserProfileHomeCityPatch: Encodable {
     let home_region: String?
     let home_country: String?
     let show_home_city: Bool
+}
+
+struct UserProfileGenderPatch: Encodable {
+    let gender: String?
 }
 
 struct UserProfileBackgroundPatch: Encodable {

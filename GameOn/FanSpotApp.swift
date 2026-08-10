@@ -114,6 +114,17 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         let userInfo = notification.request.content.userInfo
         // DM / friend-request pushes: suppress system banner while foregrounded so
         // realtime + in-app UX remain the single in-app path (no duplicate alerts).
+        if FanTeamInvitationNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
+            // Suppress banner; refresh My Teams → Invitations without duplicate system UX.
+            FanTeamInvitationNotificationDeepLinkBridge.shared.noteForegroundArrival(userInfo: userInfo)
+            return []
+        }
+        if FanTeamDeletedNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
+            FanTeamDeletedNotificationDeepLinkBridge.shared.noteForegroundArrival(userInfo: userInfo)
+            return []
+        }
         if DirectMessageNotificationDeepLinkBridge.shared
             .shouldSuppressForegroundSystemPresentation(userInfo: userInfo)
             || FriendRequestNotificationDeepLinkBridge.shared
@@ -141,6 +152,8 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
             BusinessProAwardNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             DirectMessageNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FriendRequestNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanTeamInvitationNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanTeamDeletedNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             ChatMessageNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             PokeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }

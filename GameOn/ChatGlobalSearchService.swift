@@ -99,7 +99,8 @@ final class ChatGlobalSearchController: ObservableObject {
                 inboxKind: row.inboxKind,
                 groupMemberCount: row.groupMemberCount,
                 isGroupMuted: row.isGroupMuted,
-                pickupGameId: row.pickupGameId
+                pickupGameId: row.pickupGameId,
+                fanTeamId: row.fanTeamId
             )
         }
 
@@ -133,7 +134,8 @@ final class ChatGlobalSearchController: ObservableObject {
                         inboxKind: row.inboxKind,
                         groupMemberCount: row.groupMemberCount,
                         isGroupMuted: row.isGroupMuted,
-                        pickupGameId: row.pickupGameId
+                        pickupGameId: row.pickupGameId,
+                        fanTeamId: row.fanTeamId
                     )
                 }
             )
@@ -205,8 +207,8 @@ final class ChatGlobalSearchController: ObservableObject {
         )
         snapshot = next
 
-        async let serverConversations = fetchServerConversations(query: rawQuery)
-        async let serverMessages = fetchServerMessages(query: rawQuery, conversationId: nil)
+        async let serverConversations = fetchServerConversations(query: rawQuery, inbox: inbox)
+        async let serverMessages = fetchServerMessages(query: rawQuery, conversationId: nil, inbox: inbox)
 
         let remoteConversations = (try? await serverConversations) ?? []
         let remoteMessages = (try? await serverMessages) ?? []
@@ -240,10 +242,17 @@ final class ChatGlobalSearchController: ObservableObject {
     ) async -> [ChatGlobalSearchMessageHit] {
         let normalized = ChatGlobalSearchLocalMatcher.normalize(query)
         guard normalized.count >= 2 else { return [] }
-        return (try? await fetchServerMessages(query: query, conversationId: conversationId)) ?? []
+        return (try? await fetchServerMessages(
+            query: query,
+            conversationId: conversationId,
+            inbox: latestInbox
+        )) ?? []
     }
 
-    private func fetchServerConversations(query: String) async throws -> [ChatGlobalSearchConversationHit] {
+    private func fetchServerConversations(
+        query: String,
+        inbox: [ChatViewModel.FriendDisplay]
+    ) async throws -> [ChatGlobalSearchConversationHit] {
         struct Params: Encodable {
             let p_query: String
             let p_limit: Int
@@ -253,11 +262,30 @@ final class ChatGlobalSearchController: ObservableObject {
             .execute()
             .value
         return rows.compactMap { row in
-            guard let kind = ChatGlobalSearchConversationKind(rawValue: row.conversation_kind) else { return nil }
+            guard let rawKind = ChatGlobalSearchConversationKind(rawValue: row.conversation_kind) else { return nil }
+            let kind = ChatGlobalSearchConversationKind.resolve(
+                raw: rawKind,
+                conversationId: row.conversation_id,
+                pickupGameId: row.pickup_game_id,
+                inbox: inbox
+            )
+            let title: String = {
+                guard kind == .team else { return row.title }
+                let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                    teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                        forConversationId: row.conversation_id
+                    ),
+                    conversationId: row.conversation_id
+                )?.name
+                return ChatInboxFanTeamRowIdentity.preferredTitle(
+                    teamName: teamName,
+                    fallbackConversationTitle: row.title
+                )
+            }()
             return ChatGlobalSearchConversationHit(
                 conversationId: row.conversation_id,
                 kind: kind,
-                title: row.title,
+                title: title,
                 subtitle: row.subtitle ?? "",
                 peerUserId: row.peer_user_id,
                 pickupGameId: row.pickup_game_id,
@@ -272,7 +300,8 @@ final class ChatGlobalSearchController: ObservableObject {
 
     private func fetchServerMessages(
         query: String,
-        conversationId: UUID?
+        conversationId: UUID?,
+        inbox: [ChatViewModel.FriendDisplay]
     ) async throws -> [ChatGlobalSearchMessageHit] {
         struct Params: Encodable {
             let p_query: String
@@ -300,16 +329,35 @@ final class ChatGlobalSearchController: ObservableObject {
             .execute()
             .value
         return rows.compactMap { row in
-            guard let kind = ChatGlobalSearchConversationKind(rawValue: row.conversation_kind) else { return nil }
+            guard let rawKind = ChatGlobalSearchConversationKind(rawValue: row.conversation_kind) else { return nil }
+            let kind = ChatGlobalSearchConversationKind.resolve(
+                raw: rawKind,
+                conversationId: row.conversation_id,
+                pickupGameId: row.pickup_game_id,
+                inbox: inbox
+            )
             let preview = row.safe_preview.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !preview.isEmpty else { return nil }
             // Re-run through client formatter for localization of known English server summaries.
             let localized = Self.localizeServerPreview(preview, languageCode: languageCode)
+            let conversationTitle: String = {
+                guard kind == .team else { return row.conversation_title }
+                let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                    teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                        forConversationId: row.conversation_id
+                    ),
+                    conversationId: row.conversation_id
+                )?.name
+                return ChatInboxFanTeamRowIdentity.preferredTitle(
+                    teamName: teamName,
+                    fallbackConversationTitle: row.conversation_title
+                )
+            }()
             return ChatGlobalSearchMessageHit(
                 messageId: row.message_id,
                 conversationId: row.conversation_id,
                 kind: kind,
-                conversationTitle: row.conversation_title,
+                conversationTitle: conversationTitle,
                 peerUserId: row.peer_user_id,
                 pickupGameId: row.pickup_game_id,
                 senderId: row.sender_id,

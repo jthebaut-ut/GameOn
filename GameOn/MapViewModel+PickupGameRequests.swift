@@ -68,7 +68,8 @@ extension MapViewModel {
     func createPickupGameInvites(
         game: PickupGameRow,
         inviteeUserIds: [UUID],
-        message: String?
+        message: String?,
+        showsToast: Bool = true
     ) async -> [PickupGameInviteCreateResult] {
         guard canFanUsePickupGamesUI else {
             logBusinessUserGateBlocked(action: "invitePickupFriends")
@@ -87,7 +88,8 @@ extension MapViewModel {
             return []
         }
 
-        let uniqueIds = Array(NSOrderedSet(array: inviteeUserIds).compactMap { $0 as? UUID }).prefix(20)
+        let uniqueIds = Array(NSOrderedSet(array: inviteeUserIds).compactMap { $0 as? UUID })
+            .prefix(PickupInviteRecipientGate.maxInviteesPerGame)
         let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let payloadMessage = trimmed.isEmpty ? nil : String(trimmed.prefix(280))
 #if DEBUG
@@ -113,7 +115,9 @@ extension MapViewModel {
                 .value
             let created = rows.filter { $0.outcome == "created" }.count
             let duplicates = rows.filter { $0.outcome == "duplicate" }.count
-            let skipped = rows.filter { $0.outcome == "skipped" }.count
+            let skipped = rows.filter {
+                ["skipped", "already_playing", "already_pending"].contains($0.outcome)
+            }.count
             let maxReached = rows.filter { $0.outcome == "max_reached" }.count
 #if DEBUG
             print("[PickupInviteDebug] backendResponseCount=\(rows.count)")
@@ -128,13 +132,20 @@ extension MapViewModel {
             }
             print("[PickupInviteDebug] returnedErrorMessage=nil")
 #endif
-            if created > 0 {
-                let suffix = created == 1 ? "" : "s"
-                showSocialActionToast("Sent \(created) invite\(suffix).", isError: false)
-            } else if duplicates > 0 {
-                showSocialActionToast("Those fans were already invited.", isError: false)
-            } else {
-                showSocialActionToast("No invites were sent.", isError: true)
+            if showsToast {
+                if created > 0 {
+                    let suffix = created == 1 ? "" : "s"
+                    var message = "Sent \(created) invite\(suffix)."
+                    let ineligible = duplicates + skipped
+                    if ineligible > 0 {
+                        message += " \(ineligible) already participating or ineligible."
+                    }
+                    showSocialActionToast(message, isError: false)
+                } else if duplicates > 0 {
+                    showSocialActionToast("Those fans were already invited.", isError: false)
+                } else {
+                    showSocialActionToast("No invites were sent.", isError: true)
+                }
             }
             return rows
         } catch {
@@ -143,7 +154,9 @@ extension MapViewModel {
             print("[PickupInviteDebug] returnedErrorMessage=\(error.localizedDescription)")
             print("[PickupInviteDebug] returnedErrorDetail=\(String(describing: error))")
 #endif
-            showSocialActionToast(error.localizedDescription, isError: true)
+            if showsToast {
+                showSocialActionToast(error.localizedDescription, isError: true)
+            }
             return []
         }
     }
@@ -186,19 +199,124 @@ extension MapViewModel {
 
     func loadPickupInviteStatusesByInviteeUserId(gameId: UUID) async -> [UUID: String] {
         guard canFanUsePickupGamesUI else { return [:] }
+        struct JoinGateRow: Decodable {
+            let requester_user_id: UUID
+            let status: String?
+        }
         do {
-            let rows: [PickupAlreadyInvitedUserRow] = try await supabase
+            async let inviteRowsTask: [PickupAlreadyInvitedUserRow] = supabase
                 .from("pickup_game_invites")
                 .select("invitee_user_id,status")
                 .eq("pickup_game_id", value: gameId.uuidString.lowercased())
                 .limit(200)
                 .execute()
                 .value
-            return rows.reduce(into: [UUID: String]()) { result, row in
-                result[row.invitee_user_id] = row.status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            async let joinRowsTask: [JoinGateRow] = supabase
+                .from("pickup_game_requests")
+                .select("requester_user_id,status")
+                .eq("pickup_game_id", value: gameId.uuidString.lowercased())
+                .in("status", values: ["pending", "approved"])
+                .limit(200)
+                .execute()
+                .value
+            let (inviteRows, joinRows) = try await (inviteRowsTask, joinRowsTask)
+            var result: [UUID: String] = [:]
+            for row in inviteRows {
+                let st = row.status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                if st != "cancelled" {
+                    result[row.invitee_user_id] = st.isEmpty ? "pending" : st
+                }
             }
+            for row in joinRows {
+                let st = row.status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+                if st == "approved" {
+                    result[row.requester_user_id] = "going"
+                } else if st == "pending", result[row.requester_user_id] == nil {
+                    result[row.requester_user_id] = "join_pending"
+                }
+            }
+            return result
         } catch {
             return [:]
+        }
+    }
+
+    @discardableResult
+    func createPickupGameInvitesFromFanTeams(
+        game: PickupGameRow,
+        teamIds: [UUID],
+        showsToast: Bool = true
+    ) async -> [PickupGameInviteCreateResult] {
+        guard canFanUsePickupGamesUI else {
+            logBusinessUserGateBlocked(action: "invitePickupFriends")
+            if showsToast {
+                showSocialActionToast(BusinessFanGateCopy.pickupFanOnly, isError: true)
+            }
+            return []
+        }
+        guard let uid = currentUserAuthId else {
+            if showsToast {
+                showSocialActionToast("Sign in to invite friends.", isError: true)
+            }
+            return []
+        }
+        guard game.creator_user_id == uid, game.isPickupGameInvitable() else {
+            if showsToast {
+                showSocialActionToast("This game can't receive invites.", isError: true)
+            }
+            return []
+        }
+        if await refreshActiveBanGate(reason: "pickupInviteCreateFromTeam") {
+            return []
+        }
+        let uniqueTeamIds = Array(NSOrderedSet(array: teamIds).compactMap { $0 as? UUID })
+        guard !uniqueTeamIds.isEmpty else { return [] }
+
+        let service = FanTeamsService()
+        var allRows: [PickupGameInviteCreateResult] = []
+        do {
+            for teamId in uniqueTeamIds {
+                let rows = try await service.createPickupInvitesFromFanTeam(
+                    teamId: teamId,
+                    pickupGameId: game.id
+                )
+                allRows.append(contentsOf: rows)
+            }
+            // Dedupe by invitee (mixed team overlap).
+            var seen = Set<UUID>()
+            var deduped: [PickupGameInviteCreateResult] = []
+            for row in allRows {
+                if seen.insert(row.invitee_user_id).inserted {
+                    deduped.append(row)
+                }
+            }
+            let created = deduped.filter { $0.outcome == "created" }.count
+            let ineligible = deduped.filter { $0.outcome != "created" }.count
+#if DEBUG
+            print(
+                "[PickupInviteDebug] teamBulk created=\(created) ineligible=\(ineligible) teams=\(uniqueTeamIds.count)"
+            )
+#endif
+            if showsToast {
+                if created > 0 {
+                    var message = "Sent \(created) invite\(created == 1 ? "" : "s")."
+                    if ineligible > 0 {
+                        message += " \(ineligible) already participating or ineligible."
+                    }
+                    showSocialActionToast(message, isError: false)
+                } else {
+                    showSocialActionToast("No invites were sent.", isError: true)
+                }
+            }
+            return deduped
+        } catch {
+#if DEBUG
+            print("[PickupInviteDebug] teamBulk error=\(error.localizedDescription)")
+#endif
+            if showsToast {
+                showSocialActionToast(error.localizedDescription, isError: true)
+            }
+            return []
         }
     }
 
@@ -575,8 +693,16 @@ extension MapViewModel {
 #endif
                 showSocialActionToast("You're in the game", isError: false)
             } else if normalized == "maybe" {
+                await syncPickupGamesToAppleCalendarIfNeeded(
+                    reason: "pickupInviteMaybe",
+                    forceBypassFreshness: true
+                )
                 showSocialActionToast("Marked maybe.", isError: false)
             } else {
+                await syncPickupGamesToAppleCalendarIfNeeded(
+                    reason: "pickupInviteDeclined",
+                    forceBypassFreshness: true
+                )
                 showSocialActionToast("Invite declined.", isError: false)
             }
         } catch {

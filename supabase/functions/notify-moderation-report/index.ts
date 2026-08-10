@@ -2,7 +2,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "npm:@supabase/supabase-js@2"
 
 /**
- * Admin email for moderation reports (user / conversation / message / group_conversation / group_message).
+ * Admin email for moderation reports
+ * (user / conversation / message / group_conversation / group_message / fan_team).
  *
  * Secrets (set via `supabase secrets set`):
  *   ADMIN_EMAIL_TO, RESEND_API_KEY, RESEND_FROM
@@ -15,7 +16,8 @@ import { createClient } from "npm:@supabase/supabase-js@2"
  *
  * Auth:
  * - User JWT (iOS best-effort invoke for user/conversation/message/group types)
- * - Service-role bearer (preferred async pg_net queue for group_conversation / group_message)
+ * - Service-role bearer (preferred async pg_net queue for group_conversation /
+ *   group_message / fan_team)
  *
  * Conversation-report emails read the bounded `conversation_reports.message_snapshot`
  * from the database only when `admin_review_consent_granted === true` (never from client
@@ -24,7 +26,13 @@ import { createClient } from "npm:@supabase/supabase-js@2"
  * `group_message_reports` / `message_reports` over client payload.
  */
 
-type ReportType = "user" | "conversation" | "message" | "group_conversation" | "group_message"
+type ReportType =
+  | "user"
+  | "conversation"
+  | "message"
+  | "group_conversation"
+  | "group_message"
+  | "fan_team"
 
 /** Client may send `reporter_user_id`; it is ignored for JWT callers — reporter is JWT subject. */
 interface Payload {
@@ -111,6 +119,22 @@ interface GroupMessageReportRow {
   status: string | null
 }
 
+interface FanTeamReportRow {
+  id: string
+  reporter_user_id: string
+  owner_user_id: string
+  team_id: string
+  category: string | null
+  details: string | null
+  team_name_snapshot: string | null
+  team_logo_url_snapshot: string | null
+  team_sport_snapshot: string | null
+  member_count_snapshot: number | null
+  moderation_notified_at: string | null
+  created_at: string | null
+  status: string | null
+}
+
 interface ProfileNameRow {
   id: string
   display_name: string | null
@@ -139,6 +163,7 @@ function normalizeReportType(raw: string | null | undefined): ReportType | null 
     || t === "message"
     || t === "group_conversation"
     || t === "group_message"
+    || t === "fan_team"
   ) {
     return t
   }
@@ -349,6 +374,31 @@ async function loadGroupMessageReport(
   return data as GroupMessageReportRow | null
 }
 
+async function loadFanTeamReport(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+  reporterUserId?: string | null,
+): Promise<FanTeamReportRow | null> {
+  let query = admin
+    .from("fan_team_reports")
+    .select(
+      "id,reporter_user_id,owner_user_id,team_id,category,details,team_name_snapshot,team_logo_url_snapshot,team_sport_snapshot,member_count_snapshot,moderation_notified_at,created_at,status",
+    )
+    .eq("id", reportId)
+
+  if (reporterUserId) {
+    query = query.eq("reporter_user_id", reporterUserId)
+  }
+
+  const { data, error } = await query.maybeSingle()
+
+  if (error) {
+    console.error("notify-moderation-report: fan_team_reports load failed", error.message)
+    return null
+  }
+  return data as FanTeamReportRow | null
+}
+
 interface MessageReportRow {
   id: string
   reporter_user_id: string
@@ -431,6 +481,21 @@ async function markGroupMessageReportNotified(
   }
 }
 
+async function markFanTeamReportNotified(
+  admin: ReturnType<typeof createClient>,
+  reportId: string,
+): Promise<void> {
+  const { error } = await admin
+    .from("fan_team_reports")
+    .update({ moderation_notified_at: new Date().toISOString() })
+    .eq("id", reportId)
+    .is("moderation_notified_at", null)
+
+  if (error) {
+    console.error("notify-moderation-report: failed to stamp fan_team moderation_notified_at", error.message)
+  }
+}
+
 async function fetchReporterEmail(
   admin: ReturnType<typeof createClient>,
   reporterUserId: string,
@@ -494,7 +559,12 @@ Deno.serve(async (req) => {
     })
   }
 
-  if (isServiceRole && reportType !== "group_conversation" && reportType !== "group_message") {
+  if (
+    isServiceRole
+    && reportType !== "group_conversation"
+    && reportType !== "group_message"
+    && reportType !== "fan_team"
+  ) {
     return new Response(JSON.stringify({ error: "service_role_type_not_allowed" }), {
       status: 403,
       headers: { "Content-Type": "application/json" },
@@ -525,7 +595,12 @@ Deno.serve(async (req) => {
     userId = user.id
     reporterEmail = user.email?.trim() || ""
 
-    if (!payload.category?.trim() && reportType !== "group_conversation" && reportType !== "group_message") {
+    if (
+      !payload.category?.trim()
+      && reportType !== "group_conversation"
+      && reportType !== "group_message"
+      && reportType !== "fan_team"
+    ) {
       return new Response(JSON.stringify({ error: "missing_fields" }), {
         status: 400,
         headers: { "Content-Type": "application/json" },
@@ -535,6 +610,7 @@ Deno.serve(async (req) => {
     if (
       reportType !== "group_conversation"
       && reportType !== "group_message"
+      && reportType !== "fan_team"
       && !payload.reported_user_id?.trim()
     ) {
       return new Response(JSON.stringify({ error: "missing_fields" }), {
@@ -559,7 +635,11 @@ Deno.serve(async (req) => {
       }
     }
 
-    if (reportType === "group_conversation" || reportType === "group_message") {
+    if (
+      reportType === "group_conversation"
+      || reportType === "group_message"
+      || reportType === "fan_team"
+    ) {
       if (!normalizeReportId(payload.report_id)) {
         return new Response(JSON.stringify({ error: "report_id_required" }), {
           status: 400,
@@ -611,6 +691,9 @@ Deno.serve(async (req) => {
   let messageSnapshotForEmail = ""
   let messageSnapshotFromDb = false
   let reporterUserIdForEmail = userId
+  let fanTeamId = ""
+  let fanTeamLogoUrl = ""
+  let fanTeamSport = ""
 
   if (reportType === "group_conversation") {
     if (!admin || !reportIdNormalized) {
@@ -701,6 +784,52 @@ Deno.serve(async (req) => {
       .eq("id", groupMessageReport.conversation_id)
       .maybeSingle()
     groupTitle = ((conversation as { title?: string } | null)?.title ?? groupTitle).trim() || "Group"
+  }
+
+  if (reportType === "fan_team") {
+    if (!admin || !reportIdNormalized) {
+      return new Response(JSON.stringify({ error: "server_misconfigured" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    const teamReport = await loadFanTeamReport(
+      admin,
+      reportIdNormalized,
+      isServiceRole ? null : userId,
+    )
+    if (!teamReport) {
+      return new Response(JSON.stringify({ error: "report_not_found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    if (teamReport.moderation_notified_at) {
+      return new Response(JSON.stringify({ ok: true, skipped: true, reason: "already_notified" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+
+    reporterUserIdForEmail = teamReport.reporter_user_id
+    if (isServiceRole || !reporterEmail) {
+      reporterEmail = await fetchReporterEmail(admin, teamReport.reporter_user_id)
+    }
+    reportedUserIdForEmail = teamReport.owner_user_id
+    fanTeamId = teamReport.team_id
+    groupTitle = (teamReport.team_name_snapshot ?? "").trim() || "(untitled Team)"
+    fanTeamLogoUrl = (teamReport.team_logo_url_snapshot ?? "").trim()
+    fanTeamSport = (teamReport.team_sport_snapshot ?? "").trim()
+    memberCountDisplay =
+      teamReport.member_count_snapshot == null
+        ? memberCountDisplay || "—"
+        : String(teamReport.member_count_snapshot)
+    categoryForEmail = (teamReport.category || categoryForEmail).trim() || "other"
+    createdAtForEmail = (teamReport.created_at || createdAtForEmail).trim()
+    const dbDetails = (teamReport.details ?? "").trim()
+    detailsForEmail = dbDetails.length > 0 ? dbDetails : detailsForEmail
   }
 
   if (reportType === "message" && userId) {
@@ -914,10 +1043,22 @@ Deno.serve(async (req) => {
         ? `<tr><td style="padding:6px 0;vertical-align:top"><strong>Member count</strong></td><td style="padding:6px 0">${escapeHtml(memberCountDisplay || "—")}</td></tr>`
         : ""
     }`
+    : reportType === "fan_team"
+    ? `<tr><td style="padding:6px 0;vertical-align:top"><strong>Team name</strong></td><td style="padding:6px 0">${escapeHtml(groupTitle || "—")}</td></tr>` +
+      `<tr><td style="padding:6px 0;vertical-align:top"><strong>Team ID</strong></td><td style="padding:6px 0">${escapeHtml(fanTeamId || "—")}</td></tr>` +
+      `<tr><td style="padding:6px 0;vertical-align:top"><strong>Sport</strong></td><td style="padding:6px 0">${escapeHtml(fanTeamSport || "—")}</td></tr>` +
+      `<tr><td style="padding:6px 0;vertical-align:top"><strong>Member count</strong></td><td style="padding:6px 0">${escapeHtml(memberCountDisplay || "—")}</td></tr>` +
+      `<tr><td style="padding:6px 0;vertical-align:top"><strong>Team logo URL</strong></td><td style="padding:6px 0">${
+        fanTeamLogoUrl
+          ? `<a href="${escapeHtml(fanTeamLogoUrl)}">${escapeHtml(fanTeamLogoUrl)}</a>`
+          : "—"
+      }</td></tr>`
     : ""
 
   const reportedUserRow = reportType === "group_conversation"
     ? ""
+    : reportType === "fan_team"
+    ? `<tr><td style="padding:6px 0;vertical-align:top"><strong>Team owner user ID</strong></td><td style="padding:6px 0">${escapeHtml(reportedUserIdForEmail || "—")}</td></tr>`
     : `<tr><td style="padding:6px 0;vertical-align:top"><strong>Reported user ID</strong></td><td style="padding:6px 0">${escapeHtml(reportedUserIdForEmail || "—")}</td></tr>`
 
   const reviewWindowSection = ""
@@ -928,7 +1069,9 @@ Deno.serve(async (req) => {
       ? `${adminReviewBaseUrl.replace(/\/+$/, "")}?reportId=${encodeURIComponent(reportIdNormalized)}#group-conversation-reports`
       : reportType === "group_message"
         ? `${adminReviewBaseUrl.replace(/\/+$/, "")}?reportId=${encodeURIComponent(reportIdNormalized)}#group-message-reports`
-        : `${adminReviewBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(reportIdNormalized)}`
+        : reportType === "fan_team"
+          ? `${adminReviewBaseUrl.replace(/\/+$/, "")}?reportId=${encodeURIComponent(reportIdNormalized)}#fan-team-reports`
+          : `${adminReviewBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(reportIdNormalized)}`
     : ""
   const reportReviewLinkLine = reportReviewLink
     ? `<p style="margin:8px 0"><strong>Admin review:</strong> <a href="${escapeHtml(reportReviewLink)}">${escapeHtml(reportReviewLink)}</a></p>`
@@ -939,7 +1082,9 @@ Deno.serve(async (req) => {
       ? "group conversation"
       : reportType === "group_message"
         ? "group message"
-        : reportType
+        : reportType === "fan_team"
+          ? "fan team"
+          : reportType
 
   const html = `<!DOCTYPE html>
 <html>
@@ -1003,6 +1148,9 @@ Deno.serve(async (req) => {
   }
   if (reportType === "group_message" && admin && reportIdNormalized) {
     await markGroupMessageReportNotified(admin, reportIdNormalized)
+  }
+  if (reportType === "fan_team" && admin && reportIdNormalized) {
+    await markFanTeamReportNotified(admin, reportIdNormalized)
   }
 
   return new Response(JSON.stringify({ ok: true }), {

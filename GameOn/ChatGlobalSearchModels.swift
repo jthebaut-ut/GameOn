@@ -4,13 +4,14 @@ enum ChatGlobalSearchConversationKind: String, Codable, Sendable {
     case direct
     case business
     case group
+    case team
     case pickup
 
     var inboxKind: ChatInboxConversationKind {
         switch self {
         case .direct: return .direct
         case .business: return .business
-        case .group, .pickup: return .group
+        case .group, .team, .pickup: return .group
         }
     }
 
@@ -20,6 +21,8 @@ enum ChatGlobalSearchConversationKind: String, Codable, Sendable {
             return true
         case .fans:
             return self == .direct
+        case .teams:
+            return self == .team
         case .businesses:
             return self == .business
         case .groups:
@@ -27,6 +30,28 @@ enum ChatGlobalSearchConversationKind: String, Codable, Sendable {
         case .pickup:
             return self == .pickup
         }
+    }
+
+    /// Remap server `group` hits that are Fan Team chats using already-loaded inbox / Team snapshots.
+    @MainActor
+    static func resolve(
+        raw: ChatGlobalSearchConversationKind,
+        conversationId: UUID,
+        pickupGameId: UUID?,
+        inbox: [ChatViewModel.FriendDisplay]
+    ) -> ChatGlobalSearchConversationKind {
+        if pickupGameId != nil || raw == .pickup { return .pickup }
+        if raw == .team { return .team }
+        if raw == .group {
+            if let row = inbox.first(where: { ($0.conversationId ?? $0.id) == conversationId }),
+               row.isFanTeamChat {
+                return .team
+            }
+            if FanTeamIdentityRealtimeCoordinator.shared.teamId(forConversationId: conversationId) != nil {
+                return .team
+            }
+        }
+        return raw
     }
 }
 
@@ -76,6 +101,7 @@ enum ChatGlobalSearchLocalMatcher {
             .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
     }
 
+    @MainActor
     static func conversationHits(
         from inbox: [ChatViewModel.FriendDisplay],
         query: String,
@@ -89,6 +115,8 @@ enum ChatGlobalSearchLocalMatcher {
             let kind: ChatGlobalSearchConversationKind
             if row.isPickupGameChat {
                 kind = .pickup
+            } else if row.isFanTeamChat {
+                kind = .team
             } else {
                 switch row.inboxKind {
                 case .direct: kind = .direct
@@ -97,10 +125,21 @@ enum ChatGlobalSearchLocalMatcher {
                 }
             }
             let conversationId = row.conversationId ?? row.id
+            let title: String = {
+                guard row.isFanTeamChat else { return row.preview.displayName }
+                let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                    teamId: row.fanTeamId,
+                    conversationId: conversationId
+                )?.name
+                return ChatInboxFanTeamRowIdentity.preferredTitle(
+                    teamName: teamName,
+                    fallbackConversationTitle: row.preview.displayName
+                )
+            }()
             return ChatGlobalSearchConversationHit(
                 conversationId: conversationId,
                 kind: kind,
-                title: row.preview.displayName,
+                title: title,
                 subtitle: row.preview.username.map { "@\($0)" } ?? (row.subtitle ?? ""),
                 peerUserId: row.isGroupConversation ? nil : row.preview.id,
                 pickupGameId: row.pickupGameId,
@@ -113,8 +152,21 @@ enum ChatGlobalSearchLocalMatcher {
         }
     }
 
+    @MainActor
     private static func matchesConversation(_ row: ChatViewModel.FriendDisplay, query: String) -> Bool {
-        let name = normalize(row.preview.displayName)
+        let conversationId = row.conversationId ?? row.id
+        let displayName: String = {
+            guard row.isFanTeamChat else { return row.preview.displayName }
+            let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                teamId: row.fanTeamId,
+                conversationId: conversationId
+            )?.name
+            return ChatInboxFanTeamRowIdentity.preferredTitle(
+                teamName: teamName,
+                fallbackConversationTitle: row.preview.displayName
+            )
+        }()
+        let name = normalize(displayName)
         let username = normalize(row.preview.username ?? "")
         let subtitle = normalize(row.subtitle ?? "")
         return name.contains(query) || username.contains(query) || subtitle.contains(query)

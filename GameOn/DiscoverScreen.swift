@@ -810,6 +810,8 @@ private struct PickupGameMapMarker: View {
     var isCluster = false
     var allowsPulse = true
     var count: Int?
+    /// Team-linked Discover pin: logo (or sport fallback) replaces the sport glyph.
+    var teamIdentity: PickupDiscoverTeamIdentity? = nil
 
     @Environment(\.colorScheme) private var colorScheme
     @State private var pulse = false
@@ -864,16 +866,29 @@ private struct PickupGameMapMarker: View {
                 }
                 .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.24), radius: isSelected ? 10 : 7, y: isSelected ? 6 : 4)
 
-            Circle()
-                .fill((reusedSportChipIcon ? accentColor : Color.white).opacity(reusedSportChipIcon ? 0.18 : 0.10))
-                .frame(width: baseSize * 0.68, height: baseSize * 0.68)
+            if let teamIdentity {
+                FanTeamMarkView(
+                    sport: teamIdentity.teamSport.isEmpty ? sport : teamIdentity.teamSport,
+                    logoURL: teamIdentity.logoURL,
+                    logoThumbnailURL: teamIdentity.logoThumbnailURL,
+                    colorHex: teamIdentity.colorHex,
+                    size: baseSize * 0.72,
+                    preferDetailURL: false,
+                    displayRefreshToken: teamIdentity.displayRefreshToken
+                )
+                .accessibilityHidden(true)
+            } else {
+                Circle()
+                    .fill((reusedSportChipIcon ? accentColor : Color.white).opacity(reusedSportChipIcon ? 0.18 : 0.10))
+                    .frame(width: baseSize * 0.68, height: baseSize * 0.68)
 
-            MapSportChipIconGlyph(
-                sport: sport,
-                emojiSize: glyphSize,
-                symbolSize: glyphSize * 0.78,
-                frameSize: baseSize * 0.70
-            )
+                MapSportChipIconGlyph(
+                    sport: sport,
+                    emojiSize: glyphSize,
+                    symbolSize: glyphSize * 0.78,
+                    frameSize: baseSize * 0.70
+                )
+            }
 
             if let count, isCluster {
                 Text("\(count)")
@@ -1359,6 +1374,8 @@ struct DiscoverScreen: View {
         let pickupSubMode: String
         let selectedDay: Int
         let selectedSport: String
+        let teamScope: String
+        let myTeamsFingerprint: String
         let searchText: String
         let mapDisplayMode: String
         let visibleLatitudeBucket: String
@@ -1428,6 +1445,8 @@ struct DiscoverScreen: View {
         let allowsPulse: Bool
         let accentColor: Color
         let reusedSportChipIcon: Bool
+        let teamIdentity: PickupDiscoverTeamIdentity?
+        let showsPublicAvailability: Bool
     }
 
     private let primaryMapUtilityButtonSize: CGFloat = 44
@@ -2838,11 +2857,16 @@ struct DiscoverScreen: View {
 
     private var discoverScreenWithToolbar: some View {
         discoverScreenWithTertiarySheets
+            // Keyboard accessory "Done" must ONLY register while Discover is the selected tab.
+            // Discover stays mounted (opacity 0) under other tabs; an always-on `.keyboard`
+            // toolbar leaks into Team Detail Chat sheets and floats "Done" over the composer.
             .toolbar {
-                ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button(L10n.t("discover_search_keyboard_dismiss", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))) {
-                        dismissDiscoverSearchKeyboard()
+                if isDiscoverTabSelected {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button(L10n.t("discover_search_keyboard_dismiss", languageCode: L10n.normalizedLanguageCode(appLanguageRaw))) {
+                            dismissDiscoverSearchKeyboard()
+                        }
                     }
                 }
             }
@@ -2899,8 +2923,12 @@ struct DiscoverScreen: View {
     private var discoverScreenWithTertiarySheets: some View {
         discoverScreenWithClusterSheet
             .sheet(item: $pickupGameDetailNav) { token in
+                let _ = PickupDetailCrashTrace.log("detailSheetInit", gameId: token.id)
                 DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
                     .environmentObject(chatViewModel)
+                    .onAppear {
+                        PickupDetailCrashTrace.log("sheetOnAppear", gameId: token.id)
+                    }
             }
             .sheet(isPresented: $showDiscoverSportMoreSheet) {
                 DiscoverSportFilterMoreSheet(selectedSport: viewModel.selectedSport) { sport in
@@ -4831,18 +4859,25 @@ struct DiscoverScreen: View {
     private func discoverAnnotationCacheKey() -> DiscoverAnnotationCacheKey {
         let selectedDay = Int(Calendar.current.startOfDay(for: viewModel.selectedDate).timeIntervalSince1970 / 86_400)
         let region = viewModel.cameraPosition.region
+        // Explicit Double: iOS 26 terminates when `%.3f` receives Swift.Int (`?? 0` literal risk).
         let centerBucket = [
-            String(format: "%.3f", region?.center.latitude ?? 0),
-            String(format: "%.3f", region?.center.longitude ?? 0)
+            FanGeoFixedFloatFormat.d3(Double(region?.center.latitude ?? 0)),
+            FanGeoFixedFloatFormat.d3(Double(region?.center.longitude ?? 0))
         ].joined(separator: ",")
+        let myTeamsFingerprint = viewModel.discoverMyActiveFanTeamIds
+            .map { $0.uuidString.lowercased() }
+            .sorted()
+            .joined(separator: ",")
         return DiscoverAnnotationCacheKey(
             mode: viewModel.discoverMapContentMode.rawValue,
             pickupSubMode: viewModel.discoverPickupSubMode.rawValue,
             selectedDay: selectedDay,
             selectedSport: viewModel.selectedSport,
+            teamScope: viewModel.discoverPickupTeamScope.rawValue,
+            myTeamsFingerprint: myTeamsFingerprint,
             searchText: viewModel.debouncedDiscoverSearchText,
             mapDisplayMode: viewModel.mapDisplayMode.rawValue,
-            visibleLatitudeBucket: String(format: "%.4f", viewModel.visibleLatitudeDelta),
+            visibleLatitudeBucket: FanGeoFixedFloatFormat.d4(viewModel.visibleLatitudeDelta),
             cameraCenterBucket: centerBucket,
             venueSnapshotKey: venueSnapshotAnnotationFingerprint(),
             barsCount: viewModel.bars.count,
@@ -4862,6 +4897,8 @@ struct DiscoverScreen: View {
             key.pickupSubMode,
             "\(key.selectedDay)",
             key.selectedSport,
+            key.teamScope,
+            key.myTeamsFingerprint,
             key.searchText,
             key.mapDisplayMode,
             key.visibleLatitudeBucket,
@@ -4893,8 +4930,8 @@ struct DiscoverScreen: View {
         return (["count:\(viewModel.bars.count)"] + rows.map { bar in
             [
                 bar.id.uuidString.lowercased(),
-                String(format: "%.4f", bar.coordinate.latitude),
-                String(format: "%.4f", bar.coordinate.longitude),
+                FanGeoFixedFloatFormat.d4(bar.coordinate.latitude),
+                FanGeoFixedFloatFormat.d4(bar.coordinate.longitude),
                 "\(bar.games.count)"
             ].joined(separator: ":")
         })
@@ -4904,12 +4941,23 @@ struct DiscoverScreen: View {
     private func pickupGamesAnnotationFingerprint() -> String {
         let rows = Array(viewModel.pickupGamesForDiscoverMap.prefix(96))
         return (["count:\(viewModel.pickupGamesForDiscoverMap.count)"] + rows.map { row in
-            [
+            let identity = viewModel.pickupDiscoverTeamIdentityByGameId[row.id]
+            let showsAvailability = PickupDiscoverTeamPresentation.shouldShowPublicAvailability(
+                identity: identity,
+                game: row
+            )
+            return [
                 row.id.uuidString.lowercased(),
-                String(format: "%.4f", row.latitude ?? 0),
-                String(format: "%.4f", row.longitude ?? 0),
+                FanGeoFixedFloatFormat.d4(Double(row.latitude ?? 0)),
+                FanGeoFixedFloatFormat.d4(Double(row.longitude ?? 0)),
                 row.status,
-                "\(row.approved_join_count ?? -1)"
+                "\(row.approved_join_count ?? -1)",
+                identity?.teamId.uuidString.lowercased() ?? "-",
+                identity?.teamName ?? "-",
+                identity?.logoThumbnailURL ?? identity?.logoURL ?? "-",
+                identity?.colorHex ?? "-",
+                identity?.displayRefreshToken?.uuidString ?? "-",
+                showsAvailability ? "1" : "0"
             ].joined(separator: ":")
         })
         .joined(separator: "|")
@@ -4919,8 +4967,8 @@ struct DiscoverScreen: View {
         viewModel.pickupPlacesForDiscoverMap.prefix(96).map { place in
             [
                 place.id.uuidString.lowercased(),
-                String(format: "%.4f", place.latitude),
-                String(format: "%.4f", place.longitude),
+                FanGeoFixedFloatFormat.d4(place.latitude),
+                FanGeoFixedFloatFormat.d4(place.longitude),
                 place.sportTags.joined(separator: ",")
             ].joined(separator: ":")
         }
@@ -4943,14 +4991,22 @@ struct DiscoverScreen: View {
         let needed = pickupPlayersNeededDisplay(row)
         let isSelected = viewModel.selectedPickupGameForMap?.id == row.id
         let activity = pickupMarkerActivity(for: row)
+        let teamIdentity = viewModel.pickupDiscoverTeamIdentityByGameId[row.id]
+        let showsPublicAvailability = PickupDiscoverTeamPresentation.shouldShowPublicAvailability(
+            identity: teamIdentity,
+            game: row
+        )
+        let teamAccent = teamIdentity?.colorHex.flatMap { Color(fanTeamHex: $0) }
         return PickupMapMarkerDisplayValues(
             needed: needed,
             isSelected: isSelected,
-            badgeValue: pickupDemandBadgeText(for: needed),
+            badgeValue: showsPublicAvailability ? pickupDemandBadgeText(for: needed) : nil,
             activity: activity,
             allowsPulse: pickupMarkerAllowsPulse(isSelected: isSelected, activity: activity),
-            accentColor: viewModel.colorForSport(row.sport),
-            reusedSportChipIcon: mapSportIconReusesSportChipIcon(row.sport)
+            accentColor: teamAccent ?? viewModel.colorForSport(row.sport),
+            reusedSportChipIcon: mapSportIconReusesSportChipIcon(row.sport),
+            teamIdentity: teamIdentity,
+            showsPublicAvailability: showsPublicAvailability
         )
     }
 
@@ -5226,6 +5282,19 @@ struct DiscoverScreen: View {
         case .pickupGames:
             switch viewModel.discoverPickupSubMode {
             case .games:
+                if viewModel.discoverPickupTeamScope == .myTeams {
+                    if let sport = discoverStatusSportDisplayName() {
+                        return String(
+                            format: L10n.t(
+                                "discover_empty_my_teams_games_date_sport_format",
+                                languageCode: languageCode
+                            ),
+                            locale: Locale(identifier: languageCode),
+                            sport
+                        )
+                    }
+                    return L10n.t("discover_empty_my_teams_games_date", languageCode: languageCode)
+                }
                 return L10n.t("discover_empty_pickup_games_nearby", languageCode: languageCode)
             case .places:
                 return L10n.t("discover_empty_pickup_places_nearby", languageCode: languageCode)
@@ -5248,6 +5317,12 @@ struct DiscoverScreen: View {
         case .pickupGames:
             switch viewModel.discoverPickupSubMode {
             case .games:
+                if viewModel.discoverPickupTeamScope == .myTeams {
+                    return L10n.t(
+                        "discover_empty_recovery_my_teams_games",
+                        languageCode: languageCode
+                    )
+                }
                 // Date-dependent Play → Games; Places stays location-only zoom guidance.
                 return hasSpecificSport
                     ? L10n.t("discover_empty_recovery_pickup_games_date_sport", languageCode: languageCode)
@@ -5268,10 +5343,12 @@ struct DiscoverScreen: View {
     }
 
     /// Genuine Play → Games empty viewport with settled map data (no loading flicker).
+    /// Hidden while My Teams scope is on — organizing a Team game is a Team Schedule flow.
     private var showDiscoverPlayGamesEmptyCreateCTA: Bool {
         guard showDiscoverVisibleSearchEmptyHint,
               viewModel.discoverMapContentMode == .pickupGames,
               viewModel.discoverPickupSubMode == .games,
+              viewModel.discoverPickupTeamScope != .myTeams,
               !viewModel.isLoadingPickupGamesForMap else {
             return false
         }
@@ -6276,11 +6353,25 @@ struct DiscoverScreen: View {
         }
     }
 
+    /// Idempotent Discover → pickup detail presentation (rapid re-taps must not re-seed sheet item).
+    private func presentPickupGameDetailIfNeeded(id: UUID) {
+        let title = viewModel.selectedPickupGameForMap?.id == id
+            ? viewModel.selectedPickupGameForMap?.title
+            : viewModel.pickupGamesForDiscoverMap.first(where: { $0.id == id })?.title
+        PickupDetailCrashTrace.log("detailsTapped", gameId: id, title: title)
+        if pickupGameDetailNav?.id == id {
+            PickupDetailCrashTrace.log("sheetItemAlreadyPresenting", gameId: id, title: title)
+            return
+        }
+        pickupGameDetailNav = PickupDetailNavigationToken(id: id)
+        PickupDetailCrashTrace.log("sheetItemAssigned", gameId: id, title: title)
+    }
+
     private func handleDiscoverTodayDashboardNextEventTap(_ insight: DiscoverPersonalizedInsight) {
         switch insight.kind {
         case .pickup:
             if let pickupId = insight.destinationPickupGameId {
-                pickupGameDetailNav = PickupDetailNavigationToken(id: pickupId)
+                presentPickupGameDetailIfNeeded(id: pickupId)
                 return
             }
             viewModel.enqueueDiscoverTodayDashboardNav(.goingPickupGamesUpcoming)
@@ -7868,8 +7959,15 @@ struct DiscoverScreen: View {
                     .id(selectedBar.id)
             }
         } else if let pickup = viewModel.selectedPickupGameForMap {
+            let _ = PickupDetailCrashTrace.log(
+                "previewCardRender",
+                gameId: pickup.id,
+                title: pickup.title
+            )
+            // Concrete leaf types — do not inline the Team preview tree into DiscoverScreen’s
+            // bottom-overlay opaque `some View` chain (stack-guard death on Team-linked open).
             discoverPickupPreviewCard(pickup, guestMapsActionsToLogin: viewModel.isGuestDiscoverMode) {
-                pickupGameDetailNav = PickupDetailNavigationToken(id: pickup.id)
+                presentPickupGameDetailIfNeeded(id: pickup.id)
             }
             .id(pickup.id)
             .transition(
@@ -8033,11 +8131,11 @@ struct DiscoverScreen: View {
                     if let sport = discoverStatusSportDescriptor() {
                         return count == 1
                             ? String(format: L10n.t("discover_status_sport_place_one_format", languageCode: languageCode), locale: Locale(identifier: languageCode), sport)
-                            : String(format: L10n.t("discover_status_sport_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count, sport)
+                            : String(format: L10n.t("discover_status_sport_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count), sport)
                     }
                     return count == 1
                         ? L10n.t("discover_status_pickup_place_one", languageCode: languageCode)
-                        : String(format: L10n.t("discover_status_pickup_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count)
+                        : String(format: L10n.t("discover_status_pickup_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count))
                 }
                 return L10n.t("discover_status_no_pickup_places", languageCode: languageCode)
             }
@@ -8046,11 +8144,11 @@ struct DiscoverScreen: View {
                 if let sport = discoverStatusSportDescriptor() {
                     return count == 1
                         ? String(format: L10n.t("discover_status_sport_pickup_one_format", languageCode: languageCode), locale: Locale(identifier: languageCode), sport)
-                        : String(format: L10n.t("discover_status_sport_pickup_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count, sport)
+                        : String(format: L10n.t("discover_status_sport_pickup_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count), sport)
                 }
                 return count == 1
                     ? L10n.t("discover_status_pickup_game_one", languageCode: languageCode)
-                    : String(format: L10n.t("discover_status_pickup_game_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count)
+                    : String(format: L10n.t("discover_status_pickup_game_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count))
             }
             return L10n.t("discover_status_no_pickup_games", languageCode: languageCode)
         }
@@ -8061,20 +8159,20 @@ struct DiscoverScreen: View {
                 if let sport = discoverStatusSportDisplayName() {
                     return count == 1
                         ? String(format: L10n.t("discover_status_hosting_sport_one_format", languageCode: languageCode), locale: Locale(identifier: languageCode), sport)
-                        : String(format: L10n.t("discover_status_hosting_sport_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count, sport)
+                        : String(format: L10n.t("discover_status_hosting_sport_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count), sport)
                 }
                 return count == 1
                     ? L10n.t("discover_status_hosting_one", languageCode: languageCode)
-                    : String(format: L10n.t("discover_status_hosting_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count)
+                    : String(format: L10n.t("discover_status_hosting_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count))
             }
             if let sport = discoverStatusSportDescriptor() {
                 return count == 1
                     ? String(format: L10n.t("discover_status_sport_spot_one_format", languageCode: languageCode), locale: Locale(identifier: languageCode), sport)
-                    : String(format: L10n.t("discover_status_sport_spot_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count, sport)
+                    : String(format: L10n.t("discover_status_sport_spot_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count), sport)
             }
             return count == 1
                 ? L10n.t("discover_status_watch_spot_one", languageCode: languageCode)
-                : String(format: L10n.t("discover_status_watch_spot_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), count)
+                : String(format: L10n.t("discover_status_watch_spot_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count))
         }
         if viewModel.mapDisplayMode == .gamesOnly {
             if let sport = discoverStatusSportDisplayName() {
@@ -8231,7 +8329,7 @@ struct DiscoverScreen: View {
                 viewModel.discoverPickupSubMode = .games
                 viewModel.selectPickupGameOnMap(row)
             }
-            pickupGameDetailNav = PickupDetailNavigationToken(id: row.id)
+            presentPickupGameDetailIfNeeded(id: row.id)
             return true
         }
 
@@ -8656,6 +8754,7 @@ struct DiscoverScreen: View {
     private func pickupGameMapPinButton(row: PickupGameRow) -> some View {
         let display = pickupMapMarkerDisplayValues(for: row)
         logPickupBadgeDebug(row: row, playersNeeded: display.needed, badgeValue: display.badgeValue ?? "none")
+        let sportLabel = AppSportCatalog.displayLabel(forSportToken: row.sport)
         return Button {
             FGInteractionHaptics.selection()
             withAnimation(.spring(response: 0.45, dampingFraction: 0.86)) {
@@ -8670,12 +8769,22 @@ struct DiscoverScreen: View {
                 activity: display.activity,
                 demandBadgeText: display.badgeValue,
                 isSelected: display.isSelected,
-                allowsPulse: display.allowsPulse
+                allowsPulse: display.allowsPulse,
+                teamIdentity: display.teamIdentity
             )
             .zIndex(display.isSelected ? 30 : 10)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Pickup \(AppSportCatalog.displayLabel(forSportToken: row.sport)), \(display.needed) spots open, \(row.title)")
+        .accessibilityLabel(
+            PickupDiscoverTeamPresentation.mapPinAccessibilityLabel(
+                gameTitle: row.title,
+                sportLabel: sportLabel,
+                identity: display.teamIdentity,
+                showsPublicAvailability: display.showsPublicAvailability,
+                spotsNeeded: display.needed,
+                languageCode: appLanguageRaw
+            )
+        )
     }
 
     private func pickupPlacePrimarySport(_ place: PickupPlaceRow) -> String {
@@ -8917,284 +9026,48 @@ struct DiscoverScreen: View {
         openPickupHostFlow(from: place)
     }
 
+    @ViewBuilder
     private func discoverPickupPreviewCard(
         _ row: PickupGameRow,
         guestMapsActionsToLogin: Bool,
         onOpenDetails: @escaping () -> Void
     ) -> some View {
-        let locationLine: String = {
-            guard !guestMapsActionsToLogin else { return "" }
-            return [row.address, row.city, row.state]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: ", ")
-        }()
-        let detailSubtitle: String = {
-            if guestMapsActionsToLogin {
-                return "Sign in to see schedule, location, and roster details"
-            }
-            return "\(AppSportCatalog.displayLabel(forSportToken: row.sport)) • \(row.skillLevelEnum.displayTitle) • \(row.playEnvironmentEnum.shortLabel)"
-        }()
-        let sportTint = viewModel.colorForSport(row.sport)
-        let sportEmoji = viewModel.emojiForSport(row.sport)
-        let sportIconName = viewModel.iconForSport(row.sport)
-        let mainInk = colorScheme == .dark ? Color.white.opacity(0.92) : FGColor.primaryText(colorScheme)
-        let subInk = colorScheme == .dark ? Color.white.opacity(0.72) : FGColor.secondaryText(colorScheme)
-        let dismissIcon = colorScheme == .dark ? Color.white.opacity(0.72) : Color.secondary
-        let previewCorner: CGFloat = 30
-
-        let detailTitle = guestMapsActionsToLogin ? "Log in / Sign up" : "Details & join"
-        let openDetailAction = {
-            if guestMapsActionsToLogin {
-                presentGuestPickupPreviewAuth()
-            } else {
-                onOpenDetails()
-            }
-        }
-        let showStarted = !guestMapsActionsToLogin && row.hasPickupGameStarted()
-
-        return VStack(alignment: .leading, spacing: FGSpacing.md) {
-            HStack(alignment: .top, spacing: FGSpacing.md) {
-                PickupGameStartedSportGlyphFrame(showStarted: showStarted) {
-                    ZStack {
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .frame(width: 58, height: 58)
-                            .overlay {
-                                Circle()
-                                    .strokeBorder(
-                                        LinearGradient(
-                                            colors: [
-                                                Color.white.opacity(colorScheme == .dark ? 0.35 : 0.65),
-                                                sportTint.opacity(0.55)
-                                            ],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        ),
-                                        lineWidth: 1.25
-                                    )
-                            }
-                            .shadow(color: sportTint.opacity(0.35), radius: 10, y: 4)
-
-                        if !sportEmoji.isEmpty {
-                            Text(sportEmoji)
-                                .font(.system(size: 30))
-                                .accessibilityHidden(true)
-                        } else {
-                            Image(systemName: sportIconName)
-                                .font(.system(size: 26, weight: .semibold))
-                                .foregroundStyle(sportTint)
-                                .accessibilityHidden(true)
-                        }
-                    }
-                }
-
-                Button {
-                    withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
-                        openDetailAction()
-                    }
-                } label: {
-                    VStack(alignment: .leading, spacing: 7) {
-                        GameFormatBadgeView(format: row.gameFormat, colorScheme: colorScheme)
-                        Text(guestMapsActionsToLogin ? AppSportCatalog.displayLabel(forSportToken: row.sport) : row.title)
-                            .font(FGTypography.sectionTitle)
-                            .foregroundStyle(mainInk)
-                            .multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text(detailSubtitle)
-                            .font(FGTypography.metadata.weight(.medium))
-                            .foregroundStyle(subInk)
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.88)
-
-                        if !guestMapsActionsToLogin, let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) {
-                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Image(systemName: "clock.fill")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(subInk)
-                                Text(
-                                    row.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw)
-                                        ?? start.formatted(
-                                            Date.FormatStyle.dateTime
-                                                .month(.abbreviated)
-                                                .day()
-                                                .year()
-                                                .hour()
-                                                .minute()
-                                                .locale(
-                                                    Locale(
-                                                        identifier: L10n.normalizedLanguageCode(appLanguageRaw)
-                                                            .replacingOccurrences(of: "-", with: "_")
-                                                    )
-                                                )
-                                        )
-                                )
-                                    .font(FGTypography.metadata.weight(.semibold))
-                                    .foregroundStyle(mainInk)
-                            }
-                            if showStarted {
-                                PickupGameStartedLineCaption()
-                                    .padding(.top, 2)
-                            }
-                        }
-
-                        if !guestMapsActionsToLogin {
-                            HStack(alignment: .top, spacing: 8) {
-                                Image(systemName: "person.2.fill")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(FGColor.accentGreen)
-                                Text(row.participantAudienceDisplayTitle)
-                                    .font(FGTypography.caption.weight(.medium))
-                                    .foregroundStyle(subInk)
-                                    .lineLimit(2)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-
-                        if !locationLine.isEmpty {
-                            HStack(alignment: .top, spacing: 8) {
-                                Image(systemName: "mappin.circle.fill")
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .foregroundStyle(FGColor.accentBlue)
-                                Text(locationLine)
-                                    .font(FGTypography.caption)
-                                    .foregroundStyle(subInk)
-                                    .lineLimit(2)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-
-                        if !guestMapsActionsToLogin {
-                            HStack(spacing: FGSpacing.sm) {
-                                let playersNeeded = pickupPlayersNeededDisplay(row)
-                                pickupPreviewMetricCapsule(
-                                    pickupLocalizedSpotsLeft(
-                                        playersNeeded,
-                                        languageCode: appLanguageRaw
-                                    ),
-                                    mainInk: mainInk
-                                )
-                                pickupPreviewMetricCapsule(row.pickupCompactDurationLabel ?? "\(playersNeeded) players needed", mainInk: mainInk)
-                            }
-                            .padding(.top, 2)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.trailing, 4)
-                }
-                .buttonStyle(.plain)
-
-                // Top-trailing: Share then Close (dismiss stays at the far trailing edge).
-                HStack(spacing: 6) {
-                    if !guestMapsActionsToLogin, row.isEligibleForInAppShare() {
-                        PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
-                            discoverPickupPreviewTrailingControl(
-                                systemImage: "square.and.arrow.up",
-                                icon: dismissIcon
-                            )
-                        }
-                        .environmentObject(chatViewModel)
-                        // Counteract Share control's full-width frame used on action rows.
-                        .fixedSize()
-                    }
-
-                    Button {
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                            viewModel.clearPickupMapSelection()
-                        }
-                    } label: {
-                        discoverPickupPreviewTrailingControl(
-                            systemImage: "xmark",
-                            icon: dismissIcon
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss pickup preview")
-                }
-            }
-
-            if !guestMapsActionsToLogin {
-                PickupOrganizerPreviewIdentityRow(
-                    viewModel: viewModel,
-                    organizerUserId: row.creator_user_id,
-                    colorScheme: colorScheme
-                )
-            }
-
-            HStack(spacing: FGSpacing.sm) {
-                if !guestMapsActionsToLogin, let lat = row.latitude, let lon = row.longitude {
-                    Button {
-                        if let url = URL(string: "http://maps.apple.com/?ll=\(lat),\(lon)&q=Pickup%20game") {
-                            openURL(url)
-                        }
-                    } label: {
-                        Label("Directions", systemImage: "map")
-                            .font(FGTypography.metadata.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(FGColor.accentBlue)
-                }
-
-                if viewModel.discoverMapContentMode == .pickupGames {
-                    Button {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
-                            openDetailAction()
-                        }
-                    } label: {
-                        Text(detailTitle)
-                            .font(FGTypography.metadata.weight(.semibold))
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                            .minimumScaleFactor(0.78)
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(colorScheme == .dark ? Color.white.opacity(0.92) : FGColor.accentBlue)
-                }
-            }
-        }
-        .padding(FGSpacing.lg)
-        .background {
-            ZStack {
-                RoundedRectangle(cornerRadius: previewCorner, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                LinearGradient(
-                    colors: [
-                        Color.black.opacity(colorScheme == .dark ? 0.62 : 0.2),
-                        Color.black.opacity(colorScheme == .dark ? 0.4 : 0.11)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .clipShape(RoundedRectangle(cornerRadius: previewCorner, style: .continuous))
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: previewCorner, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: previewCorner, style: .continuous)
-                .strokeBorder(discoverPreviewCardBorder, lineWidth: 1)
-        }
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.42 : 0.16), radius: colorScheme == .dark ? 28 : 18, x: 0, y: colorScheme == .dark ? 16 : 10)
-        .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.1 : 0.05), radius: 14, x: 0, y: 3)
-        .task(id: row.id) {
-            guard !guestMapsActionsToLogin else { return }
-            PickupOrganizerTrustDebug.lifecycle("selected pickup card opened")
-            await viewModel.loadPickupCreatorProfilesIfNeeded(creatorUserIds: [row.creator_user_id])
-            if viewModel.pickupOrganizerSummary(for: row.creator_user_id) != nil {
-                PickupOrganizerTrustDebug.lifecycle("organizer statistics served from cache")
-            } else {
-                PickupOrganizerTrustDebug.lifecycle("organizer statistics found in existing payload", details: "none")
-            }
-            await viewModel.refreshPickupOrganizerSummaries(userIds: [row.creator_user_id])
-        }
-        .onAppear {
-            guard !guestMapsActionsToLogin else { return }
-            PickupGameStartedStateDebug.log(
+        let teamIdentity = viewModel.pickupDiscoverTeamIdentityByGameId[row.id]
+        if let teamIdentity, !guestMapsActionsToLogin {
+            DiscoverTeamLinkedPickupPreviewCard(
+                viewModel: viewModel,
                 row: row,
-                now: Date(),
-                allowedActions: "discover_map_preview"
+                teamIdentity: teamIdentity,
+                languageCode: appLanguageRaw,
+                cardBorder: discoverPreviewCardBorder,
+                onOpenDetails: onOpenDetails,
+                onDismiss: {
+                    viewModel.clearPickupMapSelection()
+                },
+                openDirections: { url in
+                    openURL(url)
+                }
             )
+            .environmentObject(chatViewModel)
+        } else {
+            DiscoverStandalonePickupPreviewCard(
+                viewModel: viewModel,
+                row: row,
+                guestMapsActionsToLogin: guestMapsActionsToLogin,
+                languageCode: appLanguageRaw,
+                cardBorder: discoverPreviewCardBorder,
+                onOpenDetails: onOpenDetails,
+                onDismiss: {
+                    viewModel.clearPickupMapSelection()
+                },
+                openDirections: { url in
+                    openURL(url)
+                },
+                presentGuestAuth: {
+                    presentGuestPickupPreviewAuth()
+                }
+            )
+            .environmentObject(chatViewModel)
         }
     }
 
@@ -9204,30 +9077,6 @@ struct DiscoverScreen: View {
         print("[GuestPickupAuthDebug] presentAuth source=pickupPreview")
 #endif
         viewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
-    }
-
-    /// Shared 38pt material circle + 44pt hit target for preview trailing Share / Close.
-    private func discoverPickupPreviewTrailingControl(
-        systemImage: String,
-        icon: Color
-    ) -> some View {
-        ZStack {
-            Circle()
-                .fill(.ultraThinMaterial)
-                .frame(width: 38, height: 38)
-                .overlay {
-                    Circle()
-                        .strokeBorder(
-                            Color.primary.opacity(colorScheme == .dark ? 0.22 : 0.12),
-                            lineWidth: 1
-                        )
-                }
-            Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(icon)
-        }
-        .frame(width: 44, height: 44)
-        .contentShape(Rectangle())
     }
 
     private var discoverPickupPinsInBounds: Int {
@@ -14304,6 +14153,13 @@ private struct DiscoverOverlaySportPillRow: View {
     @ObservedObject var viewModel: MapViewModel
     @Binding var showMoreSheet: Bool
     let onSelect: (String) -> Void
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var showsMyTeamsChip: Bool {
+        !viewModel.isGuestDiscoverMode
+            && viewModel.discoverMapContentMode == .pickupGames
+            && viewModel.discoverPickupSubMode == .games
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -14336,9 +14192,101 @@ private struct DiscoverOverlaySportPillRow: View {
                         ),
                         action: { onSelect(chip.selection) }
                     )
+                    if chip == .allSports, showsMyTeamsChip {
+                        DiscoverOverlayMyTeamsScopePill(
+                            isSelected: viewModel.discoverPickupTeamScope == .myTeams,
+                            languageCode: appLanguageRaw,
+                            action: {
+                                FGInteractionHaptics.selection()
+                                let next: DiscoverPickupTeamScope =
+                                    viewModel.discoverPickupTeamScope == .myTeams ? .all : .myTeams
+                                viewModel.setDiscoverPickupTeamScope(next)
+                            }
+                        )
+                    }
                 }
             }
         }
+        .onAppear {
+            if showsMyTeamsChip, viewModel.discoverPickupTeamScope == .myTeams {
+                Task { await viewModel.ensureDiscoverMyActiveFanTeamIdsLoaded() }
+            }
+        }
+    }
+}
+
+private struct DiscoverOverlayMyTeamsScopePill: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let isSelected: Bool
+    let languageCode: String
+    let action: () -> Void
+
+    private static let chipHeight: CGFloat = 36
+    private static let chipCornerRadius: CGFloat = 18
+
+    private var label: String {
+        L10n.t("chat_section_my_teams", languageCode: languageCode)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "shield.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(FGColor.accentGreen)
+                Text(label)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .foregroundStyle(
+                        colorScheme == .dark
+                            ? Color.white.opacity(isSelected ? 0.96 : 0.86)
+                            : FGColor.primaryText(colorScheme)
+                    )
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 11)
+            .frame(minHeight: Self.chipHeight)
+            .frame(height: Self.chipHeight)
+            .background {
+                RoundedRectangle(cornerRadius: Self.chipCornerRadius, style: .continuous)
+                    .fill(colorScheme == .dark ? .thinMaterial : .ultraThinMaterial)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.chipCornerRadius, style: .continuous)
+                            .fill(colorScheme == .dark ? Color.black.opacity(isSelected ? 0.24 : 0.34) : Color.clear)
+                    }
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.chipCornerRadius, style: .continuous)
+                            .fill(
+                                Color.white.opacity(
+                                    isSelected
+                                        ? (colorScheme == .dark ? 0.18 : 0.62)
+                                        : (colorScheme == .dark ? 0.10 : 0.44)
+                                )
+                            )
+                    }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: Self.chipCornerRadius, style: .continuous)
+                    .strokeBorder(
+                        isSelected
+                            ? FGColor.accentGreen
+                            : (colorScheme == .dark ? Color.white.opacity(0.18) : Color.black.opacity(0.04)),
+                        lineWidth: isSelected ? 1.25 : (colorScheme == .dark ? 0.75 : 0.5)
+                    )
+            }
+            .shadow(
+                color: Color.black.opacity(colorScheme == .dark ? 0.14 : 0.025),
+                radius: colorScheme == .dark ? 3 : 1,
+                y: colorScheme == .dark ? 1.5 : 0.5
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            isSelected
+                ? L10n.t("discover_filter_my_teams_selected_a11y", languageCode: languageCode)
+                : L10n.t("discover_filter_my_teams_a11y", languageCode: languageCode)
+        )
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

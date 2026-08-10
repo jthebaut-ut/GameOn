@@ -1,5 +1,35 @@
 import SwiftUI
 
+/// Bubbles composer focus so Team Detail can collapse chrome while typing.
+enum ChatComposerFocusPreferenceKey: PreferenceKey {
+    static var defaultValue = false
+
+    static func reduce(value: inout Bool, nextValue: () -> Bool) {
+        value = value || nextValue()
+    }
+}
+
+/// DEBUG-only high-signal keyboard / composer layout diagnostics for embedded Team Chat.
+/// Prefer ``TeamChatKeyboardDebug`` for Team Chat host evidence.
+enum ChatKeyboardLayoutDebug {
+    static func log(_ event: String, detail: String? = nil) {
+        TeamChatKeyboardDebug.log(event, detail: detail)
+    }
+}
+
+/// DEBUG-only mount/focus/header transitions for Team Chat keyboard root-cause evidence.
+enum TeamChatKeyboardDebug {
+    static func log(_ event: String, detail: String? = nil) {
+#if DEBUG
+        if let detail, !detail.isEmpty {
+            print("[TeamChatKeyboardDebug] \(event) \(detail)")
+        } else {
+            print("[TeamChatKeyboardDebug] \(event)")
+        }
+#endif
+    }
+}
+
 /// Shared chat message composer used by Private Chat and Group Chat.
 /// Visual layout and controls match Private Chat (`DirectChatView`) as the source of truth.
 struct ChatMessageComposer: View {

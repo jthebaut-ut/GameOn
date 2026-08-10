@@ -948,6 +948,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         isAuthSessionRestoringForProfilePresentation = false
         isUserProfileLoadingForPresentation = false
@@ -1078,6 +1079,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
         currentUserLiveVisibilityMode = .allFriends
@@ -1110,6 +1112,7 @@ extension MapViewModel {
         UserDefaults.standard.removeObject(forKey: "cachedUserHomeRegion")
         UserDefaults.standard.removeObject(forKey: "cachedUserHomeCountry")
         UserDefaults.standard.removeObject(forKey: "cachedUserShowHomeCity")
+        UserDefaults.standard.removeObject(forKey: "cachedUserGender")
         UserDefaults.standard.removeObject(forKey: "cachedUserProfileBackgroundKey")
         UserDefaults.standard.removeObject(forKey: "cachedUserLiveVisibilityEnabled")
         UserDefaults.standard.removeObject(forKey: "cachedUserLiveVisibilityMode")
@@ -1545,6 +1548,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
         currentUserLiveVisibilityMode = .allFriends
@@ -1608,6 +1612,7 @@ extension MapViewModel {
         // Keep public pickup pins on Discover after sign-out; refresh will reconcile from Supabase.
         markPickupDiscoverMapDataDirtyForNextRefresh()
         selectedPickupGameForMap = nil
+        clearDiscoverPickupTeamScopeForLogout()
         myPickupGamesForSettings = []
         myRemovedPickupGamesForSettings = []
         pickupOrganizerJoinStatsByGameId = [:]
@@ -2012,7 +2017,7 @@ extension MapViewModel {
     }
 
     private static let userProfileSelectColumns =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_business_account,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,activity_status_visible,is_deleted,created_at,last_seen_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,ad_free_enabled,home_city,home_region,home_country,show_home_city,profile_background_key"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_business_account,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,activity_status_visible,is_deleted,created_at,last_seen_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,ad_free_enabled,home_city,home_region,home_country,show_home_city,profile_background_key,gender"
 
     private static let userProfileIdentitySelectColumns =
         "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,profile_background_key"
@@ -2563,6 +2568,7 @@ extension MapViewModel {
 #endif
         currentUserNationalTeam = profile.nationalTeamIdentity
         applyCurrentUserHomeCityFromProfile(profile)
+        applyCurrentUserGenderFromProfile(profile)
         currentUserProfileBackgroundKey = profile.resolvedProfileBackgroundKey
         currentUserLiveVisibilityEnabled = profile.isVisibleForLiveFriendPresence
         currentUserLiveVisibilityMode = profile.liveVisibilityMode
@@ -4280,6 +4286,7 @@ extension MapViewModel {
             currentUserHomeRegion = UserDefaults.standard.string(forKey: "cachedUserHomeRegion") ?? ""
             currentUserHomeCountry = UserDefaults.standard.string(forKey: "cachedUserHomeCountry") ?? ""
             currentUserShowHomeCity = UserDefaults.standard.object(forKey: "cachedUserShowHomeCity") as? Bool ?? false
+            currentUserGenderRaw = UserDefaults.standard.string(forKey: "cachedUserGender") ?? ""
             currentUserProfileBackgroundKey = ProfileBackgroundCatalog.resolveKey(
                 UserDefaults.standard.string(forKey: "cachedUserProfileBackgroundKey")
             )
@@ -4565,6 +4572,7 @@ extension MapViewModel {
                         currentUserHomeRegion = UserDefaults.standard.string(forKey: "cachedUserHomeRegion") ?? ""
                         currentUserHomeCountry = UserDefaults.standard.string(forKey: "cachedUserHomeCountry") ?? ""
                         currentUserShowHomeCity = UserDefaults.standard.object(forKey: "cachedUserShowHomeCity") as? Bool ?? false
+                        currentUserGenderRaw = UserDefaults.standard.string(forKey: "cachedUserGender") ?? ""
                         currentUserProfileBackgroundKey = ProfileBackgroundCatalog.resolveKey(
                             UserDefaults.standard.string(forKey: "cachedUserProfileBackgroundKey")
                         )
@@ -5035,7 +5043,8 @@ extension MapViewModel {
                 home_region: row.home_region,
                 home_country: row.home_country,
                 show_home_city: row.show_home_city,
-                profile_background_key: row.profile_background_key
+                profile_background_key: row.profile_background_key,
+                gender: row.gender
             )
         }
 
@@ -5726,6 +5735,41 @@ extension MapViewModel {
         currentUserShowHomeCity = profile.showsHomeCityOnProfile
     }
 
+    @MainActor
+    private func applyCurrentUserGenderFromProfile(_ profile: UserProfileRow) {
+        currentUserGenderRaw = profile.gender?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    @discardableResult
+    func saveUserProfileGender(_ gender: FanProfileGender) async -> String? {
+        let session: Session
+        do {
+            session = try await supabase.auth.session
+        } catch {
+            return "Sign in to update your profile."
+        }
+
+        let patch = UserProfileGenderPatch(gender: gender.rawValue)
+        do {
+            try await supabase
+                .from("user_profiles")
+                .update(patch)
+                .eq("id", value: session.user.id.uuidString.lowercased())
+                .execute()
+
+            await MainActor.run {
+                currentUserGenderRaw = gender.rawValue
+                cacheCurrentUserProfileLocally()
+            }
+            return nil
+        } catch {
+#if DEBUG
+            Self.logPostgrestError("[ProfileGender] save failed", error)
+#endif
+            return "Couldn’t save your gender. Please try again."
+        }
+    }
+
     func setLiveVisibilityMode(_ mode: LiveVisibilityMode) async {
         await setLiveVisibilitySettings(
             enabled: currentUserLiveVisibilityEnabled,
@@ -6273,6 +6317,7 @@ extension MapViewModel {
         UserDefaults.standard.set(currentUserHomeCountry, forKey: "cachedUserHomeCountry")
         UserDefaults.standard.set(currentUserShowHomeCity, forKey: "cachedUserShowHomeCity")
         UserDefaults.standard.set(currentUserProfileBackgroundKey.rawValue, forKey: "cachedUserProfileBackgroundKey")
+        UserDefaults.standard.set(currentUserGenderRaw, forKey: "cachedUserGender")
         UserDefaults.standard.set(
             currentUserSelectedLiveVisibilityFriendIDs.map { $0.uuidString.lowercased() }.sorted(),
             forKey: "cachedUserSelectedLiveVisibilityFriendIDs"

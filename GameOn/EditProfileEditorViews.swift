@@ -408,6 +408,37 @@ struct EditProfileShowOnProfileRow: View {
     }
 }
 
+struct EditProfileGenderRow: View {
+    @Binding var gender: FanProfileGender
+    let languageCode: String
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text(L10n.t("profile_gender", languageCode: languageCode))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .frame(width: 108, alignment: .leading)
+
+            Picker("", selection: $gender) {
+                ForEach(FanProfileGender.allCases, id: \.self) { option in
+                    Text(L10n.t(option.localizedKey, languageCode: languageCode))
+                        .tag(option)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(L10n.t("profile_gender", languageCode: languageCode))
+        .accessibilityValue(L10n.t(gender.localizedKey, languageCode: languageCode))
+    }
+}
+
 // MARK: - Appearance
 
 struct EditProfileBackgroundRow: View {

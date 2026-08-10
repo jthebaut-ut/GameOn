@@ -69,6 +69,9 @@ export class ApnsClient {
       }),
     })
 
+    // HTTP 200 means APNs accepted the request for this device token string.
+    // It does NOT prove the current physical install displayed the notification
+    // (a stale still-active token can accept while the device listens on a newer one).
     if (response.status === 200) {
       return {
         ok: true,
@@ -79,6 +82,8 @@ export class ApnsClient {
     }
     const payload = await response.json().catch(() => ({}))
     const reason = typeof payload?.reason === "string" ? payload.reason : `status_${response.status}`
+    // Only invalidate on Apple token-invalid signals for THIS token row.
+    // Do not invalidate because a different token/send failed.
     const invalidate = ["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"].includes(reason)
     return {
       ok: false,

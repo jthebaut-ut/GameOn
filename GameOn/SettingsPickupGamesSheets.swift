@@ -272,19 +272,64 @@ enum SettingsPickupMyGameListCardDisplayStyle: Equatable {
 struct GameFormatBadgeView: View {
     let format: GameType
     let colorScheme: ColorScheme
+    /// Optional accent for Team-linked surfaces. Nil keeps the classic green format badge.
+    var accent: Color? = nil
+
+    private var tint: Color { accent ?? FGColor.accentGreen }
 
     var body: some View {
-        Text(format.badgeTitle)
-            .font(.caption2.weight(.bold))
-            .foregroundStyle(FGColor.accentGreen)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.11), in: Capsule(style: .continuous))
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.35 : 0.22), lineWidth: 1)
-            )
-            .accessibilityLabel("Game format: \(format.displayTitle)")
+        HStack(spacing: 4) {
+            Image(systemName: format.systemImage)
+                .font(.caption2.weight(.semibold))
+            Text(format.badgeTitle)
+                .font(.caption2.weight(.bold))
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(tint.opacity(colorScheme == .dark ? 0.18 : 0.11), in: Capsule(style: .continuous))
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(tint.opacity(colorScheme == .dark ? 0.35 : 0.22), lineWidth: 1)
+        )
+        .accessibilityLabel("Game format: \(format.displayTitle)")
+    }
+}
+
+/// Subtle Public / Private chip for Pickup detail (and similar surfaces).
+struct PickupGameVisibilityBadge: View {
+    let isVisible: Bool
+    let languageCode: String
+    let colorScheme: ColorScheme
+
+    private var title: String {
+        isVisible
+            ? L10n.t("pickup_form_visibility_public", languageCode: languageCode)
+            : L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+    }
+
+    private var symbol: String {
+        isVisible ? "globe" : "lock.fill"
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.caption2.weight(.semibold))
+            Text(title)
+                .font(.caption2.weight(.semibold))
+        }
+        .foregroundStyle(FGColor.secondaryText(colorScheme))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.14 : 0.08),
+            in: Capsule(style: .continuous)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(L10n.t("pickup_form_visibility", languageCode: languageCode)), \(title)"
+        )
     }
 }
 
@@ -896,7 +941,7 @@ struct SettingsPickupMyGameListCard: View {
             .onTapGesture { handleCardMapTap() }
 
             if !row.is_visible {
-                Text("Hidden from map")
+                Text("Private")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .padding(.top, 8)
@@ -1888,11 +1933,12 @@ private struct PickupFormSectionCard<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text(title)
-                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .textCase(nil)
+                .textCase(.uppercase)
+                .tracking(0.6)
                 .padding(.horizontal, 4)
 
             VStack(spacing: 0) {
@@ -1902,8 +1948,9 @@ private struct PickupFormSectionCard<Content: View>: View {
             .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.45 : 0.55), lineWidth: 0.5)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.35 : 0.4), lineWidth: 0.5)
             }
+            .softCardShadow()
         }
     }
 }
@@ -1969,12 +2016,13 @@ private struct PickupFormFieldRow<Trailing: View>: View {
 private struct PickupFormTrailingSelectionValue: View {
     @Environment(\.colorScheme) private var colorScheme
     let value: String
+    var emphasized: Bool = false
 
     var body: some View {
         HStack(spacing: 6) {
             Text(value)
-                .font(.system(size: 16, weight: .regular, design: .default))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .font(.system(size: 16, weight: emphasized ? .semibold : .medium, design: .rounded))
+                .foregroundStyle(emphasized ? FGColor.intentPlay : FGColor.secondaryText(colorScheme))
                 .lineLimit(1)
                 .minimumScaleFactor(0.72)
                 .allowsTightening(true)
@@ -2072,6 +2120,8 @@ struct SettingsPickupGameFormView: View {
     @ObservedObject var viewModel: MapViewModel
     let mode: PickupGameFormMode
     var pickupPlacePrefill: PickupPlaceRow? = nil
+    /// When set from My Teams → Schedule Game, reuses this same form with Team prefill + link.
+    var creationContext: PickupGameCreationContext = .standard
     var onCreated: ((PickupGameRow) -> Void)? = nil
     var onFinished: () -> Void
 
@@ -2096,6 +2146,10 @@ struct SettingsPickupGameFormView: View {
     @State private var description: String = ""
     @State private var playEnvironment: PickupPlayEnvironment = .either
     @State private var skillLevel: PickupGameSkillLevel = .casual
+    /// Nil = Not specified (nullable DB column).
+    @State private var competitionLevel: PickupCompetitionLevel? = nil
+    /// Team Schedule Game: false while showing "Team default" chrome; true after Override (or non-Team).
+    @State private var competitionLevelOverrideActive = false
     @State private var participantPreference: PickupParticipantPreference = .everyone
     @State private var specifyAgeRange = false
     @State private var minimumAge = 18
@@ -2106,9 +2160,14 @@ struct SettingsPickupGameFormView: View {
     @State private var playersNeeded: Int = 1
     @State private var useMaxPlayers: Bool = false
     @State private var maxPlayers: Int = 10
+    /// Team create / Team-linked edit: optional outside recruiting (maps to `players_needed` / `max_players`).
+    @State private var needsAdditionalPlayers: Bool = false
+    /// Public = Discover for everyone; Private = authorized viewers only (`is_visible=false`).
+    @State private var isPublicDiscover: Bool = true
     @State private var isSaving = false
     @State private var errorText: String?
     @State private var showPickupMapLocationPicker = false
+    @State private var showManualAddressEntry = false
     @State private var showSportPicker = false
     @State private var showGameDatePopover = false
     @State private var suppressGameDatePickerChangeLog = false
@@ -2125,6 +2184,8 @@ struct SettingsPickupGameFormView: View {
     @State private var creationTab: PickupGameCreationTab = .manual
     @State private var gameFormat: GameType = .pickup
     @State private var pollCreatePermission: PickupPollCreatePermission = .organizerOnly
+    /// Edit path: Team context resolved from `fan_team_game_links` when `creationContext` is `.standard`.
+    @State private var linkedTeamFormContext: PickupGameTeamCreationContext?
 
     private var organizerPostStartLockedRow: PickupGameRow? {
         if case .edit(let row) = mode, row.hasPickupGameStarted(), isCurrentUserCreator(of: row) {
@@ -2207,9 +2268,24 @@ struct SettingsPickupGameFormView: View {
         hasValidMapPinLocation || (!trimmedAddress.isEmpty && !trimmedCity.isEmpty && !trimmedState.isEmpty)
     }
 
+    /// Compact Team-only note when Team-linked and not recruiting outside players.
+    private var usesTeamOnlySafetyNote: Bool {
+        PickupTeamSafetyPresentation.usesTeamOnlyInformationalNote(
+            isTeamLinked: isTeamLinkedForm,
+            needsAdditionalPlayers: needsAdditionalPlayers
+        )
+    }
+
+    /// Create-only. Team-only games skip acknowledgement; Team recruiting + standalone require it.
     private var requiresPickupSafetyAcknowledgment: Bool {
-        if case .add = mode { return true }
-        return false
+        PickupTeamSafetyPresentation.requiresAcknowledgment(
+            isCreate: {
+                if case .add = mode { return true }
+                return false
+            }(),
+            isTeamLinked: isTeamLinkedForm,
+            needsAdditionalPlayers: needsAdditionalPlayers
+        )
     }
 
     private var pickMapSeedCoordinate: CLLocationCoordinate2D {
@@ -2354,17 +2430,42 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var shouldShowCreationTabs: Bool {
+        // Same Manual | CSV Import shell for normal Pickup and Team → Schedule Game.
         if case .add = mode { return true }
         return false
     }
 
-    private var showsCreateIntro: Bool {
+    private var shouldShowGameFormatPicker: Bool {
         if case .add = mode { return true }
         return false
     }
+
+    /// Team Schedule create, or edit of a game linked via `fan_team_game_links`.
+    private var isTeamLinkedForm: Bool {
+        creationContext.isTeamSourced || linkedTeamFormContext != nil
+    }
+
+    /// Prefer explicit Schedule Game context; otherwise use link-resolved Team identity for edit.
+    private var effectiveTeamCreationContext: PickupGameTeamCreationContext? {
+        creationContext.team ?? linkedTeamFormContext
+    }
+
+    private var showsTeamOutsideRecruitmentHowYouPlayFields: Bool {
+        PickupTeamHowYouPlayPresentation.showsOutsideRecruitmentFields(
+            isTeamLinked: isTeamLinkedForm,
+            needsAdditionalPlayers: needsAdditionalPlayers
+        )
+    }
+
+    private var availableGameFormats: [GameType] {
+        isTeamLinkedForm ? GameType.fanTeamOrganizerCases : GameType.pickupOrganizerCases
+    }
+
+    /// Rich summary card replaces the old generic intro banner for create + edit.
+    private var showsCreateIntro: Bool { false }
 
     private var showsLiveSummary: Bool {
-        true
+        !isOrganizerPostStartManage
     }
 
     private var canSubmitPickupForm: Bool {
@@ -2391,6 +2492,9 @@ struct SettingsPickupGameFormView: View {
     private var navigationTitleText: String {
         switch mode {
         case .add:
+            if creationContext.isTeamSourced {
+                return L10n.t("fan_teams_schedule_game", languageCode: languageCode)
+            }
             return L10n.t("pickup_form_nav_create", languageCode: languageCode)
         case .edit:
             if isOrganizerPostStartManage {
@@ -2412,6 +2516,32 @@ struct SettingsPickupGameFormView: View {
 
     private var summarySportEmoji: String {
         SportFilterCatalog.resolve(sport).emoji
+    }
+
+    private var summaryFormatLabel: String {
+        gameFormat.scheduleFormSummaryLabel(languageCode: languageCode)
+    }
+
+    private var summaryFormatEmoji: String {
+        gameFormat.scheduleFormSummaryEmoji
+    }
+
+    private var summaryVisibilityLabel: String {
+        isPublicDiscover
+            ? L10n.t("pickup_form_visibility_public", languageCode: languageCode)
+            : L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+    }
+
+    private var summaryVisibilitySystemImage: String {
+        isPublicDiscover ? "globe" : "lock.fill"
+    }
+
+    private var hasAnyLocationInput: Bool {
+        appliedPickupPlacePrefill != nil
+            || hasValidMapPinLocation
+            || !trimmedAddress.isEmpty
+            || !trimmedCity.isEmpty
+            || !trimmedState.isEmpty
     }
 
     private var summaryDateText: String {
@@ -2490,15 +2620,35 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var gameFormatFormSection: some View {
-        PickupFormFieldRow(systemImage: "flag.fill", label: L10n.t("pickup_form_game_format", languageCode: languageCode)) {
-            Picker("", selection: $gameFormat) {
-                ForEach(GameType.allCases, id: \.self) { type in
-                    Text(type.displayTitle(languageCode: languageCode)).tag(type)
+        PickupFormFieldRow(systemImage: gameFormat.systemImage, label: L10n.t("pickup_form_game_format", languageCode: languageCode)) {
+            Menu {
+                Picker(selection: $gameFormat) {
+                    ForEach(availableGameFormats, id: \.self) { type in
+                        Label(type.displayTitle(languageCode: languageCode), systemImage: type.systemImage)
+                            .tag(type)
+                    }
+                } label: {
+                    EmptyView()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: gameFormat.systemImage)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .accessibilityHidden(true)
+                    Text(gameFormat.scheduleFormSummaryLabel(languageCode: languageCode))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                        .accessibilityHidden(true)
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .tint(FGColor.intentPlay)
+            .accessibilityLabel(L10n.t("pickup_form_game_format", languageCode: languageCode))
+            .accessibilityValue(gameFormat.scheduleFormSummaryLabel(languageCode: languageCode))
         }
     }
 
@@ -2584,7 +2734,7 @@ struct SettingsPickupGameFormView: View {
     private var manualPickupGameForm: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: FGSpacing.lg) {
+                VStack(alignment: .leading, spacing: 24) {
                     if let errorText, !errorText.isEmpty {
                         Text(errorText)
                             .font(FGTypography.caption.weight(.semibold))
@@ -2614,17 +2764,29 @@ struct SettingsPickupGameFormView: View {
                         pickupFormLiveSummaryCard
                     }
 
+                    // Natural order: What → When → Where → Who → How → Extra.
                     pickupFormGameSection
                     pickupFormWhenSection
-                    pickupFormPlayersSection
+
+                    if !isOrganizerPostStartManage {
+                        pickupFormWhereSection
+                    } else {
+                        pickupFormWhereLockedSection
+                    }
+
+                    if isTeamLinkedForm {
+                        pickupFormTeamPlayersSection
+                    } else {
+                        pickupFormPlayersSection
+                    }
 
                     if !isOrganizerPostStartManage {
                         pickupFormHowYouPlaySection
                         pickupFormPollPermissionsSection
-                        pickupFormWhereSection
-                        pickupFormDetailsSection
+                        pickupFormDescriptionSection
+                        pickupFormSafetySection
+                        pickupFormCostSection
                     } else {
-                        pickupFormWhereLockedSection
                         pickupFormDetailsLockedSection
                     }
 
@@ -2636,6 +2798,8 @@ struct SettingsPickupGameFormView: View {
                             .accessibilityLabel(postReadinessMessage)
                     }
                 }
+                .frame(maxWidth: 680)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, FGSpacing.lg)
                 .padding(.top, FGSpacing.sm)
                 .padding(.bottom, FGSpacing.xxl)
@@ -2662,7 +2826,7 @@ struct SettingsPickupGameFormView: View {
 
     private var pickupFormIntroRow: some View {
         HStack(alignment: .center, spacing: FGSpacing.md) {
-            Image(systemName: "sportscourt.fill")
+            Image(systemName: gameFormat.systemImage)
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 40, height: 40)
@@ -2670,7 +2834,7 @@ struct SettingsPickupGameFormView: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(L10n.t("pickup_form_intro_title", languageCode: languageCode))
+                Text(gameFormat.scheduleFormIntroTitle(languageCode: languageCode))
                     .font(.system(size: 17, weight: .semibold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                 Text(L10n.t("pickup_form_intro_subtitle", languageCode: languageCode))
@@ -2681,96 +2845,172 @@ struct SettingsPickupGameFormView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .accessibilityElement(children: .combine)
-    }
-
-    private var pickupFormLiveSummaryCard: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 0) {
-                pickupSummaryColumn(
-                    emoji: summarySportEmoji.isEmpty ? nil : summarySportEmoji,
-                    systemImage: summarySportEmoji.isEmpty ? SportFilterCatalog.resolve(sport).systemImage : nil,
-                    primary: summarySportLabel,
-                    secondary: nil
-                )
-                pickupSummaryDivider
-                pickupSummaryColumn(primary: summaryDateText, secondary: summaryTimeRangeText)
-                pickupSummaryDivider
-                pickupSummaryColumn(primary: summaryPlayersPrimary, secondary: summaryPlayersSecondary)
-                pickupSummaryDivider
-                pickupSummaryColumn(primary: summaryLocationPrimary, secondary: summaryLocationSecondary)
-            }
-
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                HStack(alignment: .top, spacing: FGSpacing.md) {
-                    pickupSummaryColumn(
-                        emoji: summarySportEmoji.isEmpty ? nil : summarySportEmoji,
-                        systemImage: summarySportEmoji.isEmpty ? SportFilterCatalog.resolve(sport).systemImage : nil,
-                        primary: summarySportLabel,
-                        secondary: nil
-                    )
-                    pickupSummaryColumn(primary: summaryDateText, secondary: summaryTimeRangeText)
-                }
-                HStack(alignment: .top, spacing: FGSpacing.md) {
-                    pickupSummaryColumn(primary: summaryPlayersPrimary, secondary: summaryPlayersSecondary)
-                    pickupSummaryColumn(primary: summaryLocationPrimary, secondary: summaryLocationSecondary)
-                }
-            }
-        }
-        .padding(.horizontal, FGSpacing.md)
-        .padding(.vertical, FGSpacing.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(FGAdaptiveSurface.controlFill)
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
-                .strokeBorder(FGColor.divider(colorScheme).opacity(0.5), lineWidth: 0.5)
-        }
-        .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(summarySportLabel), \(summaryDateText), \(summaryTimeRangeText), \(summaryPlayersPrimary) \(summaryPlayersSecondary), \(summaryLocationPrimary), \(summaryLocationSecondary)"
+            "\(gameFormat.scheduleFormIntroTitle(languageCode: languageCode)). \(L10n.t("pickup_form_intro_subtitle", languageCode: languageCode))"
         )
     }
 
-    private var pickupSummaryDivider: some View {
-        Rectangle()
-            .fill(FGColor.divider(colorScheme).opacity(0.7))
-            .frame(width: 1)
-            .padding(.vertical, 4)
-            .padding(.horizontal, 6)
-            .accessibilityHidden(true)
+    /// Team → Schedule Game only: unmistakable identity before Manual | CSV.
+    @ViewBuilder
+    private var pickupFormTeamIdentityCard: some View {
+        if let team = creationContext.team {
+            let meta = team.scheduleHeaderMetaLine(languageCode: languageCode)
+            HStack(alignment: .center, spacing: 14) {
+                FanTeamMarkView(
+                    sport: team.teamSport,
+                    logoURL: team.logoURL,
+                    logoThumbnailURL: team.logoThumbnailURL,
+                    colorHex: team.colorHex,
+                    size: 56,
+                    preferDetailURL: false
+                )
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(team.teamName)
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if !meta.isEmpty {
+                        Text(meta)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.95 : 0.9))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 14)
+            .fanTeamIdentityCardChrome(
+                colorHex: team.colorHex,
+                colorScheme: colorScheme,
+                cornerRadius: FGRadius.medium,
+                baseOpacityDark: 0.78,
+                baseOpacityLight: 0.98
+            )
+            .softCardShadow()
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(team.scheduleHeaderAccessibilityLabel(languageCode: languageCode))
+        }
     }
 
-    private func pickupSummaryColumn(
-        emoji: String? = nil,
-        systemImage: String? = nil,
-        primary: String,
-        secondary: String?
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                if let emoji, !emoji.isEmpty {
-                    Text(emoji)
-                        .font(.system(size: 14))
-                        .accessibilityHidden(true)
-                } else if let systemImage {
-                    Image(systemName: systemImage)
-                        .font(.system(size: 12, weight: .semibold))
+    private var pickupFormLiveSummaryCard: some View {
+        HStack(alignment: .top, spacing: 0) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(FGColor.intentPlay)
+                .frame(width: 4)
+                .padding(.vertical, 10)
+
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: gameFormat.systemImage)
+                        .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(FGColor.intentPlay)
                         .accessibilityHidden(true)
+                    Text(summaryFormatLabel)
+                        .font(.system(size: 18, weight: .bold, design: .rounded))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                    Spacer(minLength: 0)
                 }
-                Text(primary)
-                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 10) {
+                        pickupSummaryMetric(
+                            emoji: summarySportEmoji.isEmpty ? nil : summarySportEmoji,
+                            systemImage: summarySportEmoji.isEmpty ? "sportscourt.fill" : nil,
+                            text: summarySportLabel
+                        )
+                        pickupSummaryMetric(systemImage: "calendar", text: summaryDateText)
+                        pickupSummaryMetric(systemImage: "clock.fill", text: summaryTimeRangeText)
+                        pickupSummaryMetric(systemImage: summaryVisibilitySystemImage, text: summaryVisibilityLabel)
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .top, spacing: 10) {
+                            pickupSummaryMetric(
+                                emoji: summarySportEmoji.isEmpty ? nil : summarySportEmoji,
+                                systemImage: summarySportEmoji.isEmpty ? "sportscourt.fill" : nil,
+                                text: summarySportLabel
+                            )
+                            pickupSummaryMetric(systemImage: "calendar", text: summaryDateText)
+                        }
+                        HStack(alignment: .top, spacing: 10) {
+                            pickupSummaryMetric(systemImage: "clock.fill", text: summaryTimeRangeText)
+                            pickupSummaryMetric(systemImage: summaryVisibilitySystemImage, text: summaryVisibilityLabel)
+                        }
+                    }
+                }
+
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "mappin.and.ellipse")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .padding(.top, 1)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(summaryLocationPrimary)
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(2)
+                        if summaryLocationSecondary != L10n.t("pickup_form_location_tbd", languageCode: languageCode) {
+                            Text(summaryLocationSecondary)
+                                .font(.system(size: 12, weight: .medium, design: .rounded))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .lineLimit(2)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
             }
-            if let secondary, !secondary.isEmpty {
-                Text(secondary)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(FGColor.mutedText(colorScheme))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
+            .padding(.leading, 12)
+            .padding(.trailing, 14)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(FGAdaptiveSurface.cardElevated)
+        .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                .strokeBorder(FGColor.divider(colorScheme).opacity(0.35), lineWidth: 0.5)
+        }
+        .softCardShadow()
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(summaryFormatLabel), \(summarySportLabel), \(summaryDateText), \(summaryTimeRangeText), \(summaryVisibilityLabel), \(summaryLocationPrimary), \(summaryLocationSecondary)"
+        )
+    }
+
+    private func pickupSummaryMetric(
+        emoji: String? = nil,
+        systemImage: String? = nil,
+        text: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Group {
+                if let emoji, !emoji.isEmpty {
+                    Text(emoji)
+                        .font(.system(size: 16))
+                } else if let systemImage {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                }
             }
+            .accessibilityHidden(true)
+
+            Text(text)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .lineLimit(2)
+                .minimumScaleFactor(0.8)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2828,6 +3068,19 @@ struct SettingsPickupGameFormView: View {
                     "\(L10n.t("pickup_form_sport_label", languageCode: languageCode)), \(summarySportLabel)"
                 )
                 .accessibilityAddTraits(.isButton)
+            }
+
+            PickupFormRowDivider()
+            pickupFormVisibilityRows
+
+            if shouldShowGameFormatPicker {
+                PickupFormRowDivider()
+                gameFormatFormSection
+            }
+
+            if !isOrganizerPostStartManage {
+                PickupFormRowDivider()
+                pickupFormCompetitionLevelRow
             }
         }
     }
@@ -2897,79 +3150,171 @@ struct SettingsPickupGameFormView: View {
 
     private var pickupFormPlayersSection: some View {
         PickupFormSectionCard(title: L10n.t("pickup_form_section_players", languageCode: languageCode)) {
-            PickupFormFieldRow(
-                systemImage: "person.2.fill",
-                label: L10n.t("pickup_form_players_needed", languageCode: languageCode)
-            ) {
-                HStack(spacing: 10) {
-                    Button {
-                        playersNeeded = max(1, playersNeeded - 1)
-                    } label: {
-                        Image(systemName: "minus")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(playersNeeded <= 1 ? FGColor.mutedText(colorScheme) : FGColor.primaryText(colorScheme))
-                            .frame(width: 32, height: 32)
-                            .background(FGAdaptiveSurface.controlFill, in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(playersNeeded <= 1)
-                    .accessibilityLabel(L10n.t("pickup_form_decrease_players", languageCode: languageCode))
+            playersNeededStepperRows
+            PickupFormRowDivider()
+            maxPlayersToggleRows
+        }
+        .animation(.easeInOut(duration: 0.2), value: useMaxPlayers)
+    }
 
-                    Text(playersNeededCountText)
-                        .font(.system(size: 14, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .frame(minWidth: 72)
-                        .multilineTextAlignment(.center)
-                        .accessibilityLabel(playersNeededCountText)
+    /// Team Schedule Game / Team-linked edit: roster is the audience; optional outside recruiting via existing fields.
+    private var pickupFormTeamPlayersSection: some View {
+        let team = effectiveTeamCreationContext
+        let memberCount = team?.activeMemberCount ?? 0
+        let memberLine = String(
+            format: L10n.t("pickup_form_team_active_members_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            memberCount
+        )
 
-                    Button {
-                        playersNeeded = min(20, playersNeeded + 1)
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(playersNeeded >= 20 ? FGColor.mutedText(colorScheme) : FGColor.primaryText(colorScheme))
-                            .frame(width: 32, height: 32)
-                            .background(FGAdaptiveSurface.controlFill, in: Circle())
+        return PickupFormSectionCard(title: L10n.t("pickup_form_section_team_players", languageCode: languageCode)) {
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                HStack(alignment: .center, spacing: 12) {
+                    if let team {
+                        FanTeamMarkView(
+                            sport: team.teamSport,
+                            logoURL: team.logoURL,
+                            logoThumbnailURL: team.logoThumbnailURL,
+                            colorHex: team.colorHex,
+                            size: 40,
+                            preferDetailURL: false
+                        )
+                        .accessibilityHidden(true)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(playersNeeded >= 20)
-                    .accessibilityLabel(L10n.t("pickup_form_increase_players", languageCode: languageCode))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(team?.teamName ?? "")
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(2)
+                        Text(memberLine)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.intentPlay)
+                    }
+                    Spacer(minLength: 0)
                 }
+                .accessibilityElement(children: .combine)
+
+                Text(L10n.t("pickup_form_team_players_rsvp_help", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .padding(FGSpacing.md)
 
             PickupFormRowDivider()
 
             PickupFormFieldRow(
-                systemImage: "person.3.fill",
-                label: L10n.t("pickup_form_set_max_capacity", languageCode: languageCode)
+                systemImage: "person.badge.plus",
+                label: L10n.t("pickup_form_need_additional_players", languageCode: languageCode)
             ) {
-                Toggle("", isOn: $useMaxPlayers)
+                Toggle("", isOn: $needsAdditionalPlayers)
                     .labelsHidden()
                     .tint(FGColor.intentPlay)
-                    .accessibilityLabel(L10n.t("pickup_form_set_max_capacity", languageCode: languageCode))
+                    .accessibilityLabel(L10n.t("pickup_form_need_additional_players", languageCode: languageCode))
             }
 
-            if useMaxPlayers {
+            if needsAdditionalPlayers {
                 PickupFormRowDivider()
-                PickupFormFieldRow(
-                    systemImage: "number",
-                    label: L10n.t("pickup_form_max_players", languageCode: languageCode)
-                ) {
-                    HStack(spacing: 8) {
-                        Text("\(maxPlayers)")
-                            .font(.system(size: 15, weight: .semibold, design: .rounded))
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
-                            .monospacedDigit()
-                        Stepper("", value: $maxPlayers, in: 1...100)
-                            .labelsHidden()
-                            .accessibilityLabel(L10n.t("pickup_form_max_players", languageCode: languageCode))
-                            .accessibilityValue("\(maxPlayers)")
-                    }
+                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    Text(L10n.t("pickup_form_section_additional_players", languageCode: languageCode))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .padding(.horizontal, FGSpacing.md)
+                        .padding(.top, FGSpacing.sm)
+                    playersNeededStepperRows
+                    PickupFormRowDivider()
+                    maxPlayersToggleRows
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: needsAdditionalPlayers)
         .animation(.easeInOut(duration: 0.2), value: useMaxPlayers)
+        .onChange(of: needsAdditionalPlayers) { _, enabled in
+            if enabled, playersNeeded <= PickupTeamOutsideRecruiting.inactivePlayersNeededFloor {
+                playersNeeded = 2
+            }
+            // Team-only (OFF): snap visibility to Private so hidden recruiting state cannot leave a Public shell.
+            if !enabled, isTeamLinkedForm {
+                isPublicDiscover = false
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var playersNeededStepperRows: some View {
+        PickupFormFieldRow(
+            systemImage: "person.2.fill",
+            label: L10n.t("pickup_form_players_needed", languageCode: languageCode)
+        ) {
+            HStack(spacing: 10) {
+                Button {
+                    playersNeeded = max(1, playersNeeded - 1)
+                } label: {
+                    Image(systemName: "minus")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(playersNeeded <= 1 ? FGColor.mutedText(colorScheme) : FGColor.primaryText(colorScheme))
+                        .frame(width: 32, height: 32)
+                        .background(FGAdaptiveSurface.controlFill, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(playersNeeded <= 1)
+                .accessibilityLabel(L10n.t("pickup_form_decrease_players", languageCode: languageCode))
+
+                Text(playersNeededCountText)
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .frame(minWidth: 72)
+                    .multilineTextAlignment(.center)
+                    .accessibilityLabel(playersNeededCountText)
+
+                Button {
+                    playersNeeded = min(20, playersNeeded + 1)
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(playersNeeded >= 20 ? FGColor.mutedText(colorScheme) : FGColor.primaryText(colorScheme))
+                        .frame(width: 32, height: 32)
+                        .background(FGAdaptiveSurface.controlFill, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(playersNeeded >= 20)
+                .accessibilityLabel(L10n.t("pickup_form_increase_players", languageCode: languageCode))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var maxPlayersToggleRows: some View {
+        PickupFormFieldRow(
+            systemImage: "person.3.fill",
+            label: L10n.t("pickup_form_set_max_capacity", languageCode: languageCode)
+        ) {
+            Toggle("", isOn: $useMaxPlayers)
+                .labelsHidden()
+                .tint(FGColor.intentPlay)
+                .accessibilityLabel(L10n.t("pickup_form_set_max_capacity", languageCode: languageCode))
+        }
+
+        if useMaxPlayers {
+            PickupFormRowDivider()
+            PickupFormFieldRow(
+                systemImage: "number",
+                label: L10n.t("pickup_form_max_players", languageCode: languageCode)
+            ) {
+                HStack(spacing: 8) {
+                    Text("\(maxPlayers)")
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .monospacedDigit()
+                    Stepper("", value: $maxPlayers, in: 1...100)
+                        .labelsHidden()
+                        .accessibilityLabel(L10n.t("pickup_form_max_players", languageCode: languageCode))
+                        .accessibilityValue("\(maxPlayers)")
+                }
+            }
+            .transition(.opacity.combined(with: .move(edge: .top)))
+        }
     }
 
     private var pickupFormHowYouPlaySection: some View {
@@ -2988,41 +3333,220 @@ struct SettingsPickupGameFormView: View {
                 }
             }
 
-            PickupFormRowDivider()
+            if showsTeamOutsideRecruitmentHowYouPlayFields {
+                PickupFormRowDivider()
 
-            PickupFormSelectionFieldRow(
-                systemImage: "chart.bar.fill",
-                label: L10n.t("pickup_form_skill_level", languageCode: languageCode),
-                valueText: skillLevel.displayTitle(languageCode: languageCode)
-            ) {
-                Picker(selection: $skillLevel) {
-                    ForEach(PickupGameSkillLevel.allCases) { level in
-                        Text(level.displayTitle(languageCode: languageCode)).tag(level)
+                PickupFormSelectionFieldRow(
+                    systemImage: "chart.bar.fill",
+                    label: L10n.t("pickup_form_skill_level", languageCode: languageCode),
+                    valueText: skillLevel.displayTitle(languageCode: languageCode)
+                ) {
+                    Picker(selection: $skillLevel) {
+                        ForEach(PickupGameSkillLevel.allCases) { level in
+                            Text(level.displayTitle(languageCode: languageCode)).tag(level)
+                        }
+                    } label: {
+                        EmptyView()
                     }
-                } label: {
-                    EmptyView()
                 }
-            }
 
-            PickupFormRowDivider()
+                PickupFormRowDivider()
 
-            PickupFormSelectionFieldRow(
-                systemImage: "person.2.fill",
-                label: L10n.t("pickup_form_whos_welcome", languageCode: languageCode),
-                valueText: participantPreference.displayTitle(languageCode: languageCode)
-            ) {
-                Picker(selection: $participantPreference) {
-                    ForEach(PickupParticipantPreference.allCases) { pref in
-                        Text(pref.displayTitle(languageCode: languageCode)).tag(pref)
+                PickupFormSelectionFieldRow(
+                    systemImage: "person.2.fill",
+                    label: L10n.t("pickup_form_whos_welcome", languageCode: languageCode),
+                    valueText: participantPreference.displayTitle(languageCode: languageCode)
+                ) {
+                    Picker(selection: $participantPreference) {
+                        ForEach(PickupParticipantPreference.allCases) { pref in
+                            Text(pref.displayTitle(languageCode: languageCode)).tag(pref)
+                        }
+                    } label: {
+                        EmptyView()
                     }
-                } label: {
-                    EmptyView()
                 }
+
+                PickupFormRowDivider()
+
+                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                    ageRangeControls
+                }
+                .padding(FGSpacing.md)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
+        .animation(.easeInOut(duration: 0.2), value: needsAdditionalPlayers)
+        .animation(.easeInOut(duration: 0.2), value: isTeamLinkedForm)
         .onChange(of: participantPreference) { _, newValue in
+            guard showsTeamOutsideRecruitmentHowYouPlayFields else { return }
             applySuggestedAgeRange(for: newValue)
         }
+    }
+
+    private var pickupFormVisibilityRows: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.sm) {
+            Text(L10n.t("pickup_form_visibility", languageCode: languageCode))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+
+            GameOnSegmentedControl(
+                tabs: [
+                    GameOnSegmentedTab(
+                        id: true,
+                        title: L10n.t("pickup_form_visibility_public", languageCode: languageCode),
+                        systemImage: "globe",
+                        tint: FGColor.intentPlay,
+                        accessibilityLabel: L10n.t("pickup_form_visibility_public", languageCode: languageCode)
+                    ),
+                    GameOnSegmentedTab(
+                        id: false,
+                        title: L10n.t("pickup_form_visibility_private", languageCode: languageCode),
+                        systemImage: "lock.fill",
+                        tint: FGColor.intentPlay,
+                        accessibilityLabel: L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+                    ),
+                ],
+                selection: Binding(
+                    get: { isPublicDiscover },
+                    set: { newValue in
+                        // Team roster-only games cannot be Public while recruiting is OFF.
+                        if newValue, isTeamLinkedForm, !needsAdditionalPlayers {
+                            isPublicDiscover = false
+                            return
+                        }
+                        isPublicDiscover = newValue
+                    }
+                ),
+                accent: FGColor.intentPlay,
+                titleMinimumScaleFactor: 0.78
+            )
+            .accessibilityLabel(L10n.t("pickup_form_visibility", languageCode: languageCode))
+            .disabled(isTeamLinkedForm && !needsAdditionalPlayers)
+
+            Text(visibilityHelpText)
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel(visibilityHelpText)
+        }
+        .padding(FGSpacing.md)
+        .animation(.easeInOut(duration: 0.2), value: needsAdditionalPlayers)
+    }
+
+    /// Team create/edit with a Team default: compact inherited chrome until Override.
+    private var showsTeamCompetitionInheritedChrome: Bool {
+        guard isTeamLinkedForm,
+              !competitionLevelOverrideActive,
+              !isOrganizerPostStartManage,
+              let teamDefault = effectiveTeamCreationContext?.competitionLevel
+        else { return false }
+        return competitionLevel == teamDefault
+    }
+
+    /// Create: "Inherited from Team". Edit (matching current Team default): "Team default".
+    private var teamCompetitionInheritedCaptionKey: String {
+        if case .edit = mode { return "pickup_form_competition_team_default" }
+        return "pickup_form_competition_inherited_from_team"
+    }
+
+    private var pickupFormCompetitionLevelRow: some View {
+        Group {
+            if showsTeamCompetitionInheritedChrome {
+                HStack(alignment: .center, spacing: FGSpacing.sm) {
+                    PickupFormIconBadge(systemImage: "trophy")
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(L10n.t("pickup_form_competition_level", languageCode: languageCode))
+                            .font(.system(size: 15, weight: .regular))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                        Text(
+                            competitionLevel?.displayTitle(languageCode: languageCode)
+                                ?? L10n.t("pickup_competition_level_not_specified", languageCode: languageCode)
+                        )
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        Text(L10n.t(teamCompetitionInheritedCaptionKey, languageCode: languageCode))
+                            .font(.system(size: 12, weight: .medium, design: .rounded))
+                            .foregroundStyle(FGColor.accentGreen)
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            competitionLevelOverrideActive = true
+                        }
+                    } label: {
+                        Text(L10n.t("pickup_form_competition_override", languageCode: languageCode))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.intentPlay)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .overlay {
+                                Capsule(style: .continuous)
+                                    .strokeBorder(FGColor.intentPlay.opacity(0.85), lineWidth: 1.25)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(L10n.t("pickup_form_competition_override", languageCode: languageCode))
+                }
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.vertical, 12)
+                .accessibilityElement(children: .combine)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    PickupFormSelectionFieldRow(
+                        systemImage: "trophy",
+                        label: L10n.t("pickup_form_competition_level", languageCode: languageCode),
+                        valueText: competitionLevel?.displayTitle(languageCode: languageCode)
+                            ?? L10n.t("pickup_competition_level_not_specified", languageCode: languageCode)
+                    ) {
+                        PickupCompetitionLevelMenuPicker(
+                            selection: $competitionLevel,
+                            languageCode: languageCode
+                        )
+                    }
+                    if isTeamLinkedForm,
+                       competitionLevelOverrideActive,
+                       let teamDefault = effectiveTeamCreationContext?.competitionLevel {
+                        HStack(spacing: 10) {
+                            if competitionLevel != teamDefault {
+                                Text(L10n.t("pickup_form_competition_game_specific", languageCode: languageCode))
+                                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            }
+                            Spacer(minLength: 0)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    competitionLevel = teamDefault
+                                    competitionLevelOverrideActive = false
+                                }
+                            } label: {
+                                Text(L10n.t("pickup_form_competition_use_team_default", languageCode: languageCode))
+                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(FGColor.intentPlay)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(
+                                L10n.t("pickup_form_competition_use_team_default", languageCode: languageCode)
+                            )
+                        }
+                        .padding(.horizontal, FGSpacing.md)
+                        .padding(.bottom, FGSpacing.sm)
+                    }
+                }
+            }
+        }
+    }
+
+    private var visibilityHelpText: String {
+        if isTeamLinkedForm {
+            return isPublicDiscover
+                ? L10n.t("pickup_form_visibility_public_help_team", languageCode: languageCode)
+                : L10n.t("pickup_form_visibility_private_help_team", languageCode: languageCode)
+        }
+        return isPublicDiscover
+            ? L10n.t("pickup_form_visibility_public_help", languageCode: languageCode)
+            : L10n.t("pickup_form_visibility_private_help", languageCode: languageCode)
     }
 
     private var pickupFormPollPermissionsSection: some View {
@@ -3062,42 +3586,53 @@ struct SettingsPickupGameFormView: View {
             if let appliedPickupPlacePrefill {
                 pickupPlacePrefillCard(appliedPickupPlacePrefill)
                     .padding(FGSpacing.sm)
-            } else {
-                Button {
-                    showPickupMapLocationPicker = true
-                } label: {
-                    PickupFormFieldRow(
-                        systemImage: "mappin.and.ellipse",
-                        label: locationRowPrimaryLabel,
-                        showsChevron: true
-                    ) {
-                        Text(locationRowTrailingText)
-                            .font(.system(size: 15, weight: .medium))
+            } else if hasAnyLocationInput {
+                if let preview = pickupLocationPreview {
+                    pickupLocationMapPreview(
+                        coordinate: preview.coordinate,
+                        helperText: preview.helperText,
+                        canOpenPicker: true
+                    )
+                    .padding(.horizontal, FGSpacing.sm)
+                    .padding(.top, FGSpacing.sm)
+                }
+
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: "mappin.and.ellipse")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay)
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(summaryLocationPrimary)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .fixedSize(horizontal: false, vertical: true)
+                        if !summaryLocationSecondary.isEmpty,
+                           summaryLocationSecondary != L10n.t("pickup_form_location_tbd", languageCode: languageCode) {
+                            Text(summaryLocationSecondary)
+                                .font(.system(size: 13, weight: .medium, design: .rounded))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        showPickupMapLocationPicker = true
+                    } label: {
+                        Text(L10n.t("pickup_form_change_location", languageCode: languageCode))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
                             .foregroundStyle(FGColor.intentPlay)
-                            .lineLimit(1)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .overlay {
+                                Capsule(style: .continuous)
+                                    .strokeBorder(FGColor.intentPlay.opacity(0.85), lineWidth: 1.25)
+                            }
                     }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel(
-                    "\(L10n.t("pickup_form_location_label", languageCode: languageCode)), \(locationRowPrimaryLabel), \(locationRowTrailingText)"
-                )
-
-                PickupFormRowDivider()
-
-                VStack(alignment: .leading, spacing: 8) {
-                    TextField(L10n.t("pickup_form_street_address", languageCode: languageCode), text: addressBinding, axis: .vertical)
-                        .lineLimit(1...3)
-                    TextField(L10n.t("pickup_form_city", languageCode: languageCode), text: cityBinding)
-                    HStack(spacing: FGSpacing.sm) {
-                        TextField(L10n.t("pickup_form_state", languageCode: languageCode), text: stateBinding)
-                        TextField(L10n.t("pickup_form_zip", languageCode: languageCode), text: zipCodeBinding)
-                            .textInputAutocapitalization(.characters)
-                            .keyboardType(.numbersAndPunctuation)
-                    }
-                }
-                .font(.system(size: 15))
                 .padding(.horizontal, FGSpacing.md)
-                .padding(.vertical, FGSpacing.sm)
+                .padding(.vertical, FGSpacing.md)
 
                 if let foot = locationGuidanceFootnote {
                     Text(foot)
@@ -3107,14 +3642,77 @@ struct SettingsPickupGameFormView: View {
                         .padding(.bottom, FGSpacing.sm)
                 }
 
-                if let preview = pickupLocationPreview {
-                    pickupLocationMapPreview(
-                        coordinate: preview.coordinate,
-                        helperText: preview.helperText,
-                        canOpenPicker: true
-                    )
-                    .padding(.horizontal, FGSpacing.sm)
-                    .padding(.bottom, FGSpacing.sm)
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 8) {
+                        TextField(L10n.t("pickup_form_street_address", languageCode: languageCode), text: addressBinding, axis: .vertical)
+                            .lineLimit(1...3)
+                        TextField(L10n.t("pickup_form_city", languageCode: languageCode), text: cityBinding)
+                        HStack(spacing: FGSpacing.sm) {
+                            TextField(L10n.t("pickup_form_state", languageCode: languageCode), text: stateBinding)
+                            TextField(L10n.t("pickup_form_zip", languageCode: languageCode), text: zipCodeBinding)
+                                .textInputAutocapitalization(.characters)
+                                .keyboardType(.numbersAndPunctuation)
+                        }
+                    }
+                    .font(.system(size: 15))
+                    .padding(.top, 6)
+                } label: {
+                    Text(L10n.t("pickup_form_address_details", languageCode: languageCode))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+                .tint(FGColor.intentPlay)
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.bottom, FGSpacing.md)
+            } else {
+                Button {
+                    showPickupMapLocationPicker = true
+                } label: {
+                    PickupFormFieldRow(
+                        systemImage: "mappin.and.ellipse",
+                        label: L10n.t("pickup_form_choose_location", languageCode: languageCode),
+                        showsChevron: true
+                    ) {
+                        Text(L10n.t("pickup_form_select_location", languageCode: languageCode))
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.intentPlay)
+                            .lineLimit(1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    "\(L10n.t("pickup_form_choose_location", languageCode: languageCode)), \(L10n.t("pickup_form_select_location", languageCode: languageCode))"
+                )
+
+                if showManualAddressEntry {
+                    VStack(alignment: .leading, spacing: 8) {
+                        TextField(L10n.t("pickup_form_street_address", languageCode: languageCode), text: addressBinding, axis: .vertical)
+                            .lineLimit(1...3)
+                        TextField(L10n.t("pickup_form_city", languageCode: languageCode), text: cityBinding)
+                        HStack(spacing: FGSpacing.sm) {
+                            TextField(L10n.t("pickup_form_state", languageCode: languageCode), text: stateBinding)
+                            TextField(L10n.t("pickup_form_zip", languageCode: languageCode), text: zipCodeBinding)
+                                .textInputAutocapitalization(.characters)
+                                .keyboardType(.numbersAndPunctuation)
+                        }
+                    }
+                    .font(.system(size: 15))
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.bottom, FGSpacing.md)
+                } else {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showManualAddressEntry = true
+                        }
+                    } label: {
+                        Text(L10n.t("pickup_form_enter_address_manually", languageCode: languageCode))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.intentPlay)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, FGSpacing.md)
+                            .padding(.bottom, FGSpacing.md)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -3154,72 +3752,38 @@ struct SettingsPickupGameFormView: View {
         }
     }
 
-    private var pickupFormDetailsSection: some View {
-        PickupFormSectionCard(title: L10n.t("pickup_form_section_details", languageCode: languageCode)) {
-            if shouldShowCreationTabs {
-                gameFormatFormSection
-                PickupFormRowDivider()
-            }
+    private var pickupFormDescriptionSection: some View {
+        PickupFormSectionCard(title: L10n.t("pickup_form_description", languageCode: languageCode)) {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField(
+                    L10n.t("pickup_form_description_placeholder", languageCode: languageCode),
+                    text: $description,
+                    axis: .vertical
+                )
+                .lineLimit(3...8)
+                .font(.system(size: 15))
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(L10n.t("pickup_form_description_optional", languageCode: languageCode))
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                TextField("", text: $description, axis: .vertical)
-                    .lineLimit(2...6)
-            }
-            .padding(.horizontal, FGSpacing.md)
-            .padding(.vertical, FGSpacing.sm)
-
-            PickupFormRowDivider()
-
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                pickupSafetyNotice
-                if requiresPickupSafetyAcknowledgment {
-                    Toggle(
-                        L10n.t("pickup_form_safety_acknowledge", languageCode: languageCode),
-                        isOn: $pickupSafetyAcknowledged
-                    )
-                    .tint(FGColor.intentPlay)
-                }
-            }
-            .padding(FGSpacing.md)
-
-            PickupFormRowDivider()
-
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                Text(L10n.t("pickup_form_cost", languageCode: languageCode))
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                Picker(L10n.t("pickup_form_entry", languageCode: languageCode), selection: $costKind) {
-                    ForEach(PickupCostKind.allCases) { k in
-                        Text(k.title(languageCode: languageCode)).tag(k)
-                    }
-                }
-                .pickerStyle(.segmented)
-                if costKind == .paid {
-                    TextField(L10n.t("pickup_form_amount_usd", languageCode: languageCode), text: $entryFeeText)
-                        .keyboardType(.decimalPad)
-                    Text(L10n.t("pickup_form_paid_fee_hint", languageCode: languageCode))
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "lightbulb.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(FGColor.intentPlay.opacity(0.85))
+                        .padding(.top, 1)
+                        .accessibilityHidden(true)
+                    Text(L10n.t("pickup_form_description_helper", languageCode: languageCode))
                         .font(FGTypography.caption)
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(FGSpacing.md)
-
-            PickupFormRowDivider()
-
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                ageRangeControls
-            }
-            .padding(FGSpacing.md)
+            .padding(.horizontal, FGSpacing.md)
+            .padding(.vertical, FGSpacing.md)
 
             PickupFormRowDivider()
 
             HStack(alignment: .top, spacing: FGSpacing.sm) {
-                Image(systemName: "info.circle.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(FGColor.accentBlue)
+                Image(systemName: "clock.badge.exclamationmark.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(FGColor.intentPlay.opacity(0.9))
                     .padding(.top, 1)
                     .accessibilityHidden(true)
                 Text(L10n.t("pickup_form_auto_delete_notice", languageCode: languageCode))
@@ -3229,6 +3793,60 @@ struct SettingsPickupGameFormView: View {
             }
             .padding(FGSpacing.md)
         }
+    }
+
+    private var pickupFormSafetySection: some View {
+        PickupFormSectionCard(title: L10n.t("pickup_form_safety_section", languageCode: languageCode)) {
+            Group {
+                if usesTeamOnlySafetyNote {
+                    pickupTeamOnlySafetyNotice
+                } else {
+                    VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                        pickupSafetyNotice
+                        if requiresPickupSafetyAcknowledgment {
+                            Toggle(
+                                L10n.t("pickup_form_safety_acknowledge", languageCode: languageCode),
+                                isOn: $pickupSafetyAcknowledged
+                            )
+                            .tint(FGColor.intentPlay)
+                        }
+                    }
+                }
+            }
+            .padding(FGSpacing.md)
+            .animation(.easeInOut(duration: 0.2), value: usesTeamOnlySafetyNote)
+            .animation(.easeInOut(duration: 0.2), value: requiresPickupSafetyAcknowledgment)
+        }
+    }
+
+    private var pickupFormCostSection: some View {
+        PickupFormSectionCard(title: L10n.t("pickup_form_cost", languageCode: languageCode)) {
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                GameOnSegmentedControl(
+                    tabs: PickupCostKind.allCases.map { kind in
+                        GameOnSegmentedTab(
+                            id: kind,
+                            title: kind.title(languageCode: languageCode),
+                            tint: FGColor.intentPlay
+                        )
+                    },
+                    selection: $costKind,
+                    accent: FGColor.intentPlay,
+                    titleMinimumScaleFactor: 0.85
+                )
+                .accessibilityLabel(L10n.t("pickup_form_cost", languageCode: languageCode))
+
+                if costKind == .paid {
+                    TextField(L10n.t("pickup_form_amount_usd", languageCode: languageCode), text: $entryFeeText)
+                        .keyboardType(.decimalPad)
+                    Text(L10n.t("pickup_form_paid_fee_hint", languageCode: languageCode))
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                }
+            }
+            .padding(FGSpacing.md)
+        }
+        .animation(.easeInOut(duration: 0.2), value: costKind)
     }
 
     private var pickupFormDetailsLockedSection: some View {
@@ -3246,6 +3864,13 @@ struct SettingsPickupGameFormView: View {
     var body: some View {
         VStack(spacing: 0) {
             if shouldShowCreationTabs {
+                if creationContext.isTeamSourced, creationContext.team != nil {
+                    pickupFormTeamIdentityCard
+                        .padding(.horizontal, FGSpacing.lg)
+                        .padding(.top, FGSpacing.md)
+                        .padding(.bottom, FGSpacing.sm)
+                }
+
                 GameOnSegmentedControl(
                     tabs: PickupGameCreationTab.allCases.map { tab in
                         GameOnSegmentedTab(
@@ -3259,16 +3884,26 @@ struct SettingsPickupGameFormView: View {
                     titleMinimumScaleFactor: 0.85
                 )
                 .padding(.horizontal, FGSpacing.lg)
-                .padding(.top, FGSpacing.md)
+                .padding(.top, creationContext.isTeamSourced ? FGSpacing.xs : FGSpacing.md)
                 .padding(.bottom, FGSpacing.sm)
             }
 
             if shouldShowCreationTabs && creationTab == .csvImport {
                 PickupBulkImportPreviewView(
                     viewModel: viewModel,
+                    creationContext: creationContext,
                     showsNavigationChrome: false,
                     onImported: {
-                        Task { await viewModel.loadMyPickupGamesForSettings(forceRefresh: true, reason: "pickupImportInserted") }
+                        // Import service already refreshes Discover once at the end.
+                        // Team sheet `onFinished` reloads Team → Games once on dismiss.
+                        if !creationContext.isTeamSourced {
+                            Task {
+                                await viewModel.loadMyPickupGamesForSettings(
+                                    forceRefresh: true,
+                                    reason: "pickupImportInserted"
+                                )
+                            }
+                        }
                     },
                     onDoneAfterSuccess: {
                         onFinished()
@@ -3284,14 +3919,25 @@ struct SettingsPickupGameFormView: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button(L10n.t("pickup_form_cancel", languageCode: languageCode)) { onFinished(); dismiss() }
+                    .foregroundStyle(FGColor.intentPlay)
             }
             if !shouldShowCreationTabs || creationTab == .manual {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(confirmationActionTitle) {
+                    Button {
                         Task { await save() }
+                    } label: {
+                        Text(confirmationActionTitle)
+                            .font(.system(size: 15, weight: .bold, design: .rounded))
+                            .foregroundStyle(canSubmitPickupForm ? Color.white : FGColor.mutedText(colorScheme))
+                            .padding(.horizontal, canSubmitPickupForm ? 14 : 0)
+                            .padding(.vertical, canSubmitPickupForm ? 7 : 0)
+                            .background {
+                                if canSubmitPickupForm {
+                                    Capsule(style: .continuous)
+                                        .fill(FGColor.intentPlay)
+                                }
+                            }
                     }
-                    .fontWeight(.semibold)
-                    .foregroundStyle(canSubmitPickupForm ? FGColor.intentPlay : FGColor.mutedText(colorScheme))
                     .disabled(!canSubmitPickupForm)
                 }
             }
@@ -3319,6 +3965,9 @@ struct SettingsPickupGameFormView: View {
             if !shouldShowCreationTabs {
                 creationTab = .manual
             }
+        }
+        .task(id: editModePickupGameId) {
+            await resolveLinkedTeamFormContextIfNeeded()
         }
         .onDisappear {
             addressPreviewGeocodeTask?.cancel()
@@ -3485,9 +4134,13 @@ struct SettingsPickupGameFormView: View {
             state = ""
             zipCode = ""
             description = ""
-            gameFormat = .pickup
+            gameFormat = creationContext.isTeamSourced
+                ? GameType.defaultForTeamCreate
+                : GameType.defaultForNormalCreate
             playEnvironment = .either
             skillLevel = .casual
+            competitionLevel = nil
+            competitionLevelOverrideActive = !creationContext.isTeamSourced
             participantPreference = .everyone
             specifyAgeRange = false
             minimumAge = 18
@@ -3498,15 +4151,21 @@ struct SettingsPickupGameFormView: View {
             playersNeeded = 1
             useMaxPlayers = false
             maxPlayers = 10
+            needsAdditionalPlayers = false
+            isPublicDiscover = PickupGameEditPrivacyPolicy.defaultIsPublicForNewGame(
+                isTeamSourcedCreate: creationContext.isTeamSourced
+            )
             pollCreatePermission = .organizerOnly
             coordinatesLockedFromMap = false
             mapPinnedCoordinate = nil
             addressPreviewCoordinate = nil
             addressPreviewAddressLine = ""
             pickupSafetyAcknowledged = false
+            showManualAddressEntry = false
             if let pickupPlacePrefill {
                 applyPickupPlacePrefill(pickupPlacePrefill)
             }
+            applyTeamCreationContextPrefillIfNeeded()
         case .edit(let row):
             title = row.title
             sport = row.sport
@@ -3521,10 +4180,21 @@ struct SettingsPickupGameFormView: View {
             let splitState = Self.splitStoredStateAndZip(row.state)
             state = splitState.state
             zipCode = splitState.zipCode
+            showManualAddressEntry = !(row.address ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !(row.city ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             description = row.description ?? ""
             gameFormat = row.gameFormat
             playEnvironment = row.playEnvironmentEnum
             skillLevel = row.skillLevelEnum
+            competitionLevel = row.competitionLevel
+            if creationContext.isTeamSourced {
+                competitionLevelOverrideActive = !PickupTeamCompetitionInheritance.startsInInheritedMode(
+                    gameLevel: row.competitionLevel,
+                    teamDefault: creationContext.team?.competitionLevel
+                )
+            } else {
+                competitionLevelOverrideActive = true
+            }
             participantPreference = row.participantPreferenceEnum
             if let ageMin = row.age_min {
                 let normalized = PickupGameAgeRangeFormatter.normalized(min: ageMin, max: row.age_max)
@@ -3557,7 +4227,13 @@ struct SettingsPickupGameFormView: View {
                 useMaxPlayers = false
                 maxPlayers = Swift.max(row.playersNeededClamped, 2)
             }
+            // Seed Team recruiting toggle from persisted capacity (authoritative OFF = floor + no max).
+            needsAdditionalPlayers = PickupTeamOutsideRecruiting.isEnabled(
+                playersNeeded: row.playersNeededClamped,
+                maxPlayers: row.max_players
+            )
             pollCreatePermission = row.pollCreatePermission
+            isPublicDiscover = row.is_visible
             if let latitude = row.latitude,
                let longitude = row.longitude {
                 let savedCoordinate = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
@@ -3576,6 +4252,53 @@ struct SettingsPickupGameFormView: View {
             addressPreviewAddressLine = ""
             pickupSafetyAcknowledged = true
         }
+    }
+
+    private var editModePickupGameId: UUID? {
+        if case .edit(let row) = mode { return row.id }
+        return nil
+    }
+
+    @MainActor
+    private func resolveLinkedTeamFormContextIfNeeded() async {
+        guard case .edit(let row) = mode, !creationContext.isTeamSourced else { return }
+        do {
+            linkedTeamFormContext = try await FanTeamsService().loadTeamCreationContext(
+                forPickupGameId: row.id
+            )
+            if let teamDefault = linkedTeamFormContext?.competitionLevel {
+                competitionLevelOverrideActive = !PickupTeamCompetitionInheritance.startsInInheritedMode(
+                    gameLevel: competitionLevel,
+                    teamDefault: teamDefault
+                )
+            }
+        } catch {
+            linkedTeamFormContext = nil
+#if DEBUG
+            print(
+                "[PickupTeamForm] link context failed id=\(row.id.uuidString.lowercased()) " +
+                "error=\(error.localizedDescription)"
+            )
+#endif
+        }
+    }
+
+    private func applyTeamCreationContextPrefillIfNeeded() {
+        guard let team = creationContext.team, creationContext.isTeamSourced else { return }
+        let teamSport = team.teamSport.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !teamSport.isEmpty {
+            sport = teamSport
+        }
+        let teamName = team.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !teamName.isEmpty {
+            title = teamName
+        }
+        // Initialize once from Team default (resolved value persisted on save).
+        competitionLevel = PickupTeamCompetitionInheritance.initialGameLevel(
+            teamDefault: team.competitionLevel
+        )
+        // Inherited chrome only when Team has a concrete default.
+        competitionLevelOverrideActive = team.competitionLevel == nil
     }
 
     private func applyPickupPlacePrefill(_ place: PickupPlaceRow) {
@@ -3626,15 +4349,44 @@ struct SettingsPickupGameFormView: View {
 
     private var pickupSafetyNotice: some View {
         HStack(alignment: .top, spacing: FGSpacing.sm) {
-            Image(systemName: "exclamationmark.shield.fill")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(FGColor.accentYellow)
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(FGColor.intentPlay)
                 .padding(.top, 1)
-            Text("Pickup games and meetups involve physical activity and real-world interaction. Participate at your own risk and use good judgment.")
-                .font(FGTypography.caption)
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(L10n.t("pickup_form_safety_title", languageCode: languageCode))
+                    .font(.system(size: 15, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                Text(L10n.t("pickup_form_safety_body", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+        .accessibilityElement(children: .combine)
+    }
+
+    /// Team roster-only: lightweight informational reminder (no acknowledgement toggle).
+    private var pickupTeamOnlySafetyNotice: some View {
+        HStack(alignment: .top, spacing: FGSpacing.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(L10n.t("pickup_form_safety_title", languageCode: languageCode))
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                Text(L10n.t("fan_team_game_safety_team_only_body", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isStaticText)
     }
 
     private static func feeTextFieldString(from amount: Double) -> String {
@@ -3774,20 +4526,31 @@ struct SettingsPickupGameFormView: View {
         errorText = nil
 
         if let postStartRow = organizerPostStartLockedRow {
-            let playersN = min(20, max(1, playersNeeded))
-            let approved = postStartRow.approvedJoinCount
-            guard playersN >= approved else {
-                errorText = "Players needed can’t be fewer than the number already approved (\(approved))."
-                return
-            }
-            var maxP: Int?
-            if useMaxPlayers {
-                let capped = min(100, max(1, maxPlayers))
-                guard capped >= playersN else {
-                    errorText = "Max players must be at least the number of players needed."
+            let playersN: Int
+            let maxP: Int?
+            if isTeamLinkedForm, !needsAdditionalPlayers {
+                // Turning recruitment OFF must not silently remove approved outside players;
+                // only stop new outside recruiting via capacity sentinel.
+                let inactive = PickupTeamOutsideRecruiting.inactivePersistence()
+                playersN = inactive.playersNeeded
+                maxP = inactive.maxPlayers
+            } else {
+                playersN = min(20, max(1, playersNeeded))
+                let approved = postStartRow.approvedJoinCount
+                guard playersN >= approved else {
+                    errorText = "Players needed can’t be fewer than the number already approved (\(approved))."
                     return
                 }
-                maxP = capped
+                if useMaxPlayers {
+                    let capped = min(100, max(1, maxPlayers))
+                    guard capped >= playersN else {
+                        errorText = "Max players must be at least the number of players needed."
+                        return
+                    }
+                    maxP = capped
+                } else {
+                    maxP = nil
+                }
             }
 
             isSaving = true
@@ -3822,15 +4585,22 @@ struct SettingsPickupGameFormView: View {
             return
         }
 
-        let ageRange = normalizedAgeRangePayload()
-        if specifyAgeRange {
-            guard let minAge = ageRange.min else {
-                errorText = "Choose a minimum age for this pickup game."
-                return
-            }
-            if let maxAge = ageRange.max, minAge > maxAge {
-                errorText = "Minimum age can’t be greater than maximum age."
-                return
+        // Team + recruiting OFF: hide outside eligibility fields; don't require/persist age gates.
+        // Form @State is preserved for toggle-back in this session.
+        let ageRange: (min: Int?, max: Int?)
+        if isTeamLinkedForm, !needsAdditionalPlayers {
+            ageRange = (nil, nil)
+        } else {
+            ageRange = normalizedAgeRangePayload()
+            if specifyAgeRange {
+                guard let minAge = ageRange.min else {
+                    errorText = "Choose a minimum age for this pickup game."
+                    return
+                }
+                if let maxAge = ageRange.max, minAge > maxAge {
+                    errorText = "Minimum age can’t be greater than maximum age."
+                    return
+                }
             }
         }
 
@@ -3844,15 +4614,34 @@ struct SettingsPickupGameFormView: View {
             feeParsed = (amt * 100.0).rounded() / 100.0
         }
 
-        let playersN = min(20, max(1, playersNeeded))
-        var maxP: Int?
-        if useMaxPlayers {
-            let capped = min(100, max(1, maxPlayers))
-            guard capped >= playersN else {
-                errorText = "Max players must be at least the number of players needed."
-                return
+        let playersN: Int
+        let maxP: Int?
+        if isTeamLinkedForm, !needsAdditionalPlayers {
+            // Authoritative OFF: Team roster audience only; stops outside recruiting detection.
+            let inactive = PickupTeamOutsideRecruiting.inactivePersistence()
+            playersN = inactive.playersNeeded
+            maxP = inactive.maxPlayers
+        } else {
+            playersN = min(20, max(1, playersNeeded))
+            if useMaxPlayers {
+                let capped = min(100, max(1, maxPlayers))
+                guard capped >= playersN else {
+                    errorText = "Max players must be at least the number of players needed."
+                    return
+                }
+                maxP = capped
+            } else {
+                maxP = nil
             }
-            maxP = capped
+        }
+
+        // Outside recruitment preference metadata: keep session values when ON; when Team OFF,
+        // persist Everyone so hidden "Who’s welcome" cannot imply outside eligibility filters.
+        let preferencePayload: String
+        if isTeamLinkedForm, !needsAdditionalPlayers {
+            preferencePayload = PickupParticipantPreference.everyone.rawValue
+        } else {
+            preferencePayload = participantPreference.rawValue
         }
 
         isSaving = true
@@ -3921,6 +4710,16 @@ struct SettingsPickupGameFormView: View {
                     print("[PickupHostPrefillDebug] savedPickupPlaceLocation=true placeId=\(appliedPickupPlacePrefill.id.uuidString.lowercased()) address=\(addr) city=\(c) state=\(st) zip=\(trimmedZipCode) latitude=\(latFinal) longitude=\(lonFinal)")
                 }
 #endif
+                let isTeamCreate = creationContext.isTeamSourced
+                if isTeamCreate, !GameType.fanTeamLinkableCases.contains(gameFormat) {
+                    errorText = L10n.t("pickup_form_team_format_error", languageCode: languageCode)
+                    return
+                }
+                let createdVisibility = PickupGameEditPrivacyPolicy.resolvedIsVisible(
+                    formIsPublic: isPublicDiscover,
+                    isTeamLinked: isTeamLinkedForm,
+                    needsAdditionalPlayers: needsAdditionalPlayers
+                )
                 let created = try await viewModel.insertPickupGame(
                     title: trimmedTitle,
                     sport: sport,
@@ -3935,15 +4734,28 @@ struct SettingsPickupGameFormView: View {
                     longitude: lonFinal,
                     playersNeeded: playersN,
                     playEnvironment: playEnvironment.rawValue,
-                    participantPreference: participantPreference.rawValue,
+                    participantPreference: preferencePayload,
                     ageMin: ageRange.min,
                     ageMax: ageRange.max,
                     isFree: isFree,
                     entryFeeAmount: feeParsed,
                     maxPlayers: maxP,
                     gameFormat: gameFormat,
-                    pollCreatePermission: pollCreatePermission
+                    competitionLevel: competitionLevel,
+                    pollCreatePermission: pollCreatePermission,
+                    isVisible: createdVisibility
                 )
+                if let team = creationContext.team, isTeamCreate {
+                    do {
+                        _ = try await FanTeamsService().linkPickupGameToFanTeam(
+                            teamId: team.teamId,
+                            pickupGameId: created.id
+                        )
+                    } catch {
+                        try? await viewModel.deletePickupGame(id: created.id)
+                        throw error
+                    }
+                }
                 onCreated?(created)
                 if appliedPickupPlacePrefill != nil {
                     createdFromPickupPlace = created
@@ -3952,11 +4764,17 @@ struct SettingsPickupGameFormView: View {
                 let gameStartISO = PickupGameModels.encodeSupabaseTimestamptz(start)
                 let endISO = PickupGameModels.encodeSupabaseTimestamptz(end)
                 let removeISO = PickupGameModels.encodedPickupRemoveAfterAt(forEncodedGameStart: gameStartISO)
+                let resolvedVisibility = PickupGameEditPrivacyPolicy.resolvedIsVisible(
+                    formIsPublic: isPublicDiscover,
+                    isTeamLinked: isTeamLinkedForm,
+                    needsAdditionalPlayers: needsAdditionalPlayers
+                )
                 let patch = PickupGameFullUpdate(
                     title: trimmedTitle,
                     sport: sport,
                     description: desc.isEmpty ? nil : desc,
                     game_format: gameFormat.rawValue,
+                    competition_level: competitionLevel?.rawValue,
                     skill_level: skillLevel.rawValue,
                     game_start_at: gameStartISO,
                     end_time: endISO,
@@ -3965,10 +4783,10 @@ struct SettingsPickupGameFormView: View {
                     state: st.isEmpty ? nil : st,
                     latitude: latFinal,
                     longitude: lonFinal,
-                    is_visible: true,
+                    is_visible: resolvedVisibility,
                     players_needed: playersN,
                     play_environment: playEnvironment.rawValue,
-                    participant_preference: participantPreference.rawValue,
+                    participant_preference: preferencePayload,
                     age_min: ageRange.min,
                     age_max: ageRange.max,
                     is_free: isFree,

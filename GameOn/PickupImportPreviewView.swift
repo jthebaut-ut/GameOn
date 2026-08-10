@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 struct PickupBulkImportPreviewView: View {
     @ObservedObject var viewModel: MapViewModel
+    /// Shared with Manual create so Team → Schedule Game → CSV Import links each row.
+    var creationContext: PickupGameCreationContext = .standard
     var showsNavigationChrome = true
     var onImported: () -> Void
     var onDoneAfterSuccess: () -> Void = {}
@@ -550,7 +552,11 @@ struct PickupBulkImportPreviewView: View {
         defer { isLoadingPreview = false }
 
         do {
-            let rows = try await PickupBulkImportService.loadPreview(from: url, viewModel: viewModel)
+            let rows = try await PickupBulkImportService.loadPreview(
+                from: url,
+                viewModel: viewModel,
+                creationContext: creationContext
+            )
             previewRows = rows
             selectedRowIDs = Set(rows.filter { $0.status.isImportable }.map(\.id))
         } catch {
@@ -597,7 +603,11 @@ struct PickupBulkImportPreviewView: View {
         errorMessage = nil
         defer { isImporting = false }
 
-        let result = await PickupBulkImportService.importRows(rowsToImport, viewModel: viewModel)
+        let result = await PickupBulkImportService.importRows(
+            rowsToImport,
+            viewModel: viewModel,
+            creationContext: creationContext
+        )
         importResult = result
         if result.insertedCount > 0 {
             onImported()

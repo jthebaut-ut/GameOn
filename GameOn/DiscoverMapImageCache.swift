@@ -80,7 +80,7 @@ nonisolated enum ImageCacheDebug {
         trace("[ImageCacheDebug] imageInvocationId=\(invocationId)")
         trace("[ImageCacheDebug] inflightInsertThread=\(threadLabel())")
         trace("[ImageCacheDebug] inflightLookupThread=\(lookupThread)")
-        trace("[ImageCacheDebug] lookupInsertGapMs=\(String(format: "%.3f", lookupInsertGapMs))")
+        trace("[ImageCacheDebug] lookupInsertGapMs=\(FanGeoFixedFloatFormat.d3(lookupInsertGapMs))")
     }
 
     /// Global probe outside actor isolation to detect overlapping lookups before any insert.
@@ -340,8 +340,8 @@ nonisolated enum ImageCacheDebug {
         let diskRate = lookups > 0 ? Double(disk) / Double(lookups) : 0
         DebugLogGate.hotPathPerf("[ImageCacheDebug] sessionSummary reason=\(reason)")
         DebugLogGate.hotPathPerf("[ImageCacheDebug] lookupCount=\(lookups)")
-        DebugLogGate.hotPathPerf("[ImageCacheDebug] memoryHitRate=\(String(format: "%.3f", memoryRate))")
-        DebugLogGate.hotPathPerf("[ImageCacheDebug] diskHitRate=\(String(format: "%.3f", diskRate))")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] memoryHitRate=\(FanGeoFixedFloatFormat.d3(memoryRate))")
+        DebugLogGate.hotPathPerf("[ImageCacheDebug] diskHitRate=\(FanGeoFixedFloatFormat.d3(diskRate))")
         DebugLogGate.hotPathPerf("[ImageCacheDebug] memoryHits=\(mem)")
         DebugLogGate.hotPathPerf("[ImageCacheDebug] diskHits=\(disk)")
         DebugLogGate.hotPathPerf("[ImageCacheDebug] networkFetchCount=\(net)")

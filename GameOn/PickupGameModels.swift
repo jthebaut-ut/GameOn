@@ -2,12 +2,66 @@ import Foundation
 
 func pickupLocalizedSpotsOpen(_ count: Int, languageCode: String) -> String {
     let key = count == 1 ? "pickup_spot_open_singular" : "pickup_spots_open_plural"
-    return String(format: L10n.t(key, languageCode: languageCode), count)
+    return String(format: L10n.t(key, languageCode: languageCode), Int64(count))
 }
 
 func pickupLocalizedSpotsLeft(_ count: Int, languageCode: String) -> String {
     let key = count == 1 ? "pickup_spot_left_singular" : "pickup_spots_left_plural"
-    return String(format: L10n.t(key, languageCode: languageCode), count)
+    return String(format: L10n.t(key, languageCode: languageCode), Int64(count))
+}
+
+/// Compact / spoken duration from whole minutes between authoritative start and end.
+/// Visible UI stays short (`2h`, `1h 30m`, `45m`); VoiceOver can use the spoken form.
+nonisolated enum PickupGameDurationPresentation {
+    /// Compact chip / inline label. No "game" suffix.
+    /// Reuses activity-status `h` / `m` unit keys so locales like Polish (`g`) and Chinese (`时`/`分`) stay correct.
+    static func compactLabel(totalMinutes: Int, languageCode: String) -> String? {
+        guard totalMinutes > 0 else { return nil }
+        let lang = L10n.normalizedLanguageCode(languageCode)
+        let locale = Locale(identifier: lang.replacingOccurrences(of: "-", with: "_"))
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        let hoursPart: String? = hours > 0
+            ? String(
+                format: L10n.t("activity_status_compact_hours_format", languageCode: lang),
+                locale: locale,
+                hours
+            )
+            : nil
+        let minutesPart: String? = minutes > 0
+            ? String(
+                format: L10n.t("activity_status_compact_minutes_format", languageCode: lang),
+                locale: locale,
+                minutes
+            )
+            : nil
+        switch (hoursPart, minutesPart) {
+        case let (h?, m?):
+            return "\(h) \(m)"
+        case let (h?, nil):
+            return h
+        case let (nil, m?):
+            return m
+        default:
+            return nil
+        }
+    }
+
+    /// Locale-aware spoken duration for accessibility (e.g. "2 hours", "30 minutes").
+    static func spokenLabel(totalMinutes: Int, languageCode: String) -> String? {
+        guard totalMinutes > 0 else { return nil }
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute]
+        formatter.unitsStyle = .full
+        var calendar = Calendar(identifier: .gregorian)
+        let code = L10n.normalizedLanguageCode(languageCode)
+        calendar.locale = Locale(identifier: code.replacingOccurrences(of: "-", with: "_"))
+        formatter.calendar = calendar
+        var components = DateComponents()
+        components.hour = totalMinutes / 60
+        components.minute = totalMinutes % 60
+        return formatter.string(from: components)
+    }
 }
 
 /// Automatic removal: `remove_after_at` is always `game_start_at` + this many hours (DB trigger + app payloads).
@@ -108,10 +162,36 @@ enum PickupExpirationEditDebug {
     }
 }
 
-enum GameType: String, Codable, CaseIterable {
+/// Authoritative `pickup_games.game_format` tokens (event type — not competition level).
+/// `team_event` is intentionally omitted from v1 (players_needed >= 1 blocks non-playing events).
+enum GameType: String, Codable, CaseIterable, Hashable {
     case pickup
     case practice
     case scrimmage
+    /// Legacy Team fixture token. Preserve existing rows; new Team creates prefer `.league_game`.
+    case match
+    case league_game
+    case tournament_game
+    case tryout
+    case clinic
+
+    /// Classic Pickup create/edit (excludes legacy Team-only `.match`).
+    static var pickupOrganizerCases: [GameType] {
+        [.pickup, .practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic]
+    }
+
+    /// My Teams → Schedule Game (same column). Includes legacy `.match` for edit compatibility.
+    static var fanTeamOrganizerCases: [GameType] {
+        [.practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match]
+    }
+
+    /// Formats allowed by `link_pickup_game_to_fan_team` (plain pickup excluded).
+    static var fanTeamLinkableCases: [GameType] {
+        [.practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match]
+    }
+
+    static var defaultForTeamCreate: GameType { .league_game }
+    static var defaultForNormalCreate: GameType { .pickup }
 
     var displayTitle: String {
         displayTitle(languageCode: nil)
@@ -125,11 +205,356 @@ enum GameType: String, Codable, CaseIterable {
             return L10n.t("pickup_game_format_practice", languageCode: languageCode)
         case .scrimmage:
             return L10n.t("pickup_game_format_scrimmage", languageCode: languageCode)
+        case .match:
+            return L10n.t("fan_team_game_type_match", languageCode: languageCode)
+        case .league_game:
+            return L10n.t("pickup_game_format_league_game", languageCode: languageCode)
+        case .tournament_game:
+            return L10n.t("pickup_game_format_tournament_game", languageCode: languageCode)
+        case .tryout:
+            return L10n.t("pickup_game_format_tryout", languageCode: languageCode)
+        case .clinic:
+            return L10n.t("pickup_game_format_clinic", languageCode: languageCode)
         }
     }
 
     var badgeTitle: String {
         displayTitle.uppercased()
+    }
+
+    var systemImage: String {
+        switch self {
+        case .pickup: return "person.3.fill"
+        case .practice: return "figure.run"
+        case .scrimmage: return "arrow.left.arrow.right"
+        case .match, .league_game: return "trophy.fill"
+        case .tournament_game: return "medal.fill"
+        case .tryout: return "person.badge.plus"
+        case .clinic: return "graduationcap.fill"
+        }
+    }
+
+    /// Create-form hero title. Updates live when Game Format changes (presentation only).
+    func scheduleFormIntroTitle(languageCode: String?) -> String {
+        switch self {
+        case .pickup:
+            return L10n.t("pickup_form_intro_title_pickup", languageCode: languageCode)
+        case .practice:
+            return L10n.t("pickup_form_intro_title_practice", languageCode: languageCode)
+        case .scrimmage:
+            return L10n.t("pickup_form_intro_title_scrimmage", languageCode: languageCode)
+        case .league_game:
+            return L10n.t("pickup_form_intro_title_league_game", languageCode: languageCode)
+        case .tournament_game:
+            return L10n.t("pickup_form_intro_title_tournament_game", languageCode: languageCode)
+        case .tryout:
+            return L10n.t("pickup_form_intro_title_tryout", languageCode: languageCode)
+        case .clinic:
+            return L10n.t("pickup_form_intro_title_clinic", languageCode: languageCode)
+        case .match:
+            return L10n.t("pickup_form_intro_title_match", languageCode: languageCode)
+        }
+    }
+
+    /// Live summary card primary label for the selected format.
+    func scheduleFormSummaryLabel(languageCode: String?) -> String {
+        switch self {
+        case .pickup:
+            return L10n.t("pickup_form_summary_format_pickup", languageCode: languageCode)
+        case .clinic:
+            // Prefer short "Clinic" over picker label "Clinic / Camp".
+            return L10n.t("pickup_form_summary_format_clinic", languageCode: languageCode)
+        case .practice, .scrimmage, .league_game, .tournament_game, .tryout, .match:
+            return displayTitle(languageCode: languageCode)
+        }
+    }
+
+    /// Compact emoji for the live summary card format column.
+    var scheduleFormSummaryEmoji: String {
+        switch self {
+        case .pickup: return "🤝"
+        case .practice: return "⚽"
+        case .scrimmage: return "🔄"
+        case .league_game, .match: return "🏆"
+        case .tournament_game: return "🏅"
+        case .tryout: return "📋"
+        case .clinic: return "🎓"
+        }
+    }
+
+    /// Soft parse for CSV / wire strings. Unknown → nil (callers choose fallback).
+    static func parse(_ raw: String?) -> GameType? {
+        let normalized = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+        guard !normalized.isEmpty else { return nil }
+        if let exact = GameType(rawValue: normalized) { return exact }
+        switch normalized {
+        case "league", "leaguegame", "league_fixture":
+            return .league_game
+        case "tournament", "tournamentgame":
+            return .tournament_game
+        case "tryouts", "try_out":
+            return .tryout
+        case "camp", "clinic_camp", "cliniccamp":
+            return .clinic
+        case "game", "fixture":
+            return .league_game
+        default:
+            return nil
+        }
+    }
+}
+
+/// Optional `pickup_games.competition_level` (sport level — not event type).
+enum PickupCompetitionLevel: String, Codable, CaseIterable, Hashable, Identifiable {
+    case youth
+    case high_school
+    case college_university
+    case adult_recreational
+    case adult_competitive
+    case semi_pro
+    case professional
+
+    var id: String { rawValue }
+
+    func displayTitle(languageCode: String?) -> String {
+        switch self {
+        case .youth:
+            return L10n.t("pickup_competition_level_youth", languageCode: languageCode)
+        case .high_school:
+            return L10n.t("pickup_competition_level_high_school", languageCode: languageCode)
+        case .college_university:
+            return L10n.t("pickup_competition_level_college_university", languageCode: languageCode)
+        case .adult_recreational:
+            return L10n.t("pickup_competition_level_adult_recreational", languageCode: languageCode)
+        case .adult_competitive:
+            return L10n.t("pickup_competition_level_adult_competitive", languageCode: languageCode)
+        case .semi_pro:
+            return L10n.t("pickup_competition_level_semi_pro", languageCode: languageCode)
+        case .professional:
+            return L10n.t("pickup_competition_level_professional", languageCode: languageCode)
+        }
+    }
+
+    static func parse(_ raw: String?) -> PickupCompetitionLevel? {
+        let compact = (raw ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "/", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let collapsed = compact
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: "_")
+        guard !collapsed.isEmpty else { return nil }
+        if let exact = PickupCompetitionLevel(rawValue: collapsed) { return exact }
+        switch collapsed {
+        case "college", "university", "college_university", "uni":
+            return .college_university
+        case "hs", "highschool", "high_school":
+            return .high_school
+        case "adult_rec", "recreational", "adult_recreation", "rec":
+            return .adult_recreational
+        case "adult_comp", "competitive", "adult":
+            return .adult_competitive
+        case "semipro", "semi_professional", "semi_pro":
+            return .semi_pro
+        case "pro", "professional":
+            return .professional
+        case "kids", "youth":
+            return .youth
+        default:
+            return nil
+        }
+    }
+}
+
+/// Lightweight context for opening the shared Pickup create form from My Teams.
+/// Carries presentation identity (logo/color/level) so Schedule Game can show which Team
+/// without an extra RPC — populated from the already-loaded `FanTeamSummary`.
+struct PickupGameTeamCreationContext: Equatable, Hashable, Sendable {
+    let teamId: UUID
+    let teamName: String
+    let teamSport: String
+    /// Active roster size for Team Players presentation (not auto-RSVP).
+    let activeMemberCount: Int
+    /// Team default competition level — new games inherit unless overridden.
+    let competitionLevel: PickupCompetitionLevel?
+    let logoURL: String?
+    let logoThumbnailURL: String?
+    let colorHex: String?
+
+    init(
+        teamId: UUID,
+        teamName: String,
+        teamSport: String,
+        activeMemberCount: Int = 0,
+        competitionLevel: PickupCompetitionLevel? = nil,
+        logoURL: String? = nil,
+        logoThumbnailURL: String? = nil,
+        colorHex: String? = nil
+    ) {
+        self.teamId = teamId
+        self.teamName = teamName
+        self.teamSport = teamSport
+        self.activeMemberCount = max(0, activeMemberCount)
+        self.competitionLevel = competitionLevel
+        self.logoURL = logoURL
+        self.logoThumbnailURL = logoThumbnailURL
+        self.colorHex = colorHex
+    }
+
+    init(from summary: FanTeamSummary) {
+        self.init(
+            teamId: summary.id,
+            teamName: summary.name,
+            teamSport: summary.sport,
+            activeMemberCount: summary.memberCount,
+            competitionLevel: summary.competitionLevel,
+            logoURL: summary.logoURL,
+            logoThumbnailURL: summary.logoThumbnailURL,
+            colorHex: summary.colorHex
+        )
+    }
+
+    /// Youth · Soccer · 24 members (hides level when nil). Presentation only.
+    func scheduleHeaderMetaLine(languageCode: String) -> String {
+        FanTeamMetaLine.compose(
+            competitionLevel: competitionLevel,
+            sport: AppSportCatalog.displayLabel(forSportToken: teamSport),
+            memberCount: activeMemberCount > 0 ? activeMemberCount : nil,
+            languageCode: languageCode
+        )
+    }
+
+    func scheduleHeaderAccessibilityLabel(languageCode: String) -> String {
+        var parts = [
+            L10n.t("pickup_form_team_scheduling_a11y_prefix", languageCode: languageCode),
+            teamName,
+        ]
+        let sport = AppSportCatalog.displayLabel(forSportToken: teamSport)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sport.isEmpty {
+            parts.append(sport)
+        }
+        if let competitionLevel {
+            parts.append(competitionLevel.displayTitle(languageCode: languageCode))
+        }
+        return parts.joined(separator: ". ")
+    }
+}
+
+/// Team-linked games reuse `players_needed` / `max_players` for optional outside recruiting.
+/// DB floor is `players_needed >= 1`; Team create with recruiting OFF persists `1` + `max_players = nil`.
+enum PickupTeamOutsideRecruiting {
+    /// Sentinel persisted when Team create has “Need additional players” OFF.
+    static let inactivePlayersNeededFloor = 1
+
+    /// Whether a Team-linked row is recruiting outside the Team roster.
+    static func isEnabled(playersNeeded: Int, maxPlayers: Int?) -> Bool {
+        if maxPlayers != nil { return true }
+        return playersNeeded > inactivePlayersNeededFloor
+    }
+
+    /// Values to persist for Team create/import when not recruiting outside.
+    static func inactivePersistence() -> (playersNeeded: Int, maxPlayers: Int?) {
+        (inactivePlayersNeededFloor, nil)
+    }
+}
+
+/// Team Schedule / Team-linked edit: HOW YOU PLAY always keeps Indoor/Outdoor;
+/// skill / who’s welcome / age govern outside recruitment only.
+enum PickupTeamHowYouPlayPresentation {
+    /// Standalone Pickup always shows recruitment eligibility fields.
+    /// Team-linked games show them only while “Need additional players” is ON.
+    static func showsOutsideRecruitmentFields(
+        isTeamLinked: Bool,
+        needsAdditionalPlayers: Bool
+    ) -> Bool {
+        if !isTeamLinked { return true }
+        return needsAdditionalPlayers
+    }
+}
+
+/// Team-linked Schedule Game safety: roster-only = informational note; recruiting outside = full ack.
+enum PickupTeamSafetyPresentation {
+    /// Compact Team-only note (no toggle) when Team-linked and not recruiting outside players.
+    static func usesTeamOnlyInformationalNote(
+        isTeamLinked: Bool,
+        needsAdditionalPlayers: Bool
+    ) -> Bool {
+        isTeamLinked && !needsAdditionalPlayers
+    }
+
+    /// Acknowledgement is create-only. Edit never re-requires it (existing product semantics).
+    /// Team-only create does not require acknowledgement; Team recruiting + standalone do.
+    static func requiresAcknowledgment(
+        isCreate: Bool,
+        isTeamLinked: Bool,
+        needsAdditionalPlayers: Bool
+    ) -> Bool {
+        guard isCreate else { return false }
+        if usesTeamOnlyInformationalNote(
+            isTeamLinked: isTeamLinked,
+            needsAdditionalPlayers: needsAdditionalPlayers
+        ) {
+            return false
+        }
+        return true
+    }
+}
+
+enum PickupGameCreationSource: String, Equatable, Sendable {
+    case standard
+    case team
+}
+
+struct PickupGameCreationContext: Equatable, Sendable {
+    var source: PickupGameCreationSource
+    var team: PickupGameTeamCreationContext?
+
+    static let standard = PickupGameCreationContext(source: .standard, team: nil)
+
+    static func team(_ team: PickupGameTeamCreationContext) -> PickupGameCreationContext {
+        PickupGameCreationContext(source: .team, team: team)
+    }
+
+    var isTeamSourced: Bool { source == .team && team != nil }
+}
+
+/// Product rules for Public/Private on create/edit (`pickup_games.is_visible`).
+///
+/// - Normal Pickup create defaults Public (`true`).
+/// - Team → Schedule Game create defaults Private (`false`).
+/// - Team-linked + “Need additional players” OFF → always Private (Team RSVP only; not outside-discoverable).
+/// - Team-linked + recruiting ON → organizer Public/Private selection wins.
+/// - Standalone Pickup → organizer selection wins.
+/// - Edit seeds from the existing row only (never from Team create context).
+/// - Team link is independent of visibility (Public Team-linked games stay linked when recruiting).
+enum PickupGameEditPrivacyPolicy {
+    /// Initial value for a **new** game only. Edit must use `row.is_visible`.
+    static func defaultIsPublicForNewGame(isTeamSourcedCreate: Bool) -> Bool {
+        !isTeamSourcedCreate
+    }
+
+    /// Persist the organizer's form selection for standalone / Team-recruiting games.
+    static func resolvedIsVisible(formIsPublic: Bool) -> Bool {
+        formIsPublic
+    }
+
+    /// Team roster-only games (recruiting OFF) must not remain publicly discoverable.
+    static func resolvedIsVisible(
+        formIsPublic: Bool,
+        isTeamLinked: Bool,
+        needsAdditionalPlayers: Bool
+    ) -> Bool {
+        if isTeamLinked, !needsAdditionalPlayers {
+            return false
+        }
+        return formIsPublic
     }
 }
 
@@ -143,6 +568,8 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
     let sport: String
     let description: String?
     let game_format: String
+    /// Optional sport level axis (`youth`…`professional`). Nil = not specified.
+    let competition_level: String?
     /// Stored tokens: `casual`, `beginner_friendly`, `intermediate`, `competitive`.
     let skill_level: String
     let game_start_at: String
@@ -184,6 +611,7 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
         sport: String,
         description: String?,
         game_format: String,
+        competition_level: String? = nil,
         skill_level: String,
         game_start_at: String,
         end_time: String?,
@@ -216,6 +644,7 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
         self.sport = sport
         self.description = description
         self.game_format = game_format
+        self.competition_level = competition_level
         self.skill_level = skill_level
         self.game_start_at = game_start_at
         self.end_time = end_time
@@ -307,6 +736,7 @@ extension PickupGameRow {
             sport: sport,
             description: description,
             game_format: game_format,
+            competition_level: competition_level,
             skill_level: skill_level,
             game_start_at: game_start_at,
             end_time: end_time,
@@ -356,18 +786,24 @@ extension PickupGameRow {
         return "\(start.formatted(date: .omitted, time: .shortened)) – \(end.formatted(date: .omitted, time: .shortened))"
     }
 
-    var pickupCompactDurationLabel: String? {
+    /// Whole minutes between start and end (authoritative `game_start_at` / end).
+    var pickupDurationMinutes: Int? {
         guard let start = PickupGameModels.parseSupabaseTimestamptz(game_start_at),
               let end = PickupGameModels.endDate(for: self),
               end > start else {
             return nil
         }
         let minutes = Int((end.timeIntervalSince(start) / 60).rounded())
-        guard minutes > 0 else { return nil }
-        if minutes % 60 == 0 {
-            return "\(minutes / 60)h game"
-        }
-        return "\(minutes / 60)h \(minutes % 60)m game"
+        return minutes > 0 ? minutes : nil
+    }
+
+    /// Compact duration for chips / inline use: `45m`, `1h`, `1h 30m`, `2h` (no "game" suffix).
+    func pickupCompactDurationLabel(languageCode: String) -> String? {
+        guard let minutes = pickupDurationMinutes else { return nil }
+        return PickupGameDurationPresentation.compactLabel(
+            totalMinutes: minutes,
+            languageCode: languageCode
+        )
     }
 
     var pickupDateWithCompactTimeRange: String? {
@@ -379,6 +815,47 @@ extension PickupGameRow {
         return pickupDateWithCompactTimeRange(
             locale: Locale(identifier: code.replacingOccurrences(of: "-", with: "_"))
         )
+    }
+
+    /// Discover / list compact line: `Aug 10, 2026 • 3:03 PM – 5:03 PM • 2h`.
+    func pickupDateWithCompactTimeRangeAndDuration(languageCode: String) -> String? {
+        guard let base = pickupDateWithCompactTimeRange(languageCode: languageCode) else { return nil }
+        guard let duration = pickupCompactDurationLabel(languageCode: languageCode) else { return base }
+        return "\(base) • \(duration)"
+    }
+
+    /// VoiceOver-friendly date/time/duration (verbose spoken duration).
+    func pickupDateTimeDurationAccessibilityLabel(languageCode: String) -> String? {
+        guard let start = PickupGameModels.parseSupabaseTimestamptz(game_start_at) else { return nil }
+        let code = L10n.normalizedLanguageCode(languageCode)
+        let locale = Locale(identifier: code.replacingOccurrences(of: "-", with: "_"))
+        let dateStyle = Date.FormatStyle.dateTime
+            .month(.wide)
+            .day()
+            .year()
+            .locale(locale)
+        let timeStyle = Date.FormatStyle.dateTime
+            .hour()
+            .minute()
+            .locale(locale)
+        let dateText = start.formatted(dateStyle)
+        let end = end_time.flatMap { PickupGameModels.parseSupabaseTimestamptz($0) }
+            ?? PickupGameModels.defaultPickupEndTime(forStart: start)
+        let timePart: String
+        if end > start {
+            timePart = "\(start.formatted(timeStyle)) to \(end.formatted(timeStyle))"
+        } else {
+            timePart = start.formatted(timeStyle)
+        }
+        if let minutes = pickupDurationMinutes,
+           let spoken = PickupGameDurationPresentation.spokenLabel(
+            totalMinutes: minutes,
+            languageCode: code
+           ) {
+            // Spoken duration already locale-aware ("2 hours"); avoid ambiguous compact "2h".
+            return "\(dateText), \(timePart), \(spoken)"
+        }
+        return "\(dateText), \(timePart)"
     }
 
     private func pickupDateWithCompactTimeRange(locale: Locale) -> String? {
@@ -403,7 +880,11 @@ extension PickupGameRow {
     }
 
     var gameFormat: GameType {
-        GameType(rawValue: game_format) ?? .pickup
+        GameType.parse(game_format) ?? GameType(rawValue: game_format) ?? .pickup
+    }
+
+    var competitionLevel: PickupCompetitionLevel? {
+        PickupCompetitionLevel.parse(competition_level)
     }
 
     func isPickupGameInvitable(now: Date = Date()) -> Bool {
@@ -415,6 +896,18 @@ extension PickupGameRow {
         }
         return true
     }
+
+    /// Soft-cancelled organizer lifecycle (`status = removed`).
+    var isPickupGameSoftCancelled: Bool {
+        let st = status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return st == "removed" || st == "cancelled" || st == "canceled"
+    }
+
+    /// Organizer may cancel only while the game is still active.
+    func canOrganizerCancelPickupGame(viewerUserId: UUID?) -> Bool {
+        guard let viewerUserId, creator_user_id == viewerUserId else { return false }
+        return status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "active"
+    }
 }
 
 struct PickupGameInsert: Encodable {
@@ -424,6 +917,7 @@ struct PickupGameInsert: Encodable {
     let sport: String
     let description: String?
     let game_format: String
+    let competition_level: String?
     let skill_level: String
     let game_start_at: String
     let end_time: String
@@ -446,7 +940,8 @@ struct PickupGameInsert: Encodable {
     let remove_after_at: String
     let poll_create_permission: String
 
-    /// Write payload with canonical 12h pickup retention and forced Discover visibility.
+    /// Write payload with canonical 12h pickup retention. Preserves caller `is_visible`
+    /// (classic create passes true; Team Schedule Game passes false).
     func withCanonicalPickupCleanupDelay() -> PickupGameInsert {
         let remove = PickupGameModels.encodedPickupRemoveAfterAt(forEncodedGameStart: game_start_at)
         return PickupGameInsert(
@@ -456,6 +951,7 @@ struct PickupGameInsert: Encodable {
             sport: sport,
             description: description,
             game_format: game_format,
+            competition_level: competition_level,
             skill_level: skill_level,
             game_start_at: game_start_at,
             end_time: end_time,
@@ -464,7 +960,7 @@ struct PickupGameInsert: Encodable {
             state: state,
             latitude: latitude,
             longitude: longitude,
-            is_visible: true,
+            is_visible: is_visible,
             players_needed: players_needed,
             play_environment: play_environment,
             participant_preference: participant_preference,
@@ -485,6 +981,7 @@ struct PickupGameFullUpdate: Encodable {
     let sport: String
     let description: String?
     let game_format: String
+    let competition_level: String?
     let skill_level: String
     let game_start_at: String
     let end_time: String
@@ -507,7 +1004,8 @@ struct PickupGameFullUpdate: Encodable {
     let remove_after_at: String
     let poll_create_permission: String
 
-    /// Write payload with canonical 12h pickup retention and forced Discover visibility.
+    /// Write payload with canonical 12h pickup retention. Preserves caller `is_visible`
+    /// so Team-private games are not republished on edit.
     func withCanonicalPickupCleanupDelay() -> PickupGameFullUpdate {
         let remove = PickupGameModels.encodedPickupRemoveAfterAt(forEncodedGameStart: game_start_at)
         return PickupGameFullUpdate(
@@ -515,6 +1013,7 @@ struct PickupGameFullUpdate: Encodable {
             sport: sport,
             description: description,
             game_format: game_format,
+            competition_level: competition_level,
             skill_level: skill_level,
             game_start_at: game_start_at,
             end_time: end_time,
@@ -523,7 +1022,7 @@ struct PickupGameFullUpdate: Encodable {
             state: state,
             latitude: latitude,
             longitude: longitude,
-            is_visible: true,
+            is_visible: is_visible,
             players_needed: players_needed,
             play_environment: play_environment,
             participant_preference: participant_preference,

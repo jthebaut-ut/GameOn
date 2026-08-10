@@ -248,6 +248,32 @@ export function buildFriendRequestPushAlert(args: {
 }
 
 /**
+ * Fan Team invitation (poke-style identity title):
+ * title = "Jennifer (@jennifer)" | "Jennifer" | "@jennifer" | "FanGeo User"
+ * body  = "Invited you to join Team A"
+ *
+ * Inviter identity and team name must come from authoritative backend rows —
+ * never from client-supplied display strings.
+ */
+export function buildFanTeamInvitationPushAlert(args: {
+  inviterDisplayName: string
+  inviterHandle?: string | null
+  teamName: string
+  hasExplicitDisplayName?: boolean
+}): PushAlertContent {
+  const title = formatDirectPushTitle(
+    args.inviterDisplayName,
+    args.inviterHandle,
+    args.hasExplicitDisplayName ?? true,
+  )
+  const team = sanitizeConversationTitle(args.teamName, "your Team")
+  return {
+    title,
+    body: clampBody(`Invited you to join ${team}`),
+  }
+}
+
+/**
  * Profile poke (iMessage-style social):
  * title = "Michiel (@michiel)" | "Michiel" | "@michiel" | "FanGeo User"
  * body  = "Poked you 👋"

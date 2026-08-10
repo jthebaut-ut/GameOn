@@ -29,6 +29,10 @@ enum PushDeepLinkLog {
         print("[PushDeepLink] selecting_requests_section")
     }
 
+    static func selectingMyTeamsSection() {
+        print("[PushDeepLink] selecting_my_teams_section")
+    }
+
     static func opening(conversation: UUID?, kind: String) {
         let cid = conversation?.uuidString.lowercased() ?? "nil"
         print("[PushDeepLink] opening kind=\(kind) conversation=\(cid)")

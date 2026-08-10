@@ -11,16 +11,30 @@ struct PickupBulkImportResult {
 
 enum PickupBulkImportService {
     @MainActor
-    static func loadPreview(from url: URL, viewModel: MapViewModel) async throws -> [PickupBulkImportPreparedRow] {
+    static func loadPreview(
+        from url: URL,
+        viewModel: MapViewModel,
+        creationContext: PickupGameCreationContext? = nil
+    ) async throws -> [PickupBulkImportPreparedRow] {
+        // Resolve default on MainActor — avoids evaluating MainActor-isolated
+        // `PickupGameCreationContext.standard` in a nonisolated default-arg context.
+        let creationContext = creationContext ?? .standard
 #if DEBUG
-        print("[PickupBulkImport] loadPreviewStarted file=\(url.lastPathComponent)")
+        print(
+            "[PickupBulkImport] loadPreviewStarted file=\(url.lastPathComponent) " +
+            "teamSourced=\(creationContext.isTeamSourced)"
+        )
 #endif
         let didAccess = url.startAccessingSecurityScopedResource()
         defer {
             if didAccess { url.stopAccessingSecurityScopedResource() }
         }
         let rawRows = try PickupBulkImportParser.parseFile(at: url)
-        let rows = await PickupBulkImportValidator.validate(rawRows: rawRows, viewModel: viewModel)
+        let rows = await PickupBulkImportValidator.validate(
+            rawRows: rawRows,
+            viewModel: viewModel,
+            creationContext: creationContext
+        )
 #if DEBUG
         let summary = PickupBulkImportValidator.summary(for: rows)
         print("[PickupBulkImport] previewReady total=\(summary.totalCount) importable=\(summary.importableCount)")
@@ -29,10 +43,23 @@ enum PickupBulkImportService {
     }
 
     @MainActor
-    static func importRows(_ rows: [PickupBulkImportPreparedRow], viewModel: MapViewModel) async -> PickupBulkImportResult {
+    static func importRows(
+        _ rows: [PickupBulkImportPreparedRow],
+        viewModel: MapViewModel,
+        creationContext: PickupGameCreationContext? = nil
+    ) async -> PickupBulkImportResult {
+        let creationContext = creationContext ?? .standard
         let candidates = rows.filter { $0.status.isImportable }
+        let isTeamSourced = creationContext.isTeamSourced
+        let team = creationContext.team
+        let isVisible = PickupGameEditPrivacyPolicy.defaultIsPublicForNewGame(
+            isTeamSourcedCreate: isTeamSourced
+        )
 #if DEBUG
-        print("[PickupBulkInsert] started rows=\(candidates.count)")
+        print(
+            "[PickupBulkInsert] started rows=\(candidates.count) " +
+            "teamSourced=\(isTeamSourced) isVisible=\(isVisible)"
+        )
 #endif
         var inserted: [PickupGameRow] = []
         var failed: [(rowNumber: Int, message: String)] = []
@@ -70,8 +97,32 @@ enum PickupBulkImportService {
                     isFree: row.isFree,
                     entryFeeAmount: row.isFree ? nil : row.entryFeeAmount,
                     maxPlayers: row.maxPlayers,
-                    gameFormat: row.gameType
+                    gameFormat: row.gameType,
+                    competitionLevel: row.competitionLevel,
+                    isVisible: isVisible
                 )
+
+                if isTeamSourced, let team {
+                    do {
+                        _ = try await FanTeamsService().linkPickupGameToFanTeam(
+                            teamId: team.teamId,
+                            pickupGameId: insertedRow.id
+                        )
+                    } catch {
+                        // Same orphan cleanup as Manual Team create.
+                        try? await viewModel.deletePickupGame(id: insertedRow.id)
+#if DEBUG
+                        print(
+                            "[PickupBulkInsert] row=\(row.rowNumber) linkFailed " +
+                            "orphanedSoftRemoved id=\(insertedRow.id.uuidString.lowercased()) " +
+                            "error=\(error.localizedDescription)"
+                        )
+#endif
+                        failed.append((row.rowNumber, error.localizedDescription))
+                        continue
+                    }
+                }
+
                 inserted.append(insertedRow)
 #if DEBUG
                 print("[PickupBulkInsert] row=\(row.rowNumber) success=true id=\(insertedRow.id.uuidString.lowercased())")
@@ -84,6 +135,7 @@ enum PickupBulkImportService {
             }
         }
 
+        // One Discover / settings refresh after the whole batch (not per row).
         if !inserted.isEmpty {
             await viewModel.loadMyPickupGamesForSettings(forceRefresh: true, reason: "pickupBulkImportInserted")
             await viewModel.refreshPickupGamesForDiscoverMap(force: true, preservePickupCalendarDotDatesCache: true)

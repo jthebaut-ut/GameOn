@@ -916,6 +916,8 @@ final class MapViewModel: ObservableObject {
     @Published var currentUserHomeRegion: String = ""
     @Published var currentUserHomeCountry: String = ""
     @Published var currentUserShowHomeCity: Bool = false
+    /// `user_profiles.gender` raw token (`male` / `female` / …). Empty = unset.
+    @Published var currentUserGenderRaw: String = ""
     /// Curated profile background catalog key (default FanGeo).
     @Published var currentUserProfileBackgroundKey: ProfileBackgroundKey = .fangeo
     @Published var isAuthSessionRestoringForProfilePresentation: Bool = false
@@ -1185,6 +1187,14 @@ final class MapViewModel: ObservableObject {
     @Published var pickupMyLatestJoinRequestByGameId: [UUID: PickupGameRequestRow] = [:]
     /// Privacy-safe public roster from `get_pickup_game_roster` (organizer + approved; pending only for organizer).
     @Published var pickupGameRosterByGameId: [UUID: PickupGameRosterPayload] = [:]
+    /// Discover accent for Team-linked pickups the viewer can see (hex). Derived from `pickupDiscoverTeamIdentityByGameId`.
+    @Published var pickupDiscoverTeamAccentHexByGameId: [UUID: String] = [:]
+    /// Discover Team identity (name/logo/color) for Team-linked pickups the viewer can already see.
+    @Published var pickupDiscoverTeamIdentityByGameId: [UUID: PickupDiscoverTeamIdentity] = [:]
+    /// Play → Games membership scope (`all` vs `myTeams`). Session-only; orthogonal to sport/date.
+    @Published var discoverPickupTeamScope: DiscoverPickupTeamScope = .all
+    /// Active Fan Team ids for My Teams map scope (synced from `FanTeamIdentityRealtimeCoordinator`).
+    @Published var discoverMyActiveFanTeamIds: Set<UUID> = []
     /// In-flight roster fetches (dedupe concurrent detail + sheet loads).
     @Published var pickupGameRosterInFlightGameIds: Set<UUID> = []
     /// Last roster load error per game (debug / sheet banner).
@@ -1432,6 +1442,8 @@ final class MapViewModel: ObservableObject {
     let repeatMinuteOptions = [15, 30, 60, 120]
 
     private var fanProfileAvatarChangeObserver: NSObjectProtocol?
+    private var fanTeamIdentityChangeObserver: NSObjectProtocol?
+    private var fanTeamMembershipSnapshotsObserver: NSObjectProtocol?
 
     init() {
         #if DEBUG
@@ -1449,11 +1461,37 @@ final class MapViewModel: ObservableObject {
                 self?.applyFanProfileAvatarChangeToLocalCaches(change)
             }
         }
+        fanTeamIdentityChangeObserver = NotificationCenter.default.addObserver(
+            forName: FanTeamIdentityChangeCenter.identityDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let change = FanTeamIdentityChangeCenter.identityChange(from: notification) else { return }
+            Task { @MainActor [weak self] in
+                self?.applyFanTeamIdentityChangeToDiscoverCaches(change)
+            }
+        }
+        fanTeamMembershipSnapshotsObserver = NotificationCenter.default.addObserver(
+            forName: FanTeamIdentityRealtimeCoordinator.membershipSnapshotsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncDiscoverMyActiveFanTeamIdsFromCoordinator()
+            }
+        }
+        syncDiscoverMyActiveFanTeamIdsFromCoordinator()
     }
 
     deinit {
         if let fanProfileAvatarChangeObserver {
             NotificationCenter.default.removeObserver(fanProfileAvatarChangeObserver)
+        }
+        if let fanTeamIdentityChangeObserver {
+            NotificationCenter.default.removeObserver(fanTeamIdentityChangeObserver)
+        }
+        if let fanTeamMembershipSnapshotsObserver {
+            NotificationCenter.default.removeObserver(fanTeamMembershipSnapshotsObserver)
         }
     }
 

@@ -100,6 +100,9 @@ struct ScalableSportFilterChipsHStack: View {
     @Binding var showMoreSheet: Bool
     var spacing: CGFloat = 10
     var isCompact: Bool = true
+    /// Schedule → Play (and similar): insert My Teams scope chip after All.
+    var showsMyTeamsScopeChip: Bool = false
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     var body: some View {
         HStack(spacing: spacing) {
@@ -107,6 +110,19 @@ struct ScalableSportFilterChipsHStack: View {
                 switch item.kind {
                 case .all:
                     sportChip(selection: "All")
+                    if showsMyTeamsScopeChip, !viewModel.isGuestDiscoverMode {
+                        FanGeoMyTeamsScopeFilterChip(
+                            isSelected: viewModel.discoverPickupTeamScope == .myTeams,
+                            isCompact: isCompact,
+                            languageCode: appLanguageRaw
+                        ) {
+                            let next: DiscoverPickupTeamScope =
+                                viewModel.discoverPickupTeamScope == .myTeams ? .all : .myTeams
+                            withAnimation(.spring()) {
+                                viewModel.setDiscoverPickupTeamScope(next)
+                            }
+                        }
+                    }
                 case .sport(let selection, let displayTitle):
                     sportChip(selection: selection, displayTitle: displayTitle)
                 case .more:
@@ -138,6 +154,7 @@ struct ScalableSportFilterChipRow: View {
     @Binding var showMoreSheet: Bool
     var rowSpacing: CGFloat = 10
     var isCompact: Bool = true
+    var showsMyTeamsScopeChip: Bool = false
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -145,10 +162,94 @@ struct ScalableSportFilterChipRow: View {
                 viewModel: viewModel,
                 showMoreSheet: $showMoreSheet,
                 spacing: rowSpacing,
-                isCompact: isCompact
+                isCompact: isCompact,
+                showsMyTeamsScopeChip: showsMyTeamsScopeChip
             )
             .padding(.horizontal, 4)
         }
+    }
+}
+
+/// Shared My Teams scope chip (Schedule Play / Discover-compatible styling via SportFilterChip accent language).
+struct FanGeoMyTeamsScopeFilterChip: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    let isSelected: Bool
+    var isCompact: Bool = true
+    let languageCode: String
+    let action: () -> Void
+
+    private var accent: Color { FGColor.accentGreen }
+    private var label: String {
+        L10n.t("chat_section_my_teams", languageCode: languageCode)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 6) {
+                Image(systemName: "shield.fill")
+                    .font(.system(size: isCompact ? 14 : 15, weight: .semibold, design: .rounded))
+                    .foregroundStyle(isSelected ? Color.white : accent)
+                Text(label)
+                    .font(.system(size: isCompact ? 13 : 14, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .padding(.horizontal, isCompact ? 11 : 12)
+            .padding(.vertical, isCompact ? 0 : 1)
+            .frame(height: isCompact ? 34 : 36, alignment: .center)
+            .foregroundStyle(isSelected ? Color.white : FGColor.primaryText(colorScheme))
+            .background {
+                Group {
+                    if isSelected {
+                        Capsule(style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [accent.opacity(0.98), accent.opacity(0.76)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .overlay {
+                                Capsule(style: .continuous)
+                                    .fill(Color.white.opacity(colorScheme == .dark ? 0.10 : 0.14))
+                                    .blendMode(.overlay)
+                            }
+                    } else {
+                        ZStack {
+                            Capsule(style: .continuous)
+                                .fill(.ultraThinMaterial)
+                            Capsule(style: .continuous)
+                                .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.72))
+                            Capsule(style: .continuous)
+                                .fill(accent.opacity(colorScheme == .dark ? 0.10 : 0.065))
+                        }
+                    }
+                }
+            }
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(
+                        isSelected ? Color.white.opacity(0.22) : accent.opacity(colorScheme == .dark ? 0.26 : 0.20),
+                        lineWidth: isSelected ? 1 : 0.9
+                    )
+            )
+            .contentShape(Capsule(style: .continuous))
+            .shadow(
+                color: isSelected ? accent.opacity(colorScheme == .dark ? 0.34 : 0.22) : .black.opacity(colorScheme == .dark ? 0.14 : 0.05),
+                radius: isCompact ? (isSelected ? 10 : 5) : (isSelected ? 12 : 6),
+                x: 0,
+                y: isCompact ? (isSelected ? 4 : 2) : (isSelected ? 5 : 2.5)
+            )
+            .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isSelected)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            isSelected
+                ? L10n.t("discover_filter_my_teams_selected_a11y", languageCode: languageCode)
+                : L10n.t("discover_filter_my_teams_a11y", languageCode: languageCode)
+        )
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 

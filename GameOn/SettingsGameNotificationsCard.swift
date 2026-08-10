@@ -260,7 +260,10 @@ struct SettingsGameNotificationsCard: View {
                 fanCalendarGatedInteractable {
                     notificationToggle(
                         title: L10n.t("Pickup Games", languageCode: appLanguageRaw),
-                        subtitle: L10n.t("Pickup games you host or join.", languageCode: appLanguageRaw),
+                        subtitle: L10n.t(
+                            "notifications_calendar_pickup_games_subtitle",
+                            languageCode: appLanguageRaw
+                        ),
                         isOn: loggingBinding(
                             key: "syncPickupGamesToAppleCalendar",
                             title: L10n.t("Pickup Games", languageCode: appLanguageRaw),

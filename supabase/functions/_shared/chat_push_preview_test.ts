@@ -7,6 +7,7 @@
 import { assertEquals } from "https://deno.land/std@0.224.0/assert/mod.ts"
 import {
   buildDirectChatPushAlert,
+  buildFanTeamInvitationPushAlert,
   buildFriendRequestPushAlert,
   buildGroupChatPushAlert,
   buildPokePushAlert,
@@ -318,6 +319,61 @@ Deno.test("poke: deleted/missing fallback", () => {
   })
   assertEquals(alert.title, "FanGeo User")
   assertEquals(alert.body, "Poked you 👋")
+})
+
+Deno.test("team invitation: display name + username", () => {
+  const alert = buildFanTeamInvitationPushAlert({
+    inviterDisplayName: "Jennifer",
+    inviterHandle: "jennifer",
+    teamName: "Team A",
+  })
+  assertEquals(alert.title, "Jennifer (@jennifer)")
+  assertEquals(alert.body, "Invited you to join Team A")
+})
+
+Deno.test("team invitation: display name only", () => {
+  const alert = buildFanTeamInvitationPushAlert({
+    inviterDisplayName: "Jennifer",
+    inviterHandle: null,
+    teamName: "Team A",
+  })
+  assertEquals(alert.title, "Jennifer")
+  assertEquals(alert.body, "Invited you to join Team A")
+})
+
+Deno.test("team invitation: username only", () => {
+  const alert = buildFanTeamInvitationPushAlert({
+    inviterDisplayName: "jennifer",
+    inviterHandle: "jennifer",
+    teamName: "Team A",
+    hasExplicitDisplayName: false,
+  })
+  assertEquals(alert.title, "@jennifer")
+  assertEquals(alert.body, "Invited you to join Team A")
+})
+
+Deno.test("team invitation: missing profile identity", () => {
+  const identity = resolveSenderIdentity(null)
+  const alert = buildFanTeamInvitationPushAlert({
+    inviterDisplayName: identity.displayName,
+    inviterHandle: identity.handle,
+    teamName: "Team A",
+    hasExplicitDisplayName: identity.hasExplicitDisplayName,
+  })
+  assertEquals(alert.title, "FanGeo User")
+  assertEquals(alert.body, "Invited you to join Team A")
+})
+
+Deno.test("team invitation: long team name truncates cleanly", () => {
+  const alert = buildFanTeamInvitationPushAlert({
+    inviterDisplayName: "Jennifer",
+    inviterHandle: "jennifer",
+    teamName: "A".repeat(200),
+  })
+  assertEquals(alert.title, "Jennifer (@jennifer)")
+  assertEquals(alert.body.startsWith("Invited you to join "), true)
+  assertEquals(alert.body.length <= 110, true)
+  assertEquals(alert.body.includes("\n"), false)
 })
 
 Deno.test("title helpers", () => {

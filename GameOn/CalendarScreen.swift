@@ -1032,6 +1032,18 @@ struct CalendarScreen: View {
             .onChange(of: viewModel.selectedSport) { _, _ in
                 handleCalendarSelectedSportChange()
             }
+            .onChange(of: viewModel.discoverPickupTeamScope) { _, _ in
+                handleCalendarMyTeamsScopeChange()
+            }
+            .onChange(of: viewModel.discoverMyActiveFanTeamIds) { _, _ in
+                handleCalendarMyTeamsMembershipChange()
+            }
+            .onChange(of: viewModel.pickupDiscoverTeamIdentityByGameId.count) { _, _ in
+                if isCalendarTabSelected {
+                    ensureCalendarDateStripInventoryCache()
+                    refreshCalendarDisplayedEventsIdentityIfNeeded()
+                }
+            }
             .onChange(of: viewModel.calendarTabGameFilter) { _, _ in
                 handleCalendarGameFilterChange()
             }
@@ -1841,6 +1853,25 @@ struct CalendarScreen: View {
         )
     }
 
+    private func handleCalendarMyTeamsScopeChange() {
+        refreshCurrentDayCalendarSearchForLoadedDataChange()
+        guard isCalendarTabSelected else { return }
+        viewModel.calendarEventsListCache.removeAll()
+        ensureCalendarDateStripInventoryCache()
+        refreshCalendarDisplayedEventsIdentityIfNeeded()
+        if viewModel.discoverPickupTeamScope == .myTeams {
+            Task { await viewModel.ensureDiscoverMyActiveFanTeamIdsLoaded() }
+        }
+    }
+
+    private func handleCalendarMyTeamsMembershipChange() {
+        refreshCurrentDayCalendarSearchForLoadedDataChange()
+        guard isCalendarTabSelected else { return }
+        viewModel.calendarEventsListCache.removeAll()
+        ensureCalendarDateStripInventoryCache()
+        refreshCalendarDisplayedEventsIdentityIfNeeded()
+    }
+
     private func handleCalendarGameFilterChange() {
         noteScheduleRecentInteraction()
         logScheduleTapProtectedIfNeeded()
@@ -2364,9 +2395,15 @@ struct CalendarScreen: View {
         let stripKey = calendarDateStripDates
             .map { String(Int(Calendar.current.startOfDay(for: $0).timeIntervalSince1970)) }
             .joined(separator: ",")
+        let myTeams = viewModel.discoverMyActiveFanTeamIds
+            .map { $0.uuidString.lowercased() }
+            .sorted()
+            .joined(separator: ",")
         return [
             effectiveCalendarGameFilter.rawValue,
             viewModel.selectedSport,
+            viewModel.discoverPickupTeamScope.rawValue,
+            myTeams,
             calendarProGamesSportFilter,
             calendarFeaturedEventFilterSlug ?? "",
             calendarLeagueCountryFilterRaw,
@@ -2374,6 +2411,7 @@ struct CalendarScreen: View {
             "\(viewModel.scheduleLiveMatchesContentRevision)",
             "\(viewModel.events.count)",
             "\(viewModel.pickupGamesForDiscoverMap.count)",
+            "\(viewModel.pickupDiscoverTeamIdentityByGameId.count)",
             "\(viewModel.liveMatches.count)",
             stripKey
         ].joined(separator: "|")
@@ -2754,6 +2792,9 @@ struct CalendarScreen: View {
         case .venueGames:
             return L10n.t("schedule_noun_watch_parties", languageCode: calendarScheduleLanguageCode)
         case .pickupGames:
+            if viewModel.discoverPickupTeamScope == .myTeams {
+                return L10n.t("schedule_noun_team_games", languageCode: calendarScheduleLanguageCode)
+            }
             return L10n.t("schedule_noun_pickup_games", languageCode: calendarScheduleLanguageCode)
         case .proGames:
             return L10n.t("professional_games", languageCode: calendarScheduleLanguageCode)
@@ -2789,7 +2830,35 @@ struct CalendarScreen: View {
     }
 
     private var calendarPickupGamesEmptyStateTitle: String {
-        L10n.t("no_pickup_games_found", languageCode: calendarScheduleLanguageCode)
+        if viewModel.discoverPickupTeamScope == .myTeams {
+            return L10n.t("no_team_games_found", languageCode: calendarScheduleLanguageCode)
+        }
+        return L10n.t("no_pickup_games_found", languageCode: calendarScheduleLanguageCode)
+    }
+
+    private var calendarPickupGamesEmptyStateSupporting: String {
+        if viewModel.discoverPickupTeamScope == .myTeams {
+            if let sport = calendarMyTeamsEmptySportLabel {
+                return String(
+                    format: L10n.t(
+                        "no_team_games_found_supporting_sport_format",
+                        languageCode: calendarScheduleLanguageCode
+                    ),
+                    locale: Locale(identifier: calendarScheduleLanguageCode),
+                    sport
+                )
+            }
+            return L10n.t("no_team_games_found_supporting", languageCode: calendarScheduleLanguageCode)
+        }
+        return L10n.t("no_pickup_games_found_supporting", languageCode: calendarScheduleLanguageCode)
+    }
+
+    private var calendarMyTeamsEmptySportLabel: String? {
+        let sport = viewModel.selectedSport.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sport.isEmpty, sport.localizedCaseInsensitiveCompare("All") != .orderedSame else {
+            return nil
+        }
+        return AppSportCatalog.displayLabel(forSportToken: sport)
     }
 
     private var calendarWatchPartiesEmptyStateTitle: String {
@@ -2803,29 +2872,33 @@ struct CalendarScreen: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(calendarColorScheme))
 
-                Text(L10n.t("no_pickup_games_found_supporting", languageCode: calendarScheduleLanguageCode))
+                Text(calendarPickupGamesEmptyStateSupporting)
                     .font(.subheadline)
                     .foregroundStyle(FGColor.secondaryText(calendarColorScheme))
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Button {
-                openDiscoverForPickupGames()
-            } label: {
-                Text(L10n.t("open_discover", languageCode: calendarScheduleLanguageCode))
-                    .font(.subheadline.weight(.bold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
+            if viewModel.discoverPickupTeamScope != .myTeams {
+                Button {
+                    openDiscoverForPickupGames()
+                } label: {
+                    Text(L10n.t("open_discover", languageCode: calendarScheduleLanguageCode))
+                        .font(.subheadline.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.white)
+                .background(FGColor.intentPlay, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.white)
-            .background(FGColor.intentPlay, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(.secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .frame(maxWidth: .infinity, minHeight: Self.eventsListMinHeight, alignment: .center)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(calendarPickupGamesEmptyStateTitle). \(calendarPickupGamesEmptyStateSupporting)")
     }
 
     private var calendarWatchPartiesEmptyState: some View {
@@ -3300,8 +3373,14 @@ struct CalendarScreen: View {
             viewModel: viewModel,
             showMoreSheet: $showCalendarSportMoreSheet,
             rowSpacing: 10,
-            isCompact: true
+            isCompact: true,
+            showsMyTeamsScopeChip: effectiveCalendarGameFilter == .pickupGames
         )
+        .onAppear {
+            guard effectiveCalendarGameFilter == .pickupGames,
+                  viewModel.discoverPickupTeamScope == .myTeams else { return }
+            Task { await viewModel.ensureDiscoverMyActiveFanTeamIdsLoaded() }
+        }
     }
 
     private func proGamesSportChip(selection: String, displayTitle: String? = nil) -> some View {
@@ -4480,7 +4559,7 @@ struct CalendarScreen: View {
         guard !isBusinessCalendarAccess, viewModel.canFanUsePickupGamesUI else { return [] }
         let calendar = Calendar.current
         return viewModel.pickupGamesForDiscoverMap.compactMap { row in
-            guard calendarSearchPickupRowPassesListingFilters(row),
+            guard viewModel.calendarTabPickupRowPassesScheduleFilters(row),
                   let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else {
                 return nil
             }
@@ -4504,7 +4583,9 @@ struct CalendarScreen: View {
             return calendarSport(event.sport, matchesFilter: viewModel.selectedSport)
         case .pickup(let event):
             guard effectiveCalendarGameFilter == .pickupGames else { return false }
-            return calendarSport(event.sport, matchesFilter: viewModel.selectedSport)
+            guard calendarSport(event.sport, matchesFilter: viewModel.selectedSport) else { return false }
+            // My Teams scope already applied in `loadedPickupSearchEvents`; keep sport-only here.
+            return true
         case .pro(let match):
             guard effectiveCalendarGameFilter == .proGames else { return false }
             if let selectedCalendarFeaturedEvent {
@@ -4523,16 +4604,6 @@ struct CalendarScreen: View {
         }
         return sport.localizedCaseInsensitiveCompare(trimmedFilter) == .orderedSame
             || SportFilterCatalog.storedSport(sport, matchesSearchQuery: trimmedFilter)
-    }
-
-    private func calendarSearchPickupRowPassesListingFilters(_ row: PickupGameRow, now: Date = Date()) -> Bool {
-        guard row.is_visible, row.status.lowercased() == "active" else { return false }
-        if let removeAfterRaw = row.remove_after_at,
-           let removeAfter = PickupGameModels.parseSupabaseTimestamptz(removeAfterRaw),
-           removeAfter <= now {
-            return false
-        }
-        return true
     }
 
     private func calendarVenueEvent(_ event: SportsEvent, matchesNormalizedQuery normalizedQuery: String) -> Bool {

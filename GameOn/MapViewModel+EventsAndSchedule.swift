@@ -233,17 +233,22 @@ extension MapViewModel {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let pd = pickupDiscoverCalendarDayPublicFingerprint(selectedDay: selectedDay, searchQuery: q, filter: filter)
         let viewportScope = filter == .venueGames ? calendarTabMapViewportScopeFingerprint() : 0
-        return "\(y)-\(m)|\(Int(day.timeIntervalSince1970))|\(selectedSport)|\(calendarUsesVisibleMapRegionOnly)|\(scheduleDataGeneration)|ctf:\(filter.rawValue)|q:\(q)|pd:\(pd)|vps:\(viewportScope)"
+        let teamScope = discoverPickupTeamScope.rawValue
+        let myTeams = discoverMyActiveFanTeamIds.map { $0.uuidString.lowercased() }.sorted().joined(separator: ",")
+        return "\(y)-\(m)|\(Int(day.timeIntervalSince1970))|\(selectedSport)|\(calendarUsesVisibleMapRegionOnly)|\(scheduleDataGeneration)|ctf:\(filter.rawValue)|q:\(q)|pd:\(pd)|vps:\(viewportScope)|ts:\(teamScope)|mt:\(myTeams)"
     }
 
-    /// Fingerprint for **public** pickup rows shown on Calendar (Discover map list only; ignores personal join-request caches).
+    /// Fingerprint for pickup rows shown on Calendar (Discover map list + My Teams scope; ignores personal join-request caches).
     private func pickupDiscoverCalendarDayPublicFingerprint(selectedDay: Date, searchQuery: String, filter: CalendarTabGameFilter) -> Int {
         guard filter == .pickupGames else { return 0 }
         let cal = Calendar.current
         let dayStart = cal.startOfDay(for: selectedDay)
         var h = Hasher()
+        h.combine(discoverPickupTeamScope.rawValue)
+        h.combine(discoverMyActiveFanTeamIds)
         for row in pickupGamesForDiscoverMap {
             guard calendarTabPickupRowPassesListingFilters(row) else { continue }
+            guard calendarTabPickupRowPassesTeamScope(row) else { continue }
             guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
             guard cal.isDate(start, inSameDayAs: dayStart) else { continue }
             guard selectedSport == "All" || row.sport == selectedSport else { continue }
@@ -254,6 +259,7 @@ extension MapViewModel {
             h.combine(row.players_needed)
             h.combine(row.status)
             h.combine(row.is_visible)
+            h.combine(pickupDiscoverTeamIdentityByGameId[row.id]?.teamId)
         }
         return h.finalize()
     }
@@ -383,22 +389,47 @@ extension MapViewModel {
     }
 
     private func calendarTabPickupRowPassesListingFilters(_ row: PickupGameRow, now: Date = Date()) -> Bool {
-        guard row.is_visible, row.status.lowercased() == "active" else { return false }
+        guard row.status.lowercased() == "active" else { return false }
         if let remStr = row.remove_after_at,
            let rem = PickupGameModels.parseSupabaseTimestamptz(remStr),
            rem <= now {
             return false
         }
-        return true
+        if row.is_visible { return true }
+        // Private Team games already returned by Discover RLS for active members.
+        guard !isGuestDiscoverMode else { return false }
+        return DiscoverPickupTeamScopeFilter.includes(
+            gameId: row.id,
+            scope: .myTeams,
+            myActiveTeamIds: discoverMyActiveFanTeamIds,
+            teamIdentityByGameId: pickupDiscoverTeamIdentityByGameId
+        )
     }
 
-    /// Public Discover-map pickup rows for the Calendar tab (same-day, sport/search filters). No personal join-request merge.
+    /// Schedule Play My Teams scope (shared state with Discover map).
+    private func calendarTabPickupRowPassesTeamScope(_ row: PickupGameRow) -> Bool {
+        DiscoverPickupTeamScopeFilter.includes(
+            gameId: row.id,
+            scope: discoverPickupTeamScope,
+            myActiveTeamIds: discoverMyActiveFanTeamIds,
+            teamIdentityByGameId: pickupDiscoverTeamIdentityByGameId
+        )
+    }
+
+    /// Whether a Schedule/search pickup row passes listing + My Teams scope.
+    func calendarTabPickupRowPassesScheduleFilters(_ row: PickupGameRow, now: Date = Date()) -> Bool {
+        calendarTabPickupRowPassesListingFilters(row, now: now)
+            && calendarTabPickupRowPassesTeamScope(row)
+    }
+
+    /// Public Discover-map pickup rows for the Calendar tab (same-day, sport/search/My Teams). No personal join-request merge.
     private func calendarTabPickupPublicRows(for selectedDate: Date, searchQuery: String, logDebug: Bool = false) -> [PickupGameRow] {
         let cal = Calendar.current
         let now = Date()
         var rows: [PickupGameRow] = []
         for row in pickupGamesForDiscoverMap {
             guard calendarTabPickupRowPassesListingFilters(row, now: now) else { continue }
+            guard calendarTabPickupRowPassesTeamScope(row) else { continue }
             guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
             guard cal.isDate(start, inSameDayAs: selectedDate) else { continue }
             guard selectedSport == "All" || row.sport == selectedSport else { continue }
@@ -596,6 +627,7 @@ extension MapViewModel {
             var result = Set<Date>()
             for row in pickupGamesForDiscoverMap {
                 guard calendarTabPickupRowPassesListingFilters(row, now: now) else { continue }
+                guard calendarTabPickupRowPassesTeamScope(row) else { continue }
                 guard let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) else { continue }
                 let day = cal.startOfDay(for: start)
                 guard stripDays.contains(day) else { continue }

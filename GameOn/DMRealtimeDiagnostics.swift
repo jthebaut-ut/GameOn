@@ -25,7 +25,7 @@ enum DMRealtimeDiagnostics {
 #if DEBUG
         let wall = isoFormatter.string(from: Date())
         let mono = ProcessInfo.processInfo.systemUptime
-        print("[DMRealtimeDiag] \(fields) wall=\(wall) monoBootSec=\(String(format: "%.3f", mono))")
+        print("[DMRealtimeDiag] \(fields) wall=\(wall) monoBootSec=\(FanGeoFixedFloatFormat.d3(mono))")
 #endif
     }
 }
@@ -49,9 +49,9 @@ enum ChatRealtimeAudit {
         extra: String? = nil
     ) {
 #if DEBUG
-        let conv = conversationId.map { String($0.uuidString.prefix(8)).lowercased() } ?? "nil"
-        var line = "[ChatRealtimeAudit] conv=\(conv) gen=\(generation) event=\(event)"
-        if let status { line += " status=\(status)" }
+        let conv = conversationId.map { $0.uuidString.lowercased() } ?? "nil"
+        var line = "[ChatRealtime] conv=\(conv) generation=\(generation) event=\(event)"
+        if let status { line += " state=\(status)" }
         if let extra, !extra.isEmpty { line += " \(extra)" }
         print(line)
 #endif
@@ -68,9 +68,9 @@ enum ChatRealtimeAudit {
         log(
             conversationId: conversationId,
             generation: generation,
-            event: "status",
+            event: "status_transition",
             status: String(describing: new),
-            extra: "old=\(String(describing: old)) new=\(String(describing: new)) reason=\(reason)"
+            extra: "previous=\(String(describing: old)) new=\(String(describing: new)) reason=\(reason)"
         )
 #endif
     }

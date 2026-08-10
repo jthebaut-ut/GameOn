@@ -230,7 +230,7 @@ struct PickupOrganizerSummary: Equatable, Sendable {
     }
 
     private func formatAverage(_ value: Double) -> String {
-        String(format: "%.1f", value)
+        FanGeoFixedFloatFormat.string(value, decimals: 1)
     }
 
     // MARK: - Discover map compact trust line
@@ -253,7 +253,7 @@ struct PickupOrganizerSummary: Equatable, Sendable {
                     format: L10n.t("pickup_discover_trust_rated_one_hosted_format", languageCode: lang),
                     locale: Locale(identifier: lang),
                     avgText,
-                    ratings
+                    Int64(ratings)
                 )
             }
             if hosted > 1 {
@@ -261,8 +261,8 @@ struct PickupOrganizerSummary: Equatable, Sendable {
                     format: L10n.t("pickup_discover_trust_rated_many_hosted_format", languageCode: lang),
                     locale: Locale(identifier: lang),
                     avgText,
-                    ratings,
-                    hosted
+                    Int64(ratings),
+                    Int64(hosted)
                 )
             }
             // Ratings without hosted count (legacy inconsistency) — still show rating portion.
@@ -270,7 +270,7 @@ struct PickupOrganizerSummary: Equatable, Sendable {
                 format: L10n.t("pickup_discover_trust_rated_one_hosted_format", languageCode: lang),
                 locale: Locale(identifier: lang),
                 avgText,
-                ratings
+                Int64(ratings)
             )
         }
 
@@ -281,7 +281,7 @@ struct PickupOrganizerSummary: Equatable, Sendable {
             return String(
                 format: L10n.t("pickup_discover_trust_no_ratings_many_hosted_format", languageCode: lang),
                 locale: Locale(identifier: lang),
-                hosted
+                Int64(hosted)
             )
         }
         return nil
@@ -313,15 +313,15 @@ struct PickupOrganizerSummary: Equatable, Sendable {
                     format: L10n.t("pickup_discover_trust_a11y_rated_one_hosted_format", languageCode: lang),
                     locale: Locale(identifier: lang),
                     avgText,
-                    ratings
+                    Int64(ratings)
                 )
             } else {
                 trustPart = String(
                     format: L10n.t("pickup_discover_trust_a11y_rated_many_hosted_format", languageCode: lang),
                     locale: Locale(identifier: lang),
                     avgText,
-                    ratings,
-                    max(hosted, 1)
+                    Int64(ratings),
+                    Int64(max(hosted, 1))
                 )
             }
         } else if hosted == 1 {
@@ -330,7 +330,7 @@ struct PickupOrganizerSummary: Equatable, Sendable {
             trustPart = String(
                 format: L10n.t("pickup_discover_trust_a11y_no_ratings_format", languageCode: lang),
                 locale: Locale(identifier: lang),
-                hosted
+                Int64(hosted)
             )
         } else {
             return organizerPart

@@ -137,6 +137,7 @@ struct ProfileIdentityCard: View {
     @State private var editedHomeCountry = ""
     @State private var editedHomeCityDisplay = ""
     @State private var editedShowHomeCity = false
+    @State private var editedGender: FanProfileGender = .preferNotToSay
     @State private var editedProfileBackgroundKey: ProfileBackgroundKey = .fangeo
     @State private var identityMessage = ""
     @State private var handleStatusMessage = ""
@@ -3085,6 +3086,13 @@ struct ProfileIdentityCard: View {
                         )
                     }
 
+                    EditProfileSection(title: L10n.t("profile_gender", languageCode: appLanguageRaw)) {
+                        EditProfileGenderRow(
+                            gender: $editedGender,
+                            languageCode: appLanguageRaw
+                        )
+                    }
+
                     EditProfileSection(title: L10n.t("appearance", languageCode: appLanguageRaw)) {
                         EditProfileBackgroundRow(
                             backgroundKey: editedProfileBackgroundKey,
@@ -3246,6 +3254,7 @@ struct ProfileIdentityCard: View {
             languageCode: appLanguageRaw
         ) ?? viewModel.currentUserHomeCity
         editedShowHomeCity = viewModel.currentUserShowHomeCity
+        editedGender = FanProfileGender.parse(viewModel.currentUserGenderRaw) ?? .preferNotToSay
         editedProfileBackgroundKey = viewModel.currentUserProfileBackgroundKey
         handleStatusMessage = ""
         handleStatusIsPositive = false
@@ -3272,8 +3281,10 @@ struct ProfileIdentityCard: View {
                 languageCode: appLanguageRaw
             ) ?? viewModel.currentUserHomeCity).trimmingCharacters(in: .whitespacesAndNewlines)
             || editedShowHomeCity != viewModel.currentUserShowHomeCity
+        let genderDirty = editedGender.rawValue
+            != (FanProfileGender.parse(viewModel.currentUserGenderRaw) ?? .preferNotToSay).rawValue
         let backgroundDirty = editedProfileBackgroundKey != viewModel.currentUserProfileBackgroundKey
-        return nameDirty || handleDirty || bioDirty || cityDirty || backgroundDirty
+        return nameDirty || handleDirty || bioDirty || cityDirty || genderDirty || backgroundDirty
     }
 
 #if DEBUG
@@ -3507,6 +3518,23 @@ struct ProfileIdentityCard: View {
 
 #if DEBUG
         print("[FanProfileSave] requestSucceeded homeCity")
+#endif
+
+        if let err = await viewModel.saveUserProfileGender(editedGender) {
+#if DEBUG
+            print("[FanProfileSave] requestFailed=\(err)")
+            print("[FanProfileSave] dismissed=false")
+            print("[FanProfileSave] profileRefreshed=partial_identity_home_city_saved")
+#endif
+            await MainActor.run {
+                identityMessage = err
+                viewModel.showSocialActionToast(err, isError: true)
+            }
+            return
+        }
+
+#if DEBUG
+        print("[FanProfileSave] requestSucceeded gender")
 #endif
 
         if let err = await viewModel.saveUserProfileBackgroundKey(editedProfileBackgroundKey) {

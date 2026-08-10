@@ -495,8 +495,19 @@ final class GroupChatService {
         return (channel, stream)
     }
 
+    /// Bounded remove — a dying Phoenix socket must not hang chat teardown forever.
     func removeRealtimeChannel(_ channel: RealtimeChannelV2) async {
-        await client.removeChannel(channel)
+        let timeoutNs = ChatRealtimeChannelSerializer.defaultTimeoutNs
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await self.client.removeChannel(channel)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNs)
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     private func decodeUUID(from data: Data) throws -> UUID {

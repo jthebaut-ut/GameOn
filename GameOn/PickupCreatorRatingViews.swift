@@ -52,11 +52,19 @@ struct PickupCreatorTrustLineView: View {
 }
 
 struct PickupOrganizerPreviewIdentityRow: View {
+    enum Style: Equatable {
+        /// Standard Discover pickup emphasis.
+        case standard
+        /// Secondary hierarchy under Team identity on Team-linked preview cards.
+        case secondaryUnderTeam
+    }
+
     @ObservedObject var viewModel: MapViewModel
     let organizerUserId: UUID
     let colorScheme: ColorScheme
     /// Optional explicit summary; defaults to the shared Discover/profile cache.
     var summary: PickupOrganizerSummary? = nil
+    var style: Style = .standard
 
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
@@ -88,20 +96,39 @@ struct PickupOrganizerPreviewIdentityRow: View {
         return FGColor.intentPlay
     }
 
+    private var isSecondary: Bool { style == .secondaryUnderTeam }
+
+    private var avatarSize: CGFloat { isSecondary ? 32 : 40 }
+    private var avatarFrame: CGFloat { isSecondary ? 36 : 44 }
+
+    private var nameLine: String {
+        guard !displayName.isEmpty else {
+            return L10n.t("pickup_discover_organizer_label", languageCode: languageCode)
+        }
+        if isSecondary {
+            return String(
+                format: L10n.t("pickup_preview_organized_by_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                displayName
+            )
+        }
+        return "\(displayName) · \(L10n.t("pickup_discover_organizer_label", languageCode: languageCode))"
+    }
+
     var body: some View {
         PublicProfileAvatarTap(userId: organizerUserId, context: "discover_pickup_organizer") {
-            HStack(alignment: .center, spacing: 8) {
+            HStack(alignment: .center, spacing: isSecondary ? 10 : 8) {
                 UserAvatarView(
                     avatarThumbnailURL: viewModel.pickupOrganizerAvatarThumbnailForDetail(userId: organizerUserId),
                     avatarURL: viewModel.pickupOrganizerAvatarFullForDetail(userId: organizerUserId),
                     avatarDisplayRefreshToken: viewModel.pickupOrganizerAvatarRefreshTokenForDetail(userId: organizerUserId),
                     displayName: displayName,
                     email: emailLine,
-                    size: 40,
+                    size: avatarSize,
                     fallbackStyle: colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome,
                     imagePlaceholderTint: colorScheme == .dark ? .white.opacity(0.72) : nil
                 )
-                .frame(width: 44, height: 44)
+                .frame(width: avatarFrame, height: avatarFrame)
                 .background {
                     Circle()
                         .fill(colorScheme == .dark ? Color.white.opacity(0.10) : Color(white: 0.88))
@@ -110,26 +137,35 @@ struct PickupOrganizerPreviewIdentityRow: View {
                     Circle()
                         .strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.28 : 0.58), lineWidth: 1)
                 }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.12), radius: 5, x: 0, y: 2)
+                .shadow(
+                    color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.10),
+                    radius: isSecondary ? 3 : 5,
+                    x: 0,
+                    y: isSecondary ? 1 : 2
+                )
 
-                VStack(alignment: .leading, spacing: 1) {
-                    if !displayName.isEmpty {
-                        Text(
-                            "\(displayName) · \(L10n.t("pickup_discover_organizer_label", languageCode: languageCode))"
+                VStack(alignment: .leading, spacing: isSecondary ? 2 : 1) {
+                    Text(nameLine)
+                        .font(
+                            isSecondary
+                                ? FGTypography.caption.weight(.medium)
+                                : FGTypography.metadata.weight(.semibold)
                         )
-                        .font(FGTypography.metadata.weight(.semibold))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .foregroundStyle(
+                            isSecondary
+                                ? FGColor.secondaryText(colorScheme)
+                                : FGColor.primaryText(colorScheme)
+                        )
                         .lineLimit(1)
                         .minimumScaleFactor(0.82)
-                    }
 
                     if let trustLine {
                         Text(trustLine)
                             .font(FGTypography.caption.weight(.medium))
                             .foregroundStyle(
-                                (resolvedSummary?.hasRatings == true)
+                                (resolvedSummary?.hasRatings == true && !isSecondary)
                                     ? ratingAccent
-                                    : FGColor.secondaryText(colorScheme)
+                                    : FGColor.mutedText(colorScheme)
                             )
                             .lineLimit(1)
                             .minimumScaleFactor(0.75)
@@ -140,6 +176,7 @@ struct PickupOrganizerPreviewIdentityRow: View {
                 .allowsHitTesting(false)
             }
             .contentShape(Rectangle())
+            .opacity(isSecondary ? 0.92 : 1)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)

@@ -27,6 +27,10 @@ Do not target people with harassment, threats, hate speech, slurs, bullying, sta
 
 Keep Fan Chats and venue/event comments useful for the local sports crowd. Do not derail threads with spam, personal attacks, false venue information, or coordinated abuse. Report content that violates these rules.
 
+## My Teams
+
+Team names, logos, Team Chat, invitations, and Team games must follow these Community Guidelines. Do not use Teams to harass, hate, spam, impersonate, share sexual/illegal content, or bypass blocks. Report a Team, a Team Chat message, or a user when something violates the rules. FanGeo may remove Team content, deactivate Teams, or take account action for violations.
+
 ## Direct Messages
 
 Direct messages are for respectful conversation with people who accepted a friend connection. Do not send abusive, threatening, sexual, scam, spam, or repeated unwanted messages. If someone asks you to stop, stop.
@@ -37,8 +41,8 @@ Use good judgment before meeting anyone in person. Meet in public places, avoid 
 
 ## Report and Block
 
-Use in-app report tools for abusive users, comments, messages, conversations, or venue issues where available. Block users who should not contact you. Reports should be truthful and made in good faith.
+Use in-app report tools for abusive users, comments, messages, conversations, Teams, Team Chat, or venue issues where available. Block users who should not contact you. Reports should be truthful and made in good faith. Reporting a Team does not automatically remove it; leave a Team separately if you no longer want access.
 
 ## Enforcement
 
-FanGeo may warn users, remove content, hide comments, restrict messaging, suspend accounts, delete accounts, preserve reports, or take other action depending on severity, context, and repeat behavior.
+FanGeo may warn users, remove content (including Team names/logos), hide comments, restrict messaging, deactivate Teams, suspend accounts, delete accounts, preserve reports, or take other action depending on severity, context, and repeat behavior.

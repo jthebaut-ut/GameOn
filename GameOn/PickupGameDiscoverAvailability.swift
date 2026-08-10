@@ -75,6 +75,9 @@ struct PickupGameAvailabilityContext: Equatable {
     var requireValidCoordinates: Bool
     /// Guest Discover floor (start-of-day); games before this day are excluded when set.
     var guestRecentFloor: Date?
+    /// When true (authenticated Discover), private rows (`is_visible=false`) that RLS already
+    /// returned for the viewer remain eligible. Guests must keep this false.
+    var allowAuthorizedPrivateGames: Bool = false
 
     static func == (lhs: PickupGameAvailabilityContext, rhs: PickupGameAvailabilityContext) -> Bool {
         lhs.timeZone.identifier == rhs.timeZone.identifier
@@ -83,6 +86,7 @@ struct PickupGameAvailabilityContext: Equatable {
             && lhs.requireMapBounds == rhs.requireMapBounds
             && lhs.requireValidCoordinates == rhs.requireValidCoordinates
             && lhs.guestRecentFloor == rhs.guestRecentFloor
+            && lhs.allowAuthorizedPrivateGames == rhs.allowAuthorizedPrivateGames
             && lhs.mapBounds?.minLat == rhs.mapBounds?.minLat
             && lhs.mapBounds?.maxLat == rhs.mapBounds?.maxLat
             && lhs.mapBounds?.minLon == rhs.mapBounds?.minLon
@@ -196,7 +200,7 @@ enum PickupGameAvailabilityResolver {
             )
         }
 
-        if !candidate.isVisible {
+        if !candidate.isVisible, !context.allowAuthorizedPrivateGames {
             return PickupGameAvailabilityEvaluation(
                 discoverEligible: false,
                 decodedStart: decodedStart,
@@ -320,7 +324,12 @@ struct PickupGameMapBounds: Equatable, Hashable, Sendable {
 
     /// Same formatting as Discover calendar-dot cache buckets.
     var bucketString: String {
-        String(format: "%.3f|%.3f|%.3f|%.3f", minLat, maxLat, minLon, maxLon)
+        [
+            FanGeoFixedFloatFormat.d3(minLat),
+            FanGeoFixedFloatFormat.d3(maxLat),
+            FanGeoFixedFloatFormat.d3(minLon),
+            FanGeoFixedFloatFormat.d3(maxLon)
+        ].joined(separator: "|")
     }
 
     func contains(latitude: Double, longitude: Double) -> Bool {
@@ -369,7 +378,9 @@ struct PickupGameMonthAvailabilityRequestContext: Equatable, Sendable {
             mapBounds: mapBounds?.asTuple,
             requireMapBounds: true,
             requireValidCoordinates: true,
-            guestRecentFloor: guestRecentFloor
+            guestRecentFloor: guestRecentFloor,
+            // Guest requests capture a guestRecentFloor; authenticated requests do not.
+            allowAuthorizedPrivateGames: guestRecentFloor == nil
         )
     }
 

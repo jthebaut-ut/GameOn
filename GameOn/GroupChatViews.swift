@@ -2,6 +2,21 @@ import SwiftUI
 import Supabase
 import UIKit
 
+/// Bounded Phoenix join timeout for Group / Team Chat (same 15s policy as Direct Chat).
+private struct GroupChatRealtimeSubscribeTimeoutError: Error {}
+
+#if DEBUG
+private enum GroupChatRealtimeDebug {
+    static func log(_ message: String) {
+        print("[GroupChatRealtime] \(message)")
+    }
+}
+#else
+private enum GroupChatRealtimeDebug {
+    static func log(_ message: String) {}
+}
+#endif
+
 /// Neutral copy for invite eligibility / authorization failures (never disclose blocks).
 /// Also routes backend age-access denials into the shared age gate (single system).
 @MainActor
@@ -194,11 +209,23 @@ struct NewMessageFriendPickerSheet: View {
 
 // MARK: - Group conversation
 
+/// How ``GroupChatView`` is hosted in the navigation hierarchy.
+enum GroupChatPresentationStyle: Equatable, Sendable {
+    /// Full navigation destination (main Chat inbox → conversation).
+    case standard
+    /// Embedded under Team Detail tabs; Team header already provides identity.
+    case embeddedInTeamDetail
+}
+
 struct GroupChatView: View {
     let conversationId: UUID
     @ObservedObject var chatViewModel: ChatViewModel
     /// When set, this thread is presented as a pickup-game chat (header + info gating).
     var pickupContext: PickupGameChatContext? = nil
+    /// When set, this thread is presented as a Fan Team chat (header branding only).
+    var fanTeamContext: FanTeamChatContext? = nil
+    /// Embedded Team Detail Chat omits the duplicate nav title/logo (Team header already shows it).
+    var presentationStyle: GroupChatPresentationStyle = .standard
     @EnvironmentObject private var mapViewModel: MapViewModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -208,7 +235,9 @@ struct GroupChatView: View {
     init(
         conversationId: UUID,
         chatViewModel: ChatViewModel,
-        pickupContext: PickupGameChatContext? = nil
+        pickupContext: PickupGameChatContext? = nil,
+        fanTeamContext: FanTeamChatContext? = nil,
+        presentationStyle: GroupChatPresentationStyle = .standard
     ) {
 #if DEBUG
         ChatNavDebugCounters.log("destination.init", detail: "kind=group")
@@ -216,8 +245,17 @@ struct GroupChatView: View {
         self.conversationId = conversationId
         self.chatViewModel = chatViewModel
         self.pickupContext = pickupContext
+        self.fanTeamContext = fanTeamContext
+        self.presentationStyle = presentationStyle
+        _resolvedFanTeamContext = State(initialValue: fanTeamContext)
     }
 
+    private var isEmbeddedInTeamDetail: Bool {
+        presentationStyle == .embeddedInTeamDetail
+    }
+
+    @State private var resolvedFanTeamContext: FanTeamChatContext?
+    @State private var fanTeamMarkRefreshToken: UUID?
     @State private var title: String = L10n.t("group_chat_default_title")
     @State private var messages: [GroupMessageRow] = []
     @State private var draft: String = ""
@@ -230,6 +268,8 @@ struct GroupChatView: View {
     @State private var details: [GroupConversationDetailRow] = []
     @State private var memberPreviews: [UUID: UserPreview] = [:]
     @State private var realtimeChannel: RealtimeChannelV2?
+    /// Channel created but not yet promoted after a successful subscribe (mirrors Direct Chat).
+    @State private var establishingRealtimeChannel: RealtimeChannelV2?
     @State private var realtimeListenTask: Task<Void, Never>?
     /// Owns subscribe/retry so SwiftUI `.task` cancellation cannot abandon a healthy channel at `.connecting`.
     @State private var groupRealtimeSubscriptionTask: Task<Void, Never>?
@@ -239,7 +279,21 @@ struct GroupChatView: View {
     @State private var ownedGroupChannelGeneration: Int = 0
     @State private var groupRealtimeStopTask: Task<Void, Never>?
     @State private var groupHadSuccessfulSubscribe = false
+    @State private var groupRealtimeWatchdogTask: Task<Void, Never>?
+    @State private var groupWatchdogGeneration: Int = 0
+    @State private var groupWatchdogCheckInProgress = false
+    @State private var groupRealtimeSubscribeAttemptStartedAt: Date?
+    @State private var groupFallbackPollingTask: Task<Void, Never>?
+    @State private var groupFallbackPollingGeneration: Int = 0
     @State private var seenMessageIds: Set<UUID> = []
+
+    /// Same stuck-Connecting policy as Direct Chat (`DirectChatPresenter`).
+    private static let watchdogSubscribeGrace: TimeInterval = 3.0
+    private static let subscribeStuckThreshold: TimeInterval = 12.0
+    private static let realtimeWatchdogIntervalNs: UInt64 = 5_000_000_000
+    private static let groupSubscribeTimeoutNs: UInt64 = 15_000_000_000
+    private static let fallbackPollingStartDelayNs: UInt64 = 4_000_000_000
+    private static let fallbackPollingIntervalNs: UInt64 = 2_500_000_000
     @State private var reportTarget: GroupMessageRow?
     @State private var reportCategory: ModerationReportCategory = .spam
     @State private var isSubmittingReport = false
@@ -372,6 +426,10 @@ struct GroupChatView: View {
     }
 
     private var displayTitle: String {
+        if let resolvedFanTeamContext {
+            let trimmed = resolvedFanTeamContext.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
         if let pickupContext {
             let trimmed = pickupContext.title.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
@@ -379,7 +437,18 @@ struct GroupChatView: View {
         return title
     }
 
+    private var isFanTeamChat: Bool { resolvedFanTeamContext != nil || fanTeamContext != nil }
+
+    /// Presentation-only empty-state for new Team chats (no persisted system message).
+    private var shouldShowFanTeamWelcomeCard: Bool {
+        guard isFanTeamChat, !isLoading else { return false }
+        return !messages.contains(where: { !$0.isSystemMessage })
+    }
+
     private var headerAccessibilityLabel: String {
+        if let resolvedFanTeamContext {
+            return "\(displayTitle). \(resolvedFanTeamContext.headerSubtitle(languageCode: languageCode))"
+        }
         let names = headerPreviewNames
         if names.isEmpty {
             return title
@@ -406,123 +475,218 @@ struct GroupChatView: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    if canLoadOlder, !messages.isEmpty {
-                        Button {
-                            Task { await loadOlder() }
-                        } label: {
-                            HStack {
-                                Spacer()
-                                if isLoadingOlder {
-                                    ProgressView()
-                                } else {
-                                    Text(L10n.t("group_chat_load_earlier", languageCode: appLanguageRaw))
-                                        .font(.caption.weight(.semibold))
+        VStack(spacing: 0) {
+            if isEmbeddedInTeamDetail {
+                embeddedConversationChrome
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        if canLoadOlder, !messages.isEmpty {
+                            Button {
+                                Task { await loadOlder() }
+                            } label: {
+                                HStack {
+                                    Spacer()
+                                    if isLoadingOlder {
+                                        ProgressView()
+                                    } else {
+                                        Text(L10n.t("group_chat_load_earlier", languageCode: appLanguageRaw))
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    Spacer()
                                 }
-                                Spacer()
+                                .padding(.vertical, 8)
                             }
-                            .padding(.vertical, 8)
+                            .buttonStyle(.plain)
+                            .disabled(isLoadingOlder)
                         }
-                        .buttonStyle(.plain)
-                        .disabled(isLoadingOlder)
-                    }
 
-                    ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
-                        groupBubble(message, showsSenderIdentity: showsSenderIdentity(at: index))
-                            .chatReplyHighlight(
-                                isHighlighted: highlightedReplyMessageId == message.id,
+                        if shouldShowFanTeamWelcomeCard, let resolvedFanTeamContext {
+                            FanTeamChatWelcomeCard(
+                                teamName: resolvedFanTeamContext.teamName,
+                                sport: resolvedFanTeamContext.sport,
+                                languageCode: languageCode,
                                 colorScheme: colorScheme
                             )
-                            .contextMenu {
-                                if !message.isSystemMessage {
-                                    groupMessageContextMenu(for: message)
+                            .id("fan-team-welcome")
+                        }
+
+                        ForEach(Array(messages.enumerated()), id: \.element.id) { index, message in
+                            groupBubble(message, showsSenderIdentity: showsSenderIdentity(at: index))
+                                .chatReplyHighlight(
+                                    isHighlighted: highlightedReplyMessageId == message.id,
+                                    colorScheme: colorScheme
+                                )
+                                .contextMenu {
+                                    if !message.isSystemMessage {
+                                        groupMessageContextMenu(for: message)
+                                    }
                                 }
+                                .id(message.id)
+                        }
+                    }
+                    .padding(16)
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: messages.last?.id) { _, newId in
+                    guard let newId else { return }
+                    withAnimation {
+                        proxy.scrollTo(newId, anchor: .bottom)
+                    }
+                }
+                .onChange(of: composerFocused) { _, focused in
+                    if isEmbeddedInTeamDetail {
+                        TeamChatKeyboardDebug.log(
+                            focused ? "focus.true" : "focus.false",
+                            detail: "source=GroupChatView conversation=\(conversationId.uuidString)"
+                        )
+                    }
+                    guard focused, let lastId = messages.last?.id else { return }
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
+                }
+                .onChange(of: pendingScrollToMessageId) { _, messageId in
+                    guard let messageId else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo(messageId, anchor: .center)
+                        }
+                        highlightedReplyMessageId = messageId
+                        pendingScrollToMessageId = nil
+                        let clearDelay: TimeInterval = UIAccessibility.isReduceMotionEnabled ? 0.15 : 1.1
+                        DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) {
+                            if highlightedReplyMessageId == messageId {
+                                highlightedReplyMessageId = nil
                             }
-                            .id(message.id)
-                    }
-                }
-                .padding(16)
-            }
-            .onChange(of: messages.last?.id) { _, newId in
-                guard let newId else { return }
-                withAnimation {
-                    proxy.scrollTo(newId, anchor: .bottom)
-                }
-            }
-            .onChange(of: pendingScrollToMessageId) { _, messageId in
-                guard let messageId else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        proxy.scrollTo(messageId, anchor: .center)
-                    }
-                    highlightedReplyMessageId = messageId
-                    pendingScrollToMessageId = nil
-                    let clearDelay: TimeInterval = UIAccessibility.isReduceMotionEnabled ? 0.15 : 1.1
-                    DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) {
-                        if highlightedReplyMessageId == messageId {
-                            highlightedReplyMessageId = nil
                         }
                     }
                 }
             }
         }
+        .preference(key: ChatComposerFocusPreferenceKey.self, value: composerFocused)
+        // Single authoritative composer placement (matches Direct Chat). System keyboard
+        // safe area lifts this inset — do not add manual keyboardHeight padding.
         .safeAreaInset(edge: .bottom, spacing: 8) {
             groupComposer
+                .onAppear {
+                    if isEmbeddedInTeamDetail {
+                        TeamChatKeyboardDebug.log(
+                            "composer.mounted",
+                            detail: "conversation=\(conversationId.uuidString)"
+                        )
+                    }
+                }
+                .onDisappear {
+                    if isEmbeddedInTeamDetail {
+                        TeamChatKeyboardDebug.log(
+                            "composer.unmounted",
+                            detail: "conversation=\(conversationId.uuidString)"
+                        )
+                    }
+                }
         }
         .background(colorScheme == .dark ? Color.black : Color(.systemBackground))
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                Button {
-                    showInfo = true
-                } label: {
-                    VStack(spacing: 2) {
-                        Text(displayTitle)
-                            .font(.headline.weight(.semibold))
-                            .foregroundStyle(FGColor.primaryText(colorScheme))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.85)
-
-                        if isPickupGameChat {
-                            Text(headerSubtitleText)
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.85)
-                        } else if !details.isEmpty {
-                            GroupChatMemberHeaderPreview(
-                                members: Array(headerOtherMembers.prefix(3)),
-                                subtitle: headerSubtitleText,
-                                colorScheme: colorScheme
-                            )
-                            .frame(maxWidth: 220)
-                        }
-                    }
-                    .frame(minHeight: details.isEmpty && pickupContext == nil ? 28 : 40)
-                }
-                .buttonStyle(.plain)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(headerAccessibilityLabel)
-                .accessibilityHint(L10n.t("group_chat_info_a11y", languageCode: languageCode))
-            }
-
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 12) {
-                    Button {
-                        showConversationSearch = true
-                    } label: {
-                        Image(systemName: "magnifyingglass")
-                    }
-                    .accessibilityLabel(L10n.t("chat_conversation_search_title", languageCode: languageCode))
-
+            if !isEmbeddedInTeamDetail {
+                ToolbarItem(placement: .principal) {
                     Button {
                         showInfo = true
                     } label: {
-                        Image(systemName: "info.circle")
+                        HStack(spacing: 8) {
+                            if let resolvedFanTeamContext {
+                                FanTeamMarkView(
+                                    sport: resolvedFanTeamContext.sport,
+                                    logoURL: resolvedFanTeamContext.logoURL,
+                                    logoThumbnailURL: resolvedFanTeamContext.logoThumbnailURL,
+                                    colorHex: resolvedFanTeamContext.colorHex,
+                                    size: 28,
+                                    preferDetailURL: false,
+                                    displayRefreshToken: fanTeamMarkRefreshToken
+                                )
+                                .accessibilityHidden(true)
+                            }
+                            VStack(spacing: 2) {
+                                Text(displayTitle)
+                                    .font(.headline.weight(.semibold))
+                                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
+
+                                if let resolvedFanTeamContext {
+                                    Text(resolvedFanTeamContext.headerSubtitle(languageCode: languageCode))
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
+                                } else if isPickupGameChat {
+                                    Text(headerSubtitleText)
+                                        .font(.caption2.weight(.medium))
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.85)
+                                } else if !details.isEmpty {
+                                    GroupChatMemberHeaderPreview(
+                                        members: Array(headerOtherMembers.prefix(3)),
+                                        subtitle: headerSubtitleText,
+                                        colorScheme: colorScheme
+                                    )
+                                    .frame(maxWidth: 220)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, isFanTeamChat ? 10 : 0)
+                        .padding(.vertical, isFanTeamChat ? 5 : 0)
+                        .background {
+                            if isFanTeamChat {
+                                FanTeamIdentityCardFill(
+                                    colorHex: resolvedFanTeamContext?.colorHex ?? fanTeamContext?.colorHex,
+                                    colorScheme: colorScheme,
+                                    cornerRadius: 14,
+                                    baseOpacityDark: 0.55,
+                                    baseOpacityLight: 0.92
+                                )
+                            }
+                        }
+                        .overlay {
+                            if isFanTeamChat {
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .strokeBorder(
+                                        FanTeamColorTheme.strokeColor(
+                                            colorHex: resolvedFanTeamContext?.colorHex ?? fanTeamContext?.colorHex,
+                                            colorScheme: colorScheme,
+                                            fallback: Color.clear
+                                        ),
+                                        lineWidth: 1
+                                    )
+                            }
+                        }
+                        .frame(minHeight: details.isEmpty && pickupContext == nil && !isFanTeamChat ? 28 : 40)
                     }
-                    .accessibilityLabel(L10n.t("group_chat_info_a11y", languageCode: appLanguageRaw))
+                    .buttonStyle(.plain)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(headerAccessibilityLabel)
+                    .accessibilityHint(L10n.t("group_chat_info_a11y", languageCode: languageCode))
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    HStack(spacing: 12) {
+                        Button {
+                            showConversationSearch = true
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                        }
+                        .accessibilityLabel(L10n.t("chat_conversation_search_title", languageCode: languageCode))
+
+                        Button {
+                            showInfo = true
+                        } label: {
+                            Image(systemName: "info.circle")
+                        }
+                        .accessibilityLabel(L10n.t("group_chat_info_a11y", languageCode: appLanguageRaw))
+                    }
                 }
             }
         }
@@ -664,6 +828,31 @@ struct GroupChatView: View {
             guard let change = FanProfileChangeCenter.avatarChange(from: notification) else { return }
             applyMemberAvatarChange(change)
         }
+        .onAppear {
+            hydrateFanTeamContextFromCoordinatorIfNeeded()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: FanTeamIdentityChangeCenter.identityDidChangeNotification)) { notification in
+            guard let change = FanTeamIdentityChangeCenter.identityChange(from: notification) else { return }
+            if let current = resolvedFanTeamContext ?? fanTeamContext,
+               current.teamId == change.teamId || current.conversationId == change.conversationId {
+                resolvedFanTeamContext = current.applying(change)
+                fanTeamMarkRefreshToken = change.displayRefreshToken
+                return
+            }
+            guard change.conversationId == conversationId else { return }
+            resolvedFanTeamContext = FanTeamChatContext(
+                conversationId: change.conversationId,
+                teamId: change.teamId,
+                teamName: change.name,
+                sport: change.sport,
+                memberCount: resolvedFanTeamContext?.memberCount ?? fanTeamContext?.memberCount ?? 0,
+                competitionLevel: change.competitionLevel,
+                logoURL: change.logoURL,
+                logoThumbnailURL: change.logoThumbnailURL,
+                colorHex: change.colorHex
+            )
+            fanTeamMarkRefreshToken = change.displayRefreshToken
+        }
         .onDisappear {
 #if DEBUG
             ChatNavDebugCounters.log("directChat.onDisappear", detail: "kind=group")
@@ -689,13 +878,7 @@ struct GroupChatView: View {
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active else { return }
             Task {
-                ChatRealtimeAudit.log(
-                    conversationId: conversationId,
-                    generation: chatRealtimeLifecycleGeneration,
-                    event: "foregroundRepair",
-                    status: String(describing: realtimeConnectionStatus)
-                )
-                await subscribeGroupRealtime(reason: "foreground", beginNewLifecycle: true)
+                await forceRebuildGroupRealtimeAfterForeground()
             }
         }
         .onChange(of: chatViewModel.currentUserAuthId) { _, newId in
@@ -716,6 +899,37 @@ struct GroupChatView: View {
                 reason: "became_visible"
             )
         }
+    }
+
+    /// Compact search/info chrome for Team Detail embedding (avoids a second Team title/logo header).
+    private var embeddedConversationChrome: some View {
+        HStack(spacing: 4) {
+            Spacer(minLength: 0)
+            Button {
+                showConversationSearch = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .frame(width: 36, height: 32)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t("chat_conversation_search_title", languageCode: languageCode))
+
+            Button {
+                showInfo = true
+            } label: {
+                Image(systemName: "info.circle")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .frame(width: 36, height: 32)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t("group_chat_info_a11y", languageCode: languageCode))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .background(colorScheme == .dark ? Color.black : Color(.systemBackground))
     }
 
     private var groupComposer: some View {
@@ -1565,6 +1779,19 @@ struct GroupChatView: View {
         preview(for: id).displayName
     }
 
+    /// Inbox / search may open Team chat without `fanTeamContext`; hydrate from the shared identity cache.
+    private func hydrateFanTeamContextFromCoordinatorIfNeeded() {
+        if resolvedFanTeamContext == nil, let fanTeamContext {
+            resolvedFanTeamContext = fanTeamContext
+        }
+        guard resolvedFanTeamContext == nil else { return }
+        if let context = FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+            forConversationId: conversationId
+        ) {
+            resolvedFanTeamContext = context
+        }
+    }
+
     @MainActor
     private func load() async {
         isLoading = true
@@ -1616,6 +1843,14 @@ struct GroupChatView: View {
         }
     }
 
+    private var isGroupRealtimeSubscribed: Bool {
+        realtimeChannel?.status == .subscribed && subscribedConversationId == conversationId
+    }
+
+    private var groupRealtimeTopic: String {
+        "group-thread-\(conversationId.uuidString.lowercased())"
+    }
+
     @MainActor
     private func beginGroupRealtimeLifecycle(reason: String) -> Int {
         chatRealtimeLifecycleGeneration += 1
@@ -1626,6 +1861,9 @@ struct GroupChatView: View {
             event: "generationStart",
             status: String(describing: realtimeConnectionStatus),
             extra: "reason=\(reason)"
+        )
+        GroupChatRealtimeDebug.log(
+            "generationStart conv=\(conversationId.uuidString.lowercased()) gen=\(gen) reason=\(reason) style=\(String(describing: presentationStyle))"
         )
         return gen
     }
@@ -1647,10 +1885,14 @@ struct GroupChatView: View {
             to: next,
             reason: reason
         )
+        GroupChatRealtimeDebug.log(
+            "status \(String(describing: old))→\(String(describing: next)) reason=\(reason) gen=\(gen) conv=\(conversationId.uuidString.lowercased())"
+        )
     }
 
     /// If the channel is already subscribed but UI status is stale, repair without reconnecting.
     @MainActor
+    @discardableResult
     private func repairGroupRealtimeStatusFromChannelHealth(reason: String) -> Bool {
         guard let channel = realtimeChannel,
               subscribedConversationId == conversationId else {
@@ -1666,8 +1908,11 @@ struct GroupChatView: View {
         )
         guard channel.status == .subscribed else { return false }
         if realtimeConnectionStatus != .live && realtimeConnectionStatus != .connected {
-            setGroupRealtimeStatus(.live, reason: "repairFromChannelHealth:\(reason)")
+            setGroupRealtimeStatus(.live, reason: "repair_to_live:\(reason)")
             groupHadSuccessfulSubscribe = true
+            GroupChatRealtimeDebug.log(
+                "repair_to_live conv=\(conversationId.uuidString.lowercased()) reason=\(reason) topic=\(channel.topic)"
+            )
             ChatRealtimeAudit.log(
                 conversationId: conversationId,
                 generation: chatRealtimeLifecycleGeneration,
@@ -1677,6 +1922,28 @@ struct GroupChatView: View {
             )
         }
         return true
+    }
+
+    @MainActor
+    private func isGroupRealtimeSubscribeStuck() -> Bool {
+        guard !isGroupRealtimeSubscribed else { return false }
+        guard realtimeConnectionStatus == .connecting
+            || realtimeConnectionStatus == .reconnecting
+            || realtimeConnectionStatus == .offline
+        else { return false }
+        if let started = groupRealtimeSubscribeAttemptStartedAt {
+            return Date().timeIntervalSince(started) >= Self.subscribeStuckThreshold
+        }
+        return groupRealtimeSubscriptionTask != nil || establishingRealtimeChannel != nil
+    }
+
+    private func groupChannelStatusIsUnhealthy(_ status: String) -> Bool {
+        let s = status.lowercased()
+        return s.contains("error")
+            || s.contains("timedout")
+            || s.contains("timed_out")
+            || s.contains("closed")
+            || s == "unsubscribed"
     }
 
     @MainActor
@@ -1700,14 +1967,20 @@ struct GroupChatView: View {
                 status: String(describing: realtimeConnectionStatus),
                 extra: "reason=staleGeneration currentGen=\(chatRealtimeLifecycleGeneration)"
             )
+            GroupChatRealtimeDebug.log(
+                "stale_callback_ignored source=teardown stopGen=\(stopGen) current=\(chatRealtimeLifecycleGeneration)"
+            )
             return
         }
 
+        stopGroupRealtimeWatchdog(reason: "teardown")
+        stopGroupFallbackPolling(reason: "teardown")
         groupRealtimeSubscriptionTask?.cancel()
         groupRealtimeSubscriptionTask = nil
         realtimeListenTask?.cancel()
         realtimeListenTask = nil
         let channel = realtimeChannel
+        let establishing = establishingRealtimeChannel
         let channelGen = ownedGroupChannelGeneration
 
         if channelGen > stopGen {
@@ -1722,22 +1995,30 @@ struct GroupChatView: View {
         }
 
         realtimeChannel = nil
+        establishingRealtimeChannel = nil
         subscribedConversationId = nil
+        groupRealtimeSubscribeAttemptStartedAt = nil
         setGroupRealtimeStatus(statusAfter, reason: "teardown", generation: stopGen)
 
-        if let channel {
+        for ch in [channel, establishing].compactMap({ $0 }) {
+            GroupChatRealtimeDebug.log(
+                "remove_start topic=\(ch.topic) gen=\(stopGen) conv=\(conversationId.uuidString.lowercased())"
+            )
             ChatRealtimeAudit.log(
                 conversationId: conversationId,
                 generation: stopGen,
                 event: "channelRemoved",
-                extra: "topic=\(channel.topic)"
+                extra: "topic=\(ch.topic)"
             )
             await ChatRealtimeChannelSerializer.shared.removeExclusive(
-                topic: channel.topic,
-                channel: channel
-            ) { [service] ch in
-                await service.removeRealtimeChannel(ch)
+                topic: ch.topic,
+                channel: ch
+            ) { [service] channelToRemove in
+                await service.removeRealtimeChannel(channelToRemove)
             }
+            GroupChatRealtimeDebug.log(
+                "remove_done topic=\(ch.topic) gen=\(stopGen)"
+            )
         }
 
         ChatRealtimeAudit.log(
@@ -1748,10 +2029,249 @@ struct GroupChatView: View {
         )
     }
 
+    @MainActor
+    private func startGroupRealtimeWatchdogIfNeeded() {
+        guard groupRealtimeWatchdogTask == nil else { return }
+        let gen = chatRealtimeLifecycleGeneration
+        groupWatchdogGeneration = gen
+        GroupChatRealtimeDebug.log(
+            "watchdog_start gen=\(gen) conv=\(conversationId.uuidString.lowercased()) style=\(String(describing: presentationStyle))"
+        )
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "watchdogStart",
+            status: String(describing: realtimeConnectionStatus)
+        )
+        groupRealtimeWatchdogTask = Task { @MainActor in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: Self.realtimeWatchdogIntervalNs)
+                } catch {
+                    return
+                }
+                guard chatRealtimeLifecycleGeneration == gen else {
+                    GroupChatRealtimeDebug.log(
+                        "stale_callback_ignored source=watchdog gen=\(gen) current=\(chatRealtimeLifecycleGeneration)"
+                    )
+                    return
+                }
+                await runGroupRealtimeWatchdogCheck(reason: "timer")
+            }
+        }
+    }
+
+    @MainActor
+    private func stopGroupRealtimeWatchdog(reason: String) {
+        guard groupRealtimeWatchdogTask != nil else { return }
+        groupRealtimeWatchdogTask?.cancel()
+        groupRealtimeWatchdogTask = nil
+        GroupChatRealtimeDebug.log("watchdog_stop reason=\(reason)")
+    }
+
+    @MainActor
+    private func groupRealtimeWatchdogDecision(reason: String) -> (needsReconnect: Bool, reconnectReason: String) {
+        if repairGroupRealtimeStatusFromChannelHealth(reason: "watchdog:\(reason)") {
+            return (false, "healthyRepaired")
+        }
+
+        let stuck = isGroupRealtimeSubscribeStuck()
+
+        if realtimeChannel == nil, establishingRealtimeChannel == nil {
+            if stuck {
+                return (true, "subscribeStuck")
+            }
+            if groupRealtimeSubscriptionTask != nil {
+                // Task-active alone is not healthy forever (Direct Chat hung-removeChannel fix).
+                if let started = groupRealtimeSubscribeAttemptStartedAt,
+                   Date().timeIntervalSince(started) < Self.watchdogSubscribeGrace {
+                    return (false, "subscribeGrace")
+                }
+                if stuck {
+                    return (true, "subscribeTaskStuck")
+                }
+                return (false, "subscribeTaskActive")
+            }
+            if let started = groupRealtimeSubscribeAttemptStartedAt,
+               Date().timeIntervalSince(started) < Self.watchdogSubscribeGrace {
+                return (false, "subscribeGrace")
+            }
+            return (true, "noActiveChannel")
+        }
+
+        if stuck {
+            return (true, "establishingOrChannelStuck")
+        }
+
+        if let channel = realtimeChannel ?? establishingRealtimeChannel {
+            let status = String(describing: channel.status)
+            if groupChannelStatusIsUnhealthy(status) {
+                return (true, "channelStatus.\(status)")
+            }
+        }
+
+        if groupRealtimeSubscriptionTask == nil,
+           realtimeListenTask == nil,
+           !isGroupRealtimeSubscribed {
+            return (true, "subscriptionLoopMissing")
+        }
+        return (false, "healthy")
+    }
+
+    @MainActor
+    @discardableResult
+    private func runGroupRealtimeWatchdogCheck(reason: String) async -> Bool {
+        guard !groupWatchdogCheckInProgress else { return false }
+        groupWatchdogCheckInProgress = true
+        defer { groupWatchdogCheckInProgress = false }
+
+        let decision = groupRealtimeWatchdogDecision(reason: reason)
+        GroupChatRealtimeDebug.log(
+            "watchdog_check reason=\(reason) needsReconnect=\(decision.needsReconnect) detail=\(decision.reconnectReason) status=\(String(describing: realtimeConnectionStatus)) subscribed=\(isGroupRealtimeSubscribed) taskActive=\(groupRealtimeSubscriptionTask != nil) establishing=\(establishingRealtimeChannel != nil) conv=\(conversationId.uuidString.lowercased())"
+        )
+        if decision.needsReconnect {
+            await reconnectGroupRealtimeFromWatchdog(reason: decision.reconnectReason)
+        }
+        return decision.needsReconnect
+    }
+
+    @MainActor
+    private func reconnectGroupRealtimeFromWatchdog(reason: String) async {
+        let gen = chatRealtimeLifecycleGeneration
+        GroupChatRealtimeDebug.log(
+            "dead_channel_replaced reason=\(reason) gen=\(gen) conv=\(conversationId.uuidString.lowercased())"
+        )
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: gen,
+            event: "watchdogReconnect",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason)"
+        )
+        await tearDownGroupRealtime(statusAfter: .reconnecting, expectedGeneration: gen)
+        guard chatRealtimeLifecycleGeneration == gen else { return }
+        startGroupFallbackPollingIfNeeded(reason: reason)
+        await subscribeGroupRealtime(reason: "watchdog:\(reason)", beginNewLifecycle: true)
+    }
+
+    @MainActor
+    private func forceRebuildGroupRealtimeAfterForeground() async {
+        GroupChatRealtimeDebug.log(
+            "scene_active style=\(String(describing: presentationStyle)) status=\(String(describing: realtimeConnectionStatus)) subscribed=\(isGroupRealtimeSubscribed) stuck=\(isGroupRealtimeSubscribeStuck()) conv=\(conversationId.uuidString.lowercased())"
+        )
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "scene_active",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "style=\(String(describing: presentationStyle)) subscribed=\(isGroupRealtimeSubscribed)"
+        )
+        if isGroupRealtimeSubscribeStuck() || !isGroupRealtimeSubscribed {
+            await subscribeGroupRealtime(reason: "foregroundForceRebuild", beginNewLifecycle: true)
+        } else {
+            _ = repairGroupRealtimeStatusFromChannelHealth(reason: "foregroundHealthy")
+        }
+        // REST backfill must not claim Live — only repair if the channel is already subscribed.
+        await mergeLatestGroupMessagesFromREST(reason: "foreground_backfill")
+        _ = repairGroupRealtimeStatusFromChannelHealth(reason: "foregroundAfterBackfill")
+        startGroupRealtimeWatchdogIfNeeded()
+    }
+
+    @MainActor
+    private func startGroupFallbackPollingIfNeeded(reason: String) {
+        guard groupFallbackPollingTask == nil else { return }
+        let gen = chatRealtimeLifecycleGeneration
+        groupFallbackPollingGeneration = gen
+        GroupChatRealtimeDebug.log("fallback_poll_start reason=\(reason) gen=\(gen)")
+        groupFallbackPollingTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: Self.fallbackPollingStartDelayNs)
+            } catch {
+                return
+            }
+            while !Task.isCancelled {
+                guard chatRealtimeLifecycleGeneration == gen else { break }
+                guard !isGroupRealtimeSubscribed else { break }
+                // REST success never pins Connecting forever once we previously had Live.
+                if groupHadSuccessfulSubscribe,
+                   realtimeConnectionStatus == .connecting {
+                    setGroupRealtimeStatus(.reconnecting, reason: "fallbackPollActive", generation: gen)
+                }
+                await mergeLatestGroupMessagesFromREST(reason: "fallback_poll")
+                if isGroupRealtimeSubscribed { break }
+                do {
+                    try await Task.sleep(nanoseconds: Self.fallbackPollingIntervalNs)
+                } catch {
+                    break
+                }
+            }
+            if chatRealtimeLifecycleGeneration == gen {
+                groupFallbackPollingTask = nil
+            }
+        }
+    }
+
+    @MainActor
+    private func stopGroupFallbackPolling(reason: String) {
+        guard groupFallbackPollingTask != nil else { return }
+        groupFallbackPollingTask?.cancel()
+        groupFallbackPollingTask = nil
+        GroupChatRealtimeDebug.log("fallback_poll_stop reason=\(reason)")
+    }
+
+    @MainActor
+    private func mergeLatestGroupMessagesFromREST(reason: String) async {
+        do {
+            let latest = try await service.fetchLatestMessages(conversationId: conversationId)
+            var merged = 0
+            for row in latest where seenMessageIds.insert(row.id).inserted {
+                messages.append(row)
+                merged += 1
+            }
+            if merged > 0 {
+                messages.sort { $0.created_at < $1.created_at }
+                try? await service.markRead(conversationId: conversationId)
+                await chatViewModel.refreshInboxSummaries()
+            }
+            // REST must never assert Live.
+            if groupHadSuccessfulSubscribe,
+               !isGroupRealtimeSubscribed,
+               realtimeConnectionStatus == .connecting {
+                setGroupRealtimeStatus(.reconnecting, reason: "restFallback:\(reason)")
+            }
+            GroupChatRealtimeDebug.log(
+                "rest_merge reason=\(reason) newCount=\(merged) status=\(String(describing: realtimeConnectionStatus))"
+            )
+        } catch {
+            GroupChatRealtimeDebug.log(
+                "rest_merge_failed reason=\(reason) error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func subscribeGroupChannelWithTimeout(
+        _ channel: RealtimeChannelV2,
+        timeoutNs: UInt64 = 15_000_000_000
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await Task.detached(priority: .userInitiated) {
+                    try await channel.subscribeWithError()
+                }.value
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNs)
+                throw GroupChatRealtimeSubscribeTimeoutError()
+            }
+            defer { group.cancelAll() }
+            try await group.next()!
+        }
+    }
+
     /// Postgres INSERT on `group_messages` (includes system join/leave rows). Edit/delete events are not published.
     ///
     /// Starts an owned subscription task so SwiftUI `.task` / sheet / popover cancellation cannot leave
-    /// a successful channel stuck at `.connecting`.
+    /// a successful channel stuck at `.connecting`. Mirrors Direct Chat stuck-Connecting recovery.
     @MainActor
     private func subscribeGroupRealtime(reason: String, beginNewLifecycle: Bool = false) async {
         groupRealtimeStopTask?.cancel()
@@ -1768,7 +2288,7 @@ struct GroupChatView: View {
                 return
             }
             if repairGroupRealtimeStatusFromChannelHealth(reason: reason) {
-                if realtimeListenTask != nil || groupRealtimeSubscriptionTask != nil {
+                if realtimeListenTask != nil {
                     ChatRealtimeAudit.log(
                         conversationId: conversationId,
                         generation: chatRealtimeLifecycleGeneration,
@@ -1776,6 +2296,7 @@ struct GroupChatView: View {
                         status: String(describing: realtimeConnectionStatus),
                         extra: "reason=\(reason)"
                     )
+                    startGroupRealtimeWatchdogIfNeeded()
                     return
                 }
                 ChatRealtimeAudit.log(
@@ -1787,17 +2308,27 @@ struct GroupChatView: View {
                 )
                 // Fall through: rebuild under same generation.
             } else if groupRealtimeSubscriptionTask != nil {
-                ChatRealtimeAudit.log(
-                    conversationId: conversationId,
-                    generation: chatRealtimeLifecycleGeneration,
-                    event: "ensureInFlight",
-                    status: String(describing: realtimeConnectionStatus),
-                    extra: "reason=\(reason)"
-                )
-                return
-            } else if realtimeChannel != nil,
-                      subscribedConversationId == conversationId,
+                if isGroupRealtimeSubscribeStuck() {
+                    GroupChatRealtimeDebug.log(
+                        "dead_channel_replaced reason=stuckSubscriptionTask restart=\(reason) conv=\(conversationId.uuidString.lowercased())"
+                    )
+                    groupRealtimeSubscriptionTask?.cancel()
+                    groupRealtimeSubscriptionTask = nil
+                    // Fall through to replace.
+                } else {
+                    ChatRealtimeAudit.log(
+                        conversationId: conversationId,
+                        generation: chatRealtimeLifecycleGeneration,
+                        event: "ensureInFlight",
+                        status: String(describing: realtimeConnectionStatus),
+                        extra: "reason=\(reason)"
+                    )
+                    startGroupRealtimeWatchdogIfNeeded()
+                    return
+                }
+            } else if isGroupRealtimeSubscribed,
                       realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
+                startGroupRealtimeWatchdogIfNeeded()
                 return
             }
         }
@@ -1807,25 +2338,45 @@ struct GroupChatView: View {
             let previousGen = chatRealtimeLifecycleGeneration
             groupRealtimeSubscriptionTask?.cancel()
             groupRealtimeSubscriptionTask = nil
-            if realtimeChannel != nil || realtimeListenTask != nil {
-                await tearDownGroupRealtime(statusAfter: .connecting, expectedGeneration: previousGen)
+            if realtimeChannel != nil || establishingRealtimeChannel != nil || realtimeListenTask != nil {
+                await tearDownGroupRealtime(
+                    statusAfter: groupHadSuccessfulSubscribe ? .reconnecting : .connecting,
+                    expectedGeneration: previousGen
+                )
             }
             gen = beginGroupRealtimeLifecycle(reason: reason)
-            setGroupRealtimeStatus(.connecting, reason: "lifecycleStart:\(reason)", generation: gen)
+            setGroupRealtimeStatus(
+                groupHadSuccessfulSubscribe ? .reconnecting : .connecting,
+                reason: "lifecycleStart:\(reason)",
+                generation: gen
+            )
         } else {
             gen = chatRealtimeLifecycleGeneration
             groupRealtimeSubscriptionTask?.cancel()
             groupRealtimeSubscriptionTask = nil
-            if realtimeChannel != nil {
-                await tearDownGroupRealtime(statusAfter: .connecting, expectedGeneration: gen)
+            if realtimeChannel != nil || establishingRealtimeChannel != nil {
+                await tearDownGroupRealtime(
+                    statusAfter: groupHadSuccessfulSubscribe ? .reconnecting : .connecting,
+                    expectedGeneration: gen
+                )
             } else {
-                setGroupRealtimeStatus(.connecting, reason: "ensureReconnect:\(reason)", generation: gen)
+                setGroupRealtimeStatus(
+                    groupHadSuccessfulSubscribe ? .reconnecting : .connecting,
+                    reason: "ensureReconnect:\(reason)",
+                    generation: gen
+                )
             }
         }
 
         guard gen == chatRealtimeLifecycleGeneration else { return }
 
-        let topic = "group-thread-\(conversationId.uuidString.lowercased())"
+        let topic = groupRealtimeTopic
+        groupRealtimeSubscribeAttemptStartedAt = Date()
+        startGroupFallbackPollingIfNeeded(reason: reason)
+        startGroupRealtimeWatchdogIfNeeded()
+        GroupChatRealtimeDebug.log(
+            "subscribe_start reason=\(reason) beginNew=\(beginNewLifecycle) topic=\(topic) gen=\(gen) style=\(String(describing: presentationStyle))"
+        )
         ChatRealtimeAudit.log(
             conversationId: conversationId,
             generation: gen,
@@ -1855,12 +2406,16 @@ struct GroupChatView: View {
                     status: String(describing: realtimeConnectionStatus),
                     extra: "reason=staleGeneration source=groupSubscribeLoop"
                 )
+                GroupChatRealtimeDebug.log(
+                    "stale_callback_ignored source=groupSubscribeLoop gen=\(gen) current=\(chatRealtimeLifecycleGeneration)"
+                )
                 return
             }
 
             let nextStatus: ChatRealtimeConnectionStatus =
                 (attempt == 0 && !groupHadSuccessfulSubscribe) ? .connecting : .reconnecting
             setGroupRealtimeStatus(nextStatus, reason: attempt == 0 ? "subscribeBegin" : "retry", generation: gen)
+            groupRealtimeSubscribeAttemptStartedAt = Date()
             ChatRealtimeAudit.log(
                 conversationId: conversationId,
                 generation: gen,
@@ -1869,24 +2424,27 @@ struct GroupChatView: View {
                 extra: "attempt=\(attempt + 1) topic=\(topic) openReason=\(reason)"
             )
 
+            GroupChatRealtimeDebug.log("serializer_wait_begin topic=\(topic) gen=\(gen)")
             await ChatRealtimeChannelSerializer.shared.waitForTopicIdle(topic)
+            GroupChatRealtimeDebug.log("serializer_wait_end topic=\(topic) gen=\(gen)")
             guard gen == chatRealtimeLifecycleGeneration, !Task.isCancelled else { return }
 
             let (channel, stream) = service.groupMessagesInsertChannel(conversationId: conversationId)
-            realtimeChannel = channel
+            establishingRealtimeChannel = channel
             ownedGroupChannelGeneration = gen
-            subscribedConversationId = conversationId
             ChatRealtimeAudit.log(
                 conversationId: conversationId,
                 generation: gen,
                 event: "channelCreated",
                 extra: "topic=\(channel.topic) channelStatus=\(String(describing: channel.status))"
             )
+            GroupChatRealtimeDebug.log(
+                "channel_created topic=\(channel.topic) gen=\(gen) establishing=true"
+            )
 
             do {
-                try await channel.subscribeWithError()
+                try await subscribeGroupChannelWithTimeout(channel)
                 let stillCurrent = gen == chatRealtimeLifecycleGeneration
-                    && subscribedConversationId == conversationId
                 let channelSubscribed = channel.status == .subscribed
 
                 if !stillCurrent {
@@ -1897,23 +2455,32 @@ struct GroupChatView: View {
                         status: String(describing: realtimeConnectionStatus),
                         extra: "reason=staleGeneration source=subscribeResult channelStatus=\(String(describing: channel.status))"
                     )
+                    GroupChatRealtimeDebug.log(
+                        "stale_callback_ignored source=subscribeResult gen=\(gen)"
+                    )
+                    if establishingRealtimeChannel?.topic == channel.topic {
+                        establishingRealtimeChannel = nil
+                    }
                     await ChatRealtimeChannelSerializer.shared.removeExclusive(
                         topic: channel.topic,
                         channel: channel
                     ) { [service] ch in
                         await service.removeRealtimeChannel(ch)
                     }
-                    if gen == chatRealtimeLifecycleGeneration {
-                        realtimeChannel = nil
-                        subscribedConversationId = nil
-                    }
                     return
                 }
 
-                // Prefer authoritative channel health over Task.isCancelled (parent lifecycle cancel).
                 if channelSubscribed || stillCurrent {
+                    establishingRealtimeChannel = nil
+                    realtimeChannel = channel
+                    subscribedConversationId = conversationId
                     groupHadSuccessfulSubscribe = true
+                    groupRealtimeSubscribeAttemptStartedAt = nil
+                    stopGroupFallbackPolling(reason: "subscribed")
                     setGroupRealtimeStatus(.live, reason: "subscribeResult:subscribed", generation: gen)
+                    GroupChatRealtimeDebug.log(
+                        "subscribe_success topic=\(channel.topic) gen=\(gen) channelStatus=\(String(describing: channel.status))"
+                    )
                     ChatRealtimeAudit.log(
                         conversationId: conversationId,
                         generation: gen,
@@ -1954,12 +2521,8 @@ struct GroupChatView: View {
                             extra: "cancelled=\(Task.isCancelled)"
                         )
                         guard gen == chatRealtimeLifecycleGeneration else {
-                            ChatRealtimeAudit.log(
-                                conversationId: conversationId,
-                                generation: gen,
-                                event: "callbackIgnored",
-                                status: String(describing: realtimeConnectionStatus),
-                                extra: "reason=staleGeneration source=groupListenEnd"
+                            GroupChatRealtimeDebug.log(
+                                "stale_callback_ignored source=groupListenEnd gen=\(gen)"
                             )
                             return
                         }
@@ -1978,15 +2541,14 @@ struct GroupChatView: View {
                     return
                 }
 
+                if establishingRealtimeChannel?.topic == channel.topic {
+                    establishingRealtimeChannel = nil
+                }
                 await ChatRealtimeChannelSerializer.shared.removeExclusive(
                     topic: channel.topic,
                     channel: channel
                 ) { [service] ch in
                     await service.removeRealtimeChannel(ch)
-                }
-                if gen == chatRealtimeLifecycleGeneration {
-                    realtimeChannel = nil
-                    subscribedConversationId = nil
                 }
                 return
             } catch is CancellationError {
@@ -1997,10 +2559,14 @@ struct GroupChatView: View {
                     status: String(describing: realtimeConnectionStatus),
                     extra: "topic=\(channel.topic) channelStatus=\(String(describing: channel.status))"
                 )
-                // Intentional teardown cancels this owned task — do not resurrect `.live`.
+                if establishingRealtimeChannel?.topic == channel.topic {
+                    establishingRealtimeChannel = nil
+                }
                 if gen == chatRealtimeLifecycleGeneration {
-                    realtimeChannel = nil
-                    subscribedConversationId = nil
+                    if realtimeChannel?.topic == channel.topic {
+                        realtimeChannel = nil
+                        subscribedConversationId = nil
+                    }
                 }
                 await ChatRealtimeChannelSerializer.shared.removeExclusive(
                     topic: channel.topic,
@@ -2010,9 +2576,19 @@ struct GroupChatView: View {
                 }
                 return
             } catch {
+                let timedOut = error is GroupChatRealtimeSubscribeTimeoutError
+                let errLabel = timedOut ? "subscribe_timeout_15s" : error.localizedDescription
+                GroupChatRealtimeDebug.log(
+                    "subscribe_failure topic=\(channel.topic) gen=\(gen) error=\(errLabel) attempt=\(attempt + 1)"
+                )
+                if establishingRealtimeChannel?.topic == channel.topic {
+                    establishingRealtimeChannel = nil
+                }
                 if gen == chatRealtimeLifecycleGeneration {
-                    realtimeChannel = nil
-                    subscribedConversationId = nil
+                    if realtimeChannel?.topic == channel.topic {
+                        realtimeChannel = nil
+                        subscribedConversationId = nil
+                    }
                 }
                 await ChatRealtimeChannelSerializer.shared.removeExclusive(
                     topic: channel.topic,
@@ -2026,7 +2602,7 @@ struct GroupChatView: View {
                     generation: gen,
                     event: "subscribeResult",
                     status: String(describing: realtimeConnectionStatus),
-                    extra: "result=error attempt=\(attempt) error=\(error.localizedDescription)"
+                    extra: "result=error attempt=\(attempt) error=\(errLabel)"
                 )
                 if attempt >= delaysNs.count {
                     if gen == chatRealtimeLifecycleGeneration {
@@ -2035,6 +2611,9 @@ struct GroupChatView: View {
                             reason: "subscribeExhausted",
                             generation: gen
                         )
+                        // Keep watchdog + fallback alive so exhausted attempts still recover.
+                        startGroupFallbackPollingIfNeeded(reason: "subscribeExhausted")
+                        startGroupRealtimeWatchdogIfNeeded()
                     }
                     return
                 }
@@ -2099,14 +2678,10 @@ struct GroupChatView: View {
         guard !isRefreshingMessages else { return }
         isRefreshingMessages = true
         defer { isRefreshingMessages = false }
-        let wasLive = realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected
         _ = repairGroupRealtimeStatusFromChannelHealth(reason: "manualRefreshPrecheck")
-        let channelHealthy = realtimeChannel?.status == .subscribed
-            && subscribedConversationId == conversationId
-        let needsRepair = realtimeChannel == nil
-            || subscribedConversationId != conversationId
+        let channelHealthy = isGroupRealtimeSubscribed
+        let needsRepair = !channelHealthy
             || !(realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected)
-            || !channelHealthy
         ChatRealtimeAudit.log(
             conversationId: conversationId,
             generation: chatRealtimeLifecycleGeneration,
@@ -2120,9 +2695,13 @@ struct GroupChatView: View {
             seenMessageIds = Set(latest.map(\.id))
             try? await service.markRead(conversationId: conversationId)
             await chatViewModel.refreshInboxSummaries()
-            if wasLive, realtimeConnectionStatus == .live || realtimeConnectionStatus == .connected {
-                // Keep healthy live status after REST merge.
+            // REST success must never pin Connecting or claim Live by itself.
+            if !isGroupRealtimeSubscribed,
+               groupHadSuccessfulSubscribe,
+               realtimeConnectionStatus == .connecting {
+                setGroupRealtimeStatus(.reconnecting, reason: "manualRefreshRestOnly")
             }
+            _ = repairGroupRealtimeStatusFromChannelHealth(reason: "manualRefreshPostMerge")
             if needsRepair {
                 ChatRealtimeAudit.log(
                     conversationId: conversationId,

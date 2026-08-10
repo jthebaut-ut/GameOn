@@ -204,6 +204,9 @@ private final class DirectChatPresenter: ObservableObject {
     private var initialLatestFetchConversationId: UUID?
     private static let initialFetchBackfillCoalesceWindow: TimeInterval = 2.5
     private static let watchdogSubscribeGrace: TimeInterval = 3.0
+    /// After this, a subscribe task / establishing channel that never reaches Live is treated as stuck
+    /// (typically hung `removeChannel` / serializer wait) and must be force-replaced.
+    private static let subscribeStuckThreshold: TimeInterval = 12.0
     private var threadRealtimeChannelName: String?
     private var threadRealtimeChannelStatus: String = "none"
     private var lastThreadRealtimeSubscribeAt: Date?
@@ -737,11 +740,40 @@ private final class DirectChatPresenter: ObservableObject {
         }
     }
 
+    private func isRealtimeSubscribeStuck() -> Bool {
+        guard !isThreadRealtimeSubscribed else { return false }
+        guard realtimeConnectionStatus == .connecting
+            || realtimeConnectionStatus == .reconnecting
+            || realtimeConnectionStatus == .offline
+        else { return false }
+        if let started = realtimeSubscribeAttemptStartedAt {
+            return Date().timeIntervalSince(started) >= Self.subscribeStuckThreshold
+        }
+        // Task marked active with no attempt clock — treat as stuck after a short grace.
+        return threadRealtimeSubscriptionTask != nil || threadRealtimeSubscriptionLoopActive
+    }
+
     private func startRealtimeSubscriptionLoopIfNeeded(reason: String) {
-        guard threadRealtimeSubscriptionTask == nil else {
-            DMRealtimeDiagnostics.debug("channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionTaskAlreadyExists reason=\(reason)")
-            DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
-            return
+        if threadRealtimeSubscriptionTask != nil {
+            if isRealtimeSubscribeStuck() {
+                ChatRealtimeAudit.log(
+                    conversationId: conversationId,
+                    generation: chatRealtimeLifecycleGeneration,
+                    event: "dead_channel_replaced",
+                    status: String(describing: realtimeConnectionStatus),
+                    extra: "reason=stuckSubscriptionTask restart=\(reason)"
+                )
+                threadRealtimeSubscriptionTask?.cancel()
+                threadRealtimeSubscriptionTask = nil
+                threadRealtimeSubscriptionTaskId = nil
+                threadRealtimeSubscriptionStartReason = nil
+                threadRealtimeSubscriptionLoopActive = false
+                isThreadRealtimeSubscribing = false
+            } else {
+                DMRealtimeDiagnostics.debug("channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionTaskAlreadyExists reason=\(reason)")
+                DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(conversationId?.uuidString.lowercased() ?? "nil")")
+                return
+            }
         }
         let gen = chatRealtimeLifecycleGeneration
         subscriptionLoopGeneration = gen
@@ -805,13 +837,15 @@ private final class DirectChatPresenter: ObservableObject {
                     break
                 }
 
-                if !self.isThreadFallbackPollingActive {
+                    if !self.isThreadFallbackPollingActive {
                     self.isThreadFallbackPollingActive = true
                     self.lastThreadFallbackPollSucceeded = nil
                     self.refreshHeaderConnectionStatus()
                     DMRealtimeDiagnostics.debug("fallbackPollingActive=true reason=\(reason)")
-                    if !self.isThreadRealtimeSubscribed {
-                        self.realtimeConnectionStatus = .connecting
+                    // REST fallback must not pin UI to Connecting forever — use Reconnecting once we
+                    // previously had Live, otherwise leave the lifecycle state machine alone.
+                    if !self.isThreadRealtimeSubscribed, self.lastThreadRealtimeSubscribeAt != nil {
+                        self.realtimeConnectionStatus = .reconnecting
                     }
                 }
 
@@ -819,8 +853,8 @@ private final class DirectChatPresenter: ObservableObject {
                 self.lastThreadFallbackPollSucceeded = result.didFetch
                 self.refreshHeaderConnectionStatus()
                 DMRealtimeDiagnostics.debug("fallbackPollingMergedCount=\(result.mergedCount)")
-                if result.didFetch, !self.isThreadRealtimeSubscribed {
-                    self.realtimeConnectionStatus = .connecting
+                if result.didFetch, !self.isThreadRealtimeSubscribed, self.lastThreadRealtimeSubscribeAt != nil {
+                    self.realtimeConnectionStatus = .reconnecting
                 }
 
                 guard !self.isThreadRealtimeSubscribed else { break }
@@ -862,11 +896,23 @@ private final class DirectChatPresenter: ObservableObject {
            activeRealtimeThreadConversationId != cid {
             return (true, "activeConversationChanged")
         }
+
+        // Channel already subscribed but UI still Connecting — repair without teardown.
+        if repairDirectRealtimeStatusFromChannelHealth(reason: "watchdog:\(reason)") {
+            return (false, "healthyRepaired")
+        }
+
+        let stuck = isRealtimeSubscribeStuck()
+
         if messagesRealtimeChannel == nil, establishingRealtimeChannel == nil {
+            if stuck {
+                return (true, "subscribeStuck")
+            }
             if isThreadRealtimeSubscribing {
                 return (false, "subscribeInFlight")
             }
             if threadRealtimeSubscriptionTask != nil || threadRealtimeSubscriptionLoopActive {
+                // Previously treated as healthy forever — that left Connecting… when removeChannel hung.
                 return (false, "subscribeTaskActive")
             }
             if let started = realtimeSubscribeAttemptStartedAt,
@@ -875,14 +921,106 @@ private final class DirectChatPresenter: ObservableObject {
             }
             return (true, "noActiveChannel")
         }
+
+        if stuck {
+            return (true, "establishingOrChannelStuck")
+        }
+
         let status = threadRealtimeChannelStatusDescription()
         if threadRealtimeChannelStatusIsUnhealthy(status) {
             return (true, "channelStatus.\(status)")
         }
-        if threadRealtimeSubscriptionTask == nil, !threadRealtimeSubscriptionLoopActive {
+        if threadRealtimeSubscriptionTask == nil, !threadRealtimeSubscriptionLoopActive, !isThreadRealtimeSubscribed {
             return (true, "subscriptionLoopMissing")
         }
         return (false, "healthy")
+    }
+
+    /// If the channel is already subscribed but UI status is stale, repair without reconnecting.
+    @discardableResult
+    private func repairDirectRealtimeStatusFromChannelHealth(reason: String) -> Bool {
+        guard let channel = messagesRealtimeChannel,
+              activeRealtimeThreadConversationId == conversationId,
+              isThreadRealtimeSubscribed
+        else { return false }
+        let channelStatus = String(describing: channel.status)
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "channelHealthCheck",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason) channelStatus=\(channelStatus) topic=\(channel.topic)"
+        )
+        guard channel.status == .subscribed else { return false }
+        if realtimeConnectionStatus != .connected && realtimeConnectionStatus != .live {
+            let old = realtimeConnectionStatus
+            realtimeConnectionStatus = .connected
+            ChatRealtimeAudit.statusTransition(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                from: old,
+                to: .connected,
+                reason: "repairFromChannelHealth:\(reason)"
+            )
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "subscribe_status",
+                status: "connected",
+                extra: "result=subscribed source=channelHealthRepair topic=\(channel.topic)"
+            )
+        }
+        return true
+    }
+
+    /// Idempotent recovery entry point for appear / foreground / auth / watchdog / network-class events.
+    func reconcileDirectChatRealtime(reason: String) async {
+        ChatRealtimeAudit.log(
+            conversationId: conversationId,
+            generation: chatRealtimeLifecycleGeneration,
+            event: "reconcile",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reason=\(reason) authReady=\(currentUserId != nil) convReady=\(conversationId != nil)"
+        )
+        guard loadError == nil else { return }
+        guard currentUserId != nil else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "reconcileDeferred",
+                extra: "reason=\(reason) detail=authNotReady"
+            )
+            return
+        }
+        guard conversationId != nil else {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "reconcileDeferred",
+                extra: "reason=\(reason) detail=conversationNotReady"
+            )
+            return
+        }
+
+        if repairDirectRealtimeStatusFromChannelHealth(reason: reason) {
+            return
+        }
+
+        if isRealtimeSubscribeStuck() {
+            ChatRealtimeAudit.log(
+                conversationId: conversationId,
+                generation: chatRealtimeLifecycleGeneration,
+                event: "retry_reconcile_requested",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "reason=\(reason) detail=stuck"
+            )
+            await ensureRealtimeSubscriptionIfReady(reason: "reconcileStuck:\(reason)", beginNewLifecycle: true)
+            return
+        }
+
+        if !isThreadRealtimeSubscribed {
+            await ensureRealtimeSubscriptionIfReady(reason: "reconcile:\(reason)", beginNewLifecycle: false)
+        }
     }
 
     @discardableResult
@@ -967,24 +1105,33 @@ private final class DirectChatPresenter: ObservableObject {
 
     func forceRebuildRealtimeAfterForeground() async {
         guard loadError == nil, conversationId != nil, currentUserId != nil else { return }
-        guard chatViewModel?.canMarkActiveDirectThreadRead(
+        let isActiveVisible = chatViewModel?.canMarkActiveDirectThreadRead(
             conversationId: conversationId!,
             reason: "foreground_force_rebuild"
-        ) == true else {
-            DebugLogGate.debug("[DMRealtimeStability] skipped foreground force rebuild offscreen")
-            return
-        }
+        ) == true
+        // Do not skip when the presenter is still alive with a conversation — activeVisible can be
+        // cleared incorrectly while the DM UI remains on screen (stuck Connecting after resume).
         ChatRealtimeAudit.log(
             conversationId: conversationId,
             generation: chatRealtimeLifecycleGeneration,
-            event: "foregroundRepair",
-            status: String(describing: realtimeConnectionStatus)
+            event: "scene_active",
+            status: String(describing: realtimeConnectionStatus),
+            extra: "reconcile=true activeVisible=\(isActiveVisible)"
         )
-        await ensureRealtimeSubscriptionIfReady(reason: "foregroundForceRebuild", beginNewLifecycle: true)
+        if isRealtimeSubscribeStuck() || !isThreadRealtimeSubscribed {
+            await ensureRealtimeSubscriptionIfReady(
+                reason: isActiveVisible ? "foregroundForceRebuild" : "foregroundPresenterAlive",
+                beginNewLifecycle: true
+            )
+        } else {
+            await reconcileDirectChatRealtime(reason: "foregroundHealthy")
+        }
         let result = await refreshMessagesForCurrentThreadResult(reason: "foreground_force_rebuild")
         DMRealtimeDiagnostics.debug("backfillAfterForegroundMergedCount=\(result.mergedCount)")
         if result.didFetch, isThreadRealtimeSubscribed {
             realtimeConnectionStatus = .connected
+        } else {
+            _ = repairDirectRealtimeStatusFromChannelHealth(reason: "foregroundAfterBackfill")
         }
     }
 
@@ -1157,11 +1304,38 @@ private final class DirectChatPresenter: ObservableObject {
         }
         activeRealtimeThreadConversationId = cid
         if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
+            let status = threadRealtimeChannelStatusDescription()
+            let healthySubscribed = isThreadRealtimeSubscribed
+                && messagesRealtimeChannel?.status == .subscribed
+                && !threadRealtimeChannelStatusIsUnhealthy(status)
+            if healthySubscribed {
+                _ = repairDirectRealtimeStatusFromChannelHealth(reason: "subscribeAttemptExistingHealthy")
+                DMRealtimeDiagnostics.debug(
+                    "channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionReuseHealthy channelStatus=\(status)"
+                )
+                return
+            }
             DMRealtimeDiagnostics.debug(
-                "channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionBlockedByExistingRef channelStatus=\(threadRealtimeChannelStatusDescription())"
+                "channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionBlockedByExistingRef channelStatus=\(status)"
             )
-            DMRealtimeDiagnostics.debug("activeConversationId=\(activeRealtimeThreadConversationId?.uuidString.lowercased() ?? "nil") expectedConversationId=\(cid.uuidString.lowercased())")
-            return
+            ChatRealtimeAudit.log(
+                conversationId: cid,
+                generation: gen,
+                event: "dead_channel_replaced",
+                status: String(describing: realtimeConnectionStatus),
+                extra: "topic=\(messagesRealtimeChannel?.topic ?? establishingRealtimeChannel?.topic ?? "nil") priorStatus=\(status)"
+            )
+            await tearDownRealtimeChannelIfNeeded(
+                expectedGeneration: gen,
+                statusAfter: lastThreadRealtimeSubscribeAt != nil ? .reconnecting : .connecting
+            )
+            guard isCurrentRealtimeGeneration(gen) else { return }
+            if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
+                DMRealtimeDiagnostics.debug(
+                    "channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscriptionBlockedAfterTeardown"
+                )
+                return
+            }
         }
 
         let tid = cid.uuidString.lowercased()
@@ -1249,10 +1423,16 @@ private final class DirectChatPresenter: ObservableObject {
                 ChatRealtimeAudit.log(
                     conversationId: cid,
                     generation: gen,
-                    event: "callbackIgnored",
+                    event: "stale_callback_ignored",
                     status: String(describing: realtimeConnectionStatus),
                     extra: "reason=staleGeneration source=subscribeSuccess"
                 )
+                // Clear establishing refs if they still point at this zombie channel.
+                if let establishing = establishingRealtimeChannel,
+                   threadRealtimeChannelObjectId(establishing) == threadRealtimeChannelObjectId(channel) {
+                    establishingRealtimeChannel = nil
+                    isThreadRealtimeSubscribing = false
+                }
                 await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: channel.topic, channel: channel) { [service] ch in
                     await service.removeRealtimeChannel(ch)
                 }
@@ -1282,10 +1462,18 @@ private final class DirectChatPresenter: ObservableObject {
                 ChatRealtimeAudit.log(
                     conversationId: cid,
                     generation: gen,
-                    event: "callbackIgnored",
+                    event: "stale_callback_ignored",
                     status: String(describing: realtimeConnectionStatus),
                     extra: "reason=staleGeneration source=subscribeFailure"
                 )
+                if let establishing = establishingRealtimeChannel,
+                   threadRealtimeChannelObjectId(establishing) == threadRealtimeChannelObjectId(channel) {
+                    establishingRealtimeChannel = nil
+                    isThreadRealtimeSubscribing = false
+                }
+                await ChatRealtimeChannelSerializer.shared.removeExclusive(topic: channel.topic, channel: channel) { [service] ch in
+                    await service.removeRealtimeChannel(ch)
+                }
                 throw CancellationError()
             }
             establishingRealtimeChannel = nil
@@ -1466,7 +1654,11 @@ private final class DirectChatPresenter: ObservableObject {
             DMRealtimeDiagnostics.debug("ignoredReason=conversationNotReady reason=\(reason)")
             return
         }
-        if beginNewLifecycle || (!isThreadRealtimeSubscribed && threadRealtimeSubscriptionTask == nil) {
+        if repairDirectRealtimeStatusFromChannelHealth(reason: reason) {
+            startThreadFallbackPollingIfNeeded(reason: reason)
+            return
+        }
+        if beginNewLifecycle || (!isThreadRealtimeSubscribed && threadRealtimeSubscriptionTask == nil) || isRealtimeSubscribeStuck() {
             startRealtimeSubscriptionLoopIfNeeded(reason: reason)
         }
         startThreadFallbackPollingIfNeeded(reason: reason)
@@ -1646,9 +1838,14 @@ private final class DirectChatPresenter: ObservableObject {
                 dmDebugReceivedDatesByServerID[$0.id] = fallbackReceivedAt
                 logDMEndToEnd(row: $0, conversationId: cid, fallbackUsed: true, receivedAt: fallbackReceivedAt)
             }
-            // REST merge must not demote a healthy live subscription.
+            // REST merge must not demote a healthy live subscription, and must not pin
+            // Connecting… when recovery is already in progress.
             if !isThreadRealtimeSubscribed {
-                realtimeConnectionStatus = .connecting
+                if lastThreadRealtimeSubscribeAt != nil {
+                    if realtimeConnectionStatus != .reconnecting && realtimeConnectionStatus != .offline {
+                        realtimeConnectionStatus = .reconnecting
+                    }
+                }
             }
 #if DEBUG
             print("[DirectChatRealtime] refresh merged newCount=\(tailNew.count) thread=\(tid) reason=\(reason)")
@@ -2985,6 +3182,13 @@ struct DirectChatView: View {
         .onChange(of: scenePhase) { _, phase in
             DMRealtimeDiagnostics.debug("scenePhase=\(String(describing: phase))")
             DMRealtimeDiagnostics.debug("activeConversationId=\(presenter.conversationId?.uuidString.lowercased() ?? "nil") scenePhase=\(String(describing: phase))")
+            ChatRealtimeAudit.log(
+                conversationId: presenter.conversationId,
+                generation: presenter.chatRealtimeLifecycleGeneration,
+                event: phase == .active ? "app_foreground" : "app_background",
+                status: String(describing: presenter.realtimeConnectionStatus),
+                extra: "scenePhase=\(String(describing: phase))"
+            )
             guard phase == .active else { return }
             Task {
                 await refreshDirectChatPresence(source: "foreground")
@@ -3000,7 +3204,7 @@ struct DirectChatView: View {
         .onChange(of: chatViewModel.currentUserAuthId) { _, authId in
             guard authId == nil else {
                 Task {
-                    await presenter.ensureRealtimeSubscriptionIfReady(reason: "auth_user_id_changed")
+                    await presenter.reconcileDirectChatRealtime(reason: "auth_user_id_changed")
                 }
                 return
             }

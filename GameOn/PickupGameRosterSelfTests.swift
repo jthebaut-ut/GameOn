@@ -181,6 +181,136 @@ enum PickupGameRosterSelfTests {
         expect(organizer.isOrganizer, "organizer_role_flag")
         expect(!playing[0].isOrganizer, "player_not_organizer_role")
 
+        // Team declined bucket (20260948): multiple historical request rows per user must
+        // collapse before SwiftUI ForEach(id: user_id) — root cause of Team detail crash.
+        let declinedUser = UUID()
+        let declinedDupes = [
+            PickupGameRosterMember(
+                user_id: declinedUser,
+                request_id: UUID(),
+                display_name: "Dana",
+                username: nil,
+                avatar_url: nil,
+                avatar_thumbnail_url: nil,
+                role: "declined",
+                status: "withdrawn"
+            ),
+            PickupGameRosterMember(
+                user_id: declinedUser,
+                request_id: UUID(),
+                display_name: "Dana",
+                username: nil,
+                avatar_url: nil,
+                avatar_thumbnail_url: nil,
+                role: "declined",
+                status: "rejected"
+            )
+        ]
+        let uniqueDeclined = PickupGameRosterPresentation.uniqueMembersByUserId(declinedDupes)
+        expect(uniqueDeclined.count == 1, "declined_dedupe_by_user_id")
+        expect(uniqueDeclined.first?.status == "withdrawn", "declined_keeps_first_occurrence")
+
+        let teamPayload = PickupGameRosterPayload(
+            pickup_game_id: UUID(),
+            viewer_is_organizer: false,
+            organizer: organizer,
+            playing: playing + [
+                PickupGameRosterMember(
+                    user_id: approvedA,
+                    request_id: UUID(),
+                    display_name: "Alex Dup",
+                    username: nil,
+                    avatar_url: nil,
+                    avatar_thumbnail_url: nil,
+                    role: "playing",
+                    status: "approved"
+                )
+            ],
+            pending: [],
+            declined: declinedDupes,
+            no_response: [
+                PickupGameRosterMember(
+                    user_id: pendingId,
+                    request_id: nil,
+                    display_name: "Casey",
+                    username: nil,
+                    avatar_url: nil,
+                    avatar_thumbnail_url: nil,
+                    role: "no_response",
+                    status: "no_response"
+                ),
+                PickupGameRosterMember(
+                    user_id: pendingId,
+                    request_id: nil,
+                    display_name: "Casey",
+                    username: nil,
+                    avatar_url: nil,
+                    avatar_thumbnail_url: nil,
+                    role: "no_response",
+                    status: "no_response"
+                )
+            ],
+            approved_join_count: 2,
+            playing_total_count: 3
+        )
+        expect(teamPayload.playing.count == 2, "payload_init_dedupes_playing")
+        expect(teamPayload.declinedMembers.count == 1, "payload_init_dedupes_declined")
+        expect(teamPayload.noResponseMembers.count == 1, "payload_init_dedupes_no_response")
+        expect(
+            Set(teamPayload.stackMembers.map(\.user_id)).count == teamPayload.stackMembers.count,
+            "stack_members_unique_user_ids"
+        )
+        expect(
+            !teamPayload.stackMembers.contains(where: { $0.user_id == organizerId && $0.role == "playing" }),
+            "stack_excludes_organizer_from_playing_dupes"
+        )
+
+        // Organizer also present in playing must not produce duplicate ForEach IDs.
+        let organizerAlsoPlaying = PickupGameRosterPayload(
+            pickup_game_id: UUID(),
+            viewer_is_organizer: true,
+            organizer: organizer,
+            playing: [
+                PickupGameRosterMember(
+                    user_id: organizerId,
+                    request_id: UUID(),
+                    display_name: "Host",
+                    username: "host",
+                    avatar_url: nil,
+                    avatar_thumbnail_url: nil,
+                    role: "playing",
+                    status: "approved"
+                )
+            ] + playing,
+            pending: [],
+            approved_join_count: 2,
+            playing_total_count: 3
+        )
+        expect(
+            organizerAlsoPlaying.stackMembers.filter { $0.user_id == organizerId }.count == 1,
+            "stack_dedupes_organizer_also_in_playing"
+        )
+
+        // Team attendance presentation: buckets → flat unique rows.
+        let attendanceRows = PickupTeamAttendancePresentation.rows(from: teamPayload)
+        expect(
+            Set(attendanceRows.map(\.id)).count == attendanceRows.count,
+            "attendance_rows_unique_user_ids"
+        )
+        let attendanceCounts = PickupTeamAttendancePresentation.counts(from: teamPayload)
+        expect(attendanceCounts.going == 3, "attendance_going_count_stack")
+        expect(attendanceCounts.maybe == 0, "attendance_maybe_empty_when_pending_cleared")
+        expect(attendanceCounts.noResponse == 1, "attendance_no_response_count")
+        expect(attendanceCounts.cantGo == 1, "attendance_cant_go_count")
+        expect(
+            PickupDetailAttendanceCategory.going.aggregateTitleKey() == "Going",
+            "aggregate_going_key_not_personal"
+        )
+        expect(
+            PickupDetailAttendanceCategory.going.personalTitleKey() == "fan_team_rsvp_going",
+            "personal_going_key_preserved"
+        )
+
         print("[PickupRosterTest] failures=\(failures)")
     }
 }

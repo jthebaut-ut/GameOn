@@ -102,9 +102,12 @@ struct DirectChatNavRoute: Identifiable, Hashable {
 struct GroupChatNavRoute: Identifiable, Hashable {
     var id: UUID { conversationId }
     let conversationId: UUID
+    /// Optional Team branding for My Teams → Team Chat (presentation only; ignored for route identity).
+    let fanTeamContext: FanTeamChatContext?
 
-    init(conversationId: UUID) {
+    init(conversationId: UUID, fanTeamContext: FanTeamChatContext? = nil) {
         self.conversationId = conversationId
+        self.fanTeamContext = fanTeamContext
     }
 
     func hash(into hasher: inout Hasher) {

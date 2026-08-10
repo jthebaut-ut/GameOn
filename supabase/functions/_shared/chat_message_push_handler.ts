@@ -16,6 +16,10 @@ import {
   type ChatPushKind,
   type SenderIdentity,
 } from "./chat_push_preview.ts"
+import {
+  loadMutedFanTeamMemberIds,
+  resolveFanTeamIdForConversation,
+} from "./fan_team_push_mute.ts"
 
 export type ChatMessagePushPayload = {
   message_id?: string
@@ -391,6 +395,15 @@ async function handleGroupMessage(
     return json({ ok: true, skipped: true, reason: "no_recipients", sent: 0 })
   }
 
+  // Team Chat = group conversation linked via fan_teams.group_conversation_id.
+  // Per-Team mute suppresses APNs for that Team only; regular Group Chat unchanged.
+  const fanTeamId = chatType === "group"
+    ? await resolveFanTeamIdForConversation(admin, conversation.id as string)
+    : null
+  const teamMutedRecipientIds = fanTeamId
+    ? await loadMutedFanTeamMemberIds(admin, fanTeamId, recipientIds)
+    : new Set<string>()
+
   const senderIdentity = resolveSenderIdentity(await loadSenderProfile(admin, senderId))
   let conversationTitle = (conversation.title as string | null) ?? ""
   if (chatType === "pickup" && conversation.pickup_game_id) {
@@ -423,6 +436,15 @@ async function handleGroupMessage(
       continue
     }
     if (claim === "exists") continue
+
+    if (teamMutedRecipientIds.has(recipientId)) {
+      console.log(
+        `${LOG_PREFIX} team_push_muted_skip team_id=${fanTeamId} recipient_user_id=${recipientId} ` +
+          `conversation_id=${conversation.id} message_id=${message.id}`,
+      )
+      await finalizeDelivery(admin, "group", message.id, recipientId, "skipped", "team_push_muted", 0)
+      continue
+    }
 
     const { data: prefs } = await admin
       .from("user_notification_preferences")

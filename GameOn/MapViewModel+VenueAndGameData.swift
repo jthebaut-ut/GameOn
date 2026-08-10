@@ -717,14 +717,11 @@ extension MapViewModel {
         for coverageBounds: DiscoverMapBoundsWindow,
         source: String
     ) -> String {
-        String(
-            format: "%@|c:%.3f,%.3f|s:%.3f,%.3f",
+        [
             source,
-            coverageBounds.centerLat,
-            coverageBounds.centerLon,
-            coverageBounds.latSpan,
-            coverageBounds.lonSpan
-        )
+            "c:\(FanGeoFixedFloatFormat.d3(coverageBounds.centerLat)),\(FanGeoFixedFloatFormat.d3(coverageBounds.centerLon))",
+            "s:\(FanGeoFixedFloatFormat.d3(coverageBounds.latSpan)),\(FanGeoFixedFloatFormat.d3(coverageBounds.lonSpan))"
+        ].joined(separator: "|")
     }
 
     private func filterVenueRows(

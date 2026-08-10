@@ -118,6 +118,13 @@ enum PickupGameMeaningfulChangeSelfTests {
         let cancelDiff = PickupGameMeaningfulChange.diff(before: base, after: cancelled)
         expect(cancelDiff.isCancellation, "cancellation_flag")
         expect(cancelDiff.kinds.contains(.status), "cancellation_status_kind")
+        let pushCancel = PickupGameMeaningfulChange.pushBody(for: cancelDiff, languageCode: "en")
+        expect(pushCancel.lowercased().contains("cancelled"), "push_cancel_mentions_cancelled")
+        expect(pushCancel.lowercased().contains("rock climbing"), "push_cancel_mentions_title")
+        expect(base.canOrganizerCancelPickupGame(viewerUserId: base.creator_user_id), "active_creator_can_cancel")
+        expect(!cancelled.canOrganizerCancelPickupGame(viewerUserId: cancelled.creator_user_id), "removed_cannot_cancel_again")
+        expect(!base.canOrganizerCancelPickupGame(viewerUserId: UUID()), "non_creator_cannot_cancel")
+        expect(cancelled.isPickupGameSoftCancelled, "removed_is_soft_cancelled")
 
         let sigBase = PickupGameMeaningfulChange.activitySignatureFragment(for: base)
         let sigLoc = PickupGameMeaningfulChange.activitySignatureFragment(for: locationOnly)
@@ -126,7 +133,10 @@ enum PickupGameMeaningfulChangeSelfTests {
         let pushDate = PickupGameMeaningfulChange.pushBody(for: dateDiff, languageCode: "en")
         expect(pushDate.lowercased().contains("rock climbing"), "push_date_mentions_title")
         let pushBoth = PickupGameMeaningfulChange.pushBody(for: bothDiff, languageCode: "en")
-        expect(pushBoth.lowercased().contains("date") && pushBoth.lowercased().contains("location"), "push_date_location_combined")
+        expect(
+            pushBoth.lowercased().contains("time") && pushBoth.lowercased().contains("location"),
+            "push_date_location_combined"
+        )
 
         if failures == 0 {
             print("[PickupGameMeaningfulChangeTest] ALL PASSED")

@@ -2,6 +2,11 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
 import { secretsEqual } from "../_shared/sports_worker_auth.ts"
+import { loadMutedUserIdsForPickupGame } from "../_shared/fan_team_push_mute.ts"
+import {
+  buildPickupGameChangePushAlert,
+  classifyPickupGameChange,
+} from "./pickup_game_change_push_alert.ts"
 
 /**
  * Preference-gated APNs worker for meaningful pickup-game edits/cancels.
@@ -11,6 +16,13 @@ import { secretsEqual } from "../_shared/sports_worker_auth.ts"
  *   - optional x-cron-secret matching PICKUP_GAME_CHANGE_PUSH_CRON_SECRET only
  *
  * Chat system messages are written by the SQL trigger. This worker only pushes.
+ *
+ * Recipients come from list_pickup_game_change_push_tokens (approved / Team Maybe /
+ * accepted-maybe invites). Team mute via fan_team_push_mute.ts (ordinary game-change
+ * only; not a second mute system).
+ *
+ * Multi-device: ALL active tokens per recipient are attempted (no first-token break).
+ *
  * Deploy: `supabase functions deploy notify-pickup-game-change --no-verify-jwt`
  */
 
@@ -72,65 +84,9 @@ function authorizeInvocation(
   }
 }
 
-function asString(value: unknown): string {
-  return typeof value === "string" ? value.trim() : ""
-}
-
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     .test(value)
-}
-
-function formatStartForPush(raw: string): string {
-  if (!raw) return ""
-  const date = new Date(raw)
-  if (Number.isNaN(date.getTime())) return ""
-  try {
-    return new Intl.DateTimeFormat("en-US", {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    }).format(date)
-  } catch {
-    return ""
-  }
-}
-
-/** Build alert from authoritative event row only (ignore client-supplied copy). */
-function buildAlert(event: UpdateEventRow): { title: string; body: string } {
-  const kinds = new Set((event.change_kinds ?? []).map((k) => k.toLowerCase()))
-  const payload = event.payload ?? {}
-  const titleName = asString(payload.title) || "Pickup game"
-  const afterStart = formatStartForPush(asString(payload.after_start))
-  const afterLocation = asString(payload.after_location)
-  const beforePlayers = Number(payload.before_players_needed ?? NaN)
-  const afterPlayers = Number(payload.after_players_needed ?? NaN)
-  const afterStatus = asString(payload.after_status).toLowerCase()
-  const beforeStatus = asString(payload.before_status).toLowerCase()
-
-  const pushTitle = "Pickup game updated"
-  if (beforeStatus !== "removed" && afterStatus === "removed") {
-    return { title: pushTitle, body: `${titleName} was cancelled.` }
-  }
-  if ((kinds.has("start") || kinds.has("end")) && kinds.has("location")) {
-    return { title: pushTitle, body: `${titleName} changed date and location.` }
-  }
-  if (kinds.has("start") || kinds.has("end")) {
-    const when = afterStart || "a new time"
-    return { title: pushTitle, body: `${titleName} moved to ${when}.` }
-  }
-  if (kinds.has("location")) {
-    const place = afterLocation || "a new location"
-    return { title: pushTitle, body: `${titleName} moved to ${place}.` }
-  }
-  if (kinds.has("capacity") && Number.isFinite(beforePlayers) && Number.isFinite(afterPlayers)) {
-    return {
-      title: pushTitle,
-      body: `${titleName} capacity changed from ${beforePlayers} to ${afterPlayers}.`,
-    }
-  }
-  return { title: pushTitle, body: `${titleName} was updated.` }
 }
 
 async function finalize(
@@ -148,6 +104,28 @@ async function finalize(
   })
   if (finalizeError) {
     console.error(`${LOG_PREFIX} finalize_failed status=${status} reason=${finalizeError.message}`)
+  }
+}
+
+async function recordDelivery(
+  admin: SupabaseClient,
+  updateEventId: string,
+  userId: string,
+  tokenId: string | null,
+  status: "sent" | "failed" | "skipped",
+  errorReason: string | null,
+): Promise<void> {
+  const { error } = await admin.rpc("record_pickup_game_change_push_delivery", {
+    p_update_event_id: updateEventId,
+    p_user_id: userId,
+    p_token_id: tokenId,
+    p_status: status,
+    p_error_reason: errorReason,
+  })
+  if (error) {
+    console.error(
+      `${LOG_PREFIX} delivery_record_failed user=${userId} status=${status} reason=${error.message}`,
+    )
   }
 }
 
@@ -223,8 +201,14 @@ Deno.serve(async (req) => {
   }
 
   const updateEvent = claimed as UpdateEventRow
-  const alert = buildAlert(updateEvent)
+  const changeClass = classifyPickupGameChange(updateEvent)
+  const alert = buildPickupGameChangePushAlert(updateEvent)
   const excludeEditor = updateEvent.editor_user_id?.trim() || null
+
+  console.log(
+    `${LOG_PREFIX} claimed event=${updateEventId} pickup=${updateEvent.pickup_game_id} ` +
+      `class=${changeClass} kinds=${(updateEvent.change_kinds ?? []).join(",")}`,
+  )
 
   const { data: tokens, error: tokenError } = await admin.rpc(
     "list_pickup_game_change_push_tokens",
@@ -256,7 +240,7 @@ Deno.serve(async (req) => {
     return json({ error: "apns_config", detail: detail.slice(0, 120) }, 500)
   }
 
-  // One logical push attempt per user (multi-token users: first success wins).
+  // Group ALL active tokens per user (iPhone + iPad + …). Do not collapse to one.
   const tokensByUser = new Map<string, RecipientTokenRow[]>()
   for (const row of rows) {
     const list = tokensByUser.get(row.user_id) ?? []
@@ -264,11 +248,37 @@ Deno.serve(async (req) => {
     tokensByUser.set(row.user_id, list)
   }
 
+  // Team-linked pickup games: honor per-Team push mute for linked Team members.
+  // Invited non-members are not in fan_team_members mute set.
+  const teamMutedUserIds = await loadMutedUserIdsForPickupGame(
+    admin,
+    updateEvent.pickup_game_id,
+    [...tokensByUser.keys()],
+  )
+
   let sentUsers = 0
   let failedUsers = 0
   let skippedUsers = 0
+  let sentTokens = 0
 
   for (const [userId, userTokens] of tokensByUser) {
+    if (teamMutedUserIds.has(userId)) {
+      console.log(
+        `${LOG_PREFIX} team_push_muted_skip pickup_game_id=${updateEvent.pickup_game_id} ` +
+          `recipient_user_id=${userId} update_event_id=${updateEventId}`,
+      )
+      await recordDelivery(
+        admin,
+        updateEventId,
+        userId,
+        userTokens[0]?.token_id ?? null,
+        "skipped",
+        "team_push_muted",
+      )
+      skippedUsers += 1
+      continue
+    }
+
     const { data: alreadySent, error: alreadyError } = await admin.rpc(
       "pickup_game_change_push_already_sent",
       {
@@ -286,7 +296,8 @@ Deno.serve(async (req) => {
       continue
     }
 
-    let userSent = false
+    let userSentCount = 0
+    let invalidated = 0
     let lastReason = "apns_send_failed"
     for (const row of userTokens) {
       const token: PushTokenRow = {
@@ -299,35 +310,56 @@ Deno.serve(async (req) => {
         source: SOURCE,
         pickup_game_id: updateEvent.pickup_game_id,
         pickup_update_event_id: updateEvent.id,
+        change_class: changeClass,
       })
       if (result.ok) {
-        userSent = true
-        await admin.rpc("record_pickup_game_change_push_delivery", {
-          p_update_event_id: updateEventId,
-          p_user_id: userId,
-          p_token_id: row.token_id,
-          p_status: "sent",
-          p_error_reason: null,
-        })
-        break
+        userSentCount += 1
+        // APNs HTTP 200 = accepted for that token/environment — not proof the current
+        // physical device displayed the alert (stale active tokens can still 200).
+        console.log(
+          `${LOG_PREFIX} apns_accepted tokenId=${row.token_id} environment=${result.tokenEnvironment} ` +
+            `status=${result.status} endpoint=${result.endpoint} user=${userId}`,
+        )
+        continue
       }
       lastReason = result.reason ?? `status_${result.status}`
+      console.warn(
+        `${LOG_PREFIX} apns_failed tokenId=${row.token_id} environment=${result.tokenEnvironment} ` +
+          `status=${result.status} reason=${lastReason} invalidate=${result.invalidate === true}`,
+      )
       if (result.invalidate) {
-        await admin.from("user_push_tokens").update({ is_active: false }).eq("id", row.token_id)
+        invalidated += 1
+        await admin
+          .from("user_push_tokens")
+          .update({ is_active: false, invalidated_at: new Date().toISOString() })
+          .eq("id", row.token_id)
       }
     }
 
-    if (userSent) {
+    if (userSentCount > 0) {
+      sentTokens += userSentCount
       sentUsers += 1
+      await recordDelivery(
+        admin,
+        updateEventId,
+        userId,
+        userTokens[0]?.token_id ?? null,
+        "sent",
+        null,
+      )
     } else {
       failedUsers += 1
-      await admin.rpc("record_pickup_game_change_push_delivery", {
-        p_update_event_id: updateEventId,
-        p_user_id: userId,
-        p_token_id: userTokens[0]?.token_id ?? null,
-        p_status: "failed",
-        p_error_reason: lastReason,
-      })
+      const reason = invalidated > 0 && invalidated === userTokens.length
+        ? "apns_invalid_token"
+        : lastReason
+      await recordDelivery(
+        admin,
+        updateEventId,
+        userId,
+        userTokens[0]?.token_id ?? null,
+        "failed",
+        reason,
+      )
     }
   }
 
@@ -341,13 +373,16 @@ Deno.serve(async (req) => {
 
   console.log(
     `${LOG_PREFIX} event=${updateEventId} pickup=${updateEvent.pickup_game_id} ` +
-      `auth=${auth.source} sentUsers=${sentUsers} failedUsers=${failedUsers} skippedUsers=${skippedUsers}`,
+      `class=${changeClass} auth=${auth.source} sentUsers=${sentUsers} sentTokens=${sentTokens} ` +
+      `failedUsers=${failedUsers} skippedUsers=${skippedUsers}`,
   )
 
   return json({
     ok: true,
     update_event_id: updateEventId,
+    change_class: changeClass,
     sent: sentUsers,
+    sent_tokens: sentTokens,
     failed: failedUsers,
     skipped: skippedUsers,
   })

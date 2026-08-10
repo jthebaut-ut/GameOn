@@ -42,7 +42,8 @@ enum PickupGameDiscoverAvailabilitySelfTests {
             requireMapBounds: Bool = true,
             requireValidCoordinates: Bool = true,
             guestFloor: Date? = nil,
-            now: Date = nowMDT
+            now: Date = nowMDT,
+            allowAuthorizedPrivate: Bool = false
         ) -> PickupGameAvailabilityContext {
             PickupGameAvailabilityContext(
                 timeZone: timeZone,
@@ -51,7 +52,8 @@ enum PickupGameDiscoverAvailabilitySelfTests {
                 mapBounds: bounds,
                 requireMapBounds: requireMapBounds,
                 requireValidCoordinates: requireValidCoordinates,
-                guestRecentFloor: guestFloor
+                guestRecentFloor: guestFloor,
+                allowAuthorizedPrivateGames: allowAuthorizedPrivate
             )
         }
 
@@ -116,6 +118,23 @@ enum PickupGameDiscoverAvailabilitySelfTests {
             )
             let labels = Set(days.map { PickupGameDateNormalizer.ymdString(for: $0, timeZone: denver) })
             expect(labels == ["2026-07-30", "2026-07-31"], "both_july30_and_july31_dots")
+        }
+
+        // 3b. Private pickup: guests exclude; authorized viewers keep RLS-returned rows.
+        do {
+            let start = encode(ymd: "2026-07-30", hms: "12:00:00", timeZone: denver)
+            let privateCandidate = candidate(startRaw: start, visible: false)
+            let guestEval = PickupGameAvailabilityResolver.evaluate(
+                privateCandidate,
+                context: context(allowAuthorizedPrivate: false)
+            )
+            expect(guestEval.discoverEligible == false, "private_excluded_for_guest_discover")
+            expect(guestEval.exclusionReason == .notVisible, "private_guest_reason_notVisible")
+            let authEval = PickupGameAvailabilityResolver.evaluate(
+                privateCandidate,
+                context: context(allowAuthorizedPrivate: true)
+            )
+            expect(authEval.discoverEligible == true, "private_allowed_when_authorized_flag")
         }
 
         // 4. UTC timestamp crossing local midnight → correct local day

@@ -289,10 +289,20 @@ struct FriendsTabView: View {
     }
 
     private enum ChatSection: String, CaseIterable, Identifiable {
-        case chats = "Chats"
-        case friends = "Friends"
-        case requests = "Requests"
+        case chats
+        case friends
+        case requests
+        case myTeams
         var id: String { rawValue }
+
+        var titleKey: String {
+            switch self {
+            case .chats: return "chat_section_chats"
+            case .friends: return "chat_section_friends"
+            case .requests: return "chat_section_requests"
+            case .myTeams: return "chat_section_my_teams"
+            }
+        }
     }
 
     private var chatRootBackground: Color {
@@ -506,7 +516,8 @@ struct FriendsTabView: View {
                 .navigationDestination(item: $groupNavigationRoute) { route in
                     GroupChatView(
                         conversationId: route.conversationId,
-                        chatViewModel: viewModel
+                        chatViewModel: viewModel,
+                        fanTeamContext: route.fanTeamContext
                     )
                     .environmentObject(mapViewModel)
                 }
@@ -1008,8 +1019,8 @@ struct FriendsTabView: View {
             }
         }
         .padding(4)
-        // Extra top padding only when the red *incoming* badge can overflow the capsule.
-        .padding(.top, pendingIncomingRequestCount > 0 ? 4 : 0)
+        // Extra top padding only when a red segment badge can overflow the capsule.
+        .padding(.top, (pendingIncomingRequestCount > 0 || pendingMyTeamsInvitationCount > 0) ? 4 : 0)
         .background {
             Capsule(style: .continuous)
                 .fill(Color(.secondarySystemGroupedBackground).opacity(colorScheme == .dark ? 0.36 : 0.72))
@@ -1023,6 +1034,7 @@ struct FriendsTabView: View {
         .onAppear {
 #if DEBUG
             print("[ChatRequestsBadge] incomingPending=\(pendingIncomingRequestCount) sent=\(viewModel.outgoingRequests.count)")
+            print("[ChatMyTeamsBadge] pendingForMe=\(pendingMyTeamsInvitationCount)")
 #endif
         }
         .onChange(of: pendingIncomingRequestCount) { _, count in
@@ -1030,13 +1042,27 @@ struct FriendsTabView: View {
             print("[ChatRequestsBadge] incomingPending=\(count)")
 #endif
         }
+        .onChange(of: pendingMyTeamsInvitationCount) { _, count in
+#if DEBUG
+            print("[ChatMyTeamsBadge] pendingForMe=\(count)")
+#endif
+        }
     }
 
     private func chatSectionButton(_ section: ChatSection) -> some View {
         let isSelected = selectedSection == section
         let hasUnreadDMs = viewModel.unreadDirectMessageCount > 0
-        // Red tab badge = actionable incoming requests only (never outgoing / group invites).
+        // Red tab badge = actionable incoming friend requests only (never outgoing / group invites).
         let requestsTabBadgeCount = pendingIncomingRequestCount
+        // My Teams badge = Team invitations waiting for ME (never manager-sent pending counts).
+        let myTeamsTabBadgeCount = pendingMyTeamsInvitationCount
+        let segmentBadgeCount: Int = {
+            switch section {
+            case .requests: return requestsTabBadgeCount
+            case .myTeams: return myTeamsTabBadgeCount
+            default: return 0
+            }
+        }()
         return Button {
             withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
                 selectedSection = section
@@ -1046,21 +1072,22 @@ struct FriendsTabView: View {
                 ChatSectionTabIcon(
                     systemImage: chatSectionIcon(section),
                     showUnreadDot: section == .chats && hasUnreadDMs,
-                    pendingRequestCount: section == .requests ? requestsTabBadgeCount : 0,
+                    pendingRequestCount: segmentBadgeCount,
                     tint: isSelected ? FGColor.primaryText(colorScheme) : FGColor.secondaryText(colorScheme)
                 )
                 .animation(.spring(response: 0.28, dampingFraction: 0.82), value: hasUnreadDMs)
                 .animation(.spring(response: 0.28, dampingFraction: 0.82), value: requestsTabBadgeCount)
-                .zIndex(section == .requests && requestsTabBadgeCount > 0 ? 1 : 0)
+                .animation(.spring(response: 0.28, dampingFraction: 0.82), value: myTeamsTabBadgeCount)
+                .zIndex(segmentBadgeCount > 0 ? 1 : 0)
 
-                Text(section.rawValue)
-                    .font(.system(size: 12.5, weight: isSelected ? .bold : .semibold, design: .rounded))
+                Text(L10n.t(section.titleKey, languageCode: appLanguageRaw))
+                    .font(.system(size: 11.5, weight: isSelected ? .bold : .semibold, design: .rounded))
                     .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                    .minimumScaleFactor(0.72)
                     .foregroundStyle(isSelected ? FGColor.primaryText(colorScheme) : FGColor.secondaryText(colorScheme))
             }
             .frame(maxWidth: .infinity)
-            .padding(.top, section == .requests && requestsTabBadgeCount > 0 ? 2 : 0)
+            .padding(.top, segmentBadgeCount > 0 ? 2 : 0)
             .frame(minHeight: 36)
             .background {
                 Capsule(style: .continuous)
@@ -1078,7 +1105,8 @@ struct FriendsTabView: View {
             chatSectionAccessibilityLabel(
                 section,
                 hasUnreadDMs: section == .chats && hasUnreadDMs,
-                pendingRequests: section == .requests ? requestsTabBadgeCount : 0
+                pendingRequests: section == .requests ? requestsTabBadgeCount : 0,
+                pendingMyTeamsInvitations: section == .myTeams ? myTeamsTabBadgeCount : 0
             )
         )
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -1087,17 +1115,23 @@ struct FriendsTabView: View {
     private func chatSectionAccessibilityLabel(
         _ section: ChatSection,
         hasUnreadDMs: Bool,
-        pendingRequests: Int
+        pendingRequests: Int,
+        pendingMyTeamsInvitations: Int
     ) -> String {
+        let title = L10n.t(section.titleKey, languageCode: appLanguageRaw)
         switch section {
         case .chats:
-            return hasUnreadDMs ? "\(section.rawValue), unread messages" : section.rawValue
+            return hasUnreadDMs ? "\(title), unread messages" : title
         case .requests:
-            guard pendingRequests > 0 else { return section.rawValue }
+            guard pendingRequests > 0 else { return title }
             let noun = pendingRequests == 1 ? "incoming request" : "incoming requests"
-            return "\(section.rawValue), \(pendingRequests) \(noun)"
+            return "\(title), \(pendingRequests) \(noun)"
+        case .myTeams:
+            guard pendingMyTeamsInvitations > 0 else { return title }
+            let noun = pendingMyTeamsInvitations == 1 ? "Team invitation" : "Team invitations"
+            return "\(title), \(pendingMyTeamsInvitations) \(noun)"
         default:
-            return section.rawValue
+            return title
         }
     }
 
@@ -1132,6 +1166,11 @@ struct FriendsTabView: View {
         viewModel.pendingBadgeCount
     }
 
+    /// Invitee-only Team invitation badge (`ChatViewModel.pendingFanTeamInvitationCount`).
+    private var pendingMyTeamsInvitationCount: Int {
+        viewModel.pendingFanTeamInvitationCount
+    }
+
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
     }
@@ -1144,6 +1183,8 @@ struct FriendsTabView: View {
             return "person.2.fill"
         case .requests:
             return "person.badge.plus"
+        case .myTeams:
+            return "shield.checkered"
         }
     }
 
@@ -1157,6 +1198,19 @@ struct FriendsTabView: View {
                 friendsDirectoryList
             case .requests:
                 requestsList
+            case .myTeams:
+                MyTeamsChatSectionView(
+                    mapViewModel: mapViewModel,
+                    chatViewModel: viewModel,
+                    onOpenTeamChat: { context in
+                        selectedSection = .chats
+                        openGroupChatRoute(
+                            conversationId: context.conversationId,
+                            reason: "myTeamsOpenChat",
+                            fanTeamContext: context
+                        )
+                    }
+                )
             }
         } else {
             chatsList
@@ -1169,6 +1223,7 @@ struct FriendsTabView: View {
         // Re-arm deliverers in case auth just became ready while Chat was visible.
         viewModel.deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "friendsTabConsume")
         viewModel.deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "friendsTabConsume")
+        viewModel.deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: "friendsTabConsume")
         viewModel.deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "friendsTabConsume")
 
         guard !viewModel.requiresSignIn else {
@@ -1179,6 +1234,10 @@ struct FriendsTabView: View {
         }
         if viewModel.pendingOpenFriendRequestsSection {
             consumePendingFriendRequestsSectionOpen()
+            return
+        }
+        if viewModel.pendingOpenMyTeamsInvitations {
+            consumePendingMyTeamsInvitationsOpen()
             return
         }
         if let groupId = viewModel.pendingGroupOpenConversationId {
@@ -1256,6 +1315,30 @@ struct FriendsTabView: View {
         Task { @MainActor in
             await viewModel.refreshFriendRequestListsOnly()
         }
+    }
+
+    /// APNs Fan Team invitation tap → Chat → My Teams (fail soft if invitation already gone).
+    private func consumePendingMyTeamsInvitationsOpen() {
+        guard viewModel.pendingOpenMyTeamsInvitations else { return }
+        dmNavigationRoute = nil
+        groupNavigationRoute = nil
+        if showsChatSocialSections {
+#if DEBUG
+            PushDeepLinkLog.selectingMyTeamsSection()
+#endif
+            selectedSection = .myTeams
+        } else {
+#if DEBUG
+            PushDeepLinkLog.selectingChatsSection()
+#endif
+            selectedSection = .chats
+        }
+#if DEBUG
+        print("[FanTeamInvitationPushRoute] FriendsTab selectedSection=\(selectedSection.rawValue)")
+#endif
+        viewModel.acknowledgeFanTeamInvitationPushDeepLinkOpened()
+        // Highlight id remains on ChatViewModel until MyTeamsChatSectionView consumes it.
+        // Cancelled/accepted-elsewhere invites simply won't appear after refresh (no crash).
     }
 
     private func refreshFansLiveNowAfterFirstPaint(reason: String) {
@@ -1843,19 +1926,58 @@ struct FriendsTabView: View {
     }
 
     private func chatGlobalSearchConversationFallbackRow(_ hit: ChatGlobalSearchConversationHit) -> some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(FGColor.cardBackground(colorScheme))
-                    .frame(width: 48, height: 48)
-                Image(systemName: hit.kind == .pickup ? "figure.run" : (hit.kind == .group ? "person.3.fill" : "person.fill"))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+        let teamColorHex: String? = {
+            guard hit.kind == .team else { return nil }
+            return FanTeamIdentityRealtimeCoordinator.shared.colorHex(forConversationId: hit.conversationId)
+        }()
+        let lang = L10n.normalizedLanguageCode(appLanguageRaw)
+        let resolvedTitle: String = {
+            guard hit.kind == .team else { return hit.title }
+            let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                    forConversationId: hit.conversationId
+                ),
+                conversationId: hit.conversationId
+            )?.name
+            return ChatInboxFanTeamRowIdentity.preferredTitle(
+                teamName: teamName,
+                fallbackConversationTitle: hit.title
+            )
+        }()
+
+        return HStack(spacing: 12) {
+            Group {
+                if hit.kind == .team {
+                    ChatInboxFanTeamConversationAvatar(
+                        teamId: FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                            forConversationId: hit.conversationId
+                        ),
+                        conversationId: hit.conversationId,
+                        size: 48,
+                        languageCode: lang
+                    )
+                } else if hit.kind == .pickup {
+                    ChatInboxPickupConversationAvatar(size: 48)
+                } else {
+                    ZStack {
+                        Circle()
+                            .fill(FGColor.cardBackground(colorScheme))
+                            .frame(width: 48, height: 48)
+                        Image(systemName: hit.kind == .group ? "person.3.fill" : "person.fill")
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                }
             }
             VStack(alignment: .leading, spacing: 2) {
-                Text(hit.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(resolvedTitle)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .lineLimit(1)
+                    if hit.kind == .team {
+                        ChatInboxConversationTypeBadge(kind: .teamChat, languageCode: lang)
+                    }
+                }
                 if !hit.subtitle.isEmpty {
                     Text(hit.subtitle)
                         .font(.caption)
@@ -1873,9 +1995,21 @@ struct FriendsTabView: View {
                     .background(Capsule().fill(FGColor.accentGreen))
             }
         }
-        .padding(.vertical, 4)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .fanTeamIdentityCardChrome(
+            colorHex: teamColorHex,
+            colorScheme: colorScheme,
+            cornerRadius: 16,
+            baseOpacityDark: 0.72,
+            baseOpacityLight: 0.96
+        )
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(hit.title)
+        .accessibilityLabel(
+            hit.kind == .team
+                ? "\(resolvedTitle), \(L10n.t("chat_inbox_a11y_team_conversation", languageCode: lang))"
+                : resolvedTitle
+        )
     }
 
     private func openGlobalSearchConversation(_ hit: ChatGlobalSearchConversationHit) {
@@ -1895,9 +2029,13 @@ struct FriendsTabView: View {
             viewModel.pendingOpenHighlightMessageId = nil
             if let friend = matchedFriend {
                 if friend.isGroupConversation {
+                    let cid = friend.conversationId ?? friend.id
                     dmNavigationRoute = nil
                     groupNavigationRoute = GroupChatNavRoute(
-                        conversationId: friend.conversationId ?? friend.id
+                        conversationId: cid,
+                        fanTeamContext: FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                            forConversationId: cid
+                        )
                     )
                 } else {
                     groupNavigationRoute = nil
@@ -1906,9 +2044,14 @@ struct FriendsTabView: View {
                 return
             }
             switch kind {
-            case .group, .pickup:
+            case .group, .team, .pickup:
                 dmNavigationRoute = nil
-                groupNavigationRoute = GroupChatNavRoute(conversationId: conversationId)
+                groupNavigationRoute = GroupChatNavRoute(
+                    conversationId: conversationId,
+                    fanTeamContext: FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                        forConversationId: conversationId
+                    )
+                )
             case .direct, .business:
                 guard let peer = peerUserId else { return }
                 let username = subtitle.hasPrefix("@") ? String(subtitle.dropFirst()) : nil
@@ -1944,9 +2087,13 @@ struct FriendsTabView: View {
             viewModel.pendingOpenHighlightMessageId = messageId
             if let friend = matchedFriend {
                 if friend.isGroupConversation {
+                    let cid = friend.conversationId ?? friend.id
                     dmNavigationRoute = nil
                     groupNavigationRoute = GroupChatNavRoute(
-                        conversationId: friend.conversationId ?? friend.id
+                        conversationId: cid,
+                        fanTeamContext: FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                            forConversationId: cid
+                        )
                     )
                 } else {
                     groupNavigationRoute = nil
@@ -1955,9 +2102,14 @@ struct FriendsTabView: View {
                 return
             }
             switch kind {
-            case .group, .pickup:
+            case .group, .team, .pickup:
                 dmNavigationRoute = nil
-                groupNavigationRoute = GroupChatNavRoute(conversationId: conversationId)
+                groupNavigationRoute = GroupChatNavRoute(
+                    conversationId: conversationId,
+                    fanTeamContext: FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                        forConversationId: conversationId
+                    )
+                )
             case .direct, .business:
                 guard let peer = peerUserId else { return }
                 groupNavigationRoute = nil
@@ -2613,7 +2765,13 @@ struct FriendsTabView: View {
             isGlobalSearchModeActive || isGlobalSearchFocused || !globalSearch.query.isEmpty
         if friend.isGroupConversation {
             let conversationId = friend.conversationId ?? friend.id
-            let route = GroupChatNavRoute(conversationId: conversationId)
+            let fanTeamContext = FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                forConversationId: conversationId
+            )
+            let route = GroupChatNavRoute(
+                conversationId: conversationId,
+                fanTeamContext: fanTeamContext
+            )
 #if DEBUG
             print("[ChatNav] rowTap.routePrepared kind=group")
 #endif
@@ -2701,9 +2859,17 @@ struct FriendsTabView: View {
         conversationId: UUID,
         reason: String,
         force: Bool = false,
+        fanTeamContext: FanTeamChatContext? = nil,
         onPublished: (() -> Void)? = nil
     ) {
-        let route = GroupChatNavRoute(conversationId: conversationId)
+        let resolvedContext = fanTeamContext
+            ?? FanTeamIdentityRealtimeCoordinator.shared.fanTeamChatContext(
+                forConversationId: conversationId
+            )
+        let route = GroupChatNavRoute(
+            conversationId: conversationId,
+            fanTeamContext: resolvedContext
+        )
 #if DEBUG
         print("[ChatNav] rowTap.routePrepared kind=group reason=\(reason)")
 #endif
@@ -3073,6 +3239,7 @@ private struct ChatInboxPickupConversationAvatar: View {
 private struct ChatInboxConversationTypeBadge: View {
     enum Kind {
         case group
+        case teamChat
         case pickup
         case watchSpot
     }
@@ -3092,6 +3259,7 @@ private struct ChatInboxConversationTypeBadge: View {
             Text(label)
                 .font(.system(size: fontSize, weight: .semibold, design: .rounded))
                 .lineLimit(1)
+                .minimumScaleFactor(0.85)
         }
         .padding(.horizontal, horizontalPadding)
         .padding(.vertical, verticalPadding)
@@ -3103,6 +3271,7 @@ private struct ChatInboxConversationTypeBadge: View {
     private var systemImage: String {
         switch kind {
         case .group: return "person.2.fill"
+        case .teamChat: return "shield.fill"
         case .pickup: return "figure.run"
         case .watchSpot: return "building.2.fill"
         }
@@ -3113,6 +3282,8 @@ private struct ChatInboxConversationTypeBadge: View {
         case .group, .pickup:
             // Pickup group chats keep the existing "Group" wording; color carries type identity.
             return L10n.t("chat_inbox_badge_group", languageCode: languageCode)
+        case .teamChat:
+            return L10n.t("chat_inbox_badge_team_chat", languageCode: languageCode)
         case .watchSpot:
             return L10n.t("chat_inbox_badge_watch_spot", languageCode: languageCode)
         }
@@ -3121,6 +3292,7 @@ private struct ChatInboxConversationTypeBadge: View {
     private var accent: Color {
         switch kind {
         case .group: return FGColor.accentBlue
+        case .teamChat: return FGColor.accentBlue
         case .pickup: return FGColor.intentPlay
         case .watchSpot: return FGColor.accentGreen
         }
@@ -3165,6 +3337,9 @@ private struct ChatFriendInboxRow: View {
         if item.isPickupGameChat {
             return .pickup
         }
+        if ChatInboxFanTeamRowIdentity.showsTeamChatBadge(isFanTeamChat: item.isFanTeamChat) {
+            return .teamChat
+        }
         switch item.inboxKind {
         case .direct:
             return nil
@@ -3175,9 +3350,28 @@ private struct ChatFriendInboxRow: View {
         }
     }
 
+    /// Team name from identity cache when available; otherwise the inbox preview title.
+    private var conversationTitle: String {
+        if item.isFanTeamChat {
+            let conversationId = item.conversationId ?? item.id
+            let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+                teamId: item.fanTeamId,
+                conversationId: conversationId
+            )?.name
+            return ChatInboxFanTeamRowIdentity.preferredTitle(
+                teamName: teamName,
+                fallbackConversationTitle: item.preview.displayName
+            )
+        }
+        return item.preview.displayName
+    }
+
     private var conversationTypeAccessibilityPhrase: String {
         if item.isPickupGameChat {
             return "Pickup game"
+        }
+        if item.isFanTeamChat {
+            return L10n.t("chat_inbox_a11y_team_conversation", languageCode: languageCode)
         }
         switch item.inboxKind {
         case .direct:
@@ -3194,7 +3388,7 @@ private struct ChatFriendInboxRow: View {
             String(
                 format: L10n.t("chat_inbox_a11y_open_conversation_format", languageCode: languageCode),
                 locale: Locale(identifier: languageCode),
-                item.preview.displayName
+                conversationTitle
             ),
             conversationTypeAccessibilityPhrase
         ]
@@ -3228,7 +3422,7 @@ private struct ChatFriendInboxRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .center, spacing: 6) {
                     Button(action: onOpenConversation) {
-                        Text(item.preview.displayName)
+                        Text(conversationTitle)
                             .font(.subheadline.weight(isUnread ? .semibold : .medium))
                             .foregroundStyle(FGColor.primaryText(colorScheme))
                             .lineLimit(1)
@@ -3328,8 +3522,14 @@ private struct ChatFriendInboxRow: View {
         .padding(.horizontal, ChatInboxRowMetrics.rowPadding)
         .padding(.vertical, ChatInboxRowMetrics.rowVerticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(rowBackground)
+        .background { inboxRowBackground }
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay {
+            if let teamStroke = fanTeamRowStroke {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(teamStroke, lineWidth: 1)
+            }
+        }
         .overlay(alignment: .leading) {
             if isUnread {
                 Capsule()
@@ -3392,11 +3592,35 @@ private struct ChatFriendInboxRow: View {
         }
     }
 
-    private var rowBackground: Color {
-        if isUnread {
-            return FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.10)
+    private var fanTeamColorHex: String? {
+        guard item.isFanTeamChat else { return nil }
+        if let teamId = item.fanTeamId {
+            return FanTeamIdentityRealtimeCoordinator.shared.colorHex(forTeamId: teamId)
         }
-        return FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96)
+        let conversationId = item.conversationId ?? item.id
+        return FanTeamIdentityRealtimeCoordinator.shared.colorHex(forConversationId: conversationId)
+    }
+
+    private var fanTeamRowStroke: Color? {
+        guard !isUnread,
+              let accent = FanTeamColorTheme.accentColor(colorHex: fanTeamColorHex, colorScheme: colorScheme)
+        else { return nil }
+        return accent.opacity(FanTeamColorTheme.strokeOpacity(for: colorScheme))
+    }
+
+    @ViewBuilder
+    private var inboxRowBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+        if isUnread {
+            shape.fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.10))
+        } else if let accent = FanTeamColorTheme.accentColor(colorHex: fanTeamColorHex, colorScheme: colorScheme) {
+            ZStack {
+                shape.fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96))
+                shape.fill(accent.opacity(FanTeamColorTheme.tintOpacity(for: colorScheme)))
+            }
+        } else {
+            shape.fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 0.96))
+        }
     }
 
     @ViewBuilder
@@ -3405,6 +3629,14 @@ private struct ChatFriendInboxRow: View {
 
         if item.isPickupGameChat {
             ChatInboxPickupConversationAvatar(size: avatarSize)
+        } else if item.isFanTeamChat {
+            // Team logo / sport-color mark — never member stack or generic group icon.
+            ChatInboxFanTeamConversationAvatar(
+                teamId: item.fanTeamId,
+                conversationId: item.conversationId ?? item.id,
+                size: avatarSize,
+                languageCode: languageCode
+            )
         } else if item.isGroupConversation {
             GroupInboxMemberAvatarCluster(
                 memberIds: groupAvatarMemberIds,
@@ -3895,6 +4127,10 @@ private struct FriendsTabLifecycleModifier: ViewModifier {
                 onPendingDmOpen()
             }
             .onChange(of: viewModel.pendingOpenFriendRequestsSection) { _, open in
+                guard open else { return }
+                onPendingDmOpen()
+            }
+            .onChange(of: viewModel.pendingOpenMyTeamsInvitations) { _, open in
                 guard open else { return }
                 onPendingDmOpen()
             }

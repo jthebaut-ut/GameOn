@@ -71,6 +71,9 @@ final class ChatViewModel: ObservableObject {
         let isGroupMuted: Bool
         /// When set, this group inbox row is a pickup-game private chat.
         let pickupGameId: UUID?
+        /// When set, this group inbox row is an official Fan Team chat (`fan_teams.group_conversation_id`).
+        /// Sourced from already-loaded Team membership snapshots — no extra inbox RPC.
+        let fanTeamId: UUID?
 
         init(
             id: UUID,
@@ -83,7 +86,8 @@ final class ChatViewModel: ObservableObject {
             inboxKind: ChatInboxConversationKind = .direct,
             groupMemberCount: Int = 0,
             isGroupMuted: Bool = false,
-                pickupGameId: UUID? = nil
+            pickupGameId: UUID? = nil,
+            fanTeamId: UUID? = nil
         ) {
             self.id = id
             self.preview = preview
@@ -96,10 +100,12 @@ final class ChatViewModel: ObservableObject {
             self.groupMemberCount = groupMemberCount
             self.isGroupMuted = isGroupMuted
             self.pickupGameId = pickupGameId
+            self.fanTeamId = fanTeamId
         }
 
         var isGroupConversation: Bool { inboxKind == .group }
         var isPickupGameChat: Bool { pickupGameId != nil }
+        var isFanTeamChat: Bool { fanTeamId != nil && !isPickupGameChat }
     }
 
     struct IncomingRequestDisplay: Identifiable, Hashable {
@@ -135,6 +141,14 @@ final class ChatViewModel: ObservableObject {
             tabBadgeState.setPendingBadgeCount(pendingBadgeCount)
         }
     }
+    /// Chat → My Teams segment badge: pending Team invitations addressed to **me**
+    /// (`list_my_pending_fan_team_invitations`). Distinct from manager Team-card
+    /// `pendingInvitationCount` (invites I sent).
+    @Published private(set) var pendingFanTeamInvitationCount: Int = 0 {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "myTeamsInvitationBadge")
+        }
+    }
     /// Unread peer DMs for the signed-in user (MainTabView private chat tab badge + ``AppIconBadgeSync``). Server source: inbox RPC unread totals / `get_dm_unread_total`; not friend-request counts.
     @Published private(set) var unreadDirectMessageCount: Int = 0 {
         didSet {
@@ -153,6 +167,8 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var pendingDirectMessageNotificationDeepLink: DirectMessageNotificationDeepLinkRequest?
     /// Cold-start / background APNs friend-request tap waiting for auth + Chat shell readiness.
     @Published private(set) var pendingFriendRequestNotificationDeepLink: FriendRequestNotificationDeepLinkRequest?
+    /// Cold-start / background APNs Fan Team invitation tap waiting for auth + Chat shell readiness.
+    @Published private(set) var pendingFanTeamInvitationNotificationDeepLink: FanTeamInvitationNotificationDeepLinkRequest?
     /// Cold-start / background APNs unified chat_message tap waiting for auth + Chat shell readiness.
     @Published private(set) var pendingChatMessageNotificationDeepLink: ChatMessageNotificationDeepLinkRequest?
     /// When true, ``MainTabView`` selects Chat and ``FriendsTabView`` selects Requests.
@@ -162,6 +178,15 @@ final class ChatViewModel: ObservableObject {
             mainTabState.setPendingOpenFriendRequestsSection(pendingOpenFriendRequestsSection)
         }
     }
+    /// When true, ``MainTabView`` selects Chat and ``FriendsTabView`` selects My Teams (invitations).
+    @Published var pendingOpenMyTeamsInvitations: Bool = false {
+        didSet {
+            MainTabObservationPerf.chatPublished(category: "deepLink")
+            mainTabState.setPendingOpenMyTeamsInvitations(pendingOpenMyTeamsInvitations)
+        }
+    }
+    /// Optional invitation id to highlight after opening My Teams from a Team invitation push.
+    @Published var pendingHighlightFanTeamInvitationId: UUID?
     /// Optional message id to scroll/highlight after opening a DM or group from global search.
     @Published var pendingOpenHighlightMessageId: UUID?
     /// Newly created venue-scoped DM threads that should show the one-time intro banner.
@@ -372,6 +397,12 @@ final class ChatViewModel: ObservableObject {
     /// Debounces ``ensureSignedInSocialRealtimeIfNeeded()`` after app foreground to avoid reconnect storms.
     private var socialRealtimeForegroundTask: Task<Void, Never>?
     private var fanProfileAvatarChangeObserver: NSObjectProtocol?
+    private var fanTeamIdentityInboxObserver: NSObjectProtocol?
+    private var fanTeamMembershipInboxObserver: NSObjectProtocol?
+    private var fanTeamInvitationBadgeObserver: NSObjectProtocol?
+    private var fanTeamDeletedBadgeObserver: NSObjectProtocol?
+    private var pendingFanTeamInvitationCountRefreshTask: Task<Void, Never>?
+    private var lastPendingFanTeamInvitationCountRefreshAt: Date?
     private var ensureSocialRealtimeInFlightTask: Task<Void, Never>?
     private var fullRefreshInFlightTask: Task<Void, Never>?
     private var lastSocialRealtimeEnsureAt: Date?
@@ -438,6 +469,7 @@ final class ChatViewModel: ObservableObject {
 #endif
         deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "auth:\(source)")
         deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "auth:\(source)")
+        deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: "auth:\(source)")
         deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "auth:\(source)")
     }
 
@@ -468,6 +500,7 @@ final class ChatViewModel: ObservableObject {
         if newAuthId != nil {
             deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
             deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
+            deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
             deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "accountChange:\(reason)")
         }
     }
@@ -477,6 +510,7 @@ final class ChatViewModel: ObservableObject {
         incomingRequests = []
         outgoingRequests = []
         pendingBadgeCount = 0
+        pendingFanTeamInvitationCount = 0
         unreadDirectMessageCount = 0
         pendingGroupInvitations = []
         pendingGroupInvitationPreviews = [:]
@@ -528,8 +562,11 @@ final class ChatViewModel: ObservableObject {
         if nextAuthId == nil {
             pendingDirectMessageNotificationDeepLink = nil
             pendingFriendRequestNotificationDeepLink = nil
+            pendingFanTeamInvitationNotificationDeepLink = nil
             pendingChatMessageNotificationDeepLink = nil
             pendingOpenFriendRequestsSection = false
+            pendingOpenMyTeamsInvitations = false
+            pendingHighlightFanTeamInvitationId = nil
         }
         dmInAppNotification = nil
         activeVisibleConversationId = nil
@@ -581,6 +618,25 @@ final class ChatViewModel: ObservableObject {
         friendshipsRealtimeBoundUserId = nil
         chatPresenceChannel = nil
 
+        if let fanTeamIdentityInboxObserver {
+            NotificationCenter.default.removeObserver(fanTeamIdentityInboxObserver)
+            self.fanTeamIdentityInboxObserver = nil
+        }
+        if let fanTeamMembershipInboxObserver {
+            NotificationCenter.default.removeObserver(fanTeamMembershipInboxObserver)
+            self.fanTeamMembershipInboxObserver = nil
+        }
+        if let fanTeamInvitationBadgeObserver {
+            NotificationCenter.default.removeObserver(fanTeamInvitationBadgeObserver)
+            self.fanTeamInvitationBadgeObserver = nil
+        }
+        if let fanTeamDeletedBadgeObserver {
+            NotificationCenter.default.removeObserver(fanTeamDeletedBadgeObserver)
+            self.fanTeamDeletedBadgeObserver = nil
+        }
+        pendingFanTeamInvitationCountRefreshTask?.cancel()
+        pendingFanTeamInvitationCountRefreshTask = nil
+        lastPendingFanTeamInvitationCountRefreshAt = nil
         Task {
             if let inboxChannel {
                 await supabase.removeChannel(inboxChannel)
@@ -591,6 +647,7 @@ final class ChatViewModel: ObservableObject {
             if let presenceChannel {
                 await supabase.removeChannel(presenceChannel)
             }
+            await FanTeamIdentityRealtimeCoordinator.shared.stop()
             await AppIconBadgeSync.apply(count: 0)
         }
 #if DEBUG
@@ -680,6 +737,21 @@ final class ChatViewModel: ObservableObject {
         startInboxRealtimeListenerIfNeeded()
         startFriendshipsRealtimeListenerIfNeeded()
         syncChatPresenceRealtimeIfNeeded(reason: "ensureSignedInSocialRealtime")
+        let teamIdentityUserId: UUID?
+        if let existing = currentUserAuthId {
+            teamIdentityUserId = existing
+        } else {
+            teamIdentityUserId = try? await service.currentUserId()
+        }
+        if let teamIdentityUserId {
+            currentUserAuthId = teamIdentityUserId
+            await FanTeamIdentityRealtimeCoordinator.shared.startIfNeeded(userId: teamIdentityUserId)
+            installFanTeamIdentityInboxObserverIfNeeded()
+            installFanTeamMembershipInboxObserverIfNeeded()
+            syncFanTeamClassificationOnGroupInbox()
+            installFanTeamInvitationBadgeObserversIfNeeded()
+            await refreshPendingFanTeamInvitationCount(force: true)
+        }
         lastSocialRealtimeEnsureAt = Date()
     }
 
@@ -696,6 +768,8 @@ final class ChatViewModel: ObservableObject {
 #if DEBUG
             print("[RealtimeLifecycle] foreground debounced ensure")
 #endif
+            FanTeamIdentityRealtimeCoordinator.shared.handleSceneBecameActive()
+            await self.refreshPendingFanTeamInvitationCount(force: true)
             if let last = self.lastSocialRealtimeEnsureAt,
                Date().timeIntervalSince(last) < Self.socialRealtimeForegroundSkipInterval {
                 AppPerfDebug.realtimeRestarted(false, source: "foregroundSkippedRecentEnsure")
@@ -947,7 +1021,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: display.inboxKind,
                 groupMemberCount: display.groupMemberCount,
                 isGroupMuted: display.isGroupMuted,
-                pickupGameId: display.pickupGameId
+                pickupGameId: display.pickupGameId,
+                fanTeamId: display.fanTeamId
             )
         }
         if friendsChanged {
@@ -1013,7 +1088,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: display.inboxKind,
                 groupMemberCount: display.groupMemberCount,
                 isGroupMuted: display.isGroupMuted,
-                pickupGameId: display.pickupGameId
+                pickupGameId: display.pickupGameId,
+                fanTeamId: display.fanTeamId
             )
         }
         if changed {
@@ -1324,9 +1400,11 @@ final class ChatViewModel: ObservableObject {
         pendingDirectMessageNotificationDeepLink != nil
             || pendingChatMessageNotificationDeepLink != nil
             || pendingFriendRequestNotificationDeepLink != nil
+            || pendingFanTeamInvitationNotificationDeepLink != nil
             || pendingDmOpenPreview != nil
             || pendingGroupOpenConversationId != nil
             || pendingOpenFriendRequestsSection
+            || pendingOpenMyTeamsInvitations
     }
 
     /// Remote APNs DM tap: open Chat tab + exact conversation (waits for auth when needed).
@@ -1338,11 +1416,14 @@ final class ChatViewModel: ObservableObject {
             "senderId=\(request.senderID.uuidString.lowercased())"
         )
 #endif
-        // Newer tap wins; supersede group/friend-request UI pending so DM is not starved.
+        // Newer tap wins; supersede group/friend-request/team-invite UI pending so DM is not starved.
         pendingChatMessageNotificationDeepLink = nil
         pendingFriendRequestNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
         pendingGroupOpenConversationId = nil
         pendingOpenFriendRequestsSection = false
+        pendingOpenMyTeamsInvitations = false
+        pendingHighlightFanTeamInvitationId = nil
         pendingDirectMessageNotificationDeepLink = request
         deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: "enqueue")
     }
@@ -1434,8 +1515,11 @@ final class ChatViewModel: ObservableObject {
         // Friend-request taps must not be overridden by a stale DM/group open.
         pendingDirectMessageNotificationDeepLink = nil
         pendingChatMessageNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
         pendingDmOpenPreview = nil
         pendingGroupOpenConversationId = nil
+        pendingOpenMyTeamsInvitations = false
+        pendingHighlightFanTeamInvitationId = nil
         pendingFriendRequestNotificationDeepLink = request
         deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: "enqueue")
     }
@@ -1480,6 +1564,102 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
+    /// Remote APNs Fan Team invitation tap: open Chat → My Teams after auth is ready.
+    func enqueueFanTeamInvitationNotificationDeepLink(_ request: FanTeamInvitationNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "team_invitation", conversation: nil)
+        print(
+            "[FanTeamInvitationPushRoute] enqueue invitationId=\(request.invitationID?.uuidString.lowercased() ?? "nil") " +
+            "teamId=\(request.teamID?.uuidString.lowercased() ?? "nil") " +
+            "invitedBy=\(request.invitedByUserID?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingChatMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
+        pendingOpenFriendRequestsSection = false
+        pendingFanTeamInvitationNotificationDeepLink = request
+        deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: "enqueue")
+    }
+
+    func deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: String) {
+        guard let request = pendingFanTeamInvitationNotificationDeepLink else { return }
+        guard currentUserAuthId != nil else {
+#if DEBUG
+            PushDeepLinkLog.waiting(reason: "auth")
+            print("[FanTeamInvitationPushRoute] defer until auth reason=\(reason)")
+#endif
+            return
+        }
+        // Never open My Teams invitations as the inviter on their own device.
+        if let invitedBy = request.invitedByUserID, currentUserAuthId == invitedBy {
+#if DEBUG
+            print("[FanTeamInvitationPushRoute] ignore: current user is inviter")
+#endif
+            pendingFanTeamInvitationNotificationDeepLink = nil
+            pendingHighlightFanTeamInvitationId = nil
+            return
+        }
+
+        if let invitationID = request.invitationID {
+            pendingHighlightFanTeamInvitationId = invitationID
+        }
+
+        if !pendingOpenMyTeamsInvitations {
+#if DEBUG
+            PushDeepLinkLog.queued(type: "team_invitation", conversation: nil)
+            print("[FanTeamInvitationPushRoute] deliver pendingOpenMyTeamsInvitations reason=\(reason)")
+#endif
+            pendingOpenMyTeamsInvitations = true
+        }
+        Task { await refreshPendingFanTeamInvitationCount(force: true) }
+    }
+
+    func acknowledgeFanTeamInvitationPushDeepLinkOpened() {
+        pendingFanTeamInvitationNotificationDeepLink = nil
+        pendingOpenMyTeamsInvitations = false
+        // Keep `pendingHighlightFanTeamInvitationId` until My Teams consumes it.
+#if DEBUG
+        PushDeepLinkLog.completed(conversation: nil, kind: "team_invitation")
+#endif
+    }
+
+    /// Returns and clears the invitation id to highlight in My Teams (fail-soft if already gone).
+    func consumePendingHighlightFanTeamInvitationId() -> UUID? {
+        let id = pendingHighlightFanTeamInvitationId
+        pendingHighlightFanTeamInvitationId = nil
+        return id
+    }
+
+    /// Remote APNs Team-deleted tap: open Chat → My Teams (never a dead Team Detail).
+    func enqueueFanTeamDeletedNotificationDeepLink(_ request: FanTeamDeletedNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "team_deleted", conversation: nil)
+        print(
+            "[FanTeamDeletedPushRoute] enqueue teamId=\(request.teamID?.uuidString.lowercased() ?? "nil") " +
+            "eventId=\(request.eventID?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingChatMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
+        pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
+        pendingOpenFriendRequestsSection = false
+        pendingHighlightFanTeamInvitationId = nil
+        // Reuse My Teams section open (no invitation highlight).
+        if !pendingOpenMyTeamsInvitations {
+            pendingOpenMyTeamsInvitations = true
+        }
+#if DEBUG
+        PushDeepLinkLog.queued(type: "team_deleted", conversation: nil)
+#endif
+        _ = request
+    }
+
     /// Remote APNs unified chat_message tap: open Chat → exact DM or group/pickup conversation.
     func enqueueChatMessageNotificationDeepLink(_ request: ChatMessageNotificationDeepLinkRequest) {
 #if DEBUG
@@ -1491,7 +1671,10 @@ final class ChatViewModel: ObservableObject {
 #endif
         pendingDirectMessageNotificationDeepLink = nil
         pendingFriendRequestNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
         pendingOpenFriendRequestsSection = false
+        pendingOpenMyTeamsInvitations = false
+        pendingHighlightFanTeamInvitationId = nil
         pendingChatMessageNotificationDeepLink = request
         deliverPendingChatMessageNotificationDeepLinkIfReady(reason: "enqueue")
     }
@@ -2065,7 +2248,8 @@ final class ChatViewModel: ObservableObject {
             inboxKind: old.inboxKind,
             groupMemberCount: old.groupMemberCount,
             isGroupMuted: old.isGroupMuted,
-            pickupGameId: old.pickupGameId
+            pickupGameId: old.pickupGameId,
+            fanTeamId: old.fanTeamId
         )
         var next = friends
         next[idx] = updated
@@ -2216,7 +2400,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: old.inboxKind,
                 groupMemberCount: old.groupMemberCount,
                 isGroupMuted: old.isGroupMuted,
-                pickupGameId: old.pickupGameId
+                pickupGameId: old.pickupGameId,
+                fanTeamId: old.fanTeamId
             )
             var next = friends
             next[idx] = updated
@@ -2502,6 +2687,142 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
+    private func installFanTeamIdentityInboxObserverIfNeeded() {
+        guard fanTeamIdentityInboxObserver == nil else { return }
+        fanTeamIdentityInboxObserver = NotificationCenter.default.addObserver(
+            forName: FanTeamIdentityChangeCenter.identityDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { note in
+            guard let change = FanTeamIdentityChangeCenter.identityChange(from: note) else { return }
+            Task { @MainActor [weak self] in
+                self?.applyFanTeamIdentityChangeToGroupInbox(change)
+            }
+        }
+    }
+
+    private func installFanTeamMembershipInboxObserverIfNeeded() {
+        guard fanTeamMembershipInboxObserver == nil else { return }
+        fanTeamMembershipInboxObserver = NotificationCenter.default.addObserver(
+            forName: FanTeamIdentityRealtimeCoordinator.membershipSnapshotsDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.syncFanTeamClassificationOnGroupInbox()
+            }
+        }
+    }
+
+    /// Re-tags group inbox rows as Fan Team chats using already-loaded Team membership snapshots.
+    func syncFanTeamClassificationOnGroupInbox() {
+        var changed = false
+        let next = friends.map { row -> FriendDisplay in
+            guard row.inboxKind == .group, !row.isPickupGameChat else { return row }
+            let conversationId = row.conversationId ?? row.id
+            let teamId = FanTeamIdentityRealtimeCoordinator.shared.teamId(forConversationId: conversationId)
+            let teamTitle = Self.fanTeamInboxTitle(
+                teamId: teamId,
+                conversationId: conversationId,
+                fallback: row.preview.displayName
+            )
+            let titleChanged = teamId != nil && row.preview.displayName != teamTitle
+            guard row.fanTeamId != teamId || titleChanged else { return row }
+            changed = true
+            let preview: UserPreview = {
+                guard titleChanged else { return row.preview }
+                return row.preview.replacingDisplayName(teamTitle)
+            }()
+            return FriendDisplay(
+                id: row.id,
+                preview: preview,
+                subtitle: row.subtitle,
+                lastMessageAt: row.lastMessageAt,
+                unreadCount: row.unreadCount,
+                isConversationBacked: row.isConversationBacked,
+                conversationId: row.conversationId,
+                inboxKind: row.inboxKind,
+                groupMemberCount: row.groupMemberCount,
+                isGroupMuted: row.isGroupMuted,
+                pickupGameId: row.pickupGameId,
+                fanTeamId: teamId
+            )
+        }
+        if changed {
+            friends = next
+        }
+    }
+
+    /// Authoritative Team name for inbox rows (never inferred from title strings).
+    private static func fanTeamInboxTitle(
+        teamId: UUID?,
+        conversationId: UUID,
+        fallback: String
+    ) -> String {
+        let teamName = FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+            teamId: teamId,
+            conversationId: conversationId
+        )?.name
+        return ChatInboxFanTeamRowIdentity.preferredTitle(
+            teamName: teamName,
+            fallbackConversationTitle: fallback
+        )
+    }
+
+    private func installFanTeamInvitationBadgeObserversIfNeeded() {
+        if fanTeamInvitationBadgeObserver == nil {
+            fanTeamInvitationBadgeObserver = NotificationCenter.default.addObserver(
+                forName: .fanTeamInvitationPushArrivedInForeground,
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor [weak self] in
+                    await self?.refreshPendingFanTeamInvitationCount(force: true)
+                }
+            }
+        }
+        if fanTeamDeletedBadgeObserver == nil {
+            fanTeamDeletedBadgeObserver = NotificationCenter.default.addObserver(
+                forName: .fanTeamDeletedPushArrivedInForeground,
+                object: nil,
+                queue: .main
+            ) { _ in
+                Task { @MainActor [weak self] in
+                    await self?.refreshPendingFanTeamInvitationCount(force: true)
+                }
+            }
+        }
+    }
+
+    /// Updates group inbox Team identity (name + classification). Does not touch unread/history.
+    func applyFanTeamIdentityChangeToGroupInbox(_ change: FanTeamIdentityChange) {
+        guard let idx = friends.firstIndex(where: {
+            $0.isGroupConversation
+                && ($0.conversationId == change.conversationId || $0.id == change.conversationId)
+        }) else { return }
+        let existing = friends[idx]
+        let trimmed = change.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nextTitle = ChatInboxFanTeamRowIdentity.preferredTitle(
+            teamName: trimmed.isEmpty ? nil : trimmed,
+            fallbackConversationTitle: existing.preview.displayName
+        )
+        let preview = existing.preview.replacingDisplayName(nextTitle)
+        friends[idx] = FriendDisplay(
+            id: existing.id,
+            preview: preview,
+            subtitle: existing.subtitle,
+            lastMessageAt: existing.lastMessageAt,
+            unreadCount: existing.unreadCount,
+            isConversationBacked: existing.isConversationBacked,
+            conversationId: existing.conversationId,
+            inboxKind: existing.inboxKind,
+            groupMemberCount: existing.groupMemberCount,
+            isGroupMuted: existing.isGroupMuted,
+            pickupGameId: existing.pickupGameId,
+            fanTeamId: existing.fanTeamId ?? change.teamId
+        )
+    }
+
     /// Lightweight tab-intent preload: unread DM badge + pending request counts only (no inbox body reload).
     func prefetchTabIntentChatBadgeData() async {
         guard (try? await directChatService.currentUserId()) != nil else {
@@ -2510,7 +2831,48 @@ final class ChatViewModel: ObservableObject {
         }
         await refreshUnreadDirectMessageCount(force: true)
         await refreshFriendRequestListsOnly()
+        await refreshPendingFanTeamInvitationCount(force: true)
         noteChatTabIntentPreloadCompleted()
+    }
+
+    /// Apply in-memory My Teams invitation list length (accept/decline/local refresh).
+    func applyPendingFanTeamInvitationCount(_ count: Int) {
+        let next = max(0, count)
+        guard pendingFanTeamInvitationCount != next else { return }
+        pendingFanTeamInvitationCount = next
+#if DEBUG
+        print("[ChatMyTeamsBadge] apply count=\(next)")
+#endif
+    }
+
+    /// Authoritative refresh from `list_my_pending_fan_team_invitations` (invitee-only pending).
+    func refreshPendingFanTeamInvitationCount(force: Bool = false) async {
+        if let inFlight = pendingFanTeamInvitationCountRefreshTask {
+            await inFlight.value
+            if !force { return }
+        }
+        if !force,
+           let last = lastPendingFanTeamInvitationCountRefreshAt,
+           Date().timeIntervalSince(last) < 2 {
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let invitations = try await FanTeamsService().listMyPendingInvitations()
+                self.applyPendingFanTeamInvitationCount(invitations.count)
+                self.lastPendingFanTeamInvitationCountRefreshAt = Date()
+            } catch {
+#if DEBUG
+                print("[ChatMyTeamsBadge] refresh failed error=\(error.localizedDescription)")
+#endif
+            }
+        }
+        pendingFanTeamInvitationCountRefreshTask = task
+        await task.value
+        if pendingFanTeamInvitationCountRefreshTask == task {
+            pendingFanTeamInvitationCountRefreshTask = nil
+        }
     }
 
     func shouldSkipChatTabIntentPreload() -> Bool {
@@ -2814,7 +3176,8 @@ final class ChatViewModel: ObservableObject {
             inboxKind: existing.inboxKind,
             groupMemberCount: existing.groupMemberCount,
             isGroupMuted: isMuted,
-            pickupGameId: existing.pickupGameId
+            pickupGameId: existing.pickupGameId,
+            fanTeamId: existing.fanTeamId
         )
     }
 
@@ -3074,11 +3437,25 @@ final class ChatViewModel: ObservableObject {
 
     private func buildGroupInboxDisplays(from rows: [GroupInboxSummaryRow], me: UUID) -> [FriendDisplay] {
         let displays = rows.map { row -> FriendDisplay in
+            let fallbackTitle = row.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? L10n.t("group_chat_default_title")
+                : row.title
+            let fanTeamId: UUID? = {
+                guard row.pickup_game_id == nil else { return nil }
+                return FanTeamIdentityRealtimeCoordinator.shared.teamId(
+                    forConversationId: row.conversation_id
+                )
+            }()
+            let displayName = fanTeamId == nil
+                ? fallbackTitle
+                : Self.fanTeamInboxTitle(
+                    teamId: fanTeamId,
+                    conversationId: row.conversation_id,
+                    fallback: fallbackTitle
+                )
             let preview = UserPreview(
                 id: row.conversation_id,
-                displayName: row.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? L10n.t("group_chat_default_title")
-                    : row.title,
+                displayName: displayName,
                 username: nil,
                 email: nil,
                 avatarURL: nil,
@@ -3108,7 +3485,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: .group,
                 groupMemberCount: max(0, row.member_count),
                 isGroupMuted: row.is_muted == true,
-                pickupGameId: row.pickup_game_id
+                pickupGameId: row.pickup_game_id,
+                fanTeamId: fanTeamId
             )
         }
         return applyHiddenInboxPeerFilter(displays)
@@ -3568,7 +3946,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: old.inboxKind,
                 groupMemberCount: old.groupMemberCount,
                 isGroupMuted: old.isGroupMuted,
-                pickupGameId: old.pickupGameId
+                pickupGameId: old.pickupGameId,
+                fanTeamId: old.fanTeamId
             )
             var next = friends
             next[idx] = updated
@@ -5249,7 +5628,8 @@ final class ChatViewModel: ObservableObject {
                 inboxKind: existing.inboxKind,
                 groupMemberCount: existing.groupMemberCount,
                 isGroupMuted: existing.isGroupMuted,
-                pickupGameId: existing.pickupGameId
+                pickupGameId: existing.pickupGameId,
+                fanTeamId: existing.fanTeamId
             )
             return
         }
@@ -5266,7 +5646,8 @@ final class ChatViewModel: ObservableObject {
             inboxKind: existing.inboxKind,
             groupMemberCount: existing.groupMemberCount,
             isGroupMuted: existing.isGroupMuted,
-            pickupGameId: existing.pickupGameId
+            pickupGameId: existing.pickupGameId,
+            fanTeamId: existing.fanTeamId
         )
     }
 
@@ -5475,6 +5856,7 @@ final class ChatMainTabState: ObservableObject {
     @Published private(set) var pendingDmOpenPreview: UserPreview?
     @Published private(set) var pendingGroupOpenConversationId: UUID?
     @Published private(set) var pendingOpenFriendRequestsSection = false
+    @Published private(set) var pendingOpenMyTeamsInvitations = false
     @Published private(set) var dmInAppNotification: ChatViewModel.DmInAppNotificationPayload?
     /// True while FriendsTab has a DM or group conversation route. Shell hide is gated by active Chat tab.
     @Published private(set) var hidesFloatingTabBarForDirectChat = false
@@ -5494,6 +5876,12 @@ final class ChatMainTabState: ObservableObject {
     func setPendingOpenFriendRequestsSection(_ value: Bool) {
         guard pendingOpenFriendRequestsSection != value else { return }
         pendingOpenFriendRequestsSection = value
+        MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
+    }
+
+    func setPendingOpenMyTeamsInvitations(_ value: Bool) {
+        guard pendingOpenMyTeamsInvitations != value else { return }
+        pendingOpenMyTeamsInvitations = value
         MainTabObservationPerf.projectionPublished(scope: "routing", category: "deepLink")
     }
 

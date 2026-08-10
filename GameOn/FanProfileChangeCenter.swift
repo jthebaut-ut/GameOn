@@ -94,4 +94,24 @@ extension UserPreview {
             venueScopedThread: venueScopedThread
         )
     }
+
+    func replacingDisplayName(_ displayName: String) -> UserPreview {
+        UserPreview(
+            id: id,
+            displayName: displayName,
+            username: username,
+            email: email,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            isBusinessAccount: isBusinessAccount,
+            isDeleted: isDeleted,
+            lastSeenAtRaw: lastSeenAtRaw,
+            activityStatusVisible: activityStatusVisible,
+            dmConversationId: dmConversationId,
+            businessVenueId: businessVenueId,
+            businessVenueBusinessId: businessVenueBusinessId,
+            businessVenueBusinessName: businessVenueBusinessName,
+            venueScopedThread: venueScopedThread
+        )
+    }
 }

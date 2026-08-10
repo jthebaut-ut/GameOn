@@ -2,6 +2,10 @@ import Foundation
 
 /// Authoritative meaningful pickup-game field changes for Going activity, chat system
 /// messages, and edit push notifications. Ignores audit/sync-only noise.
+///
+/// Server push recipients (`list_pickup_game_change_push_tokens`, migration 20260946):
+/// approved joiners; Team-linked Maybe (`pending` RSVP); accepted/maybe invitees.
+/// Normal Pickup pending join requests are not notified. APNs copy is Edge-authoritative.
 nonisolated enum PickupGameMeaningfulChangeKind: String, CaseIterable, Sendable {
     case title
     case sport
@@ -198,6 +202,15 @@ nonisolated enum PickupGameMeaningfulChange {
             ? L10n.t("pickup_edit_fallback_title", languageCode: languageCode)
             : changes.title
         if changes.isCancellation {
+            let when = formattedStart(changes.afterStartRaw, languageCode: languageCode)
+            if !when.isEmpty {
+                return String(
+                    format: L10n.t("pickup_edit_push_cancelled_when_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    title,
+                    when
+                )
+            }
             return String(
                 format: L10n.t("pickup_edit_push_cancelled_format", languageCode: languageCode),
                 locale: Locale(identifier: languageCode),

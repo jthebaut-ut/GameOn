@@ -117,7 +117,8 @@ enum AdMobConfiguration {
         guard AdDiagnostics.enabled else { return false }
         switch (format, placement) {
         case ("banner", "discover.bottomStrip"),
-             ("native", "chat.inboxFeed"):
+             ("native", "chat.inboxFeed"),
+             ("native", "chat.myTeamsFeed"):
             return true
         default:
             return usesTestAds

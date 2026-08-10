@@ -17,6 +17,8 @@ struct MainTabView: View {
     let performsInitialBootstrap: Bool
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @SceneStorage("selectedMainTab") private var selectedTabStorage: String = AppTab.discover.rawValue
 
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
@@ -550,15 +552,15 @@ struct MainTabView: View {
         .onChange(of: viewModel.profileEditPresentationEvaluationKey) { _, _ in
             evaluateBlockingFanIdentitySetupPresentation(reason: "profilePresentationStateChanged")
         }
-        .onChange(of: chatMainTabState.pendingDmOpenPreview) { _, preview in
-            handlePendingDmOpenPreviewChange(preview)
-        }
-        .onChange(of: chatMainTabState.pendingGroupOpenConversationId) { _, groupId in
-            handlePendingGroupOpenConversationChange(groupId)
-        }
-        .onChange(of: chatMainTabState.pendingOpenFriendRequestsSection) { _, open in
-            handlePendingOpenFriendRequestsSectionChange(open)
-        }
+        .modifier(
+            MainTabChatPushRouteObservers(
+                chatMainTabState: chatMainTabState,
+                onPendingDmOpenPreview: handlePendingDmOpenPreviewChange,
+                onPendingGroupOpenConversation: handlePendingGroupOpenConversationChange,
+                onPendingOpenFriendRequestsSection: handlePendingOpenFriendRequestsSectionChange,
+                onPendingOpenMyTeamsInvitations: handlePendingOpenMyTeamsInvitationsChange
+            )
+        )
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
         }
@@ -1216,10 +1218,15 @@ struct MainTabView: View {
     private func reconcilePendingChatPushRoutesIfNeeded(reason: String) {
         chatViewModel.deliverPendingDirectMessageNotificationDeepLinkIfReady(reason: reason)
         chatViewModel.deliverPendingFriendRequestNotificationDeepLinkIfReady(reason: reason)
+        chatViewModel.deliverPendingFanTeamInvitationNotificationDeepLinkIfReady(reason: reason)
         chatViewModel.deliverPendingChatMessageNotificationDeepLinkIfReady(reason: reason)
 
         if chatMainTabState.pendingOpenFriendRequestsSection {
             handlePendingOpenFriendRequestsSectionChange(true)
+            return
+        }
+        if chatMainTabState.pendingOpenMyTeamsInvitations {
+            handlePendingOpenMyTeamsInvitationsChange(true)
             return
         }
         if let groupId = chatMainTabState.pendingGroupOpenConversationId {
@@ -1284,6 +1291,23 @@ struct MainTabView: View {
             }
             privateChatUnlockedForCurrentSelection = true
             selectTab(.chat, reason: "pendingOpenFriendRequestsSection")
+            updateDirectChatReadStateVisibility()
+        }
+    }
+
+    private func handlePendingOpenMyTeamsInvitationsChange(_ open: Bool) {
+        guard open else { return }
+#if DEBUG
+        PushDeepLinkLog.selectingChatTab(reason: "pendingOpenMyTeamsInvitations")
+#endif
+        if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
+            Task { await selectChatTabAfterDeviceAuth() }
+        } else {
+            if !requireDeviceAuthForPrivateChat {
+                print("[PrivateChatSecurityDebug] biometricPromptSkippedReason=settingDisabled")
+            }
+            privateChatUnlockedForCurrentSelection = true
+            selectTab(.chat, reason: "pendingOpenMyTeamsInvitations")
             updateDirectChatReadStateVisibility()
         }
     }
@@ -1594,65 +1618,86 @@ struct MainTabView: View {
 
     /// Independent overlay: does not participate in `DirectChatView` layout; hidden while Chat is
     /// selected and a conversation destination requires chrome hide (see ``hidesFloatingTabBarForActiveChatConversation``).
+    ///
+    /// Layout contract:
+    /// - Fill the shell ZStack proposal (same pattern as ``dmInAppNotificationBannerLayer``).
+    /// - Bottom-align the capsule to the **current** container safe area (no `Spacer`, no
+    ///   absolute Y / `UIScreen` math). After landscape→portrait, a non-expanding `VStack`+`Spacer`
+    ///   can receive an intrinsic-height proposal and appear mid-list; the fill frame prevents that.
+    /// - Ignore keyboard safe-area so a residual keyboard inset after dismiss/rotation cannot
+    ///   permanently park the bar above the home indicator. Conversation composers own keyboard
+    ///   avoidance; inbox Chat hides this bar while a thread is open.
     private var floatingTabBarChrome: some View {
         let _ = MainTabObservationPerf.floatingBarEvaluated(selectedTab: selectedTab.rawValue)
         let layout = FloatingTabBarLayout.resolve(barWidth: floatingTabBarWidth)
-        return VStack {
-            Spacer()
+        return HStack(spacing: layout.itemSpacing) {
+            tabButton(.discover, title: localized("discover"), icon: "map.fill", layout: layout)
 
-            HStack(spacing: layout.itemSpacing) {
-                tabButton(.discover, title: localized("discover"), icon: "map.fill", layout: layout)
+            tabButton(
+                .live,
+                title: localized("live"),
+                icon: "dot.radiowaves.left.and.right",
+                glow: FGColor.accentGreen,
+                layout: layout
+            )
 
-                tabButton(
-                    .live,
-                    title: localized("live"),
-                    icon: "dot.radiowaves.left.and.right",
-                    glow: FGColor.accentGreen,
-                    layout: layout
-                )
+            calendarTabButton(layout: layout)
 
-                calendarTabButton(layout: layout)
+            followingTabButton(layout: layout)
 
-                followingTabButton(layout: layout)
+            chatTabButton(layout: layout)
 
-                chatTabButton(layout: layout)
-
-                Button {
-                    handleTabBarTap(.account, reason: "accountTabButton")
-                } label: {
-                    accountTabAvatar(layout: layout)
-                }
-                .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
-                .layoutPriority(-1)
-                .fixedSize(horizontal: true, vertical: false)
-                .disabled(viewModel.isSafeLogoutBlockingUI)
+            Button {
+                handleTabBarTap(.account, reason: "accountTabButton")
+            } label: {
+                accountTabAvatar(layout: layout)
             }
-            .padding(.horizontal, layout.barHorizontalPadding)
-            .padding(.vertical, layout.barVerticalPadding)
-            .background {
-                ZStack {
-                    RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                    RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
-                        .fill(floatingTabBarTint)
-                }
-            }
-            .clipShape(RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
-                    .strokeBorder(floatingTabBarBorder, lineWidth: 1)
-            }
-            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.12), radius: colorScheme == .dark ? 18 : 10, y: 8)
-            .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.08 : 0.04), radius: 10, y: 2)
-            .padding(.horizontal, layout.screenHorizontalInset)
-            .padding(.bottom, layout.screenBottomInset)
+            .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+            .layoutPriority(-1)
+            .fixedSize(horizontal: true, vertical: false)
+            .disabled(viewModel.isSafeLogoutBlockingUI)
         }
-        // Available overlay width (not intrinsic capsule width) drives compact *label* metrics.
-        .onGeometryChange(for: CGFloat.self) { proxy in
-            proxy.size.width
-        } action: { newWidth in
-            guard abs(floatingTabBarWidth - newWidth) > 0.5 else { return }
-            floatingTabBarWidth = newWidth
+        .padding(.horizontal, layout.barHorizontalPadding)
+        .padding(.vertical, layout.barVerticalPadding)
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
+                    .fill(floatingTabBarTint)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: layout.barCornerRadius, style: .continuous)
+                .strokeBorder(floatingTabBarBorder, lineWidth: 1)
+        }
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.30 : 0.12), radius: colorScheme == .dark ? 18 : 10, y: 8)
+        .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.08 : 0.04), radius: 10, y: 2)
+        .padding(.horizontal, layout.screenHorizontalInset)
+        .padding(.bottom, layout.screenBottomInset)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        // Overlay width drives compact *label* metrics; height/safe-area logged in DEBUG only.
+        .onGeometryChange(for: FloatingTabBarGeometry.self) { proxy in
+            FloatingTabBarGeometry(
+                width: proxy.size.width,
+                height: proxy.size.height,
+                safeBottom: proxy.safeAreaInsets.bottom
+            )
+        } action: { geo in
+#if DEBUG
+            TabBarLayoutDebug.log(
+                geo,
+                selectedTab: selectedTab.rawValue,
+                barBottomPadding: layout.screenBottomInset,
+                horizontalSizeClass: horizontalSizeClass,
+                verticalSizeClass: verticalSizeClass,
+                scenePhase: scenePhase
+            )
+#endif
+            guard abs(floatingTabBarWidth - geo.width) > 0.5 else { return }
+            floatingTabBarWidth = geo.width
         }
         .allowsHitTesting(!viewModel.isSafeLogoutBlockingUI)
         .zIndex(2)
@@ -2391,6 +2436,51 @@ struct MainTabView: View {
     }
 }
 
+/// Geometry snapshot for the floating tab bar fill frame (current container, not UIScreen).
+/// `nonisolated` + `Sendable` so `onGeometryChange` transform can run off the main actor.
+private nonisolated struct FloatingTabBarGeometry: Equatable, Sendable {
+    var width: CGFloat
+    var height: CGFloat
+    var safeBottom: CGFloat
+}
+
+#if DEBUG
+private enum TabBarLayoutDebug {
+    private static var lastLogged: FloatingTabBarGeometry?
+
+    static func log(
+        _ geo: FloatingTabBarGeometry,
+        selectedTab: String,
+        barBottomPadding: CGFloat,
+        horizontalSizeClass: UserInterfaceSizeClass?,
+        verticalSizeClass: UserInterfaceSizeClass?,
+        scenePhase: ScenePhase
+    ) {
+        // Throttle identical frames so rotation/resume stays readable without spam.
+        if let lastLogged, lastLogged == geo { return }
+        lastLogged = geo
+        let hClass = horizontalSizeClass == .compact ? "compact" : (horizontalSizeClass == .regular ? "regular" : "nil")
+        let vClass = verticalSizeClass == .compact ? "compact" : (verticalSizeClass == .regular ? "regular" : "nil")
+        print(
+            "[TabBarLayout] w=\(Int(geo.width.rounded())) h=\(Int(geo.height.rounded())) safeAreaInsets.bottom=\(String(format: "%.1f", geo.safeBottom)) barBottomPad=\(Int(barBottomPadding)) hSize=\(hClass) vSize=\(vClass) scene=\(scenePhase) keyboardIgnored=true tab=\(selectedTab)"
+        )
+    }
+}
+
+enum FloatingTabBarLayoutSelfTests {
+    static func runAll() {
+        // Fill + bottom alignment must remain the positioning contract (no absolute Y).
+        assert(FloatingTabBarLayout.compact.screenBottomInset == 6)
+        assert(FloatingTabBarLayout.regular.screenBottomInset == 6)
+        assert(MainTabView.floatingTabBarStackHeight >= MainTabViewFloatingTabBarMetrics.overlayHeight)
+        let compact = FloatingTabBarLayout.resolve(barWidth: 390)
+        let regular = FloatingTabBarLayout.resolve(barWidth: 430)
+        assert(compact == .compact)
+        assert(regular == .regular)
+    }
+}
+#endif
+
 /// Width-driven metrics for the floating capsule tab bar (no device-name checks).
 ///
 /// Shared chrome sized to match Discover Watch/Play dock weight (stack 108, corner 28).
@@ -2469,6 +2559,31 @@ private struct FloatingTabBarLayout: Equatable {
         selectedHorizontalPadding: 12,
         selectedLabelMinimumScale: 0.9
     )
+}
+
+/// Isolates Chat push deep-link `onChange` observers so ``MainTabView`` body type-checks.
+private struct MainTabChatPushRouteObservers: ViewModifier {
+    @ObservedObject var chatMainTabState: ChatMainTabState
+    let onPendingDmOpenPreview: (UserPreview?) -> Void
+    let onPendingGroupOpenConversation: (UUID?) -> Void
+    let onPendingOpenFriendRequestsSection: (Bool) -> Void
+    let onPendingOpenMyTeamsInvitations: (Bool) -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: chatMainTabState.pendingDmOpenPreview) { _, preview in
+                onPendingDmOpenPreview(preview)
+            }
+            .onChange(of: chatMainTabState.pendingGroupOpenConversationId) { _, groupId in
+                onPendingGroupOpenConversation(groupId)
+            }
+            .onChange(of: chatMainTabState.pendingOpenFriendRequestsSection) { _, open in
+                onPendingOpenFriendRequestsSection(open)
+            }
+            .onChange(of: chatMainTabState.pendingOpenMyTeamsInvitations) { _, open in
+                onPendingOpenMyTeamsInvitations(open)
+            }
+    }
 }
 
 /// Shallow badge leaf: only this subtree observes unread/request/auth-gate changes.

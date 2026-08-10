@@ -44,6 +44,8 @@ struct PickupBulkImportPreparedRow: Identifiable, Equatable {
     let entryFeeAmount: Double?
     let coordinate: CLLocationCoordinate2D?
     let gameType: GameType
+    /// Optional CSV `competition_level` (nil when omitted / unspecified).
+    let competitionLevel: PickupCompetitionLevel?
     let leagueName: String?
     let homeTeam: String?
     let awayTeam: String?
@@ -95,16 +97,32 @@ enum PickupBulkImportValidator {
     }
 
     @MainActor
-    static func validate(rawRows: [PickupBulkImportRawRow], viewModel: MapViewModel) async -> [PickupBulkImportPreparedRow] {
+    static func validate(
+        rawRows: [PickupBulkImportRawRow],
+        viewModel: MapViewModel,
+        creationContext: PickupGameCreationContext? = nil
+    ) async -> [PickupBulkImportPreparedRow] {
+        // Resolve default on MainActor (same root cause as PickupBulkImportService).
+        let creationContext = creationContext ?? .standard
 #if DEBUG
-        print("[PickupBulkValidation] started rows=\(rawRows.count)")
+        print(
+            "[PickupBulkValidation] started rows=\(rawRows.count) " +
+            "teamSourced=\(creationContext.isTeamSourced)"
+        )
 #endif
         let duplicateKeys = duplicateRowKeys(rawRows)
         var output: [PickupBulkImportPreparedRow] = []
         output.reserveCapacity(rawRows.count)
 
         for raw in rawRows {
-            output.append(await validate(raw: raw, duplicateKeys: duplicateKeys, viewModel: viewModel))
+            output.append(
+                await validate(
+                    raw: raw,
+                    duplicateKeys: duplicateKeys,
+                    viewModel: viewModel,
+                    creationContext: creationContext
+                )
+            )
         }
 
 #if DEBUG
@@ -120,10 +138,12 @@ enum PickupBulkImportValidator {
     private static func validate(
         raw: PickupBulkImportRawRow,
         duplicateKeys: Set<String>,
-        viewModel: MapViewModel
+        viewModel: MapViewModel,
+        creationContext: PickupGameCreationContext
     ) async -> PickupBulkImportPreparedRow {
         var errors: [String] = []
         var warnings: [String] = []
+        let isTeamSourced = creationContext.isTeamSourced
 
         let title = raw.value("title")
         let sportRaw = raw.value("sport")
@@ -143,6 +163,7 @@ enum PickupBulkImportValidator {
         let isFreeRaw = raw.value("is_free")
         let entryFeeRaw = raw.value("entry_fee_amount")
         let gameFormatRaw = raw.value("game_format")
+        let competitionLevelRaw = raw.value("competition_level")
         let leagueName = raw.value("league_name")
         let homeTeam = raw.value("home_team")
         let awayTeam = raw.value("away_team")
@@ -150,23 +171,70 @@ enum PickupBulkImportValidator {
         let division = raw.value("division")
 
         appendMissing("title", title, to: &errors)
-        appendMissing("sport", sportRaw, to: &errors)
+        // Sport: normal requires CSV value; Team may omit and inherit Team sport.
         appendMissing("skill_level", skillRaw, to: &errors)
         appendMissing("game_start_at", startRaw, to: &errors)
         appendMissing("address", address, to: &errors)
         appendMissing("city", city, to: &errors)
         appendMissing("state", state, to: &errors)
-        appendMissing("players_needed", playersRaw, to: &errors)
+        if !isTeamSourced {
+            appendMissing("players_needed", playersRaw, to: &errors)
+        }
 
-        let sport = canonicalSport(from: sportRaw)
-        if sport == nil, !sportRaw.isEmpty {
+        let sportResolution = PickupBulkImportTeamRules.resolveSport(
+            csvSportRaw: sportRaw,
+            team: isTeamSourced ? creationContext.team : nil,
+            canonicalize: { canonicalSport(from: $0) }
+        )
+        if let sportError = sportResolution.error {
+            errors.append(sportError)
+        } else if sportResolution.sport == nil, !sportRaw.isEmpty {
             errors.append(invalidValueMessage(field: "sport", value: sportRaw, guidance: "Allowed sports: \(allowedSportLabels())."))
         }
+        let sport = sportResolution.sport
 
-        let gameFormat = canonicalGameFormat(from: gameFormatRaw)
-        if gameFormat == nil, !gameFormatRaw.isEmpty {
-            errors.append(invalidValueMessage(field: "game_format", value: gameFormatRaw, guidance: "Use: pickup, practice, or scrimmage."))
+        let parsedGameFormat = canonicalGameFormat(from: gameFormatRaw)
+        if parsedGameFormat == nil, !gameFormatRaw.isEmpty {
+            errors.append(
+                invalidValueMessage(
+                    field: "game_format",
+                    value: gameFormatRaw,
+                    guidance: PickupBulkImportTeamRules.gameFormatGuidance(isTeamSourced: isTeamSourced)
+                )
+            )
         }
+        let gameFormat = parsedGameFormat
+            ?? PickupBulkImportTeamRules.defaultGameFormat(isTeamSourced: isTeamSourced)
+        if let formatError = PickupBulkImportTeamRules.gameFormatErrorMessage(
+            for: gameFormat,
+            isTeamSourced: isTeamSourced
+        ) {
+            errors.append(formatError)
+        }
+
+        let parsedCompetitionLevel: PickupCompetitionLevel?
+        if competitionLevelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            parsedCompetitionLevel = nil
+        } else if let parsedLevel = PickupCompetitionLevel.parse(competitionLevelRaw) {
+            parsedCompetitionLevel = parsedLevel
+        } else {
+            parsedCompetitionLevel = nil
+            errors.append(
+                invalidValueMessage(
+                    field: "competition_level",
+                    value: competitionLevelRaw,
+                    guidance: "Use: youth, high_school, college_university, adult_recreational, adult_competitive, semi_pro, professional."
+                )
+            )
+        }
+        // Team CSV: omitted → Team default; explicit value → per-game override.
+        // Normal Pickup CSV: omitted → nil (unchanged).
+        let competitionLevel = PickupTeamCompetitionInheritance.resolveCSVLevel(
+            csvRaw: competitionLevelRaw,
+            parsed: parsedCompetitionLevel,
+            teamDefault: creationContext.team?.competitionLevel,
+            isTeamSourced: isTeamSourced
+        )
 
         let skillLevel = skillRaw.isEmpty ? PickupGameSkillLevel.casual.rawValue : canonicalSkillLevel(from: skillRaw)
         if skillLevel == nil {
@@ -195,12 +263,16 @@ enum PickupBulkImportValidator {
             errors.append("end_time must be after game_start_at.")
         }
 
-        let playersNeeded = Int(playersRaw)
-        if playersNeeded == nil, !playersRaw.isEmpty {
-            errors.append("players_needed must be numeric.")
-        } else if let playersNeeded, !(1...20).contains(playersNeeded) {
-            errors.append("players_needed must be between 1 and 20.")
+        // Team CSV: players_needed = additional outside players (not roster size).
+        let playersResolution = PickupBulkImportTeamRules.resolvePlayersNeeded(
+            csvPlayersNeeded: Int(playersRaw),
+            csvRaw: playersRaw,
+            isTeamSourced: isTeamSourced
+        )
+        if let playersError = playersResolution.error {
+            errors.append(playersError)
         }
+        let playersNeeded = playersResolution.playersNeeded
 
         var maxPlayers: Int?
         if maxPlayersRaw.isEmpty {
@@ -330,7 +402,8 @@ enum PickupBulkImportValidator {
             isFree: isFree ?? true,
             entryFeeAmount: entryFeeAmount,
             coordinate: coordinate,
-            gameType: gameFormat ?? .pickup,
+            gameType: gameFormat,
+            competitionLevel: competitionLevel,
             leagueName: leagueName.isEmpty ? nil : leagueName,
             homeTeam: homeTeam.isEmpty ? nil : homeTeam,
             awayTeam: awayTeam.isEmpty ? nil : awayTeam,
@@ -399,10 +472,14 @@ enum PickupBulkImportValidator {
     }
 
     private static func canonicalGameFormat(from raw: String) -> GameType? {
-        let normalized = normalizeToken(raw)
-        guard !normalized.isEmpty else { return .pickup }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Empty → nil so callers apply context default (normal=.pickup, Team=.league_game).
+        guard !trimmed.isEmpty else { return nil }
+        if let parsed = GameType.parse(trimmed) { return parsed }
+        let normalized = normalizeToken(trimmed)
         for type in GameType.allCases {
-            if normalizeToken(type.rawValue) == normalized || normalizeToken(type.displayTitle) == normalized {
+            if normalizeToken(type.rawValue) == normalized
+                || normalizeToken(type.displayTitle(languageCode: "en")) == normalized {
                 return type
             }
         }

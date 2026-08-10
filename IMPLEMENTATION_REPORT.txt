@@ -1,0 +1,156 @@
+IMPLEMENTATION REPORT — Create Team logo/photo selection
+Date: 2026-08-09
+Status: Complete (no SQL applied, no commit, no push)
+
+================================================================================
+1. Existing Edit Team logo path reused
+================================================================================
+
+Edit Team (`EditFanTeamSheet`) already owns the authoritative pipeline:
+
+- PhotosPicker → loadTransferable(Data) → local `pendingImageData` + `localPreviewImage`
+- Preview via `FanTeamMarkView` (local preview overrides remote URLs)
+- On Save only:
+  - `FanTeamsService.uploadTeamLogo(teamId:imageData:)`
+    - bucket: `fan-team-logos`
+    - path: `{team_id}/logo-{uuid}.jpg` + companion `_thumb.jpg`
+    - compression: `ImageCompression.jpegDataForUpload` presets `.avatar` / `.avatarThumbnail`
+  - `FanTeamsService.updateTeamIdentity` → RPC `update_fan_team_identity`
+    (`logo_url` / `logo_thumbnail_url`)
+  - `FanTeamIdentityChangeCenter.postIdentityChange`
+  - `DiscoverMapImageCache` warm for versioned display URLs
+  - best-effort Storage cleanup of replaced/removed objects via `MapViewModel`
+
+Create Team now reuses this exact upload + identity-update + cache/realtime path.
+No second bucket, path scheme, compression pipeline, or identity RPC.
+
+================================================================================
+2. Create Team UI changes
+================================================================================
+
+`CreateFanTeamSheet` (My Teams → Create Team):
+
+- Logo section at the top of the form
+- Live `FanTeamMarkView` (size 88) reacting to:
+  - selected local photo (priority)
+  - sport + Team color fallback mark when no photo
+- Controls:
+  - no photo → “Add Photo”
+  - photo selected → “Change Photo” + “Remove Photo”
+- Same visual language as Edit Team photo chrome
+- Logo remains optional (Create never requires a photo)
+
+Accessibility:
+- Preview: “Team logo”
+- Add / Change / Remove: “Add Team Photo” / “Change Team Photo” / “Remove Team Photo”
+- Edit Team a11y labels aligned to the same wording
+
+================================================================================
+3. Local pending-image behavior
+================================================================================
+
+- Picker selections stay in memory (`pendingImageData` / `localPreviewImage`)
+- Changing the photo before Create only replaces local state
+- Remove Photo clears local state; fallback mark returns
+- Nothing is uploaded until Create succeeds and `team_id` exists
+- Policy helper: `FanTeamCreateLogoPolicy.shouldUploadAfterCreate`
+
+================================================================================
+4. Create → upload → identity-update sequence
+================================================================================
+
+1. `create_fan_team` via `FanTeamsService.createTeam` (logo URLs always nil;
+   invitations + Team Chat created by existing RPC)
+2. If a final local image is still selected:
+   a. `uploadTeamLogo(teamId:imageData:)` → `fan-team-logos/{team_id}/…`
+   b. `updateTeamIdentity(... logoURL/logoThumbnailURL ...)`
+      with `updateCompetitionLevel: false` (competition already set at create)
+   c. post `FanTeamIdentityChange` when My Teams list can resolve conversation id
+   d. warm image cache for immediate marks
+3. Continue existing `onCreated` → My Teams refresh → open Team Detail
+
+Order preference honored: create Team → logo update → invitation processing already
+happened inside create RPC, then logo is attached ASAP for surfaces that refresh.
+
+================================================================================
+5. Failure semantics
+================================================================================
+
+- Create RPC fails → no upload attempted
+- Create succeeds, upload fails → Team kept; friendly warning:
+  “Team created, but the photo couldn’t be uploaded. You can add it later.”
+  Fallback sport/color mark used
+- Upload succeeds, identity update fails → best-effort delete of newly uploaded
+  full + thumb objects; same friendly warning; Team kept
+- Team is never deleted solely because logo attach failed
+
+================================================================================
+6. Storage path / security
+================================================================================
+
+Unchanged:
+- Bucket: `fan-team-logos`
+- Path: `{team_id}/logo-{uuid}.jpg` (+ `_thumb`)
+- Existing Storage RLS / Owner-Manager identity update RPC only
+- No public arbitrary upload path; no temporary global logo staging bucket
+
+================================================================================
+7. Cache / realtime behavior
+================================================================================
+
+After successful logo attach:
+- `FanTeamIdentityChangeCenter.postIdentityChange` (same as Edit)
+- My Teams / Detail / Chat listeners already apply identity changes
+- Versioned display URLs + `DiscoverMapImageCache` warm for immediate logo
+- Parent Create completion still refreshes My Teams so invitations / cards
+  pick up authoritative logo URLs
+
+================================================================================
+8. Files modified
+================================================================================
+
+- GameOn/MyTeamsChatViews.swift
+  (CreateFanTeamSheet logo UI + staged upload; FanTeamCreateLogoPolicy;
+   create info banner; mapViewModel wiring)
+- GameOn/EditFanTeamSheet.swift
+  (a11y labels aligned with Create)
+- GameOn/FanTeamsService.swift
+  (createTeam comment documents staged logo attach)
+- GameOn/FanTeamsSelfTests.swift
+  (create logo staging policy tests)
+- GameOn/Localizable.xcstrings
+  (add/change/remove a11y, Team logo a11y, upload-failure warning, footer copy)
+- IMPLEMENTATION_REPORT.txt (this file)
+
+================================================================================
+9. SQL / backend changes
+================================================================================
+
+NONE.
+
+Reused:
+- `create_fan_team`
+- Storage bucket `fan-team-logos`
+- `update_fan_team_identity`
+
+No backend blocker found for staged create → upload → identity update.
+
+================================================================================
+10. Tests
+================================================================================
+
+- `FanTeamCreateLogoPolicy` unit coverage in `FanTeamsSelfTests`
+  (no upload for nil/empty; upload only with non-empty local data;
+   Add vs Change title/a11y keys)
+- Manual matrix A–N remains the product verification checklist
+  (no-logo create, logo create, change-before-create, remove-before-create,
+   upload failure warning, invitations, My Teams/Detail/Chat marks,
+   later Edit replace/remove, cache, device/appearance)
+
+================================================================================
+11. xcodebuild result
+================================================================================
+
+BUILD SUCCEEDED
+
+BUILD SUCCEEDED
