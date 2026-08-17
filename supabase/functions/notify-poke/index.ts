@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { applyPushArtwork } from "../_shared/push_artwork.ts"
 import {
   authorizeSportsWorkerRequest,
   describeAuthCandidateClasses,
@@ -296,6 +297,7 @@ Deno.serve(async (req) => {
   if (senderIdentity.avatarURL) {
     customData.sender_avatar_url = senderIdentity.avatarURL
   }
+  applyPushArtwork(customData, senderIdentity.avatarURL, "user", pokerId)
 
   let sent = 0
   let invalidated = 0

@@ -31,6 +31,8 @@ struct PublicUserProfilePreviewView: View {
     @State private var showRemoveFriendConfirmation = false
     @State private var isBlockActionInFlight = false
     @State private var safetyActionBanner: String?
+    @State private var profileFanTeamDetail: FanTeamSummary?
+    @State private var selfPreviewFanTeamMemberships: [ProfileFanTeamMembership] = []
 
     private let profilePokesService = ProfilePokesService()
     private static let reportSubmittedBannerText = "Report submitted. FanGeo moderation will review it."
@@ -39,18 +41,31 @@ struct PublicUserProfilePreviewView: View {
         isSelfPreview || userId == viewModel.currentUserAuthId && viewModel.publicProfileIsSelfPreview
     }
 
-    /// Live My Team overlay for self-preview so national-fan sport labels never go stale.
+    /// Own public-profile preview is intentionally blocked while discovery is off.
+    private var showsSelfPreviewHiddenEmptyState: Bool {
+        viewingAsSelfPreview && !viewModel.currentUserDiscoverableByFans
+    }
+
+    /// Live Favorite Team overlay for self-preview so national-fan sport labels never go stale.
     private var presentationProfile: PublicUserProfileData? {
         guard let profile else { return nil }
         guard viewingAsSelfPreview else { return profile }
         let localTeams = FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
-        return profile.seededForSelfPreview(
+        var seeded = profile.seededForSelfPreview(
             homeCrowd: viewModel.currentUserHomeCrowdVenue,
             openToPreferences: viewModel.currentUserFanIdentityPreferences,
             primaryFavoriteTeamID: primaryFavoriteTeamIDRaw,
             favoriteTeams: localTeams,
             profileBackgroundKey: viewModel.currentUserProfileBackgroundKey
         )
+        // Owner always sees their Fan Teams on self-preview even before SQL lands / when only_me.
+        if seeded.fanTeamMemberships.isEmpty, !selfPreviewFanTeamMemberships.isEmpty {
+            seeded = seeded.replacingFanTeamMemberships(
+                selfPreviewFanTeamMemberships,
+                visibility: viewModel.currentUserMyTeamsProfileVisibility
+            )
+        }
+        return seeded
     }
 
     private var profileContentHorizontalPadding: CGFloat {
@@ -59,37 +74,47 @@ struct PublicUserProfilePreviewView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: PublicProfileSheetLayout.sectionSpacing) {
-                    if viewingAsSelfPreview {
-                        selfPreviewBanner
-                    }
-                    if isLoading, presentationProfile == nil {
-                        loadingSkeleton
-                    } else if let profile = presentationProfile {
-                        // Self-preview loader sets isPubliclyVisible; keep banner+content when projection loaded.
-                        if !profile.isPubliclyVisible {
-                            profileUnavailableState
-                        } else {
-                            if let identityLoadWarning {
-                                identityWarningBanner(identityLoadWarning)
+            Group {
+                if showsSelfPreviewHiddenEmptyState {
+                    selfPreviewHiddenEmptyState
+                } else {
+                    ScrollView {
+                        VStack(spacing: PublicProfileSheetLayout.sectionSpacing) {
+                            if viewingAsSelfPreview {
+                                selfPreviewBanner
                             }
-                            profileContent(profile)
+                            if isLoading, presentationProfile == nil {
+                                loadingSkeleton
+                            } else if let profile = presentationProfile {
+                                // Self-preview loader sets isPubliclyVisible; keep banner+content when projection loaded.
+                                if !profile.isPubliclyVisible {
+                                    profileUnavailableState
+                                } else {
+                                    if let identityLoadWarning {
+                                        identityWarningBanner(identityLoadWarning)
+                                    }
+                                    profileContent(profile)
+                                }
+                            } else {
+                                loadingSkeleton
+                            }
                         }
-                    } else {
-                        loadingSkeleton
+                        .padding(.horizontal, profileContentHorizontalPadding)
+                        .padding(.top, 4)
+                        .padding(.bottom, 16)
+                        .profileReadableContentWidth()
                     }
                 }
-                .padding(.horizontal, profileContentHorizontalPadding)
-                .padding(.top, 4)
-                .padding(.bottom, 16)
-                .profileReadableContentWidth()
             }
             .background(sheetBackground.ignoresSafeArea())
             .toolbarBackground(sheetBackgroundColor, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(colorScheme, for: .navigationBar)
-            .navigationTitle("Fan Profile")
+            .navigationTitle(
+                showsSelfPreviewHiddenEmptyState
+                    ? L10n.t("public_profile_hidden_title", languageCode: appLanguageRaw)
+                    : "Fan Profile"
+            )
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -99,8 +124,14 @@ struct PublicUserProfilePreviewView: View {
                                 ? L10n.t("public_profile_preview_done_hint", languageCode: appLanguageRaw)
                                 : ""
                         )
+                        .accessibilityLabel(
+                            showsSelfPreviewHiddenEmptyState
+                                ? L10n.t("public_profile_hidden_close_a11y", languageCode: appLanguageRaw)
+                                : L10n.t("done", languageCode: appLanguageRaw)
+                        )
                 }
-                if profile?.isPubliclyVisible == true,
+                if !showsSelfPreviewHiddenEmptyState,
+                   profile?.isPubliclyVisible == true,
                    !viewingAsSelfPreview,
                    (profile?.isDiscoverableByFans == true
                     || canShowSafetyActions
@@ -170,6 +201,19 @@ struct PublicUserProfilePreviewView: View {
                     }
                 )
             }
+            .sheet(item: $profileFanTeamDetail) { summary in
+                FanTeamDetailSheet(
+                    summary: summary,
+                    mapViewModel: viewModel,
+                    chatViewModel: chatViewModel,
+                    onOpenChat: { context in
+                        profileFanTeamDetail = nil
+                        chatViewModel.pendingGroupOpenConversationId = context.conversationId
+                        onDismiss()
+                    },
+                    onTeamsChanged: {}
+                )
+            }
             .confirmationDialog(
                 "Cancel friend request?",
                 isPresented: $showCancelFriendRequestConfirmation,
@@ -208,6 +252,11 @@ struct PublicUserProfilePreviewView: View {
             }
         }
         .task(id: userId) {
+            if showsSelfPreviewHiddenEmptyState {
+                profile = nil
+                isLoading = false
+                return
+            }
             // Prefer a process-cache snapshot immediately; never flash another user's data.
             if let cached = PublicUserProfileProcessCache.lookup(for: userId) {
                 profile = cached.data
@@ -230,6 +279,21 @@ struct PublicUserProfilePreviewView: View {
             }
             await loadProfile()
             await loadPokeSummary(for: userId)
+            if viewingAsSelfPreview {
+                await loadSelfPreviewFanTeams()
+            }
+        }
+        .onChange(of: viewModel.currentUserDiscoverableByFans) { _, discoverable in
+            guard viewingAsSelfPreview else { return }
+            if discoverable {
+                Task {
+                    await loadProfile()
+                    await loadSelfPreviewFanTeams()
+                }
+            } else {
+                profile = nil
+                isLoading = false
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: FanProfileChangeCenter.avatarDidChangeNotification)) { notification in
             guard let change = FanProfileChangeCenter.avatarChange(from: notification),
@@ -322,7 +386,10 @@ struct PublicUserProfilePreviewView: View {
                     onDismiss()
                     viewModel.focusDiscoverOnVenue(venueId)
                 },
-                onChooseHomeWatchSpot: viewingAsSelfPreview ? { onDismiss() } : nil
+                onChooseHomeWatchSpot: viewingAsSelfPreview ? { onDismiss() } : nil,
+                onOpenFanTeam: { membership in
+                    Task { await openProfileFanTeamIfAllowed(membership) }
+                }
             )
 
             if let friendActionError, !friendActionError.isEmpty {
@@ -426,6 +493,86 @@ struct PublicUserProfilePreviewView: View {
         }
         .padding(24)
         .publicProfileEditorialCard()
+    }
+
+    /// Apple-style empty state when the owner previews while discoverable_by_fans is off.
+    private var selfPreviewHiddenEmptyState: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 24)
+
+            Image(systemName: "eye.slash.circle.fill")
+                .symbolRenderingMode(.hierarchical)
+                .font(.system(size: 56, weight: .semibold))
+                .foregroundStyle(FGColor.accentBlue)
+                .padding(.bottom, 20)
+                .accessibilityHidden(true)
+
+            Text(L10n.t("public_profile_hidden_title", languageCode: appLanguageRaw))
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .multilineTextAlignment(.center)
+                .padding(.bottom, 10)
+
+            VStack(spacing: 10) {
+                Text(L10n.t("public_profile_hidden_body_line1", languageCode: appLanguageRaw))
+                Text(L10n.t("public_profile_hidden_body_line2", languageCode: appLanguageRaw))
+                Text(L10n.t("public_profile_hidden_body_line3", languageCode: appLanguageRaw))
+            }
+            .font(.system(size: 15, weight: .regular, design: .rounded))
+            .foregroundStyle(FGColor.secondaryText(colorScheme))
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 28)
+
+            Spacer(minLength: 28)
+
+            VStack(spacing: 12) {
+                Button {
+                    Task { await turnOnPublicProfileFromHiddenPreview() }
+                } label: {
+                    HStack(spacing: 8) {
+                        if viewModel.isUpdatingProfileDiscoverabilitySetting {
+                            ProgressView()
+                                .tint(.white)
+                        }
+                        Text(L10n.t("public_profile_hidden_turn_on", languageCode: appLanguageRaw))
+                            .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .foregroundStyle(Color.white)
+                    .background(FGColor.accentBlue, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .disabled(viewModel.isUpdatingProfileDiscoverabilitySetting)
+                .accessibilityLabel(L10n.t("public_profile_hidden_turn_on_a11y", languageCode: appLanguageRaw))
+
+                Button {
+                    onDismiss()
+                } label: {
+                    Text(L10n.t("Close", languageCode: appLanguageRaw))
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.accentBlue)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t("public_profile_hidden_close_a11y", languageCode: appLanguageRaw))
+            }
+            .padding(.horizontal, 28)
+            .padding(.bottom, 28)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .contain)
+    }
+
+    @MainActor
+    private func turnOnPublicProfileFromHiddenPreview() async {
+        await viewModel.setProfileDiscoverableByFans(true)
+        guard viewModel.currentUserDiscoverableByFans else { return }
+        PublicUserProfileProcessCache.invalidate(userId: userId, reason: "discoverabilityEnabledFromHiddenPreview")
+        await loadProfile()
+        await loadSelfPreviewFanTeams()
     }
 
     // MARK: - Poke UI helpers
@@ -626,7 +773,7 @@ struct PublicUserProfilePreviewView: View {
         if viewingAsSelfPreview {
             // Prefer freshly loaded public projection; only fill gaps from owner state so
             // self-preview never shows owner empty-states for already-configured data.
-            // Seed live My Team so national-fan sport subtitle matches the Account strip.
+            // Seed live Favorite Team so national-fan sport subtitle matches the Account strip.
             loaded = loaded.seededForSelfPreview(
                 homeCrowd: viewModel.currentUserHomeCrowdVenue,
                 openToPreferences: viewModel.currentUserFanIdentityPreferences,
@@ -784,7 +931,7 @@ struct PublicUserProfilePreviewView: View {
             friendActionError = nil
             chatViewModel.unfriendError = nil
         }
-        let preview = profile?.userPreviewForMessaging
+        let preview = profile?.userPreviewForMessaging()
         await chatViewModel.unfriend(peerUserId: userId, displayPreview: preview)
 
         let removalFailed = await MainActor.run { () -> Bool in
@@ -835,13 +982,19 @@ struct PublicUserProfilePreviewView: View {
             isFriendActionInFlight = true
             friendActionError = nil
         }
-        let preview = data.userPreviewForMessaging
         do {
-            _ = try await chatViewModel.startDirectConversationWithFriend(friendUserId: data.userId)
+            let conversationId = try await chatViewModel.startDirectConversationWithFriend(
+                friendUserId: data.userId
+            )
             await chatViewModel.refreshInboxSummaries()
             await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
+            let preview = data.userPreviewForMessaging(conversationId: conversationId)
             await MainActor.run {
+                // App-level Chat coordination (same as Teams roster Message):
+                // attach the canonical conversation id, then dismiss this overlay
+                // so Chat can consume `pendingDmOpenPreview` and push the thread.
                 chatViewModel.pendingDmOpenPreview = preview
+                isFriendActionInFlight = false
                 onDismiss()
             }
         } catch {
@@ -851,10 +1004,36 @@ struct PublicUserProfilePreviewView: View {
             }
         }
     }
+
+    @MainActor
+    private func openProfileFanTeamIfAllowed(_ membership: ProfileFanTeamMembership) async {
+        guard membership.viewerCanOpen else { return }
+        do {
+            let teams = try await FanTeamsService().listMyTeams()
+            if let match = teams.first(where: { $0.id == membership.teamId }) {
+                profileFanTeamDetail = match
+            }
+        } catch {
+#if DEBUG
+            print("[ProfileMyTeams] open team failed: \(error.localizedDescription)")
+#endif
+        }
+    }
+
+    @MainActor
+    private func loadSelfPreviewFanTeams() async {
+        do {
+            let teams = try await FanTeamsService().listMyTeams()
+            selfPreviewFanTeamMemberships = FanTeamsService.profileMemberships(from: teams)
+            await viewModel.loadMyTeamsProfileVisibilityIfNeeded()
+        } catch {
+            selfPreviewFanTeamMemberships = []
+        }
+    }
 }
 
-private extension PublicUserProfileData {
-    var userPreviewForMessaging: UserPreview {
+extension PublicUserProfileData {
+    func userPreviewForMessaging(conversationId: UUID? = nil) -> UserPreview {
         let handleStored = publicHandleLine
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "^@+", with: "", options: .regularExpression)
@@ -866,7 +1045,8 @@ private extension PublicUserProfileData {
             email: nil,
             avatarURL: avatarURL,
             avatarThumbnailURL: avatarThumbnailURL,
-            isBusinessAccount: isBusinessAccount
+            isBusinessAccount: isBusinessAccount,
+            dmConversationId: conversationId
         )
     }
 }

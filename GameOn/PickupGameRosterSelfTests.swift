@@ -298,10 +298,93 @@ enum PickupGameRosterSelfTests {
             "attendance_rows_unique_user_ids"
         )
         let attendanceCounts = PickupTeamAttendancePresentation.counts(from: teamPayload)
-        expect(attendanceCounts.going == 3, "attendance_going_count_stack")
+        expect(attendanceCounts.going == 2, "attendance_going_count_playing_only_not_organizer_role")
         expect(attendanceCounts.maybe == 0, "attendance_maybe_empty_when_pending_cleared")
         expect(attendanceCounts.noResponse == 1, "attendance_no_response_count")
         expect(attendanceCounts.cantGo == 1, "attendance_cant_go_count")
+
+        // Organizer Can't Go must win over always-present organizer object (Team payload).
+        let organizerCantGo = PickupGameRosterPayload(
+            pickup_game_id: UUID(),
+            viewer_is_organizer: true,
+            organizer: organizer,
+            playing: playing,
+            pending: [],
+            declined: [
+                PickupGameRosterMember(
+                    user_id: organizerId,
+                    request_id: UUID(),
+                    display_name: "Host",
+                    username: "host",
+                    avatar_url: nil,
+                    avatar_thumbnail_url: nil,
+                    role: "declined",
+                    status: "withdrawn"
+                )
+            ],
+            no_response: [],
+            approved_join_count: 2,
+            playing_total_count: 2
+        )
+        let organizerCantGoRow = PickupTeamAttendancePresentation.rows(from: organizerCantGo)
+            .first { $0.id == organizerId }
+        expect(organizerCantGoRow?.category == .cantGo, "organizer_withdrawn_is_cant_go_not_going")
+        expect(
+            FanTeamScheduleQuickRSVPState.resolve(
+                subjectUserId: organizerId,
+                roster: organizerCantGo,
+                explicitSelfRSVP: .status(.cant_go),
+                fallbackRSVP: nil
+            ) == .cantGo,
+            "explicit_self_rsvp_cant_go_wins"
+        )
+        expect(
+            FanTeamScheduleQuickRSVPState.resolve(
+                subjectUserId: organizerId,
+                roster: organizerCantGo,
+                explicitSelfRSVP: .unanswered,
+                fallbackRSVP: .going
+            ) == .noResponse,
+            "explicit_unanswered_beats_fallback_going"
+        )
+
+        // Three same-team events: RSVP cache is keyed by pickup_game_id, not team_id.
+        let eventA = UUID()
+        let eventB = UUID()
+        let eventC = UUID()
+        let cache: [UUID: FanTeamCachedSelfRSVP] = [
+            eventA: .status(.going),
+            eventB: .status(.cant_go),
+            eventC: .unanswered
+        ]
+        expect(
+            FanTeamScheduleQuickRSVPState.resolve(
+                subjectUserId: organizerId,
+                roster: nil,
+                explicitSelfRSVP: cache[eventA],
+                fallbackRSVP: nil
+            ) == .going,
+            "event_a_going_independent"
+        )
+        expect(
+            FanTeamScheduleQuickRSVPState.resolve(
+                subjectUserId: organizerId,
+                roster: nil,
+                explicitSelfRSVP: cache[eventB],
+                fallbackRSVP: nil
+            ) == .cantGo,
+            "event_b_cant_go_independent"
+        )
+        expect(
+            FanTeamScheduleQuickRSVPState.resolve(
+                subjectUserId: organizerId,
+                roster: nil,
+                explicitSelfRSVP: cache[eventC],
+                fallbackRSVP: nil
+            ) == .noResponse,
+            "event_c_unanswered_independent"
+        )
+
         expect(
             PickupDetailAttendanceCategory.going.aggregateTitleKey() == "Going",
             "aggregate_going_key_not_personal"
@@ -310,6 +393,55 @@ enum PickupGameRosterSelfTests {
             PickupDetailAttendanceCategory.going.personalTitleKey() == "fan_team_rsvp_going",
             "personal_going_key_preserved"
         )
+
+        // Managed player seats: server sends managed_player_id as user_id plus metadata.
+        let managedPlayerId = UUID()
+        let managedMembershipId = UUID()
+        let managedJSON = """
+        {
+          "user_id": "\(managedPlayerId.uuidString)",
+          "membership_id": "\(managedMembershipId.uuidString)",
+          "is_managed_player": true,
+          "managed_player_id": "\(managedPlayerId.uuidString)",
+          "display_name": "Sam (U10)",
+          "role": "no_response",
+          "status": "no_response"
+        }
+        """
+        if let managed = try? JSONDecoder().decode(
+            PickupGameRosterMember.self,
+            from: Data(managedJSON.utf8)
+        ) {
+            expect(managed.isManagedPlayer, "managed_member_decodes_flag")
+            expect(managed.managed_player_id == managedPlayerId, "managed_member_decodes_managed_id")
+            expect(managed.membership_id == managedMembershipId, "managed_member_decodes_membership_id")
+            expect(managed.user_id == managedPlayerId, "managed_member_user_id_is_managed_id")
+            expect(managed.accountUserId == nil, "managed_member_has_no_account_user_id")
+        } else {
+            failures += 1
+            print("[PickupRosterTest] FAIL managed_member_decodes")
+        }
+
+        // Legacy payloads without the new keys must keep account-seat behavior.
+        let legacyJSON = """
+        {
+          "user_id": "\(approvedA.uuidString)",
+          "display_name": "Alex",
+          "role": "playing",
+          "status": "approved"
+        }
+        """
+        if let legacy = try? JSONDecoder().decode(
+            PickupGameRosterMember.self,
+            from: Data(legacyJSON.utf8)
+        ) {
+            expect(!legacy.isManagedPlayer, "legacy_member_not_managed")
+            expect(legacy.accountUserId == approvedA, "legacy_member_account_user_id")
+            expect(legacy.membership_id == nil, "legacy_member_no_membership_id")
+        } else {
+            failures += 1
+            print("[PickupRosterTest] FAIL legacy_member_decodes")
+        }
 
         print("[PickupRosterTest] failures=\(failures)")
     }

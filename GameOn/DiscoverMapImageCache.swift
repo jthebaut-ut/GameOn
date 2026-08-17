@@ -384,6 +384,14 @@ actor DiscoverMapImageCache {
             case .detail: return .detail
             }
         }
+
+        /// Pick a downsample bucket from on-screen point size. 40–128pt marks stay
+        /// in the avatar decode (480px); larger venue cards keep the list thumbnail.
+        nonisolated static func forPointSize(_ pointSize: CGFloat, preferDetail: Bool = false) -> Bucket {
+            if preferDetail { return .detail }
+            if pointSize <= 128 { return .avatar }
+            return .venue
+        }
     }
 
     static let shared = DiscoverMapImageCache()
@@ -424,6 +432,7 @@ actor DiscoverMapImageCache {
         guard venueCount > 0 || avatarCount > 0 || detailCount > 0 else { return }
         storage.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
+        DiscoverMapImageMemoryIndex.shared.removeAll()
         ImagePerf.memoryWarningPurged(venues: venueCount, avatars: avatarCount)
     }
 
@@ -558,20 +567,38 @@ actor DiscoverMapImageCache {
     }
 
     func invalidate(urls: [URL]) {
-        for url in urls {
-            for bucket in maxEntriesByBucket.keys {
-                storage[bucket]?[url] = nil
-                let cacheKey = ImageCacheDebug.diagnosticIdentity(for: url, bucket: bucket).cacheKey
+        let exact = Set(urls)
+        let canonicals = Set(
+            urls.map { ImageDisplayURL.canonicalStorageURLString($0.absoluteString) }
+                .filter { !$0.isEmpty }
+        )
+        for bucket in maxEntriesByBucket.keys {
+            let storedKeys = Array((storage[bucket] ?? [:]).keys)
+            let matching = storedKeys.filter { key in
+                exact.contains(key)
+                    || canonicals.contains(ImageDisplayURL.canonicalStorageURLString(key.absoluteString))
+            }
+            for key in matching {
+                storage[bucket]?[key] = nil
+                DiscoverMapImageMemoryIndex.shared.remove(bucket: bucket, url: key)
+                let cacheKey = ImageCacheDebug.diagnosticIdentity(for: key, bucket: bucket).cacheKey
                 if inFlightByCacheKey[cacheKey] != nil {
                     inFlightByCacheKey[cacheKey]?.cancel()
                     inFlightByCacheKey[cacheKey] = nil
                     ImagePerf.requestCancelled()
                 }
             }
+            order[bucket]?.removeAll { key in
+                exact.contains(key)
+                    || canonicals.contains(ImageDisplayURL.canonicalStorageURLString(key.absoluteString))
+            }
         }
-        let removed = Set(urls)
-        for bucket in maxEntriesByBucket.keys {
-            order[bucket]?.removeAll { removed.contains($0) }
+        for url in exact {
+            URLCache.shared.removeCachedResponse(for: URLRequest(url: url))
+            let canonical = ImageDisplayURL.canonicalStorageURLString(url.absoluteString)
+            if !canonical.isEmpty, let canonicalURL = URL(string: canonical), canonicalURL != url {
+                URLCache.shared.removeCachedResponse(for: URLRequest(url: canonicalURL))
+            }
         }
     }
 
@@ -593,6 +620,7 @@ actor DiscoverMapImageCache {
             if bucketStorage.count >= maxEntries, let old = bucketOrder.first {
                 bucketStorage.removeValue(forKey: old)
                 bucketOrder.removeFirst()
+                DiscoverMapImageMemoryIndex.shared.remove(bucket: bucket, url: old)
                 ImagePerf.eviction()
             }
             bucketOrder.append(url)
@@ -600,6 +628,48 @@ actor DiscoverMapImageCache {
         bucketStorage[url] = image
         storage[bucket] = bucketStorage
         order[bucket] = bucketOrder
+        DiscoverMapImageMemoryIndex.shared.store(bucket: bucket, url: url, image: image)
+    }
+
+    /// Same decoded image the actor holds, without an actor hop. Used by scroll-recycled cards.
+    nonisolated func peekCachedImage(for url: URL, bucket: Bucket = .venue) -> UIImage? {
+        DiscoverMapImageMemoryIndex.shared.peek(bucket: bucket, url: url)
+    }
+}
+
+/// Lock-protected index of the same decoded images ``DiscoverMapImageCache`` stores.
+/// Not a second download cache — Profile/Discover scroll can peek without awaiting the actor.
+nonisolated private final class DiscoverMapImageMemoryIndex: @unchecked Sendable {
+    nonisolated static let shared = DiscoverMapImageMemoryIndex()
+    private let lock = NSLock()
+    private var images: [String: UIImage] = [:]
+
+    nonisolated private func key(bucket: DiscoverMapImageCache.Bucket, url: URL) -> String {
+        ImageCacheDebug.diagnosticIdentity(for: url, bucket: bucket).cacheKey
+    }
+
+    nonisolated func peek(bucket: DiscoverMapImageCache.Bucket, url: URL) -> UIImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        return images[key(bucket: bucket, url: url)]
+    }
+
+    nonisolated func store(bucket: DiscoverMapImageCache.Bucket, url: URL, image: UIImage) {
+        lock.lock()
+        images[key(bucket: bucket, url: url)] = image
+        lock.unlock()
+    }
+
+    nonisolated func remove(bucket: DiscoverMapImageCache.Bucket, url: URL) {
+        lock.lock()
+        images.removeValue(forKey: key(bucket: bucket, url: url))
+        lock.unlock()
+    }
+
+    nonisolated func removeAll() {
+        lock.lock()
+        images.removeAll(keepingCapacity: false)
+        lock.unlock()
     }
 }
 
@@ -625,11 +695,19 @@ struct CachedRemoteImagePhaseView<Content: View>: View {
         content(phase)
             .task(id: url?.absoluteString ?? "") {
                 let requestedURL = url
+                guard let requestedURL else {
+                    if case .empty = phase { return }
+                    phase = .empty
+                    return
+                }
+
+                if let peeked = DiscoverMapImageCache.shared.peekCachedImage(for: requestedURL, bucket: bucket) {
+                    applySuccessIfNeeded(peeked)
+                    return
+                }
+
                 let token = loadToken &+ 1
                 loadToken = token
-                phase = .empty
-
-                guard let requestedURL else { return }
 
                 if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL, bucket: bucket) {
                     guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
@@ -679,6 +757,7 @@ struct VenuePhotoDebugContext {
 struct DiscoverCachedRemoteImage<Placeholder: View>: View {
     let url: URL?
     var contentMode: ContentMode = .fill
+    var bucket: DiscoverMapImageCache.Bucket = .venue
     var venuePhotoDebugContext: VenuePhotoDebugContext? = nil
     @ViewBuilder var placeholder: () -> Placeholder
 
@@ -697,17 +776,26 @@ struct DiscoverCachedRemoteImage<Placeholder: View>: View {
                 placeholder()
             }
         }
-        .animation(.easeOut(duration: 0.22), value: loadedImageVisible)
         .task(id: url?.absoluteString) {
             let requestedURL = url
-            let token = loadToken &+ 1
-            loadToken = token
-            loadedImageVisible = false
-            uiImage = nil
             guard let requestedURL else {
+                uiImage = nil
+                loadedImageVisible = false
                 return
             }
-            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL) {
+
+            if let peeked = DiscoverMapImageCache.shared.peekCachedImage(for: requestedURL, bucket: bucket) {
+                if uiImage !== peeked {
+                    uiImage = peeked
+                }
+                loadedImageVisible = true
+                return
+            }
+
+            let token = loadToken &+ 1
+            loadToken = token
+
+            if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL, bucket: bucket) {
                 guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
                 if uiImage !== cached {
                     uiImage = cached
@@ -715,17 +803,17 @@ struct DiscoverCachedRemoteImage<Placeholder: View>: View {
                 loadedImageVisible = true
                 return
             }
-            if let loaded = await DiscoverMapImageCache.shared.image(for: requestedURL) {
+
+            if let loaded = await DiscoverMapImageCache.shared.image(for: requestedURL, bucket: bucket) {
                 guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
                 if uiImage !== loaded {
                     uiImage = loaded
                 }
-                await Task.yield()
-                guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
                 loadedImageVisible = true
             } else {
                 guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
                 uiImage = nil
+                loadedImageVisible = false
 #if DEBUG
                 if let context = venuePhotoDebugContext {
                     print("[VenuePhotoDebug] venueId=\(context.venueId.uuidString.lowercased())")

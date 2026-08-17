@@ -16,7 +16,7 @@ enum FavoritePlayerTeamMatchingSelfTests {
         }
 
         // Completeness: every authoritative `.player` catalog id is classified.
-        let catalogPlayers = FavoriteTeamCatalog.all.filter { $0.kind == .player }
+        let catalogPlayers = FavoriteTeamCatalog.curatedCatalog.filter { $0.kind == .player }
         expect(
             Set(catalogPlayers.map(\.id)) == Set(FavoritePlayerTeamRelationships.allCatalogPlayerIDs),
             "inventoryMatchesCatalogPlayerCount_\(catalogPlayers.count)"

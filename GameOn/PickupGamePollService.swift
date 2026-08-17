@@ -77,9 +77,16 @@ final class PickupGamePollService {
             let p_poll_id: UUID
             let p_message_id: UUID
         }
-        try await client
-            .rpc("attach_pickup_game_poll_message", params: Params(p_poll_id: pollId, p_message_id: messageId))
-            .execute()
+        // Prefer unified router (pickup + Team); fall back to pickup-only for older backends.
+        do {
+            try await client
+                .rpc("attach_chat_poll_message", params: Params(p_poll_id: pollId, p_message_id: messageId))
+                .execute()
+        } catch {
+            try await client
+                .rpc("attach_pickup_game_poll_message", params: Params(p_poll_id: pollId, p_message_id: messageId))
+                .execute()
+        }
     }
 
     func setVote(pollId: UUID, optionIds: [UUID]) async throws {
@@ -88,9 +95,18 @@ final class PickupGamePollService {
             let p_option_ids: [UUID]
         }
         do {
-            try await client
-                .rpc("set_pickup_game_poll_vote", params: Params(p_poll_id: pollId, p_option_ids: optionIds))
-                .execute()
+            do {
+                try await client
+                    .rpc("set_chat_poll_vote", params: Params(p_poll_id: pollId, p_option_ids: optionIds))
+                    .execute()
+            } catch {
+                try await client
+                    .rpc("set_pickup_game_poll_vote", params: Params(p_poll_id: pollId, p_option_ids: optionIds))
+                    .execute()
+            }
+#if DEBUG
+            TeamChatPollDebug.log("voteSubmitted", detail: "pollID=\(pollId.uuidString.lowercased())")
+#endif
         } catch {
 #if DEBUG
             print("[PickupPoll] vote failed poll=\(pollId.uuidString.lowercased())")
@@ -102,9 +118,15 @@ final class PickupGamePollService {
     func closePoll(pollId: UUID) async throws {
         struct Params: Encodable { let p_poll_id: UUID }
         do {
-            try await client
-                .rpc("close_pickup_game_poll", params: Params(p_poll_id: pollId))
-                .execute()
+            do {
+                try await client
+                    .rpc("close_chat_poll", params: Params(p_poll_id: pollId))
+                    .execute()
+            } catch {
+                try await client
+                    .rpc("close_pickup_game_poll", params: Params(p_poll_id: pollId))
+                    .execute()
+            }
         } catch {
             throw mapError(error, fallback: .closeFailed)
         }
@@ -113,9 +135,15 @@ final class PickupGamePollService {
     func deletePoll(pollId: UUID) async throws {
         struct Params: Encodable { let p_poll_id: UUID }
         do {
-            try await client
-                .rpc("delete_pickup_game_poll", params: Params(p_poll_id: pollId))
-                .execute()
+            do {
+                try await client
+                    .rpc("delete_chat_poll", params: Params(p_poll_id: pollId))
+                    .execute()
+            } catch {
+                try await client
+                    .rpc("delete_pickup_game_poll", params: Params(p_poll_id: pollId))
+                    .execute()
+            }
         } catch {
             throw mapError(error, fallback: .deleteFailed)
         }
@@ -128,9 +156,15 @@ final class PickupGamePollService {
             let p_pinned: Bool
         }
         do {
-            try await client
-                .rpc("pin_pickup_game_poll", params: Params(p_poll_id: pollId, p_pinned: pinned))
-                .execute()
+            do {
+                try await client
+                    .rpc("pin_chat_poll", params: Params(p_poll_id: pollId, p_pinned: pinned))
+                    .execute()
+            } catch {
+                try await client
+                    .rpc("pin_pickup_game_poll", params: Params(p_poll_id: pollId, p_pinned: pinned))
+                    .execute()
+            }
         } catch {
             throw mapError(error, fallback: .pinFailed)
         }
@@ -139,10 +173,26 @@ final class PickupGamePollService {
     func fetchSnapshot(pollId: UUID) async throws -> PickupGamePollSnapshot {
         struct Params: Encodable { let p_poll_id: UUID }
         do {
-            return try await client
-                .rpc("get_pickup_game_poll_snapshot", params: Params(p_poll_id: pollId))
-                .execute()
-                .value
+            do {
+                let snap: PickupGamePollSnapshot = try await client
+                    .rpc("get_chat_poll_snapshot", params: Params(p_poll_id: pollId))
+                    .execute()
+                    .value
+#if DEBUG
+                if let teamId = snap.teamId {
+                    TeamChatPollDebug.log(
+                        "realtimePollUpdated",
+                        detail: "pollID=\(pollId.uuidString.lowercased()) teamID=\(teamId.uuidString.lowercased())"
+                    )
+                }
+#endif
+                return snap
+            } catch {
+                return try await client
+                    .rpc("get_pickup_game_poll_snapshot", params: Params(p_poll_id: pollId))
+                    .execute()
+                    .value
+            }
         } catch {
 #if DEBUG
             print("[PickupPoll] snapshot failed poll=\(pollId.uuidString.lowercased())")
@@ -151,7 +201,7 @@ final class PickupGamePollService {
         }
     }
 
-    /// Vote RPCs bump `pickup_game_polls.updated_at`, so poll UPDATE realtime covers vote changes.
+    /// Vote RPCs bump poll `updated_at`, so poll UPDATE realtime covers vote changes.
     func pollUpdatesChannel(conversationId: UUID) -> (RealtimeChannelV2, AsyncStream<UpdateAction>) {
         let cid = conversationId.uuidString.lowercased()
         let channel = client.channel("pickup-polls-\(cid)")

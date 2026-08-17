@@ -54,8 +54,19 @@ enum PickupBulkImportParseError: LocalizedError {
 enum PickupBulkImportParser {
     nonisolated static let templateResourceName = "FanGeoPickupGamesTemplate"
     nonisolated static let templateResourceExtension = "xlsx"
-    private static let preferredXLSXWorksheetName = "Pickup Games Upload"
-    private static let ignoredXLSXWorksheetNames: Set<String> = ["Instructions", "Allowed Values"]
+    private static let preferredRegularXLSXWorksheetNames = [
+        "Regular Games",
+        "Pickup Games Upload"
+    ]
+    private static let preferredTeamXLSXWorksheetNames = [
+        "Team Games"
+    ]
+    private static let ignoredXLSXWorksheetNames: Set<String> = [
+        "Instructions",
+        "Allowed Values",
+        "Read Me",
+        "Lists"
+    ]
     nonisolated private static let officialTemplateRelativePath = "Resources/Templates/FanGeoPickupGamesTemplate.xlsx"
 
     static let requiredHeaders = [
@@ -138,7 +149,7 @@ enum PickupBulkImportParser {
         throw PickupBulkImportParseError.invalidXLSX("The official FanGeo pickup games template is missing from the app bundle.")
     }
 
-    static func parseFile(at url: URL) throws -> [PickupBulkImportRawRow] {
+    static func parseFile(at url: URL, prefersTeamWorksheet: Bool = false) throws -> [PickupBulkImportRawRow] {
         let ext = url.pathExtension.lowercased()
 #if DEBUG
         print("[PickupBulkImport] parseStarted ext=\(ext)")
@@ -147,7 +158,11 @@ enum PickupBulkImportParser {
         case "csv":
             return try parseCSV(data: Data(contentsOf: url), sourceURL: url)
         case "xlsx":
-            return try parseXLSX(data: Data(contentsOf: url), sourceURL: url)
+            return try parseXLSX(
+                data: Data(contentsOf: url),
+                sourceURL: url,
+                prefersTeamWorksheet: prefersTeamWorksheet
+            )
         default:
             throw PickupBulkImportParseError.unsupportedFileType
         }
@@ -172,10 +187,14 @@ enum PickupBulkImportParser {
     }
 
     static func parseXLSX(data: Data) throws -> [PickupBulkImportRawRow] {
-        try parseXLSX(data: data, sourceURL: nil)
+        try parseXLSX(data: data, sourceURL: nil, prefersTeamWorksheet: false)
     }
 
-    private static func parseXLSX(data: Data, sourceURL: URL?) throws -> [PickupBulkImportRawRow] {
+    private static func parseXLSX(
+        data: Data,
+        sourceURL: URL?,
+        prefersTeamWorksheet: Bool
+    ) throws -> [PickupBulkImportRawRow] {
         guard !data.isEmpty else { throw PickupBulkImportParseError.emptyFile }
         let archive = try MinimalXLSXArchive(data: data)
         let stringsXML = archive.stringEntry(named: "xl/sharedStrings.xml") ?? ""
@@ -189,7 +208,7 @@ enum PickupBulkImportParser {
         print("[PickupBulkImport] workbookSheets=\(worksheets.map(\.name).joined(separator: ","))")
         logRawRows(for: worksheetTables)
 #endif
-        guard let selected = selectWorksheet(from: worksheetTables) else {
+        guard let selected = selectWorksheet(from: worksheetTables, prefersTeamWorksheet: prefersTeamWorksheet) else {
             throw PickupBulkImportParseError.invalidXLSX("No worksheet with pickup game headers was found.")
         }
 #if DEBUG
@@ -206,18 +225,18 @@ enum PickupBulkImportParser {
             sourceURL: sourceURL
         )
         var sourceHeaders = Set(rawHeaders.filter { !$0.isEmpty })
-        if usesOfficialTemplateMap {
-            sourceHeaders.formUnion(officialTemplateHeaders)
-        }
         let headers = rawHeaders
         var columnMap = headerMap(from: headerRow)
-        if usesOfficialTemplateMap {
+        let hasReliableHeaders = headersProvideReliableColumnMap(rawHeaders)
+        if usesOfficialTemplateMap, !hasReliableHeaders {
+            sourceHeaders.formUnion(officialTemplateHeaders)
             forceOfficialTemplateColumns(in: &columnMap)
         }
 #if DEBUG
         print("[PickupBulkImport] detectedHeaders=\(headers.filter { !$0.isEmpty }.joined(separator: ","))")
         print("[PickupImportColumnDebug] headers=\(headerRow.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.joined(separator: "|"))")
         print("[PickupImportColumnDebug] mappedColumns=\(debugMappedColumns(columnMap))")
+        print("[PickupImportColumnDebug] headerMapped=\(hasReliableHeaders) officialForce=\(usesOfficialTemplateMap && !hasReliableHeaders)")
 #endif
         let missing = requiredHeaders.filter { columnMap[normalizeHeader($0)] == nil }
         guard missing.isEmpty else { throw PickupBulkImportParseError.missingHeader(missing) }
@@ -230,7 +249,7 @@ enum PickupBulkImportParser {
             for (header, index) in columnMap where !header.isEmpty {
                 values[header] = valueForHeader(at: index, in: row)
             }
-            if usesOfficialTemplateMap {
+            if usesOfficialTemplateMap, !hasReliableHeaders {
                 applyOfficialTemplateCorrection(to: &values, row: row, rowNumber: offset + 2)
             }
             let rawRow = PickupBulkImportRawRow(rowNumber: offset + 2, values: values, sourceHeaders: sourceHeaders)
@@ -264,6 +283,11 @@ enum PickupBulkImportParser {
     private nonisolated static func valueForHeader(at index: Int, in row: [String]) -> String {
         guard index < row.count else { return "" }
         return row[index]
+    }
+
+    private nonisolated static func headersProvideReliableColumnMap(_ rawHeaders: [String]) -> Bool {
+        let present = Set(rawHeaders.filter { !$0.isEmpty })
+        return officialTemplateForcedColumns.keys.allSatisfy { present.contains($0) }
     }
 
     private nonisolated static func shouldForceOfficialTemplateMapping(
@@ -331,10 +355,16 @@ enum PickupBulkImportParser {
     }
 
     private static func selectWorksheet(
-        from worksheetTables: [(worksheet: XLSXWorksheet, table: [[String]])]
+        from worksheetTables: [(worksheet: XLSXWorksheet, table: [[String]])],
+        prefersTeamWorksheet: Bool
     ) -> (name: String, table: [[String]])? {
-        if let preferred = worksheetTables.first(where: { $0.worksheet.name == preferredXLSXWorksheetName }) {
-            return (preferred.worksheet.name, preferred.table)
+        let preferredNames = prefersTeamWorksheet
+            ? preferredTeamXLSXWorksheetNames + preferredRegularXLSXWorksheetNames
+            : preferredRegularXLSXWorksheetNames + preferredTeamXLSXWorksheetNames
+        for name in preferredNames {
+            if let preferred = worksheetTables.first(where: { $0.worksheet.name == name }) {
+                return (preferred.worksheet.name, preferred.table)
+            }
         }
 
         for candidate in worksheetTables where !ignoredXLSXWorksheetNames.contains(candidate.worksheet.name) {
@@ -458,7 +488,10 @@ private enum XLSXSheetParser {
                         .joined()
                 } else {
                     let raw = XLSXXML.elementContents(named: "v", in: cellXML).first ?? ""
-                    if type == "s", let index = Int(raw), index >= 0, index < sharedStrings.count {
+                    if type == "b" {
+                        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        value = (normalized == "1" || normalized == "true") ? "TRUE" : "FALSE"
+                    } else if type == "s", let index = Int(raw), index >= 0, index < sharedStrings.count {
                         value = sharedStrings[index]
                     } else {
                         value = XLSXXML.unescape(raw)
@@ -486,7 +519,9 @@ private enum XLSXSheetParser {
 private enum XLSXXML {
     nonisolated static func elements(named name: String, in text: String) -> [String] {
         let escaped = NSRegularExpression.escapedPattern(for: name)
-        let pattern = #"<(?:[A-Za-z0-9_]+:)?"# + escaped + #"\b[\s\S]*?</(?:[A-Za-z0-9_]+:)?"# + escaped + #">|<(?:[A-Za-z0-9_]+:)?"# + escaped + #"\b[^>]*/>"#
+        // Match self-closing tags first. Otherwise `<c r="R2" s="30"/>` is swallowed
+        // into the next `</c>` and a blank entry_fee_amount cell becomes the country string.
+        let pattern = #"<(?:[A-Za-z0-9_]+:)?"# + escaped + #"\b[^>]*/>|<(?:[A-Za-z0-9_]+:)?"# + escaped + #"\b[\s\S]*?</(?:[A-Za-z0-9_]+:)?"# + escaped + #">"#
         return matches(pattern: pattern, in: text)
     }
 

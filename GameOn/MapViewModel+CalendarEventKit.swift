@@ -1591,7 +1591,8 @@ extension MapViewModel {
         }
     }
 
-    /// `{sportEmoji} FanGeo Pickup: {title}` using ``emojiForSport`` / ``SportFilterCatalog``.
+    /// Standalone Pickup: `{sportEmoji} FanGeo Pickup: {title}`.
+    /// Other formats (Team Meeting / Practice / …): `{sportEmoji} FanGeo: {Type} — {title}`.
     private func calendarSyncPickupDisplayTitle(
         _ rawTitle: String,
         fanGeoIdentifier: String?
@@ -1603,7 +1604,19 @@ extension MapViewModel {
         calendarSyncStripLeadingDecorativePrefix(from: &body)
         if body.isEmpty { body = "Game" }
 
-        let core = "FanGeo Pickup: \(body)"
+        let format: GameType? = {
+            guard let gameId = calendarSyncPickupGameId(from: fanGeoIdentifier),
+                  let game = resolvedPickupGameRow(for: gameId) else { return nil }
+            return game.gameFormat
+        }()
+
+        let core: String
+        if let format, format != .pickup {
+            let typeLabel = format.displayTitle(languageCode: L10n.defaultLanguageCode)
+            core = "FanGeo: \(typeLabel) — \(body)"
+        } else {
+            core = "FanGeo Pickup: \(body)"
+        }
         let icon = calendarSyncPickupSportEmoji(
             fanGeoIdentifier: fanGeoIdentifier,
             titleHint: body

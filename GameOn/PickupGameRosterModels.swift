@@ -6,6 +6,9 @@ import Foundation
 /// (`SWIFT_DEFAULT_ACTOR_ISOLATION`), but this type is immutable value data used from
 /// nonisolated presentation helpers / `Decodable` without UI.
 struct PickupGameRosterMember: Identifiable, Equatable, Hashable, Decodable, Sendable {
+    /// Participant key. For a guardian-managed seat this is the `managed_player_id`
+    /// (20260961) — managed players have no account, and the client only needs a
+    /// stable identity here.
     let user_id: UUID
     let request_id: UUID?
     let display_name: String?
@@ -14,8 +17,78 @@ struct PickupGameRosterMember: Identifiable, Equatable, Hashable, Decodable, Sen
     let avatar_thumbnail_url: String?
     let role: String?
     let status: String?
+    /// Present after 20260961 for Team roster seats (absent for outside requesters).
+    let membership_id: UUID?
+    /// Present after 20260961. Absent on older payloads → treated as `false`.
+    let is_managed_player: Bool?
+    let managed_player_id: UUID?
+
+    enum CodingKeys: String, CodingKey {
+        case user_id
+        case request_id
+        case display_name
+        case username
+        case avatar_url
+        case avatar_thumbnail_url
+        case role
+        case status
+        case membership_id
+        case is_managed_player
+        case managed_player_id
+    }
+
+    nonisolated init(
+        user_id: UUID,
+        request_id: UUID? = nil,
+        display_name: String? = nil,
+        username: String? = nil,
+        avatar_url: String? = nil,
+        avatar_thumbnail_url: String? = nil,
+        role: String? = nil,
+        status: String? = nil,
+        membership_id: UUID? = nil,
+        is_managed_player: Bool? = nil,
+        managed_player_id: UUID? = nil
+    ) {
+        self.user_id = user_id
+        self.request_id = request_id
+        self.display_name = display_name
+        self.username = username
+        self.avatar_url = avatar_url
+        self.avatar_thumbnail_url = avatar_thumbnail_url
+        self.role = role
+        self.status = status
+        self.membership_id = membership_id
+        self.is_managed_player = is_managed_player
+        self.managed_player_id = managed_player_id
+    }
+
+    nonisolated init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        user_id = try c.decode(UUID.self, forKey: .user_id)
+        request_id = try c.decodeIfPresent(UUID.self, forKey: .request_id)
+        display_name = try c.decodeIfPresent(String.self, forKey: .display_name)
+        username = try c.decodeIfPresent(String.self, forKey: .username)
+        avatar_url = try c.decodeIfPresent(String.self, forKey: .avatar_url)
+        avatar_thumbnail_url = try c.decodeIfPresent(String.self, forKey: .avatar_thumbnail_url)
+        role = try c.decodeIfPresent(String.self, forKey: .role)
+        status = try c.decodeIfPresent(String.self, forKey: .status)
+        membership_id = try c.decodeIfPresent(UUID.self, forKey: .membership_id)
+        is_managed_player = try c.decodeIfPresent(Bool.self, forKey: .is_managed_player)
+        managed_player_id = try c.decodeIfPresent(UUID.self, forKey: .managed_player_id)
+    }
 
     nonisolated var id: UUID { user_id }
+
+    /// Managed players are not social identities: no profile, DM or friend actions.
+    nonisolated var isManagedPlayer: Bool {
+        is_managed_player == true || managed_player_id != nil
+    }
+
+    /// Account id, or `nil` for a guardian-managed seat.
+    nonisolated var accountUserId: UUID? {
+        isManagedPlayer ? nil : user_id
+    }
 
     /// Pure display-name fallback: trimmed display name → @username → `"Fan"`.
     nonisolated var resolvedDisplayName: String {
@@ -45,6 +118,10 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
     let declined: [PickupGameRosterMember]?
     /// Present after 20260948 for Team-linked viewers (active members with no RSVP).
     let no_response: [PickupGameRosterMember]?
+    /// Present after 20260958 — active Team members staff-excluded from this event.
+    let excluded: [PickupGameRosterMember]?
+    /// Present after 20260958 — viewer may manage event exclusions / add-back.
+    let viewer_can_manage_event_roster: Bool?
     let approved_join_count: Int?
     let playing_total_count: Int?
 
@@ -56,6 +133,8 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
         case pending
         case declined
         case no_response
+        case excluded
+        case viewer_can_manage_event_roster
         case approved_join_count
         case playing_total_count
     }
@@ -68,6 +147,8 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
         pending: [PickupGameRosterMember],
         declined: [PickupGameRosterMember]? = nil,
         no_response: [PickupGameRosterMember]? = nil,
+        excluded: [PickupGameRosterMember]? = nil,
+        viewer_can_manage_event_roster: Bool? = nil,
         approved_join_count: Int?,
         playing_total_count: Int?
     ) {
@@ -80,6 +161,8 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
         self.pending = PickupGameRosterPresentation.uniqueMembersByUserId(pending)
         self.declined = declined.map(PickupGameRosterPresentation.uniqueMembersByUserId)
         self.no_response = no_response.map(PickupGameRosterPresentation.uniqueMembersByUserId)
+        self.excluded = excluded.map(PickupGameRosterPresentation.uniqueMembersByUserId)
+        self.viewer_can_manage_event_roster = viewer_can_manage_event_roster
         self.approved_join_count = approved_join_count
         self.playing_total_count = playing_total_count
     }
@@ -99,6 +182,12 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
             .map(PickupGameRosterPresentation.uniqueMembersByUserId)
         no_response = try c.decodeIfPresent([PickupGameRosterMember].self, forKey: .no_response)
             .map(PickupGameRosterPresentation.uniqueMembersByUserId)
+        excluded = try c.decodeIfPresent([PickupGameRosterMember].self, forKey: .excluded)
+            .map(PickupGameRosterPresentation.uniqueMembersByUserId)
+        viewer_can_manage_event_roster = try c.decodeIfPresent(
+            Bool.self,
+            forKey: .viewer_can_manage_event_roster
+        )
         approved_join_count = try c.decodeIfPresent(Int.self, forKey: .approved_join_count)
         playing_total_count = try c.decodeIfPresent(Int.self, forKey: .playing_total_count)
     }
@@ -135,6 +224,8 @@ struct PickupGameRosterPayload: Equatable, Decodable, Sendable {
 
     nonisolated var declinedMembers: [PickupGameRosterMember] { declined ?? [] }
     nonisolated var noResponseMembers: [PickupGameRosterMember] { no_response ?? [] }
+    nonisolated var excludedMembers: [PickupGameRosterMember] { excluded ?? [] }
+    nonisolated var canManageEventRoster: Bool { viewer_can_manage_event_roster == true }
 }
 
 /// Detail-screen attendance buckets mapped from existing roster / Team RSVP request statuses.
@@ -177,10 +268,17 @@ struct PickupTeamAttendanceRow: Identifiable, Equatable, Hashable, Sendable {
 }
 
 /// Builds Team-game attendance rows from `get_pickup_game_roster` (20260948 buckets).
+///
+/// Important: do **not** treat `stackMembers` (organizer ∪ playing) as Going.
+/// The organizer object is always present for the creator even when their
+/// event-specific RSVP is Maybe / Can't Go / unanswered. Using stackMembers
+/// caused Schedule quick-RSVP to flip Can't Go → Going after refresh and made
+/// every event the viewer created appear Going regardless of that event's row.
 nonisolated enum PickupTeamAttendancePresentation {
     /// Priority when a user appears in more than one bucket (should be rare after RPC dedupe).
+    /// Response buckets beat organizer-inferred Going so Can't Go / Maybe win.
     private static let categoryPriority: [PickupDetailAttendanceCategory] = [
-        .going, .maybe, .noResponse, .cantGo
+        .cantGo, .maybe, .noResponse, .going
     ]
 
     static func rows(from roster: PickupGameRosterPayload) -> [PickupTeamAttendanceRow] {
@@ -200,12 +298,34 @@ nonisolated enum PickupTeamAttendancePresentation {
             }
         }
 
-        consider(roster.stackMembers, .going)
+        // Explicit request buckets first (event-scoped).
+        consider(roster.declinedMembers, .cantGo)
         consider(roster.pending, .maybe)
         consider(roster.noResponseMembers, .noResponse)
-        consider(roster.declinedMembers, .cantGo)
+        consider(roster.playing, .going)
 
-        return categoryPriority.flatMap { category in
+        // Creator is always returned as `organizer` and (pre-fix) may be omitted from
+        // playing/declined/no_response. For Team payloads (`no_response` / `declined`
+        // keys present), never invent Going from organizer role — that made every
+        // event the creator scheduled look Going and masked Can't Go after refresh.
+        // Standalone pickups omit those keys; host still counts as Going.
+        if let organizer = roster.organizer {
+            let uid = organizer.user_id
+            let hasExplicitResponse =
+                roster.declinedMembers.contains(where: { $0.user_id == uid })
+                || roster.pending.contains(where: { $0.user_id == uid })
+                || roster.noResponseMembers.contains(where: { $0.user_id == uid })
+                || roster.playing.contains(where: { $0.user_id == uid })
+            let isTeamAttendancePayload = roster.no_response != nil || roster.declined != nil
+            if !hasExplicitResponse, !isTeamAttendancePayload {
+                consider([organizer], .going)
+            }
+        }
+
+        let displayOrder: [PickupDetailAttendanceCategory] = [
+            .going, .maybe, .noResponse, .cantGo
+        ]
+        return displayOrder.flatMap { category in
             best.values
                 .filter { $0.category == category }
                 .sorted {

@@ -1,3 +1,5 @@
+import { PUSH_ARTWORK_URL_KEY } from "./push_artwork.ts"
+
 export type PushTokenRow = {
   id: string
   user_id: string
@@ -12,6 +14,7 @@ export type ApnsSendResult = {
   tokenEnvironment: "sandbox" | "production"
   reason?: string
   invalidate?: boolean
+  apnsId?: string
 }
 
 export type PushAlertContent = {
@@ -64,10 +67,13 @@ export class ApnsClient {
         aps: {
           alert: apsAlert,
           sound: "default",
+          ...(customData[PUSH_ARTWORK_URL_KEY] ? { "mutable-content": 1 } : {}),
         },
         ...customData,
       }),
     })
+
+    const apnsId = response.headers.get("apns-id")?.trim() || undefined
 
     // HTTP 200 means APNs accepted the request for this device token string.
     // It does NOT prove the current physical install displayed the notification
@@ -78,6 +84,7 @@ export class ApnsClient {
         status: response.status,
         endpoint: host,
         tokenEnvironment: environment,
+        apnsId,
       }
     }
     const payload = await response.json().catch(() => ({}))
@@ -92,6 +99,7 @@ export class ApnsClient {
       tokenEnvironment: environment,
       reason,
       invalidate,
+      apnsId,
     }
   }
 

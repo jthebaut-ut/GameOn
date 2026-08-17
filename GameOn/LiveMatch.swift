@@ -3364,6 +3364,9 @@ nonisolated struct LiveMatch: Identifiable, Equatable, Codable {
     let featuredEventSlug: String?
     let homeTeamBadgeURL: String?
     let awayTeamBadgeURL: String?
+    var homeTeamProviderId: String? = nil
+    var awayTeamProviderId: String? = nil
+    var leagueBadgeURL: String? = nil
 
     var liveSportVisualType: LiveSportVisualType {
         LiveSportVisualType.normalize(sport)

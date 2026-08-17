@@ -191,7 +191,11 @@ struct HomeCrowdProfileCardView: View {
     private func publicVenueThumbnail(_ summary: HomeCrowdVenueSummary) -> some View {
         Group {
             if let raw = summary.thumbnailURL, let url = URL(string: raw) {
-                DiscoverCachedRemoteImage(url: url, contentMode: .fill) {
+                DiscoverCachedRemoteImage(
+                    url: url,
+                    contentMode: .fill,
+                    bucket: DiscoverMapImageCache.Bucket.forPointSize(publicImageSide)
+                ) {
                     homeCrowdPlaceholderVisual
                 }
                 .id(summary.venueId)
@@ -224,11 +228,14 @@ struct HomeCrowdProfileCardView: View {
         ZStack(alignment: .topTrailing) {
             Group {
                 if let raw = summary.thumbnailURL, let url = URL(string: raw) {
-                    DiscoverCachedRemoteImage(url: url, contentMode: .fill) {
+                    DiscoverCachedRemoteImage(
+                        url: url,
+                        contentMode: .fill,
+                        bucket: DiscoverMapImageCache.Bucket.forPointSize(imageSide)
+                    ) {
                         homeCrowdPlaceholderVisual
                     }
                     .id(summary.venueId)
-                    .transition(.opacity.combined(with: .scale(scale: 0.97)))
                 } else {
                     homeCrowdPlaceholderVisual
                 }

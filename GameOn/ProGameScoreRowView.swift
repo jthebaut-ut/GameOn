@@ -10,16 +10,17 @@ nonisolated struct ProGameTeamScoreIdentity: Equatable {
     let leading: LeadingContent
     let displayName: String
 
-    static func resolve(teamName: String, badgeURL: String?, source: String) -> ProGameTeamScoreIdentity {
+    static func resolve(teamName: String, badgeURL: String?, source: String, entityID: String? = nil, league: String? = nil) -> ProGameTeamScoreIdentity {
         let cleanedName = cleanTeamName(teamName)
         guard !cleanedName.isEmpty else {
             return ProGameTeamScoreIdentity(leading: .none, displayName: cleanedName)
         }
 
-        // Shared sports-identity policy: flags OK; remote official crests only when verified licensed.
         let artwork = SportsIdentityArtworkResolver.resolveProGameTeam(
             teamName: cleanedName,
             badgeURL: badgeURL,
+            entityID: entityID,
+            league: league,
             source: source
         )
         switch artwork.kind {
@@ -27,9 +28,7 @@ nonisolated struct ProGameTeamScoreIdentity: Equatable {
             return ProGameTeamScoreIdentity(leading: .flag(flag), displayName: cleanedName)
         case .verifiedRemote(let url):
             return ProGameTeamScoreIdentity(leading: .logoURL(url), displayName: cleanedName)
-        case .fanGeoMonogram, .genericSymbol:
-            // Consumers that only support flag/URL/none keep `.none` and show name text;
-            // rich cards can adopt ``SportsIdentityArtworkView`` in a later migration phase.
+        case .fanGeoMonogram, .genericSymbol, .playerAthleteFallback, .competitionFallback:
             return ProGameTeamScoreIdentity(leading: .none, displayName: cleanedName)
         }
     }
@@ -163,7 +162,7 @@ struct ProGameScoreboardView: View {
                 .frame(width: size, height: size, alignment: .center)
                 .accessibilityHidden(true)
         case let .logoURL(url):
-            DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
+            DiscoverCachedRemoteImage(url: url, contentMode: .fit, bucket: .avatar) {
                 Color.clear
             }
             .frame(width: size, height: size)
@@ -319,6 +318,9 @@ struct ProGameScoreBlock: View {
     let awayBadgeURL: String?
     let homeBadgeURL: String?
     let source: String
+    var league: String? = nil
+    var awayEntityID: String? = nil
+    var homeEntityID: String? = nil
 
     var isFinal: Bool = false
     var isLive: Bool = false
@@ -332,11 +334,34 @@ struct ProGameScoreBlock: View {
     var flagSource: String = "GoingPro"
 
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var artworkEpoch = SportsArtworkEpoch.shared
+
+    private var awayIdentity: ProGameTeamScoreIdentity {
+        _ = artworkEpoch.generation
+        return ProGameTeamScoreIdentity.resolve(
+            teamName: awayTeam,
+            badgeURL: awayBadgeURL,
+            source: source,
+            entityID: awayEntityID,
+            league: league
+        )
+    }
+
+    private var homeIdentity: ProGameTeamScoreIdentity {
+        _ = artworkEpoch.generation
+        return ProGameTeamScoreIdentity.resolve(
+            teamName: homeTeam,
+            badgeURL: homeBadgeURL,
+            source: source,
+            entityID: homeEntityID,
+            league: league
+        )
+    }
 
     var body: some View {
         let scoreboard = ProGameScoreboardView(
-            awayIdentity: ProGameTeamScoreIdentity.resolve(teamName: awayTeam, badgeURL: awayBadgeURL, source: source),
-            homeIdentity: ProGameTeamScoreIdentity.resolve(teamName: homeTeam, badgeURL: homeBadgeURL, source: source),
+            awayIdentity: awayIdentity,
+            homeIdentity: homeIdentity,
             awayScore: awayScore,
             homeScore: homeScore,
             style: style,
@@ -431,7 +456,7 @@ struct ProGameScoreRowView: View {
                 .font(.system(size: 15))
                 .accessibilityHidden(true)
         case let .logoURL(url):
-            DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
+            DiscoverCachedRemoteImage(url: url, contentMode: .fit, bucket: .avatar) {
                 Color.clear
             }
             .frame(width: 18, height: 18)

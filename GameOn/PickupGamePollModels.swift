@@ -157,10 +157,13 @@ struct PickupGamePollVoterRow: Codable, Equatable, Sendable {
 
 struct PickupGamePollSnapshot: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
-    let pickupGameId: UUID
+    /// Set for pickup polls; nil for Team Chat polls.
+    let pickupGameId: UUID?
+    /// Set for Team Chat polls; nil for pickup polls.
+    let teamId: UUID?
     let conversationId: UUID
     let messageId: UUID?
-    let createdBy: UUID
+    let createdBy: UUID?
     let question: String
     let allowMultiple: Bool
     let isAnonymous: Bool
@@ -181,6 +184,7 @@ struct PickupGamePollSnapshot: Codable, Equatable, Identifiable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id
         case pickupGameId = "pickup_game_id"
+        case teamId = "team_id"
         case conversationId = "conversation_id"
         case messageId = "message_id"
         case createdBy = "created_by"

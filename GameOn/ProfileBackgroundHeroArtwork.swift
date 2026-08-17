@@ -29,6 +29,9 @@ struct ProfileBackgroundHeroArtwork: View {
                 .overlay {
                     edgeSofteningOverlay
                 }
+                // Flatten image + scrims into one layer so scroll doesn't re-composite
+                // three overlays every frame while the hero is on-screen.
+                .compositingGroup()
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)

@@ -365,7 +365,7 @@ extension MapViewModel {
 
     // MARK: - Persisted acknowledgement
 
-    private func hydratedPickupFollowingSeenActivitySignatures() -> [UUID: String] {
+    func hydratedPickupFollowingSeenActivitySignatures() -> [UUID: String] {
         if !pickupFollowingSeenActivitySignatureByGameId.isEmpty {
             return pickupFollowingSeenActivitySignatureByGameId
         }

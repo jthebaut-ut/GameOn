@@ -14,6 +14,9 @@ struct FanTeamIdentityChange: Equatable, Sendable {
     let previousLogoThumbnailURL: String?
     let displayRefreshToken: UUID
     let updatedAt: Date
+    /// True when bytes were replaced (including same-URL overwrite) or the logo was removed.
+    /// Name/sport/color-only edits stay false so working bitmaps are not dropped.
+    let artworkReplaced: Bool
 
     init(
         teamId: UUID,
@@ -27,7 +30,8 @@ struct FanTeamIdentityChange: Equatable, Sendable {
         previousLogoURL: String?,
         previousLogoThumbnailURL: String?,
         displayRefreshToken: UUID = UUID(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        artworkReplaced: Bool? = nil
     ) {
         self.teamId = teamId
         self.conversationId = conversationId
@@ -41,6 +45,9 @@ struct FanTeamIdentityChange: Equatable, Sendable {
         self.previousLogoThumbnailURL = ImageDisplayURL.canonicalStorageURLString(previousLogoThumbnailURL).nilIfEmpty
         self.displayRefreshToken = displayRefreshToken
         self.updatedAt = updatedAt
+        let urlsChanged = self.previousLogoURL != self.logoURL
+            || self.previousLogoThumbnailURL != self.logoThumbnailURL
+        self.artworkReplaced = artworkReplaced ?? urlsChanged
     }
 }
 
@@ -49,12 +56,15 @@ enum FanTeamIdentityChangeCenter {
     private static let changeUserInfoKey = "FanGeo.FanTeamIdentityChange"
 
     static func postIdentityChange(_ change: FanTeamIdentityChange) {
-        invalidateCachedTeamLogoImages(
-            previousLogoURL: change.previousLogoURL,
-            previousThumbnailURL: change.previousLogoThumbnailURL,
-            nextLogoURL: change.logoURL,
-            nextThumbnailURL: change.logoThumbnailURL
-        )
+        let urls = FanTeamArtworkPropagation.urlsToInvalidate(from: change)
+        if !urls.isEmpty {
+            Task {
+                await DiscoverMapImageCache.shared.invalidate(urls: urls)
+            }
+        }
+        Task { @MainActor in
+            ProfilePhase1PersonalizationCache.applyFanTeamIdentityChange(change)
+        }
         NotificationCenter.default.post(
             name: identityDidChangeNotification,
             object: nil,
@@ -64,35 +74,6 @@ enum FanTeamIdentityChangeCenter {
 
     static func identityChange(from notification: Notification) -> FanTeamIdentityChange? {
         notification.userInfo?[changeUserInfoKey] as? FanTeamIdentityChange
-    }
-
-    /// Drop decoded images for superseded Team logo URLs so marks never keep showing the old photo.
-    static func invalidateCachedTeamLogoImages(
-        previousLogoURL: String?,
-        previousThumbnailURL: String?,
-        nextLogoURL: String?,
-        nextThumbnailURL: String?
-    ) {
-        let nextFull = ImageDisplayURL.canonicalStorageURLString(nextLogoURL)
-        let nextThumb = ImageDisplayURL.canonicalStorageURLString(nextThumbnailURL)
-        var candidates: [String] = []
-        let prevFull = ImageDisplayURL.canonicalStorageURLString(previousLogoURL)
-        let prevThumb = ImageDisplayURL.canonicalStorageURLString(previousThumbnailURL)
-        if !prevFull.isEmpty, prevFull != nextFull, prevFull != nextThumb {
-            candidates.append(prevFull)
-        }
-        if !prevThumb.isEmpty, prevThumb != nextFull, prevThumb != nextThumb {
-            candidates.append(prevThumb)
-        }
-        if let list = ImageDisplayURL.forList(thumbnail: previousThumbnailURL, full: previousLogoURL),
-           list != ImageDisplayURL.forList(thumbnail: nextThumbnailURL, full: nextLogoURL) {
-            candidates.append(list)
-        }
-        let urls = candidates.compactMap { URL(string: $0) }
-        guard !urls.isEmpty else { return }
-        Task {
-            await DiscoverMapImageCache.shared.invalidate(urls: urls)
-        }
     }
 }
 

@@ -82,7 +82,8 @@ enum FanTeamPushMuteSelfTests {
             nextGameStartsAt: nil,
             nextGameTitle: nil,
             nextGameVenue: nil,
-            createdAt: nil
+            createdAt: nil,
+            myPermissions: .teamAdministrator
         )
         expect(manager.canManage && manager.pushNotificationsMuted, "manager may mute self")
         expect(managerMuted.pushNotificationsMuted, "applying mute preserves flag")

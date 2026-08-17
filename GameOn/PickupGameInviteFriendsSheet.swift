@@ -184,7 +184,7 @@ struct PickupGameInviteFriendsSheet: View {
                         .font(FGTypography.cardTitle)
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(2)
-                    Text("\(AppSportCatalog.displayLabel(forSportToken: game.sport)) · \(game.gameFormat.displayTitle)")
+                    Text("\(game.sportIdentityLabel()) · \(game.gameFormat.displayTitle)")
                         .font(FGTypography.caption.weight(.semibold))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                     if let dateLine = game.pickupDateWithCompactTimeRange(languageCode: appLanguageRaw) {
@@ -547,7 +547,8 @@ struct PickupGameInviteFriendsSheet: View {
             }
             if teamMemberIdsByTeamId[team.id] == nil {
                 let members = try await teamsService.listMembers(teamId: team.id)
-                teamMemberIdsByTeamId[team.id] = members.map(\.userId)
+                // Managed players have no account to invite to a pickup game.
+                teamMemberIdsByTeamId[team.id] = members.compactMap(\.userId)
             }
             let candidateIds = teamMemberIdsByTeamId[team.id] ?? []
             let result = PickupInviteRecipientGate.selectableUserIds(

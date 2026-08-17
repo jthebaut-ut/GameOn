@@ -860,6 +860,7 @@ extension MapViewModel {
         if discoverMapContentMode == .pickupGames {
             if discoverPickupSubMode == .places {
                 pruneSelectedPickupPlaceIfNeeded()
+                pruneSelectedDiscoverableFanTeamIfNeeded()
                 return
             }
             if let row = selectedPickupGameForMap {
@@ -887,6 +888,7 @@ extension MapViewModel {
         discoverRemotePreviewHoldVenueId = nil
         selectedPickupGameForMap = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
     }
 
     func selectedDayEventsForMap(_ venue: BarVenue, sportFilter: String? = nil) -> [SportsEvent] {
@@ -1189,6 +1191,7 @@ extension MapViewModel {
         selectedBar = nil
         selectedPickupGameForMap = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
         discoverRemotePreviewHoldVenueId = nil
         clearDiscoverVenueEventSearchFilter()
 
@@ -1207,6 +1210,7 @@ extension MapViewModel {
                 await refreshPickupGamesForDiscoverMap(preservePickupCalendarDotDatesCache: true)
             } else if discoverMapContentMode == .pickupGames, discoverPickupSubMode == .places {
                 await refreshPickupPlacesForDiscoverMap(force: pickupPlacesForDiscoverMap.isEmpty)
+                await refreshDiscoverableFanTeamsForMap(force: discoverableFanTeamsForMap.isEmpty)
             }
         }
     }

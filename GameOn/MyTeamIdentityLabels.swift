@@ -1,6 +1,7 @@
 import Foundation
 
-/// Compact immutable display model for the authoritative primary “My Team.”
+/// Compact immutable display model for the authoritative primary Favorite Team
+/// (professional club — distinct from FanGeo “My Teams”).
 struct MyTeamDisplayModel: Equatable, Sendable {
     let teamID: String
     let teamName: String
@@ -15,23 +16,23 @@ struct MyTeamDisplayModel: Equatable, Sendable {
         sport = team.sport
     }
 
-    /// Card secondary line: sport name only (e.g. "Basketball"), not "My Basketball Team".
+    /// Card secondary line: sport name only (e.g. "Basketball"), not "Favorite Basketball Team".
     func sportLabel(languageCode: String) -> String {
         _ = languageCode
         return sport.chipTitle
     }
 
     func accessibilityLabel(languageCode: String) -> String {
-        let myTeam = L10n.t("my_team", languageCode: languageCode)
-        return "\(myTeam), \(teamName), \(sportLabel(languageCode: languageCode))"
+        let favoriteTeam = L10n.t("my_team", languageCode: languageCode)
+        return "\(favoriteTeam), \(teamName), \(sportLabel(languageCode: languageCode))"
     }
 }
 
 /// National-fan strip subtitle from the selected national-team identity only.
 ///
-/// Independent of My Team. Today `NationalTeamIdentity` stores country/flag/label
+/// Independent of Favorite Team. Today `NationalTeamIdentity` stores country/flag/label
 /// but not sport; until a catalog national-team ID is persisted, use the neutral
-/// subtitle (never infer sport from My Team, country lists, or tournaments).
+/// subtitle (never infer sport from Favorite Team, country lists, or tournaments).
 enum NationalFanIdentityDisplay {
     /// Neutral subtitle when national country identity exists without sport metadata.
     static func stripSubtitle(languageCode: String) -> String {
@@ -39,7 +40,7 @@ enum NationalFanIdentityDisplay {
     }
 
     /// Sport-specific subtitle when a structured national-team sport is known.
-    /// Pass `nil` when sport is unknown — never falls back to My Team.
+    /// Pass `nil` when sport is unknown — never falls back to Favorite Team.
     static func stripSubtitle(
         nationalTeamSport: FavoriteTeamSport?,
         languageCode: String
@@ -75,7 +76,7 @@ enum NationalFanIdentityDisplay {
     }
 }
 
-/// Sport-aware permanent subtitles for My Team / national-team identity labels.
+/// Sport-aware permanent subtitles for Favorite Team / national-team identity labels.
 /// Uses `FavoriteTeam.kind` / `FavoriteTeam.sport` — never competition/tournament names.
 enum MyTeamIdentityLabels {
     static func subtitle(

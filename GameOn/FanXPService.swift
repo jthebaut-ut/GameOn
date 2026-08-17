@@ -9,6 +9,11 @@ enum FanXPSource {
     static let pickupJoinApproved = "pickup_join_approved"
     static let pickupComplete = "pickup_complete"
     static let friendConnected = "friend_connected"
+    static let teamCreated = "team_created"
+    static let teamJoinPlayer = "team_join_player"
+    static let teamEventCreated = "team_event_created"
+    static let teamEventCompletedPlayer = "team_event_completed_player"
+    static let teamEventCompletedOrganizer = "team_event_completed_organizer"
 
     /// Server-authoritative amounts (must match `public.fan_xp_amount_for_source`).
     static func expectedAmount(for source: String) -> Int {
@@ -19,6 +24,11 @@ enum FanXPSource {
         case pickupJoinApproved: return 10
         case pickupComplete: return 15
         case friendConnected: return 5
+        case teamCreated: return 20
+        case teamJoinPlayer: return 10
+        case teamEventCreated: return 5
+        case teamEventCompletedPlayer: return 10
+        case teamEventCompletedOrganizer: return 15
         default: return 0
         }
     }
@@ -31,6 +41,11 @@ enum FanXPSource {
         case pickupJoinApproved: return "Pickup Joined"
         case pickupComplete: return "Pickup Completed"
         case friendConnected: return "Friend Connected"
+        case teamCreated: return "Team Created"
+        case teamJoinPlayer: return "Joined Team"
+        case teamEventCreated: return "Team Event Created"
+        case teamEventCompletedPlayer: return "Team Event Played"
+        case teamEventCompletedOrganizer: return "Team Event Organized"
         default: return "Fan Activity"
         }
     }
@@ -38,6 +53,28 @@ enum FanXPSource {
     /// Legacy plain string (social toast); prefer ``FanXPRewardOverlayManager``.
     static func toastLabel(for source: String, amount: Int) -> String {
         "Reputation noted · \(rewardSubtitle(for: source))"
+    }
+}
+
+/// Server-mirrored anti-farming + join-transition policy (`20260996`).
+enum FanXPTeamAwardPolicy {
+    /// First N `team_created` awards per account. Further Teams can still be created.
+    static let teamCreatedLifetimeCap = 5
+    /// Max `team_event_created` awards per account per UTC day.
+    static let teamEventCreatedDailyCap = 8
+    /// No historical backfill for seats that were already active players.
+    static let backfillsExistingPlayers = false
+
+    static func shouldAwardJoinPlayer(
+        isInsert: Bool,
+        wasEligibleAccountPlayer: Bool,
+        isEligibleAccountPlayer: Bool,
+        isManagedPlayerSeat: Bool
+    ) -> Bool {
+        if isManagedPlayerSeat { return false }
+        if !isEligibleAccountPlayer { return false }
+        if isInsert { return true }
+        return !wasEligibleAccountPlayer
     }
 }
 

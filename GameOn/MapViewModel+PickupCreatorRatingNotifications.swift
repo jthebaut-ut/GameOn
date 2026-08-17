@@ -19,7 +19,7 @@ extension MapViewModel {
             pickupGameId: pickupGameId
         )
         pendingPickupPlayingHighlightGameID = pickupGameId
-        requestedMainTabRaw = "following"
+        requestGoingRootTab()
     }
 
     @MainActor

@@ -117,6 +117,8 @@ struct SettingsScreen: View {
     @State private var venueOwnerDashboardSheet: VenueOwnerDashboardSheetRoute?
     @State private var showVenueRegisterMode = false
     @State private var showProfileSettingsSheet = false
+    @State private var profileScrollInteractionRelay = ProfileScrollInteractionRelay()
+    @State private var cachedProfileOuterInset: CGFloat?
     @State private var showBusinessProSubscriptionSheet = false
     @State private var showBusinessUsageSheet = false
     @State private var showSponsorInquirySheet = false
@@ -198,6 +200,13 @@ struct SettingsScreen: View {
             set: { newValue in
                 requireFaceIDForPrivateChat = newValue
                 print("[PrivateChatSecurityDebug] settingChanged=\(newValue)")
+#if DEBUG
+                print(
+                    "[PrivacySettingsAudit] setting=requireFaceIDForPrivateChat value=\(newValue) " +
+                    "source=UserDefaults.\(PrivateChatSecuritySettings.requireFaceIDSettingKey) " +
+                    "affectedSurface=privateChatUnlock"
+                )
+#endif
                 if isBusinessAccountProfileContext {
                     print("[BusinessPrivacySettingsDebug] faceIDToggleChanged=\(newValue)")
                 }
@@ -539,11 +548,12 @@ struct SettingsScreen: View {
         NavigationStack {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .center, spacing: 12) {
+                    HStack(alignment: .center, spacing: 10) {
                         FanGeoPagePurposeHeader(
                             title: L10n.t("profile_tab_title", languageCode: appLanguageRaw),
                             subtitle: ""
                         )
+                        .layoutPriority(1)
 
                         Spacer(minLength: 8)
 
@@ -560,9 +570,7 @@ struct SettingsScreen: View {
                                     .frame(width: 34, height: 34)
                                     .background {
                                         Circle()
-                                            .fill(.ultraThinMaterial)
-                                        Circle()
-                                            .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.82))
+                                            .fill(Color.white.opacity(colorScheme == .dark ? 0.12 : 0.88))
                                     }
                                     .overlay {
                                         Circle()
@@ -573,6 +581,9 @@ struct SettingsScreen: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel(L10n.t("Open settings", languageCode: appLanguageRaw))
                         }
+
+                        // Action Center remains available on Profile (same signed-in rule as other roots).
+                        FanGeoActionCenterHeaderButton()
                     }
                     .padding(.horizontal, 16)
                     // Title sits just below the safe-area content boundary (no duplicate nav-bar row).
@@ -624,22 +635,20 @@ struct SettingsScreen: View {
                                 )
                             )
                         } else {
-                            SettingsUnifiedAccountEntryCard(
-                                viewModel: viewModel,
-                                onSignIn: {
-                                    showRegisterMode = false
-                                    showUserAuthSheet = true
-                                },
-                                onCreateAccount: {
-                                    showRegisterMode = true
-                                    showUserAuthSheet = true
-                                },
-                                onWatchLiveWithFans: openDiscoverForVenuesFromProfile,
-                                onJoinPickupGames: openDiscoverForPickupGamesFromProfile,
-                                onVenueOwnerTools: nil,
-                                statusMessage: viewModel.authErrorMessage,
-                                attemptedLoginEmail: email
-                            )
+                            // Signed-out Profile is `SignedOutLandingView` (MainTabView fullScreenCover).
+                            // Do not mount the old guest marketing card on this tab.
+                            Color.clear
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 1)
+                                .accessibilityHidden(true)
+                                .onAppear {
+                                    guard FanGeoAuthLandingRouting.canPresentAuthLanding(
+                                        isLoggedIn: viewModel.isLoggedIn,
+                                        isVenueOwnerLoggedIn: viewModel.isVenueOwnerLoggedIn,
+                                        resolvingEmailConfirmation: viewModel.resolvingEmailConfirmation
+                                    ) else { return }
+                                    viewModel.presentPremiumAuthLanding(from: .profileTab)
+                                }
                         }
                     }
                     // Fan profile: adaptive outer inset (SE keeps 16; standard/Pro Max use 6).
@@ -647,7 +656,7 @@ struct SettingsScreen: View {
                         .horizontal,
                         isBusinessAccountProfileContext || !viewModel.isLoggedIn
                             ? 16
-                            : ProfileHeroMetrics.outerInset(screenWidth: nil)
+                            : (cachedProfileOuterInset ?? ProfileHeroMetrics.outerInset(screenWidth: nil))
                     )
                     .padding(.top, isBusinessAccountProfileContext || !viewModel.isLoggedIn ? 16 : 0)
                     .padding(.bottom, 10)
@@ -678,7 +687,7 @@ struct SettingsScreen: View {
                             .padding(.vertical, 6)
                     }
 
-                    if !shouldShowInlineBusinessDashboard && (viewModel.isVenueOwnerLoggedIn || !viewModel.isLoggedIn) {
+                    if !shouldShowInlineBusinessDashboard && viewModel.isVenueOwnerLoggedIn {
                         Group {
                             if viewModel.isVenueOwnerLoggedIn {
                                 settingsSectionHeader("Business & Venue")
@@ -908,11 +917,18 @@ struct SettingsScreen: View {
                 .padding(.bottom, SettingsScrollBottomLayout.accountTabScrollBottomInset)
             }
             .scrollIndicators(.hidden)
+            .onScrollPhaseChange { _, newPhase in
+                profileScrollInteractionRelay.setActive(newPhase != .idle)
+            }
+            .environment(\.profileScrollInteractionRelay, profileScrollInteractionRelay)
             .background(SettingsPremiumChrome.screenBackground(colorScheme).ignoresSafeArea())
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar(.hidden, for: .navigationBar)
             .onAppear {
+                if cachedProfileOuterInset == nil {
+                    cachedProfileOuterInset = ProfileHeroMetrics.outerInset(screenWidth: nil)
+                }
 #if DEBUG
                 SettingsNavigationDebug.log(
                     "settingsScreenAppear settingsScreenId=\(settingsScreenInstanceId.uuidString) isAccountTabSelected=\(isAccountTabSelected)"
@@ -960,6 +976,7 @@ struct SettingsScreen: View {
     }
 
     var body: some View {
+        let _ = ProfileOpenPerf.rootBody()
         profileOverflowLogoutPresentations(on: accountTabRootContent)
         .onChange(of: isAccountTabSelected) { _, isSelected in
             SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] accountTabSelectionChanged isSelected=\(isSelected) isLoggedIn=\(viewModel.isLoggedIn) authId=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil") businessContext=\(isBusinessAccountProfileContext)")
@@ -1022,6 +1039,11 @@ struct SettingsScreen: View {
         }
         .onChange(of: viewModel.presentFanUserAuthSheetFromDiscover) { _, shouldPresent in
             guard shouldPresent else { return }
+            if viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn {
+                viewModel.presentFanUserAuthSheetFromDiscover = false
+                viewModel.fanUserAuthSheetOpenInRegisterMode = false
+                return
+            }
             showRegisterMode = viewModel.fanUserAuthSheetOpenInRegisterMode
             showUserAuthSheet = true
             let verifiedEmail = OwnerBusinessEmail.normalized(viewModel.pendingEmailVerificationEmail)
@@ -1918,17 +1940,21 @@ struct SettingsScreen: View {
 
     @ViewBuilder
     private func profileSettingsPrivacySection() -> some View {
-        if canShowPrivateChatFaceIDSetting || canShowLiveActivitySharing || canShowPrivacyAdChoices {
+        if canShowPrivateChatFaceIDSetting {
             Section {
                 settingsSectionCard {
-                    if canShowPrivateChatFaceIDSetting {
-                        privateChatFaceIDSettingsRow
-                    }
+                    privateChatFaceIDSettingsRow
+                }
+                .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
+                .listRowBackground(Color.clear)
+            } header: {
+                settingsSectionHeader(L10n.t("settings_security_section_title", languageCode: appLanguageRaw))
+            }
+        }
 
-                    if canShowPrivateChatFaceIDSetting && (canShowLiveActivitySharing || canShowPrivacyAdChoices) {
-                        settingsRowDivider()
-                    }
-
+        if canShowLiveActivitySharing || canShowPrivacyAdChoices {
+            Section {
+                settingsSectionCard {
                     if canShowLiveActivitySharing {
                         settingsToggleRow(
                             title: L10n.t("profile_discovery_title", languageCode: appLanguageRaw),
@@ -1941,6 +1967,15 @@ struct SettingsScreen: View {
                             infoAccessibilityHint: L10n.t("privacy_setting_info_hint", languageCode: appLanguageRaw),
                             onInfo: { showProfileDiscoveryHelpSheet = true }
                         )
+                        .onChange(of: viewModel.currentUserDiscoverableByFans) { _, newValue in
+#if DEBUG
+                            print(
+                                "[PrivacySettingsAudit] setting=profileDiscoverability value=\(newValue) " +
+                                "source=user_profiles.discoverable_by_fans " +
+                                "affectedSurface=search,suggestedFans,nearby"
+                            )
+#endif
+                        }
 
                         settingsRowDivider()
 
@@ -1952,6 +1987,15 @@ struct SettingsScreen: View {
                             isUpdating: viewModel.isUpdatingActivityStatusVisibilitySetting,
                             tint: FGColor.accentGreen
                         )
+                        .onChange(of: viewModel.currentUserActivityStatusVisible) { _, newValue in
+#if DEBUG
+                            print(
+                                "[PrivacySettingsAudit] setting=activityStatusVisible value=\(newValue) " +
+                                "source=user_profiles.activity_status_visible " +
+                                "affectedSurface=chatPresence,friendsPresence,profileLastActive"
+                            )
+#endif
+                        }
 
                         settingsRowDivider()
 
@@ -1969,7 +2013,7 @@ struct SettingsScreen: View {
                 .listRowInsets(EdgeInsets(top: 10, leading: 16, bottom: 12, trailing: 16))
                 .listRowBackground(Color.clear)
             } header: {
-                settingsSectionHeader(L10n.t("privacy_and_security", languageCode: appLanguageRaw))
+                settingsSectionHeader(L10n.t("settings_profile_visibility_section_title", languageCode: appLanguageRaw))
             }
         }
     }
@@ -2027,6 +2071,8 @@ struct SettingsScreen: View {
             .padding(.trailing, FGSpacing.sm)
         }
         .accessibilityElement(children: .contain)
+        .accessibilityLabel(L10n.t("share_my_fan_activity_title", languageCode: appLanguageRaw))
+        .accessibilityHint(L10n.t("share_my_fan_activity_subtitle", languageCode: appLanguageRaw))
     }
 
     private var canShowPrivacyAdChoices: Bool {
@@ -3078,6 +3124,13 @@ struct SettingsScreen: View {
             Toggle(title, isOn: isOn)
                 .labelsHidden()
                 .disabled(isUpdating)
+                .accessibilityLabel(title)
+                .accessibilityValue(
+                    isOn.wrappedValue
+                        ? L10n.t("privacy_permissions_status_on", languageCode: appLanguageRaw)
+                        : L10n.t("privacy_permissions_status_off", languageCode: appLanguageRaw)
+                )
+                .accessibilityHint(subtitle)
         }
         .padding(.horizontal, FGSpacing.md)
         .padding(.vertical, 10)

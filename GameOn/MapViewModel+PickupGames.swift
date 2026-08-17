@@ -3,7 +3,9 @@ import Foundation
 import Supabase
 
 let pickupGamesSelectColumns =
-    "id,creator_user_id,creator_email,title,sport,description,game_format,competition_level,skill_level,game_start_at,end_time,address,city,state,latitude,longitude,is_visible,players_needed,play_environment,participant_preference,age_min,age_max,is_free,entry_fee_amount,max_players,status,approved_join_count,cleanup_delay_hours,remove_after_at,created_at,updated_at,poll_create_permission"
+    "id,creator_user_id,creator_email,title,sport,sport_subtype,description,game_format,competition_level,skill_level,game_start_at,end_time,arrival_time,address,city,state,latitude,longitude,is_visible,players_needed,play_environment,participant_preference,age_min,age_max,is_free,entry_fee_amount,max_players,status,approved_join_count,cleanup_delay_hours,remove_after_at,created_at,updated_at,poll_create_permission,opponent_name"
+/// Includes `arrival_time` after `20260973_0001_pickup_games_arrival_time.sql` (applied in production).
+/// Optional on read (`decodeIfPresent` / nil). Writes: Insert omits nil; FullUpdate encodes JSON null to clear.
 
 private let pickupOrganizerSettingsHistoryUserClearedIdsKeyPrefix = "gameon.settings.pickupOrganizerHistoryClearedIds."
 private let pickupGamesDiscoverCacheTTL: TimeInterval = 150
@@ -284,6 +286,7 @@ extension MapViewModel {
     func clearPickupMapSelection() {
         selectedPickupGameForMap = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
     }
 
     func selectPickupGameOnMap(_ row: PickupGameRow) {
@@ -291,6 +294,7 @@ extension MapViewModel {
         selectedBar = nil
         selectedEvent = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
         discoverRemotePreviewHoldVenueId = nil
         selectedPickupGameForMap = row
         PickupDetailCrashTrace.log("selectedGameAssigned", gameId: row.id, title: row.title)
@@ -438,6 +442,7 @@ extension MapViewModel {
         case .venues:
             selectedPickupGameForMap = nil
             selectedPickupPlaceForMap = nil
+            selectedDiscoverableFanTeamForMap = nil
         case .pickupGames:
             selectedBar = nil
             selectedEvent = nil
@@ -450,6 +455,7 @@ extension MapViewModel {
             guard discoverMapContentMode == .pickupGames else { return }
             guard discoverPickupSubMode == .games else {
                 await refreshPickupPlacesForDiscoverMap()
+                await refreshDiscoverableFanTeamsForMap()
                 return
             }
             guard pickupDiscoverCoordinatorDirty else { return }
@@ -545,7 +551,12 @@ extension MapViewModel {
         }
 
         if request.sport != "All" {
-            query = query.eq("sport", value: request.sport)
+            let tokens = AppSportCatalog.storedTokensMatchingDiscoverFilter(request.sport)
+            if tokens.count <= 1 {
+                query = query.eq("sport", value: tokens.first ?? request.sport)
+            } else {
+                query = query.in("sport", values: tokens)
+            }
         }
 
         let rows: [PickupGameCalendarRow] = try await query
@@ -691,6 +702,7 @@ extension MapViewModel {
         discoverPickupSubMode = .games
         selectedBar = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
 
         mergePickupInsertedLocally(row)
         let localMerge = pickupGamesForDiscoverMap.contains { $0.id == row.id }
@@ -835,7 +847,12 @@ extension MapViewModel {
             }
 
             if requestSport != "All" {
-                query = query.eq("sport", value: requestSport)
+                let tokens = AppSportCatalog.storedTokensMatchingDiscoverFilter(requestSport)
+                if tokens.count <= 1 {
+                    query = query.eq("sport", value: tokens.first ?? requestSport)
+                } else {
+                    query = query.in("sport", values: tokens)
+                }
             }
 
             // Same AABB convention as month-dot / pickup-places Discover queries.
@@ -1206,7 +1223,11 @@ extension MapViewModel {
         gameFormat: GameType = .pickup,
         competitionLevel: PickupCompetitionLevel? = nil,
         pollCreatePermission: PickupPollCreatePermission = .organizerOnly,
-        isVisible: Bool = true
+        isVisible: Bool = true,
+        opponentName: String? = nil,
+        arrivalTime: Date? = nil,
+        sportSubtype: String? = nil,
+        claimsPickupCreateXP: Bool = true
     ) async throws -> PickupGameRow {
         guard let uid = currentUserAuthId else {
             throw PickupGameClientError.notSignedIn
@@ -1237,6 +1258,10 @@ extension MapViewModel {
             creator_email: normalizedFanEmailForPickup(),
             title: title.trimmingCharacters(in: .whitespacesAndNewlines),
             sport: sport.trimmingCharacters(in: .whitespacesAndNewlines),
+            sport_subtype: SportSubtypeCatalog.normalizedSubtype(
+                sport: sport,
+                subtype: sportSubtype
+            ),
             description: emptyStringToNil(description),
             game_format: gameFormat.rawValue,
             competition_level: competitionLevel?.rawValue,
@@ -1259,7 +1284,12 @@ extension MapViewModel {
             max_players: maxPlayersClamped,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
             remove_after_at: removeISO,
-            poll_create_permission: pollCreatePermission.rawValue
+            poll_create_permission: pollCreatePermission.rawValue,
+            opponent_name: FanTeamScheduleMatchup.persistableOpponent(
+                format: gameFormat,
+                opponentName: opponentName
+            ),
+            arrival_time: arrivalTime.map { PickupGameModels.encodeSupabaseTimestamptz($0) }
         ).withCanonicalPickupCleanupDelay()
 
 #if DEBUG
@@ -1291,10 +1321,12 @@ extension MapViewModel {
             country: nil,
             sport: row.sport
         )
-        await awardFanXP(
-            source: FanXPSource.pickupCreate,
-            sourceId: row.id
-        )
+        if claimsPickupCreateXP {
+            await awardFanXP(
+                source: FanXPSource.pickupCreate,
+                sourceId: row.id
+            )
+        }
         return row
     }
 
@@ -1336,6 +1368,18 @@ extension MapViewModel {
         if let before {
             let changes = PickupGameMeaningfulChange.diff(before: before, after: row)
             print("[PickupEditNotify] meaningfulKinds=\(changes.kinds.map(\.rawValue).joined(separator: ","))")
+            print("[TeamEventChangePushDebug] update_submitted pickup_game_id=\(id.uuidString.lowercased())")
+            print(
+                "[TeamEventChangePushDebug] old_values start=\(before.game_start_at) end=\(before.end_time ?? "nil") " +
+                "address=\(before.address ?? "") status=\(before.status)"
+            )
+            print(
+                "[TeamEventChangePushDebug] new_values start=\(row.game_start_at) end=\(row.end_time ?? "nil") " +
+                "address=\(row.address ?? "") status=\(row.status)"
+            )
+            print(
+                "[TeamEventChangePushDebug] meaningful_fields detected=\(changes.kinds.map(\.rawValue).joined(separator: ","))"
+            )
         }
 #endif
         mergePickupInsertedLocally(row)
@@ -1347,7 +1391,16 @@ extension MapViewModel {
 
     /// Opens/creates the private pickup chat when the organizer has approved participants
     /// so the DB edit-notify trigger can post a system message.
+    /// Team-linked events use Team Chat — never create/open a per-event pickup conversation.
     private func ensurePickupGameChatForEditNotificationsIfNeeded(pickupGameId: UUID) async {
+        if await isPickupGameLinkedToFanTeam(pickupGameId: pickupGameId) {
+#if DEBUG
+            print(
+                "[PickupEditNotify] ensureChat skipped teamLinked=true id=\(pickupGameId.uuidString.lowercased())"
+            )
+#endif
+            return
+        }
         do {
             _ = try await GroupChatService().ensurePickupGameConversation(pickupGameId: pickupGameId)
 #if DEBUG
@@ -2024,6 +2077,100 @@ extension MapViewModel {
         }
     }
 
+    func mergePickupDiscoverTeamIdentities(_ extra: [UUID: PickupDiscoverTeamIdentity]) {
+        guard !extra.isEmpty else { return }
+        var next = pickupDiscoverTeamIdentityByGameId
+        for (gameId, identity) in extra {
+            next[gameId] = identity
+        }
+        publishPickupDiscoverTeamIdentities(next)
+    }
+
+    /// Fetches Team identities for Going cards and merges without wiping Discover cache.
+    func ensurePickupDiscoverTeamIdentities(forGameIds ids: [UUID]) async {
+        let unique = Array(Set(ids)).filter { pickupDiscoverTeamIdentityByGameId[$0] == nil }
+        guard !unique.isEmpty else { return }
+        struct Params: Encodable { let p_pickup_game_ids: [UUID] }
+        do {
+            let rpcRows: [PickupDiscoverTeamIdentityRPCRow] = try await supabase
+                .rpc(
+                    "list_pickup_discover_team_identities",
+                    params: Params(p_pickup_game_ids: unique)
+                )
+                .execute()
+                .value
+            var extra: [UUID: PickupDiscoverTeamIdentity] = [:]
+            for row in rpcRows {
+                if let identity = row.asIdentity() {
+                    extra[identity.pickupGameId] = identity
+                }
+            }
+            mergePickupDiscoverTeamIdentities(extra)
+            return
+        } catch {
+#if DEBUG
+            print("[GoingPlay] teamIdentityRPC unavailable error=\(error.localizedDescription)")
+#endif
+        }
+        await mergePickupDiscoverTeamIdentitiesViaRLS(for: unique)
+    }
+
+    private func mergePickupDiscoverTeamIdentitiesViaRLS(for pickupGameIds: [UUID]) async {
+        guard !isGuestDiscoverMode, !pickupGameIds.isEmpty else { return }
+        struct LinkRow: Decodable {
+            let pickup_game_id: UUID
+            let team_id: UUID
+        }
+        struct TeamRow: Decodable {
+            let id: UUID
+            let name: String?
+            let sport: String?
+            let color_hex: String?
+            let logo_url: String?
+            let logo_thumbnail_url: String?
+        }
+        do {
+            let links: [LinkRow] = try await supabase
+                .from("fan_team_game_links")
+                .select("pickup_game_id,team_id")
+                .in("pickup_game_id", values: pickupGameIds.map { $0.uuidString.lowercased() })
+                .limit(400)
+                .execute()
+                .value
+            guard !links.isEmpty else { return }
+            let teamIds = Array(Set(links.map(\.team_id)))
+            let teams: [TeamRow] = try await supabase
+                .from("fan_teams")
+                .select("id,name,sport,color_hex,logo_url,logo_thumbnail_url")
+                .in("id", values: teamIds.map { $0.uuidString.lowercased() })
+                .limit(200)
+                .execute()
+                .value
+            let teamById = Dictionary(uniqueKeysWithValues: teams.map { ($0.id, $0) })
+            var extra: [UUID: PickupDiscoverTeamIdentity] = [:]
+            for link in links {
+                guard let team = teamById[link.team_id] else { continue }
+                let name = (team.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { continue }
+                extra[link.pickup_game_id] = PickupDiscoverTeamIdentity(
+                    pickupGameId: link.pickup_game_id,
+                    teamId: link.team_id,
+                    teamName: name,
+                    teamSport: (team.sport ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                    colorHex: FanTeamColorPalette.normalized(team.color_hex),
+                    logoURL: ImageDisplayURL.canonicalStorageURLString(team.logo_url).nilIfEmpty,
+                    logoThumbnailURL: ImageDisplayURL.canonicalStorageURLString(team.logo_thumbnail_url).nilIfEmpty,
+                    displayRefreshToken: nil
+                )
+            }
+            mergePickupDiscoverTeamIdentities(extra)
+        } catch {
+#if DEBUG
+            print("[GoingPlay] teamIdentityRLS merge failed error=\(error.localizedDescription)")
+#endif
+        }
+    }
+
     private func publishPickupDiscoverTeamIdentities(_ next: [UUID: PickupDiscoverTeamIdentity]) {
         pickupDiscoverTeamIdentityByGameId = next
         pickupDiscoverTeamAccentHexByGameId = Dictionary(
@@ -2035,19 +2182,39 @@ extension MapViewModel {
         pruneDiscoverPickupSelectionOutsideMyTeamsScopeIfNeeded()
     }
 
-    /// Patch Discover Team pin/card identity when Team logo/name/color changes (no extra fetch).
+    /// Patch Discover Team pins, regional cache, selected preview, and pickup-game Team marks.
     func applyFanTeamIdentityChangeToDiscoverCaches(_ change: FanTeamIdentityChange) {
+        let patchedTeams = FanTeamArtworkPropagation.patchRows(discoverableFanTeamsForMap, with: change)
+        if patchedTeams.didChange {
+            discoverableFanTeamsForMap = patchedTeams.rows
+        }
+        if let selected = selectedDiscoverableFanTeamForMap, selected.id == change.teamId {
+            selectedDiscoverableFanTeamForMap = selected.applyingIdentityChange(change)
+        }
+        var nextRegional = discoverFanTeamsRegionalCache
+        var regionalChanged = false
+        for (key, entry) in discoverFanTeamsRegionalCache {
+            let patched = FanTeamArtworkPropagation.patchRows(entry.rows, with: change)
+            if patched.didChange {
+                nextRegional[key] = (patched.rows, entry.fetchedAt)
+                regionalChanged = true
+            }
+        }
+        if regionalChanged {
+            discoverFanTeamsRegionalCache = nextRegional
+        }
+
         guard !pickupDiscoverTeamIdentityByGameId.isEmpty else { return }
         var next = pickupDiscoverTeamIdentityByGameId
-        var didChange = false
+        var didChangePickup = false
         for (gameId, identity) in pickupDiscoverTeamIdentityByGameId where identity.teamId == change.teamId {
             let patched = identity.applyingIdentityChange(change)
             if patched != identity {
                 next[gameId] = patched
-                didChange = true
+                didChangePickup = true
             }
         }
-        guard didChange else { return }
+        guard didChangePickup else { return }
         publishPickupDiscoverTeamIdentities(next)
     }
 }

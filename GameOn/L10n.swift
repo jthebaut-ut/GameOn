@@ -78,11 +78,19 @@ nonisolated enum L10n {
 #endif
 
     private static func localizedString(_ key: String, languageCode: String) -> String {
-        guard let path = Bundle.main.path(forResource: languageCode, ofType: "lproj"),
-              let bundle = Bundle(path: path) else {
-            return Bundle.main.localizedString(forKey: key, value: key, table: nil)
+        let table = "Localizable"
+        if let path = Bundle.main.path(forResource: languageCode, ofType: "lproj"),
+           let bundle = Bundle(path: path) {
+            let value = bundle.localizedString(forKey: key, value: key, table: table)
+            if value != key {
+                return value
+            }
         }
-        return bundle.localizedString(forKey: key, value: key, table: nil)
+        let main = Bundle.main.localizedString(forKey: key, value: key, table: table)
+        if main != key {
+            return main
+        }
+        return key
     }
 }
 

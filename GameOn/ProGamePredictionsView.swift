@@ -819,10 +819,13 @@ struct ProGamePredictionSheet: View {
     }
 
     private func teamIdentity(for team: String) -> ProGameTeamScoreIdentity {
-        ProGameTeamScoreIdentity.resolve(
+        let match = hydratedLiveMatch
+        return ProGameTeamScoreIdentity.resolve(
             teamName: team,
             badgeURL: teamBadgeURL(for: team),
-            source: "Predictions"
+            source: "Predictions",
+            entityID: team == match?.awayTeam ? match?.awayTeamProviderId : match?.homeTeamProviderId,
+            league: match?.sourceLeagueName ?? match?.league ?? displayGame.league
         )
     }
 

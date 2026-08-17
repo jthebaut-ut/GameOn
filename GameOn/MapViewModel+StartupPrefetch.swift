@@ -258,6 +258,7 @@ extension MapViewModel {
                     return
                 }
                 await self.warmPreloadPickupPlacesForCurrentRegion()
+                await self.refreshDiscoverableFanTeamsForMap()
             }
 
             group.addTask { @MainActor [weak self, weak chatViewModel] in

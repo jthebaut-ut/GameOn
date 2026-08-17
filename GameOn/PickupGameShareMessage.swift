@@ -170,7 +170,11 @@ enum PickupGameShareMessage {
         let sharerPrefix = (sharer?.isEmpty == false)
             ? "\(sharer!) shared a FanGeo pickup game: "
             : "Shared a FanGeo pickup game: "
-        let sport = AppSportCatalog.displayLabel(forSportToken: payload.sport)
+        let sport = SportSubtypeCatalog.identityLine(
+            sport: payload.sport,
+            subtype: nil,
+            languageCode: nil
+        )
         return "\(sharerPrefix)\(payload.title) · \(sport)"
     }
 }

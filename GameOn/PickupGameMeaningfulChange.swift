@@ -3,15 +3,16 @@ import Foundation
 /// Authoritative meaningful pickup-game field changes for Going activity, chat system
 /// messages, and edit push notifications. Ignores audit/sync-only noise.
 ///
-/// Server push recipients (`list_pickup_game_change_push_tokens`, migration 20260946):
-/// approved joiners; Team-linked Maybe (`pending` RSVP); accepted/maybe invitees.
-/// Normal Pickup pending join requests are not notified. APNs copy is Edge-authoritative.
+/// Server push recipients (`list_pickup_game_change_push_tokens`, migration 20260954+):
+/// Team-linked: active members + guardians (RSVP-independent). Standalone: approved joiners
+/// + accepted/maybe invitees. APNs copy is Edge-authoritative.
 nonisolated enum PickupGameMeaningfulChangeKind: String, CaseIterable, Sendable {
     case title
     case sport
     case start
     case end
     case location
+    case opponent
     case capacity
     case welcome
     case skill
@@ -27,6 +28,7 @@ nonisolated enum PickupGameMeaningfulChangeKind: String, CaseIterable, Sendable 
         case .start: return "pickup_edit_change_date"
         case .end: return "pickup_edit_change_time"
         case .location: return "pickup_edit_change_location"
+        case .opponent: return "pickup_edit_change_opponent"
         case .capacity: return "pickup_edit_change_capacity"
         case .welcome: return "pickup_edit_change_welcome"
         case .skill: return "pickup_edit_change_skill"
@@ -151,6 +153,9 @@ nonisolated enum PickupGameMeaningfulChange {
         }
         if locationIdentityKey(for: before) != locationIdentityKey(for: after) {
             kinds.append(.location)
+        }
+        if normalizedText(before.opponent_name) != normalizedText(after.opponent_name) {
+            kinds.append(.opponent)
         }
         if PickupGameRow.clampPlayersNeeded(before.players_needed)
             != PickupGameRow.clampPlayersNeeded(after.players_needed)
@@ -343,6 +348,7 @@ nonisolated enum PickupGameMeaningfulChange {
             normalizedText(game.skill_level),
             normalizedText(game.play_environment),
             normalizedText(game.participant_preference),
+            normalizedText(game.opponent_name),
             game.is_free ? "free" : String(format: "%.2f", game.entry_fee_amount ?? 0)
         ].joined(separator: "|")
     }

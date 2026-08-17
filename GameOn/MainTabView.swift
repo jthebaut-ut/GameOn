@@ -1,11 +1,16 @@
 import CoreLocation
 import SwiftUI
 
-/// Composition root: presents Discover, Live, Schedule, Going, Chat, and Account tabs using shared view models from the root container.
+/// Composition root: presents Discover, Schedule, Going, Teams, Chat, and Account tabs using shared view models from the root container.
 ///
+/// Live remains a Schedule hub surface (not a floating-bar destination). ``AppTab.live`` remaps to
+/// Schedule → Live. ``AppTab.following`` is the Going root tab.
 /// Inactive tabs stay in the hierarchy with opacity and hit testing disabled so map and list state survive tab switches. The root bootstrap container usually preloads startup data first; this view keeps a fallback ``.task`` only for timeout / degraded-entry cases.
 struct MainTabView: View {
     private static var hasForcedDiscoverTabThisProcess = false
+    /// Last tab written by ``selectTab`` / tab-bar / deep link. Late SceneStorage
+    /// restores from a previous process are reverted when they disagree.
+    private static var lastCommittedTabRaw = AppTab.discover.rawValue
     private static var didResetImageCacheDiagnosticsThisProcess = false
 
     @ObservedObject var viewModel: MapViewModel
@@ -20,6 +25,8 @@ struct MainTabView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @SceneStorage("selectedMainTab") private var selectedTabStorage: String = AppTab.discover.rawValue
+    /// Shared with ``ScheduleHubView`` so intermediate Schedule→Going surface can migrate to the Going root tab.
+    @SceneStorage("scheduleHubSurface") private var scheduleHubSurfaceStorage: String = ScheduleHubSurface.watch.rawValue
 
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(PrivateChatSecuritySettings.requireFaceIDSettingKey) private var requireDeviceAuthForPrivateChat = false
@@ -29,6 +36,7 @@ struct MainTabView: View {
     @State private var lastAutoPresentedFanIdentitySetupUserId: UUID?
     @State private var privateChatUnlockedForCurrentSelection = false
     @State private var discoverCalendarOverlayPresented = false
+    @State private var showActionCenter = false
     /// Sticky lazy mount: Discover at launch; other tabs insert on first selection and stay mounted.
     @State private var mountedTabs: Set<AppTab> = [.discover]
     /// Two-phase first mount: tabs whose heavy subtree has been constructed. A newly mounted
@@ -77,45 +85,67 @@ struct MainTabView: View {
     }
 
     private var selectedTab: AppTab {
-        let restored = AppTab(rawValue: selectedTabStorage) ?? .discover
-        // SceneStorage can restore `.account` at process start. Honoring it during the
-        // FIRST body evaluation constructs SettingsScreen/ProfileIdentityCard before
-        // `.onAppear` forces Discover, overflowing the main-thread stack in SwiftUI
-        // generic-metadata instantiation (device crashes 2026-07-20, bug_type 309,
-        // "stack guard region" SIGSEGV in ProfileIdentityCard.body). Treat Account as
-        // Discover until the startup Discover force has run this process.
-        if restored == .account, !Self.hasForcedDiscoverTabThisProcess {
-#if DEBUG
-            Self.logSuppressedSceneRestoredAccountOnce()
-#endif
+        // Fresh process launch always paints Discover → Map first. SceneStorage may
+        // still hold the last tab from a previous process; do not honor it until
+        // `startupForceDiscover` has run. Same-process background → foreground keeps
+        // the in-memory tab after that force.
+        if !Self.hasForcedDiscoverTabThisProcess {
             return .discover
+        }
+        let restored = AppTab(rawValue: selectedTabStorage) ?? .discover
+        if restored == .live {
+            return .calendar
         }
         return restored
     }
-
-#if DEBUG
-    private static var didLogSuppressedSceneRestoredAccount = false
-    private static func logSuppressedSceneRestoredAccountOnce() {
-        guard !didLogSuppressedSceneRestoredAccount else { return }
-        didLogSuppressedSceneRestoredAccount = true
-        print("[StartupDiscover] suppressedSceneRestoredAccount=true reason=firstBodyPassBeforeDiscoverForce")
-    }
-#endif
 
     private var selectedTabBinding: Binding<AppTab> {
         Binding(
             get: { selectedTab },
             set: { newTab in
-                beginTabSwitch(to: newTab, reason: "selectedTabBinding")
-                mountTab(newTab, reason: "selectedTabBinding")
-                selectedTabStorage = newTab.rawValue
-#if DEBUG
-                if MemoryAuditProbe.isEnabled {
-                    MemoryAuditProbe.log("tab", details: "selected=\(newTab.rawValue) mounted=\(mountedTabs.map(\.rawValue).sorted().joined(separator: ","))")
-                }
-#endif
+                applyRootTabSelection(newTab, reason: "selectedTabBinding")
             }
         )
+    }
+
+    /// Remaps legacy Live root tab into Schedule + Live surface, then mounts/persists.
+    private func applyRootTabSelection(_ newTab: AppTab, reason: String, animated: Bool = true) {
+        let resolved = resolveRootTabSelection(newTab)
+        if resolved.tab == .account,
+           presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+            reason: reason,
+            source: .authGate
+           ) {
+            return
+        }
+        beginTabSwitch(to: resolved.tab, reason: reason)
+        mountTab(resolved.tab, reason: reason)
+        commitSelectedTabStorage(resolved.tab.rawValue, animated: animated)
+        syncScheduleHubActivationFlags(for: resolved.tab)
+#if DEBUG
+        if MemoryAuditProbe.isEnabled {
+            MemoryAuditProbe.log(
+                "tab",
+                details: "selected=\(resolved.tab.rawValue) surface=\(viewModel.scheduleHubSurface.rawValue) mounted=\(mountedTabs.map(\.rawValue).sorted().joined(separator: ","))"
+            )
+        }
+#endif
+    }
+
+    private struct ResolvedRootTab {
+        let tab: AppTab
+    }
+
+    private func resolveRootTabSelection(_ newTab: AppTab) -> ResolvedRootTab {
+        switch newTab {
+        case .live:
+            viewModel.scheduleHubSurface = .live
+            viewModel.pendingScheduleHubSurface = .live
+            scheduleHubSurfaceStorage = ScheduleHubSurface.live.rawValue
+            return ResolvedRootTab(tab: .calendar)
+        default:
+            return ResolvedRootTab(tab: newTab)
+        }
     }
 
     private func localized(_ key: String) -> String {
@@ -124,9 +154,12 @@ struct MainTabView: View {
 
     enum AppTab: String, CaseIterable {
         case discover
+        /// Legacy alias — remaps to Schedule → Live (not a floating-bar destination).
         case live
         case calendar
+        /// Going root tab (FollowingScreen).
         case following
+        case teams
         case chat
         case account
     }
@@ -179,6 +212,53 @@ struct MainTabView: View {
                 }
                 .interactiveDismissDisabled()
             }
+            .fullScreenCover(
+                isPresented: Binding(
+                    get: { viewModel.presentSignedOutAuthLanding },
+                    set: { presented in
+                        let honor = FanGeoAuthLandingRouting.shouldHonorPresentationWrite(
+                            requestedPresent: presented,
+                            isLoggedIn: viewModel.isLoggedIn,
+                            isVenueOwnerLoggedIn: viewModel.isVenueOwnerLoggedIn,
+                            resolvingEmailConfirmation: viewModel.resolvingEmailConfirmation
+                        )
+                        if presented {
+                            if honor {
+                                viewModel.presentSignedOutAuthLanding = true
+                            } else {
+                                viewModel.dismissSignedOutAuthUIAfterSuccessfulAuthentication()
+                            }
+                        } else {
+                            viewModel.dismissPremiumAuthLanding()
+                        }
+                    }
+                )
+            ) {
+                SignedOutLandingView(viewModel: viewModel)
+                    .interactiveDismissDisabled()
+            }
+            .onChange(of: viewModel.isLoggedIn) { _, isLoggedIn in
+                handleSignedOutAuthLandingSessionChange(
+                    isAuthenticated: isLoggedIn || viewModel.isVenueOwnerLoggedIn
+                )
+            }
+            .onChange(of: viewModel.isVenueOwnerLoggedIn) { _, isVenue in
+                handleSignedOutAuthLandingSessionChange(
+                    isAuthenticated: isVenue || viewModel.isLoggedIn
+                )
+            }
+            .onChange(of: viewModel.presentFanUserAuthSheetFromDiscover) { _, shouldPresent in
+                guard shouldPresent else { return }
+                if viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn {
+                    viewModel.presentFanUserAuthSheetFromDiscover = false
+                    viewModel.fanUserAuthSheetOpenInRegisterMode = false
+                    return
+                }
+                _ = presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+                    reason: "presentFanUserAuthSheetFromDiscover",
+                    source: .authGate
+                )
+            }
             .alert(
                 "Private chat",
                 isPresented: Binding(
@@ -201,8 +281,42 @@ struct MainTabView: View {
                     viewModel.clearSharedPickupGameDetailPresentation()
                 }
             ) { token in
-                DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                DiscoverPickupGameDetailSheet(viewModel: viewModel, token: token)
+                    .environmentObject(viewModel)
                     .environmentObject(chatViewModel)
+            }
+            .sheet(
+                item: Binding(
+                    get: { viewModel.pendingPickupCreatorRatingPromptToken },
+                    set: { viewModel.pendingPickupCreatorRatingPromptToken = $0 }
+                ),
+                onDismiss: {
+                    viewModel.clearPendingPickupCreatorRatingPromptPresentation()
+                }
+            ) { token in
+                PickupCreatorRatingPromptSheet(viewModel: viewModel, pickupGameId: token.id)
+                    .environmentObject(viewModel)
+            }
+            .sheet(
+                item: Binding(
+                    get: { viewModel.pendingOrganizerJoinRequestsGameToken },
+                    set: { viewModel.pendingOrganizerJoinRequestsGameToken = $0 }
+                ),
+                onDismiss: {
+                    viewModel.clearPendingOrganizerJoinRequestsPresentation()
+                }
+            ) { token in
+#if DEBUG
+                let _ = ActionCenterRouteDebug.log(
+                    kind: "joinApproval",
+                    pickupGameId: token.id,
+                    teamId: nil,
+                    presentation: "organizerRequests",
+                    mapViewModelInjected: true
+                )
+#endif
+                OrganizerJoinRequestsPresentationSheet(viewModel: viewModel, pickupGameId: token.id)
+                    .environmentObject(viewModel)
             }
             .sheet(
                 item: Binding(
@@ -214,6 +328,7 @@ struct MainTabView: View {
                 }
             ) { match in
                 LiveMatchDetailSheet(match: match, viewModel: viewModel)
+                    .environmentObject(viewModel)
                     .environmentObject(chatViewModel)
             }
             .onAppear {
@@ -266,19 +381,12 @@ struct MainTabView: View {
                 )
             }
 
-            lazyPreservedRoot(tab: .live) {
-                LiveScreen(
+            lazyPreservedRoot(tab: .calendar) {
+                ScheduleHubView(
                     viewModel: viewModel,
                     chatViewModel: chatViewModel,
-                    selectedTab: selectedTabBinding
-                )
-            }
-
-            lazyPreservedRoot(tab: .calendar) {
-                CalendarScreen(
-                    viewModel: viewModel,
                     selectedTab: selectedTabBinding,
-                    isCalendarTabSelected: selectedTab == .calendar
+                    isScheduleTabSelected: selectedTab == .calendar
                 )
             }
 
@@ -288,6 +396,16 @@ struct MainTabView: View {
                     selectedTab: selectedTabBinding,
                     suppressInitialAutoRefresh: true,
                     isFollowingTabSelected: selectedTab == .following
+                )
+                .environmentObject(chatViewModel)
+            }
+
+            lazyPreservedRoot(tab: .teams) {
+                TeamsTabRootView(
+                    mapViewModel: viewModel,
+                    chatViewModel: chatViewModel,
+                    selectedTab: selectedTabBinding,
+                    isTeamsTabSelected: selectedTab == .teams
                 )
             }
 
@@ -300,27 +418,33 @@ struct MainTabView: View {
             // SwiftUI generic-metadata stack overflow before Discover is forced.
             // Mount Account only while it is the selected tab (true conditional, not opacity).
             // During safe logout, never construct Account/Profile — keep Discover underneath the overlay.
+            // Signed-out Profile taps present SignedOutLandingView and never select this tab,
+            // so the old guest marketing Profile is not mounted.
             if selectedTab == .account, !viewModel.isSafeLogoutBlockingUI {
-                // AnyView keeps SettingsScreen's deep concrete type out of the
-                // root ZStack tuple (same metadata-recursion protection as above).
-                AnyView(
-                    SettingsScreen(
-                        viewModel: viewModel,
-                        selectedTab: selectedTabBinding,
-                        isAccountTabSelected: true
-                    )
+                if viewModel.isLoggedIn
+                    || viewModel.isVenueOwnerLoggedIn
+                    || viewModel.resolvingEmailConfirmation {
+                    // AnyView keeps SettingsScreen's deep concrete type out of the
+                    // root ZStack tuple (same metadata-recursion protection as above).
+                    AnyView(
+                        SettingsScreen(
+                            viewModel: viewModel,
+                            selectedTab: selectedTabBinding,
+                            isAccountTabSelected: true
+                        )
 #if DEBUG
-                    .onAppear {
-                        MainTabTypeSafetyDebug.log("accountLeafMounted=true")
-                    }
+                        .onAppear {
+                            MainTabTypeSafetyDebug.log("accountLeafMounted=true")
+                        }
 #endif
-                )
+                    )
+                }
             }
 
             // Permanently mount the floating tab bar. Hide only visually while Chat is active
             // and a conversation destination requires chrome hide — never insert/remove this
             // subtree mid NavigationStack push, and never let an inactive Chat stack suppress
-            // the bar on Discover / Live / Schedule / Going / Account.
+            // the bar on Discover / Live / Schedule / Teams / Account.
             floatingTabBarChrome
                 .opacity(
                     hidesFloatingTabBarForActiveChatConversation
@@ -343,6 +467,10 @@ struct MainTabView: View {
         .overlay(alignment: .top) {
             dmInAppNotificationBannerLayer
         }
+        .environment(\.fanGeoActionCenterChrome, actionCenterChromeValue)
+        .sheet(isPresented: $showActionCenter) {
+            actionCenterPresentedView
+        }
         .onAppear {
 #if DEBUG
             MainTabTypeSafetyDebug.log("rootShellAppeared selectedTab=\(selectedTab.rawValue)")
@@ -362,32 +490,42 @@ struct MainTabView: View {
             // root before forcing Discover — Account embeds ProfileIdentityCard and can
             // blow the main-thread stack guard during SwiftUI metadata instantiation.
             mountedTabs.insert(.discover)
-            viewModel.isCalendarTabSelected = false
             viewModel.startAutomaticTimeZoneChangeMonitoringIfNeeded()
-            viewModel.isLiveTabSelected = false
-            viewModel.isDiscoverTabSelectedForEnrichment = true
             if !Self.hasForcedDiscoverTabThisProcess {
                 Self.hasForcedDiscoverTabThisProcess = true
-                // Still force Discover first for stack-safety, then immediately reconcile any
-                // cold-start chat push route (onChange alone misses already-set pending values).
+                discoverCalendarOverlayPresented = false
+                viewModel.resetDiscoverPresentationForFreshLaunch()
                 selectTab(.discover, animated: false, reason: "startupForceDiscover")
 #if DEBUG
-                print("[StartupDiscover] selectedTab=\(AppTab.discover.rawValue)")
+                print("[FreshLaunch] tab=discover presentation=map restoreLastTab=false")
+                print("[StartupDiscover] selectedTab=discover restoreLastTab=false signedOutLandingAtRoot=false")
                 print("[PerfLazyTab] deferredAccountUntilSelected=true")
-                TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(AppTab.discover.rawValue)")
+                TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(selectedTab.rawValue)")
 #endif
             } else {
                 mountTab(selectedTab, reason: "mainTabOnAppear")
-                viewModel.isCalendarTabSelected = selectedTab == .calendar
-                viewModel.isLiveTabSelected = selectedTab == .live
+                syncScheduleHubActivationFlags(for: selectedTab)
                 viewModel.isDiscoverTabSelectedForEnrichment = selectedTab == .discover
 #if DEBUG
                 print("[PerfLazyTab] restoredSelected tab=\(selectedTab.rawValue)")
                 TabPerfDebug.log("[TabPerfDebug] tabAppeared=\(selectedTab.rawValue)")
 #endif
+                normalizeLegacySelectedTabStorageIfNeeded()
             }
             reconcilePendingChatPushRoutesIfNeeded(reason: "mainTabOnAppear")
 #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-fangeo-present-auth-landing") {
+                viewModel.presentPremiumAuthLanding(from: .authGate)
+            }
+            if let idx = ProcessInfo.processInfo.arguments.firstIndex(of: "-fangeo-select-tab"),
+               ProcessInfo.processInfo.arguments.indices.contains(idx + 1),
+               let debugTab = AppTab(rawValue: ProcessInfo.processInfo.arguments[idx + 1]),
+               debugTab != .live {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
+                    selectTab(debugTab, animated: false, reason: "debugSelectTab")
+                    print("[FreshLaunch] debugSelectTab=\(debugTab.rawValue)")
+                }
+            }
             if ProfileSettingsSequentialNavValidation.isExplicitlyEnabled {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                     selectTab(.account, animated: false, reason: "settingsNavSequentialValidation")
@@ -561,12 +699,31 @@ struct MainTabView: View {
                 onPendingOpenMyTeamsInvitations: handlePendingOpenMyTeamsInvitationsChange
             )
         )
+        .onChange(of: viewModel.pendingTeamScheduleEventDeepLink) { _, pending in
+            guard pending != nil else { return }
+#if DEBUG
+            print("[TeamScheduleNotification] selectingTeamsTab reason=pendingTeamScheduleEventDeepLink")
+#endif
+            selectTab(.teams, animated: true, reason: "teamScheduleEventPush")
+        }
+        .onChange(of: viewModel.pendingTeamScheduleJoinApproval) { _, pending in
+            guard pending != nil else { return }
+            // Action Center already selects Teams; cover APNs / other callers.
+            if selectedTab != .teams {
+                selectTab(.teams, animated: true, reason: "teamScheduleJoinApproval")
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
         }
         .onChange(of: viewModel.discoverNavigateToAccountForUserAuth) { _, go in
             guard go else { return }
-            selectTab(.account, reason: "discoverNavigateToAccountForUserAuth")
+            if !presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+                reason: "discoverNavigateToAccountForUserAuth",
+                source: .authGate
+            ) {
+                selectTab(.account, reason: "discoverNavigateToAccountForUserAuth")
+            }
             privateChatUnlockedForCurrentSelection = false
             updateDirectChatReadStateVisibility()
             viewModel.discoverNavigateToAccountForUserAuth = false
@@ -595,13 +752,30 @@ struct MainTabView: View {
             selectTab(.discover, reason: "homeCrowdPick")
             viewModel.requestDiscoverTabForHomeCrowd = false
         }
+        .onReceive(NotificationCenter.default.publisher(for: .fanGeoSelectTeamsTab)) { _ in
+            selectTab(.teams, animated: true, reason: "profile.myTeams")
+        }
         .onChange(of: selectedTabStorage) { _, newRaw in
+            if FanGeoFreshLaunchRouting.shouldRevertStaleSceneRestore(
+                restoredRaw: newRaw,
+                committedRaw: Self.lastCommittedTabRaw
+            ) {
+#if DEBUG
+                print("[FreshLaunch] revertedStaleSceneRestore from=\(newRaw) to=\(Self.lastCommittedTabRaw)")
+#endif
+                selectedTabStorage = Self.lastCommittedTabRaw
+                return
+            }
             AdDebugContext.setVisibleTab(newRaw)
 #if DEBUG
             if LiveRenderDiagnostics.enabled {
                 print("[LiveTabDebug] selectedTab=\(newRaw)")
             }
 #endif
+            if newRaw == AppTab.live.rawValue {
+                normalizeLegacySelectedTabStorageIfNeeded()
+                return
+            }
             guard let tab = AppTab(rawValue: newRaw) else { return }
             TabTapPerf.shellVisible(tab: newRaw)
             mountTab(tab, reason: "selectedTabStorage")
@@ -631,9 +805,8 @@ struct MainTabView: View {
                     ]
                 )
             }
-            viewModel.isCalendarTabSelected = tab == .calendar
-            viewModel.isLiveTabSelected = tab == .live
             viewModel.isDiscoverTabSelectedForEnrichment = tab == .discover
+            syncScheduleHubActivationFlags(for: tab)
             switch tab {
             case .discover:
                 privateChatUnlockedForCurrentSelection = false
@@ -646,8 +819,16 @@ struct MainTabView: View {
                 updateDirectChatReadStateVisibility()
                 Task { @MainActor in
                     await Task.yield()
-                    viewModel.noteCalendarTabBecameActive()
+                    if viewModel.scheduleHubSurface.isCalendarContent {
+                        viewModel.noteCalendarTabBecameActive()
+                    }
                 }
+            case .following:
+                privateChatUnlockedForCurrentSelection = false
+                updateDirectChatReadStateVisibility()
+            case .teams:
+                privateChatUnlockedForCurrentSelection = false
+                updateDirectChatReadStateVisibility()
             case .chat:
                 updateDirectChatReadStateVisibility()
                 guard viewModel.isAuthenticatedForSocialFeatures else { return }
@@ -664,6 +845,15 @@ struct MainTabView: View {
                 privateChatUnlockedForCurrentSelection = false
                 updateDirectChatReadStateVisibility()
                 return
+            }
+        }
+        .onChange(of: viewModel.scheduleHubSurface) { _, _ in
+            syncScheduleHubActivationFlags(for: selectedTab)
+            if selectedTab == .calendar, viewModel.scheduleHubSurface.isCalendarContent {
+                Task { @MainActor in
+                    await Task.yield()
+                    viewModel.noteCalendarTabBecameActive()
+                }
             }
         }
         .task(id: pokesBadgeRefreshLoopToken) {
@@ -733,12 +923,18 @@ struct MainTabView: View {
     }
 
     private func mountTab(_ tab: AppTab, reason: String) {
-        if mountedTabs.contains(tab) { return }
-        mountedTabs.insert(tab)
-        scheduleFirstMountContentActivation(tab, reason: reason)
+        let resolved: AppTab = {
+            switch tab {
+            case .live: return .calendar
+            default: return tab
+            }
+        }()
+        if mountedTabs.contains(resolved) { return }
+        mountedTabs.insert(resolved)
+        scheduleFirstMountContentActivation(resolved, reason: reason)
 #if DEBUG
-        print("[PerfLazyTab] mounted tab=\(tab.rawValue) reason=\(reason)")
-        MainTabTypeSafetyDebug.log("tabLeafMounted=\(tab.rawValue) reason=\(reason)")
+        print("[PerfLazyTab] mounted tab=\(resolved.rawValue) reason=\(reason)")
+        MainTabTypeSafetyDebug.log("tabLeafMounted=\(resolved.rawValue) reason=\(reason)")
 #endif
     }
 
@@ -792,33 +988,86 @@ struct MainTabView: View {
     ) {
         let touchAt = Date()
         let previousTab = selectedTab
-        if !isUserInitiated, previousTab != tab, lastManualTabSelection == previousTab {
-            TabTapPerf.selectionOverwritten(from: previousTab.rawValue, to: tab.rawValue, reason: reason)
+        let resolved = resolveRootTabSelection(tab)
+        let target = resolved.tab
+        if target == .account,
+           presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+            reason: reason,
+            source: isUserInitiated ? .profileTab : .authGate
+           ) {
+            return
+        }
+        if target == .account {
+            ProfileOpenPerf.beginOpen(source: reason)
+        }
+        if !isUserInitiated, previousTab != target, lastManualTabSelection == previousTab {
+            TabTapPerf.selectionOverwritten(from: previousTab.rawValue, to: target.rawValue, reason: reason)
         }
         // Everything up to the storage write must stay cheap: this is the only work standing
         // between the touch and the frame that shows the new tab. Diagnostics and preload
         // scheduling run afterwards, before SwiftUI applies the transaction.
-        noteTabSwitchStart(from: previousTab, to: tab)
-        mountTab(tab, reason: reason)
-        // Tab chrome must flip selection synchronously without spring-wrapping the whole shell.
-        // Animation here delayed perceived selection and competed with opacity crossfades.
-        if animated {
-            withAnimation(.easeInOut(duration: 0.12)) {
-                selectedTabStorage = tab.rawValue
-            }
-        } else {
-            selectedTabStorage = tab.rawValue
-        }
+        noteTabSwitchStart(from: previousTab, to: target)
+        mountTab(target, reason: reason)
+        commitSelectedTabStorage(target.rawValue, animated: animated)
+        syncScheduleHubActivationFlags(for: target)
         let selectMs = Int(Date().timeIntervalSince(touchAt) * 1000)
-        TabTapPerf.selectedTabChanged(tab: tab.rawValue)
+        TabTapPerf.selectedTabChanged(tab: target.rawValue)
 
-        finishTabSwitchBookkeeping(from: previousTab, to: tab, reason: reason)
-        TabPerformanceDebug.log("tab touch received requested=\(tab.rawValue) reason=\(reason)")
-        TabPerformanceDebug.log("selected-tab state changed to=\(tab.rawValue) touchToSelectionMs=\(selectMs)")
+        finishTabSwitchBookkeeping(from: previousTab, to: target, reason: reason)
+        TabPerformanceDebug.log("tab touch received requested=\(tab.rawValue) resolved=\(target.rawValue) reason=\(reason)")
+        TabPerformanceDebug.log("selected-tab state changed to=\(target.rawValue) touchToSelectionMs=\(selectMs)")
         if selectMs >= 50 {
             TabPerformanceDebug.log("synchronous main-thread intervalMs=\(selectMs) source=selectTab")
             TabTapPerf.mainActorBusy(ms: Double(selectMs), source: "selectTab")
         }
+    }
+
+    private func commitSelectedTabStorage(_ raw: String, animated: Bool) {
+        Self.lastCommittedTabRaw = raw
+        if animated {
+            withAnimation(.easeInOut(duration: 0.12)) {
+                selectedTabStorage = raw
+            }
+        } else {
+            selectedTabStorage = raw
+        }
+    }
+
+    /// Collapse legacy Live SceneStorage into Schedule + Live, and migrate intermediate
+    /// Schedule-embedded Going surface into the Going root tab.
+    private func normalizeLegacySelectedTabStorageIfNeeded() {
+        if selectedTabStorage == AppTab.live.rawValue {
+            if viewModel.pendingScheduleHubSurface == nil {
+                viewModel.pendingScheduleHubSurface = .live
+            }
+            viewModel.scheduleHubSurface = .live
+            scheduleHubSurfaceStorage = ScheduleHubSurface.live.rawValue
+            selectedTabStorage = AppTab.calendar.rawValue
+            return
+        }
+
+        let hubRaw = scheduleHubSurfaceStorage
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let hadLegacyGoingSurface = hubRaw == ScheduleHubSurface.legacyGoingRawValue
+        if hadLegacyGoingSurface {
+            scheduleHubSurfaceStorage = ScheduleHubSurface.watch.rawValue
+            if viewModel.scheduleHubSurface.rawValue == ScheduleHubSurface.legacyGoingRawValue {
+                viewModel.scheduleHubSurface = .watch
+            }
+            viewModel.pendingScheduleHubSurface = nil
+            // Intermediate Schedule-embedded Going → restore Going as a real root tab.
+            selectedTabStorage = AppTab.following.rawValue
+        }
+    }
+
+    /// Keep MapViewModel Live / Calendar / Going activation flags aligned with root selection.
+    private func syncScheduleHubActivationFlags(for tab: AppTab) {
+        let scheduleSelected = tab == .calendar
+        let surface = viewModel.scheduleHubSurface
+        viewModel.isLiveTabSelected = scheduleSelected && surface == .live
+        viewModel.isCalendarTabSelected = scheduleSelected && surface.isCalendarContent
+        viewModel.isFollowingTabSelected = tab == .following
     }
 
     /// Floating-bar tap entry point for every tab.
@@ -832,10 +1081,70 @@ struct MainTabView: View {
             alreadySelected: selectedTab == tab,
             overlayHitTestable: tabBarOverlayHitTestable
         )
+        if tab == .account,
+           presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+            reason: reason,
+            source: .profileTab
+           ) {
+            FGInteractionHaptics.selection()
+            return
+        }
         lastManualTabSelection = tab
         UserInteractionPriorityGate.noteUserTabInteraction(tab.rawValue)
         selectTab(tab, animated: false, reason: reason, isUserInitiated: true)
         FGInteractionHaptics.selection()
+    }
+
+    /// Signed-out Profile (and other Account destinations) present the stadium landing
+    /// over the current public tab instead of mounting the old guest Profile page.
+    @discardableResult
+    private func presentSignedOutAuthLandingInsteadOfAccountTabIfNeeded(
+        reason: String,
+        source: SignedOutAuthLandingSource
+    ) -> Bool {
+        guard FanGeoAuthLandingRouting.shouldPresentAuthLandingForSignedOutAccountTab(
+            isLoggedIn: viewModel.isLoggedIn,
+            isVenueOwnerLoggedIn: viewModel.isVenueOwnerLoggedIn,
+            resolvingEmailConfirmation: viewModel.resolvingEmailConfirmation
+        ) else { return false }
+        viewModel.presentPremiumAuthLanding(from: source)
+#if DEBUG
+        print(
+            "[SignedOutLanding] presentedFrom=\(source.rawValue) previousTab=\(selectedTab.rawValue) reason=\(reason) guestProfileMounted=false"
+        )
+#endif
+        return true
+    }
+
+    /// After a successful Profile-tab sign-in, open authenticated Profile.
+    /// After logout while Profile was selected, return to Discover so the guest page cannot appear.
+    private func handleSignedOutAuthLandingSessionChange(isAuthenticated: Bool) {
+        if isAuthenticated {
+            let fromProfile = FanGeoAuthLandingRouting.shouldSelectAccountAfterSuccessfulAuth(
+                source: viewModel.signedOutAuthLandingSource
+            )
+            viewModel.dismissSignedOutAuthUIAfterSuccessfulAuthentication()
+            if fromProfile {
+                // Next turn: let the fullScreenCover and nested auth sheets finish
+                // tearing down before Account mounts, so SwiftUI cannot bounce the landing.
+                DispatchQueue.main.async {
+                    self.selectTab(.account, animated: false, reason: "signedInFromProfileLanding")
+                }
+            }
+            return
+        }
+        if selectedTab == .account {
+            if viewModel.isAuthSessionRestoringForProfilePresentation { return }
+            if viewModel.authSessionState == .loadingSession { return }
+            if viewModel.resolvingEmailConfirmation { return }
+            if viewModel.isSafeLogoutBlockingUI || viewModel.safeLogoutNeedsDiscoverReset { return }
+            let publicTab = FanGeoAuthLandingRouting.tabAfterDismissingSignedOutProfileAuthLanding(
+                previousTabRaw: AppTab.discover.rawValue
+            )
+            if let tab = AppTab(rawValue: publicTab) {
+                selectTab(tab, animated: false, reason: "signedOutLeaveAccountTab")
+            }
+        }
     }
 
     /// True when a full-screen layer above the floating tab bar is currently accepting touches.
@@ -1087,6 +1396,10 @@ struct MainTabView: View {
             }
 #endif
             return
+        case .teams:
+            guard viewModel.isAuthenticatedForSocialFeatures else { return }
+            await chatViewModel.refreshPendingFanTeamInvitationCount(force: false)
+            return
         case .account:
             guard viewModel.isAuthenticatedForSocialFeatures else { return }
             if tabHasCachedData(.account) {
@@ -1119,13 +1432,23 @@ struct MainTabView: View {
             }
             await viewModel.refreshDiscoverCoreInBackground()
         case .calendar:
-            if viewModel.canFanUsePickupGamesUI {
-                await viewModel.refreshCalendarTabPickupSources(reason: "tabPreload")
-                // Prefer joining launch warm when it already seeded Schedule caches.
-                if viewModel.lastCalendarTabPickupSourcesRefreshAt != nil {
-                    CalendarActivationPerf.warmJoined(source: "tabPreload")
+            switch viewModel.scheduleHubSurface {
+            case .live:
+                if viewModel.liveMatchesAreFreshForTabPreload(
+                    within: Self.liveMatchesTabPreloadFreshnessInterval
+                ) {
+                    TabPerf.refreshSkipped(name: "tabIntentPreload:schedule.live", reason: "freshCache")
+                    return
                 }
-                SchedulePerf.preload(action: "completed", source: "tabPreload")
+                await viewModel.refreshLiveMatchesForLiveTabActivation(forceRefresh: false)
+            case .watch, .play, .pro:
+                if viewModel.canFanUsePickupGamesUI {
+                    await viewModel.refreshCalendarTabPickupSources(reason: "tabPreload")
+                    if viewModel.lastCalendarTabPickupSourcesRefreshAt != nil {
+                        CalendarActivationPerf.warmJoined(source: "tabPreload")
+                    }
+                    SchedulePerf.preload(action: "completed", source: "tabPreload")
+                }
             }
         case .live:
             if viewModel.liveMatchesAreFreshForTabPreload(
@@ -1172,12 +1495,20 @@ struct MainTabView: View {
         case .live:
             return !viewModel.liveMatches.isEmpty
         case .calendar:
-            return !viewModel.events.isEmpty
+            switch viewModel.scheduleHubSurface {
+            case .live:
+                return !viewModel.liveMatches.isEmpty
+            case .watch, .play, .pro:
+                return !viewModel.events.isEmpty
+            }
         case .following:
             return !viewModel.followingTabGoingItems.isEmpty
                 || !viewModel.followingTabSavedVenues.isEmpty
                 || !viewModel.myPickupGameJoinRequestCards.isEmpty
                 || !viewModel.myPickupGamesForSettings.isEmpty
+        case .teams:
+            return viewModel.isAuthenticatedForSocialFeatures
+                && chatViewModel.pendingFanTeamInvitationCount > 0
         case .chat:
             return !chatViewModel.friends.isEmpty
                 || !chatViewModel.incomingRequests.isEmpty
@@ -1204,6 +1535,8 @@ struct MainTabView: View {
                 viewModel.lastFollowingTabGlobalRefreshAt,
                 viewModel.lastSuccessfulFollowingJoinRequestsRefreshAt
             ].compactMap { $0 }.max()
+        case .teams:
+            date = nil
         case .chat:
             date = nil
         case .account:
@@ -1298,18 +1631,10 @@ struct MainTabView: View {
     private func handlePendingOpenMyTeamsInvitationsChange(_ open: Bool) {
         guard open else { return }
 #if DEBUG
-        PushDeepLinkLog.selectingChatTab(reason: "pendingOpenMyTeamsInvitations")
+        print("[FanTeamInvitationPushRoute] selectingTeamsTab reason=pendingOpenMyTeamsInvitations")
 #endif
-        if requireDeviceAuthForPrivateChat && viewModel.isAuthenticatedForSocialFeatures {
-            Task { await selectChatTabAfterDeviceAuth() }
-        } else {
-            if !requireDeviceAuthForPrivateChat {
-                print("[PrivateChatSecurityDebug] biometricPromptSkippedReason=settingDisabled")
-            }
-            privateChatUnlockedForCurrentSelection = true
-            selectTab(.chat, reason: "pendingOpenMyTeamsInvitations")
-            updateDirectChatReadStateVisibility()
-        }
+        // Team management / invitations → Teams root (not Chat, not Face ID gate).
+        selectTab(.teams, reason: "pendingOpenMyTeamsInvitations")
     }
 
     private func handleScenePhaseChange(_ phase: ScenePhase) {
@@ -1532,7 +1857,7 @@ struct MainTabView: View {
 
     private func logBottomTabStructure() {
 #if DEBUG
-        print("[NavigationDebug] bottomTabStructure=Discover|Live|Schedule|Going|Chat|Profile")
+        print("[NavigationDebug] bottomTabStructure=Discover|Schedule|Going|Teams|Chat|Profile")
 #endif
     }
 
@@ -1633,17 +1958,11 @@ struct MainTabView: View {
         return HStack(spacing: layout.itemSpacing) {
             tabButton(.discover, title: localized("discover"), icon: "map.fill", layout: layout)
 
-            tabButton(
-                .live,
-                title: localized("live"),
-                icon: "dot.radiowaves.left.and.right",
-                glow: FGColor.accentGreen,
-                layout: layout
-            )
-
             calendarTabButton(layout: layout)
 
-            followingTabButton(layout: layout)
+            goingTabButton(layout: layout)
+
+            teamsTabButton(layout: layout)
 
             chatTabButton(layout: layout)
 
@@ -1678,6 +1997,12 @@ struct MainTabView: View {
         .padding(.bottom, layout.screenBottomInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .ignoresSafeArea(.keyboard, edges: .bottom)
+        .background {
+            SecuritySessionInboxOpener(
+                viewModel: viewModel,
+                showActionCenter: $showActionCenter
+            )
+        }
         // Overlay width drives compact *label* metrics; height/safe-area logged in DEBUG only.
         .onGeometryChange(for: FloatingTabBarGeometry.self) { proxy in
             FloatingTabBarGeometry(
@@ -1884,6 +2209,8 @@ struct MainTabView: View {
         } label: {
             MainTabChatBadgeObserver(state: chatTabBadgeState) { unreadCount, pendingCount, requiresSignIn in
                 let isSelected = selectedTab == .chat
+                // Chat tab badge = unread messages only. Friend requests live in Action Center.
+                let _ = pendingCount
                 ZStack(alignment: .topTrailing) {
                     floatingTabBarCapsuleLabel(
                         isSelected: isSelected,
@@ -1897,11 +2224,6 @@ struct MainTabView: View {
                         )
                     }
                     .softActiveGlow(isSelected, color: FGColor.accentBlue)
-
-                    if pendingCount > 0 {
-                        chatTabPillBadge(count: pendingCount)
-                            .offset(x: 6, y: -6)
-                    }
                 }
                 .layoutPriority(isSelected ? 1 : 0)
             }
@@ -1981,55 +2303,323 @@ struct MainTabView: View {
         return Button {
             handleTabBarTap(.calendar, reason: "calendarTabButton")
         } label: {
-            floatingTabBarCapsuleLabel(
-                isSelected: isSelected,
-                title: localized("Schedule"),
-                layout: layout
-            ) {
-                Image(systemName: "calendar")
+            ZStack(alignment: .topTrailing) {
+                floatingTabBarCapsuleLabel(
+                    isSelected: isSelected,
+                    title: localized("Schedule"),
+                    layout: layout
+                ) {
+                    Image(systemName: "calendar")
+                }
+                .softActiveGlow(isSelected, color: FGColor.accentBlue)
+
+                if scheduleTabBadgeCount > 0 {
+                    Text(FanGeoActionCenterProjection.badgeLabel(scheduleTabBadgeCount))
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.red)
+                        .clipShape(Capsule())
+                        .offset(x: 10, y: -8)
+                        .accessibilityLabel(
+                            String(
+                                format: L10n.t("action_center_schedule_badge_a11y", languageCode: appLanguageRaw),
+                                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                                Int64(scheduleTabBadgeCount)
+                            )
+                        )
+                }
             }
-            .softActiveGlow(isSelected, color: FGColor.accentBlue)
             .layoutPriority(isSelected ? 1 : 0)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .accessibilityLabel(localized("Schedule"))
         .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
-    private func followingTabButton(layout: FloatingTabBarLayout) -> some View {
+    private func goingTabButton(layout: FloatingTabBarLayout) -> some View {
         let isSelected = selectedTab == .following
         return Button {
-            handleTabBarTap(.following, reason: "followingTabButton")
+            handleTabBarTap(.following, reason: "goingTabButton")
         } label: {
             ZStack(alignment: .topTrailing) {
                 floatingTabBarCapsuleLabel(
                     isSelected: isSelected,
-                    title: localized("going"),
+                    title: localized("going_tab_title"),
                     layout: layout
                 ) {
                     Image(systemName: "heart.fill")
                 }
                 .softActiveGlow(isSelected, color: FGColor.accentGreen)
 
-                if goingTabHasActivity {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 9, height: 9)
-                        .overlay(Circle().strokeBorder(Color.white.opacity(0.85), lineWidth: 1))
-                        .offset(x: 7, y: -6)
-                        .accessibilityLabel("Pickup games activity")
+                if goingTabBadgeCount > 0 {
+                    Text(FanGeoActionCenterProjection.badgeLabel(goingTabBadgeCount))
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.red)
+                        .clipShape(Capsule())
+                        .offset(x: 10, y: -8)
+                        .accessibilityLabel(
+                            String(
+                                format: L10n.t("going_action_needed_badge_a11y", languageCode: appLanguageRaw),
+                                locale: Locale(identifier: L10n.normalizedLanguageCode(appLanguageRaw)),
+                                Int64(goingTabBadgeCount)
+                            )
+                        )
                 }
             }
             .layoutPriority(isSelected ? 1 : 0)
         }
         .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .accessibilityLabel(localized("going_tab_title"))
         .disabled(viewModel.isSafeLogoutBlockingUI)
     }
 
-    private var goingTabHasActivity: Bool {
-        viewModel.hasUnreadPickupActivity
-            || viewModel.pickupActivityCount > 0
-            || viewModel.pendingPickupGameJoinRequestCount > 0
-            || !viewModel.incomingPickupGameInvites.isEmpty
+    private func teamsTabButton(layout: FloatingTabBarLayout) -> some View {
+        let isSelected = selectedTab == .teams
+        return Button {
+            handleTabBarTap(.teams, reason: "teamsTabButton")
+        } label: {
+            MainTabTeamsBadgeObserver(state: chatTabBadgeState) { inviteBadge in
+                // Team invitations only — pickup hosting approvals live on Going.
+                let teamsBadge = viewModel.isAuthenticatedForSocialFeatures ? max(0, inviteBadge) : 0
+                ZStack(alignment: .topTrailing) {
+                    floatingTabBarCapsuleLabel(
+                        isSelected: isSelected,
+                        title: localized("teams"),
+                        layout: layout
+                    ) {
+                        Image(systemName: "shield.checkered")
+                    }
+                    .softActiveGlow(isSelected, color: FGColor.accentBlue)
+
+                    if teamsBadge > 0 {
+                        Text(FanGeoActionCenterProjection.badgeLabel(teamsBadge))
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.red)
+                            .clipShape(Capsule())
+                            .offset(x: 10, y: -8)
+                            .accessibilityLabel(
+                                L10n.t("action_center_teams_badge_a11y", languageCode: appLanguageRaw)
+                            )
+                    }
+                }
+                .layoutPriority(isSelected ? 1 : 0)
+            }
+        }
+        .buttonStyle(FGPremiumPressButtonStyle(hapticOnPress: false))
+        .accessibilityLabel(localized("teams"))
+        .disabled(viewModel.isSafeLogoutBlockingUI)
+    }
+
+    private var scheduleTabBadgeCount: Int {
+        actionCenterSnapshot.scheduleBadgeCount
+    }
+
+    /// Going-tab badge is Going content only. Inbox owns Action Needed / invitations /
+    /// ratings / join requests — never mix those counts into this badge.
+    private var goingTabBadgeCount: Int {
+        viewModel.goingContentBadgeCount()
+    }
+
+    private var actionCenterSnapshot: FanGeoActionCenterProjection.Snapshot {
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        return viewModel.makeActionCenterSnapshot(
+            languageCode: languageCode,
+            teamInvitations: chatViewModel.pendingFanTeamInvitations.map {
+                FanGeoActionTeamInviteInput(
+                    invitationId: $0.invitationId,
+                    teamId: $0.teamId,
+                    teamName: $0.teamName,
+                    sport: $0.sport,
+                    inviterDisplayName: $0.inviterDisplayName,
+                    createdAt: $0.createdAt
+                )
+            },
+            teamInvitationCount: chatViewModel.pendingFanTeamInvitationCount,
+            friendRequests: chatViewModel.incomingRequests.map {
+                FanGeoActionFriendRequestInput(
+                    friendshipId: $0.friendship.id,
+                    requesterUserId: $0.requester.id,
+                    displayName: $0.requester.displayName,
+                    username: $0.requester.username,
+                    avatarURL: $0.requester.avatarThumbnailURL ?? $0.requester.avatarURL,
+                    createdAt: $0.friendship.created_at.flatMap(FanPropsRelativeTime.parse)
+                )
+            },
+            friendRequestCount: chatViewModel.pendingBadgeCount,
+            chatUnreadCount: chatViewModel.unreadDirectMessageCount,
+            showsBusinessClaim: businessTabShowsPendingClaimDot
+        )
+    }
+
+    private var actionCenterPresentedView: some View {
+        FanGeoActionCenterView(
+            actionNeededItems: actionCenterSnapshot.actionNeededItems,
+            notificationItems: actionCenterSnapshot.notificationItems,
+            unreadNotificationIds: actionCenterSnapshot.unreadNotificationIds,
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+            onSelect: { item in
+                if item.kind.listSection == .notifications {
+                    viewModel.markActionCenterNotificationRead(item)
+                }
+                showActionCenter = false
+                handleActionCenterItem(item)
+            },
+            onClose: { showActionCenter = false },
+            onDismissActionItem: { item in
+                viewModel.dismissActionCenterItems([item])
+                ActionCenterDismissDebug.log(
+                    "badgeAfter=\(actionCenterSnapshot.actionCenterBadgeCount)"
+                )
+            },
+            onUndoDismissActionItem: { item in
+                viewModel.undismissActionCenterItems([item])
+                ActionCenterDismissDebug.log(
+                    "badgeAfter=\(actionCenterSnapshot.actionCenterBadgeCount)"
+                )
+            },
+            onClearNotification: { item in
+                viewModel.clearActionCenterNotification(item)
+            },
+            onClearAllNotifications: {
+                viewModel.clearAllActionCenterNotifications()
+            },
+            onClearAllInbox: {
+                viewModel.clearAllInboxContent(
+                    visibleActionNeeded: actionCenterSnapshot.actionNeededItems
+                )
+            },
+            onAppearRefresh: {
+                Task { await viewModel.refreshNotificationInboxFromServer() }
+            }
+        )
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    /// Shared chrome for root headers — sheet + routing stay in MainTabView.
+    private var actionCenterChromeValue: FanGeoActionCenterChromeValue {
+        let hideForConversation = hidesFloatingTabBarForActiveChatConversation
+        let available = viewModel.isAuthenticatedForSocialFeatures && !hideForConversation
+        return FanGeoActionCenterChromeValue(
+            isAvailable: available,
+            badgeCount: actionCenterSnapshot.actionCenterBadgeCount,
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+            open: {
+                FGInteractionHaptics.selection()
+                showActionCenter = true
+            }
+        )
+    }
+
+    private func handleActionCenterItem(_ item: FanGeoActionItem) {
+        switch item.destination {
+        case .teamsHome:
+            chatViewModel.pendingOpenFanTeamRosterTeamId = nil
+            chatViewModel.pendingHighlightFanTeamInvitationId = nil
+            selectTab(.teams, animated: true, reason: "actionCenter.teamsHome")
+        case .teamsInvites:
+            if let invitationId = item.context.invitationId {
+                chatViewModel.pendingHighlightFanTeamInvitationId = invitationId
+            }
+            chatViewModel.pendingOpenMyTeamsInvitations = true
+            selectTab(.teams, animated: true, reason: "actionCenter.teamsInvites")
+        case .goingPickupInvites:
+            viewModel.pendingOpenGoingPickupInvites = true
+            if let gameId = item.context.pickupGameId {
+                viewModel.pendingScheduleActivityPickupGameId = gameId
+                viewModel.presentSharedPickupGameDetail(gameId: gameId)
+            }
+            selectTab(.following, animated: true, reason: "actionCenter.goingInvites")
+        case .goingHostingApprovals:
+            if let gameId = item.context.pickupGameId {
+                viewModel.presentOrganizerJoinApprovalFromActionCenter(
+                    pickupGameId: gameId,
+                    teamId: item.context.teamId
+                )
+                if item.context.teamId != nil {
+                    selectTab(.teams, animated: true, reason: "actionCenter.goingHosting.teamSchedule")
+                } else {
+                    selectTab(.following, animated: true, reason: "actionCenter.goingHosting")
+                }
+            } else {
+                viewModel.pendingOpenGoingHostingApprovals = true
+                selectTab(.following, animated: true, reason: "actionCenter.goingHosting")
+            }
+        case .goingPendingRating:
+            if let gameId = item.context.pickupGameId {
+                viewModel.presentPickupCreatorRatingPrompt(pickupGameId: gameId)
+            } else {
+                selectTab(.following, animated: true, reason: "actionCenter.goingRating")
+            }
+        case .chatFriendRequests:
+            chatViewModel.pendingOpenFriendRequestsSection = true
+            selectTab(.chat, animated: true, reason: "actionCenter.friendRequests")
+        case .chatUnread:
+            selectTab(.chat, animated: true, reason: "actionCenter.chatUnread")
+        case .scheduleActivity:
+            if let matchID = item.context.proGameMatchId
+                ?? item.context.proGameSnapshot?.matchID,
+               !matchID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                viewModel.enqueueProGameNotificationDeepLink(matchID: matchID)
+                selectTab(.following, animated: true, reason: "actionCenter.proGame")
+            } else if let gameId = item.context.pickupGameId {
+                viewModel.pendingScheduleActivityPickupGameId = gameId
+                viewModel.acknowledgePickupFollowingActivity(for: gameId)
+                if let teamId = item.context.teamId {
+                    viewModel.handlePickupGameChangeNotificationDeepLink(
+                        pickupGameId: gameId,
+                        teamId: teamId,
+                        rsvpResetRequired: false
+                    )
+                    selectTab(.teams, animated: true, reason: "actionCenter.scheduleActivity.team")
+                } else {
+                    viewModel.presentSharedPickupGameDetail(gameId: gameId)
+                    selectTab(.following, animated: true, reason: "actionCenter.scheduleActivity")
+                }
+            } else if item.context.teamId != nil {
+                selectTab(.teams, animated: true, reason: "actionCenter.scheduleActivity.team")
+            } else {
+                selectTab(.following, animated: true, reason: "actionCenter.scheduleActivity")
+            }
+        case .accountPokes:
+            if let pokerId = item.context.requesterUserId {
+                viewModel.presentPublicProfile(
+                    userId: pokerId,
+                    context: "action_center_poke",
+                    activeSheet: "ActionCenter"
+                )
+            } else {
+                selectTab(.account, animated: true, reason: "actionCenter.accountPokes")
+            }
+        case .accountBusinessClaim:
+            selectTab(.account, animated: true, reason: "actionCenter.account")
+        case .accountSecurity:
+            if viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn {
+                showActionCenter = true
+            } else {
+                viewModel.handleSecuritySessionReplacedDeepLink()
+            }
+        }
+    }
+
+    private func handleActionCenterDestination(_ destination: FanGeoActionDestination) {
+        handleActionCenterItem(
+            FanGeoActionItem(
+                id: destination.rawValue,
+                kind: .businessClaim,
+                titleKey: "action_center_title",
+                subtitleKey: "action_center_title",
+                destination: destination
+            )
+        )
     }
 
     private func tabButton(
@@ -2351,31 +2941,13 @@ struct MainTabView: View {
         }
     }
 
-    /// Avatar only; pickup participation activity now belongs in Going.
+    /// Avatar only — Profile tab has no ambiguous action dots (actions live in Action Center).
     private func accountTabAvatar(layout: FloatingTabBarLayout) -> some View {
-        ZStack(alignment: .topTrailing) {
-            accountTabAvatarCircleOnly(size: layout.avatarInner)
-                .frame(width: layout.avatarInner, height: layout.avatarInner)
-                .clipShape(Circle())
-
-            if accountTabPokesBadgeVisible {
-                PokesUnseenAvatarBadge(style: .tab)
-                    .offset(x: 0, y: -2)
-            }
-
-            if businessTabShowsPendingClaimDot {
-                businessPendingClaimDot
-                    .offset(x: -4, y: 2)
-            }
-        }
-        .frame(width: layout.avatarOuter, height: layout.avatarOuter)
-        .accessibilityLabel(accountTabPokesBadgeVisible ? "Account, new Pokes" : accountTabTitle)
-        .onAppear {
-            DebugLogGate.debug("[PokesBadgeUI] accountBadge visible=\(accountTabPokesBadgeVisible)")
-        }
-        .onChange(of: accountTabPokesBadgeVisible) { _, visible in
-            DebugLogGate.debug("[PokesBadgeUI] accountBadge visible=\(visible)")
-        }
+        accountTabAvatarCircleOnly(size: layout.avatarInner)
+            .frame(width: layout.avatarInner, height: layout.avatarInner)
+            .clipShape(Circle())
+            .frame(width: layout.avatarOuter, height: layout.avatarOuter)
+            .accessibilityLabel(accountTabTitle)
     }
 
     private var accountTabPokesBadgeVisible: Bool {
@@ -2470,21 +3042,30 @@ private enum TabBarLayoutDebug {
 enum FloatingTabBarLayoutSelfTests {
     static func runAll() {
         // Fill + bottom alignment must remain the positioning contract (no absolute Y).
+        assert(FloatingTabBarLayout.ultraCompact.screenBottomInset == 6)
         assert(FloatingTabBarLayout.compact.screenBottomInset == 6)
         assert(FloatingTabBarLayout.regular.screenBottomInset == 6)
         assert(MainTabView.floatingTabBarStackHeight >= MainTabViewFloatingTabBarMetrics.overlayHeight)
-        let compact = FloatingTabBarLayout.resolve(barWidth: 390)
+        let ultra = FloatingTabBarLayout.resolve(barWidth: 375)
+        let compact = FloatingTabBarLayout.resolve(barWidth: 400)
         let regular = FloatingTabBarLayout.resolve(barWidth: 430)
+        assert(ultra == .ultraCompact)
         assert(compact == .compact)
         assert(regular == .regular)
+        // Six destinations must keep ~44pt min hit height on all widths.
+        assert(ultra.itemMinHeight >= 44)
+        assert(compact.itemMinHeight >= 44)
+        assert(regular.itemMinHeight >= 44)
+        assert(ultra.itemSpacing <= compact.itemSpacing)
+        assert(ultra.barHorizontalPadding <= compact.barHorizontalPadding)
     }
 }
 #endif
 
 /// Width-driven metrics for the floating capsule tab bar (no device-name checks).
 ///
-/// Shared chrome sized to match Discover Watch/Play dock weight (stack 108, corner 28).
-/// Compact widths only reduce selected-label font / scale so “Chat” and “Schedule” stay one line.
+/// Sized for **6** root destinations (Discover → Profile). Narrow widths tighten
+/// spacing / selected-pill padding only — icons and min tap height stay ≥ 44pt.
 private struct FloatingTabBarLayout: Equatable {
     // Shared chrome — identical on all phones.
     var screenHorizontalInset: CGFloat
@@ -2503,46 +3084,69 @@ private struct FloatingTabBarLayout: Equatable {
     var avatarOuter: CGFloat
     var chatIconSlotWidth: CGFloat
 
-    // Compact-only selected-label tweaks (never shrink icons / avatar / bar chrome).
+    // Compact-only selected-label tweaks (never shrink icons / avatar / bar chrome excessively).
     var selectedLabelFontSize: CGFloat
     var selectedHorizontalPadding: CGFloat
     var selectedLabelMinimumScale: CGFloat
 
     /// `availableWidth` is the floating-bar overlay width (≈ screen width).
     static func resolve(barWidth availableWidth: CGFloat) -> FloatingTabBarLayout {
-        // Compact phones (≤ ~iPhone 11 / 16 class) only scale selected labels.
-        // Pro Max-class widths keep the baseline caption size.
+        if availableWidth < 390 {
+            return .ultraCompact
+        }
         if availableWidth < 430 {
             return .compact
         }
         return .regular
     }
 
-    static let compact = FloatingTabBarLayout(
-        screenHorizontalInset: 16,
+    /// Smallest supported phones (SE / mini class) with 6 destinations.
+    static let ultraCompact = FloatingTabBarLayout(
+        screenHorizontalInset: 8,
         screenBottomInset: 6,
-        barHorizontalPadding: 16,
-        barVerticalPadding: 10,
-        barCornerRadius: 28,
-        itemVerticalPadding: 10,
+        barHorizontalPadding: 6,
+        barVerticalPadding: 8,
+        barCornerRadius: 26,
+        itemVerticalPadding: 8,
         itemMinHeight: 44,
-        labelFontSize: 12,
-        itemSpacing: 6,
-        labelSpacing: 5,
-        unselectedHorizontalPadding: 10,
-        unselectedMinWidth: 44,
-        avatarInner: 44,
-        avatarOuter: 52,
-        chatIconSlotWidth: 22,
-        selectedLabelFontSize: 11,
-        selectedHorizontalPadding: 10,
-        selectedLabelMinimumScale: 0.82
+        labelFontSize: 10.5,
+        itemSpacing: 1,
+        labelSpacing: 2,
+        unselectedHorizontalPadding: 5,
+        unselectedMinWidth: 38,
+        avatarInner: 36,
+        avatarOuter: 42,
+        chatIconSlotWidth: 18,
+        selectedLabelFontSize: 10,
+        selectedHorizontalPadding: 7,
+        selectedLabelMinimumScale: 0.72
+    )
+
+    static let compact = FloatingTabBarLayout(
+        screenHorizontalInset: 10,
+        screenBottomInset: 6,
+        barHorizontalPadding: 8,
+        barVerticalPadding: 9,
+        barCornerRadius: 28,
+        itemVerticalPadding: 9,
+        itemMinHeight: 44,
+        labelFontSize: 11,
+        itemSpacing: 2,
+        labelSpacing: 3,
+        unselectedHorizontalPadding: 6,
+        unselectedMinWidth: 40,
+        avatarInner: 38,
+        avatarOuter: 44,
+        chatIconSlotWidth: 20,
+        selectedLabelFontSize: 10.5,
+        selectedHorizontalPadding: 8,
+        selectedLabelMinimumScale: 0.76
     )
 
     static let regular = FloatingTabBarLayout(
-        screenHorizontalInset: 16,
+        screenHorizontalInset: 14,
         screenBottomInset: 6,
-        barHorizontalPadding: 16,
+        barHorizontalPadding: 12,
         barVerticalPadding: 10,
         barCornerRadius: 28,
         itemVerticalPadding: 10,
@@ -2551,13 +3155,13 @@ private struct FloatingTabBarLayout: Equatable {
         itemSpacing: 6,
         labelSpacing: 5,
         unselectedHorizontalPadding: 10,
-        unselectedMinWidth: 44,
-        avatarInner: 44,
-        avatarOuter: 52,
-        chatIconSlotWidth: 24,
+        unselectedMinWidth: 46,
+        avatarInner: 42,
+        avatarOuter: 50,
+        chatIconSlotWidth: 22,
         selectedLabelFontSize: 12,
         selectedHorizontalPadding: 12,
-        selectedLabelMinimumScale: 0.9
+        selectedLabelMinimumScale: 0.85
     )
 }
 
@@ -2615,6 +3219,16 @@ private struct MainTabChatBadgeObserver<Content: View>: View {
     }
 }
 
+/// Teams-tab invitation badge leaf (invitee pending Team invitations only).
+private struct MainTabTeamsBadgeObserver<Content: View>: View {
+    @ObservedObject var state: ChatTabBadgeState
+    @ViewBuilder let content: (_ inviteCount: Int) -> Content
+
+    var body: some View {
+        content(max(0, state.pendingFanTeamInvitationCount))
+    }
+}
+
 /// Root-owned transient overlays (FanXP reward + Wow Moment toasts) as a named
 /// leaf so their concrete types stay out of MainTabView.body's modifier chain.
 struct MainTabTransientOverlayLayer: View {
@@ -2660,6 +3274,24 @@ struct MainTabSessionOverlayLayer: View {
                 }
 #endif
         }
+    }
+}
+
+private struct SecuritySessionInboxOpener: View {
+    @ObservedObject var viewModel: MapViewModel
+    @Binding var showActionCenter: Bool
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onChange(of: viewModel.pendingOpenActionCenterForSecurityEvent) { _, shouldOpen in
+                guard shouldOpen else { return }
+                viewModel.pendingOpenActionCenterForSecurityEvent = false
+                if viewModel.isLoggedIn || viewModel.isVenueOwnerLoggedIn {
+                    showActionCenter = true
+                }
+            }
     }
 }
 

@@ -499,6 +499,7 @@ extension MapViewModel {
         selectedEvent = nil
         selectedPickupGameForMap = nil
         discoverRemotePreviewHoldVenueId = nil
+        selectedDiscoverableFanTeamForMap = nil
         selectedPickupPlaceForMap = place
 #if DEBUG
         print("[PickupPlacesDebug] selectedPlace=\(place.id.uuidString.lowercased()) name=\(place.name)")

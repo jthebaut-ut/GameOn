@@ -288,6 +288,29 @@ nonisolated struct SavedProGame: Identifiable, Codable, Equatable {
         )
     }
 
+    func inboxSnapshot(
+        kind: FanGeoProGameInboxSnapshot.Kind,
+        scoringTeam: String? = nil
+    ) -> FanGeoProGameInboxSnapshot {
+        FanGeoProGameInboxSnapshot(
+            kind: kind,
+            matchID: stableKey,
+            homeTeam: homeTeam,
+            awayTeam: awayTeam,
+            homeScore: scoreHome,
+            awayScore: scoreAway,
+            scoringTeam: scoringTeam,
+            league: league,
+            sport: sport,
+            matchStatus: matchStatus.rawValue,
+            clock: liveClockText,
+            homeBadgeURL: SportsArtworkURLStore.shared.badgeURL(league: league, teamName: homeTeam),
+            awayBadgeURL: SportsArtworkURLStore.shared.badgeURL(league: league, teamName: awayTeam),
+            homeProviderId: nil,
+            awayProviderId: nil
+        )
+    }
+
     static func stableKey(for match: LiveMatch) -> String {
         stableKey(
             id: match.id,
@@ -662,7 +685,7 @@ extension MapViewModel {
                 showSocialActionToast(L10n.t("removed_from_pro_sports_games"), isError: false)
             } else {
                 saveProGame(match)
-                showSocialActionToast("Saved to Going.", isError: false)
+                showSocialActionToast(L10n.t("saved_to_my_sports"), isError: false)
             }
             return
         }
@@ -683,10 +706,12 @@ extension MapViewModel {
         pendingSaveProGameCompletionToken = nil
         if isLiveTabSelected {
             pendingSaveProGameReturnTabRaw = MainTabView.AppTab.live.rawValue
+        } else if isFollowingTabSelected {
+            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.following.rawValue
         } else if isCalendarTabSelected {
             pendingSaveProGameReturnTabRaw = MainTabView.AppTab.calendar.rawValue
         } else {
-            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.following.rawValue
+            pendingSaveProGameReturnTabRaw = MainTabView.AppTab.calendar.rawValue
         }
         presentSaveProGameSignInPrompt = true
 #if DEBUG
@@ -697,8 +722,8 @@ extension MapViewModel {
     @MainActor
     func dismissSaveProGameSignInPrompt() {
         presentSaveProGameSignInPrompt = false
-        // Keep pending match so Sign In → login can still complete the favorite.
-        // Not Now clears the pending action entirely.
+        // Keep pending match so Sign In / Create Account can still complete the favorite.
+        // Swipe-dismiss cancels the pending action entirely.
     }
 
     @MainActor
@@ -717,6 +742,16 @@ extension MapViewModel {
         discoverPresentFanUserAuthSheet(openRegisterMode: false)
 #if DEBUG
         print("[SaveProGameAuth] continueToLogin pending=\(pendingSaveProGameMatch != nil)")
+#endif
+    }
+
+    /// Create Account on the save-games prompt: existing fan registration sheet.
+    @MainActor
+    func continueSaveProGameCreateAccountFromPrompt() {
+        presentSaveProGameSignInPrompt = false
+        discoverPresentFanUserAuthSheet(openRegisterMode: true)
+#if DEBUG
+        print("[SaveProGameAuth] continueToRegister pending=\(pendingSaveProGameMatch != nil)")
 #endif
     }
 
@@ -751,7 +786,7 @@ extension MapViewModel {
 
         if !isProGameSaved(match) {
             saveProGame(match)
-            showSocialActionToast("Saved to Going.", isError: false)
+            showSocialActionToast(L10n.t("saved_to_my_sports"), isError: false)
 #if DEBUG
             print("[SaveProGameAuth] pendingFavoriteCompleted stableKey=\(key)")
 #endif
@@ -1341,7 +1376,13 @@ extension MapViewModel {
     ) async {
         guard enabled else {
             let previous = favoriteTeamProGames
-            favoriteTeamProGames = []
+            let favoriteTeams = FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
+            if favoriteTeams.isEmpty {
+                favoriteTeamProGames = []
+            } else {
+                let source = sharedLiveMatchesSuitableForFavoriteTeamWindow(days: windowDays) ?? liveMatches
+                favoriteTeamProGames = Self.favoriteTeamProGames(from: source, favoriteTeams: favoriteTeams)
+            }
             await reconcileFavoriteTeamProGameReminders(
                 reason: "autoFollowDisabled",
                 previousGames: previous
@@ -1529,7 +1570,8 @@ extension MapViewModel {
                     identifier: game.stableKey,
                     body: body,
                     awayTeam: game.awayTeam,
-                    homeTeam: game.homeTeam
+                    homeTeam: game.homeTeam,
+                    snapshot: game.inboxSnapshot(kind: .final)
                 )
             )
         }
@@ -1556,7 +1598,8 @@ extension MapViewModel {
                     identifier: game.stableKey,
                     body: body,
                     awayTeam: game.awayTeam,
-                    homeTeam: game.homeTeam
+                    homeTeam: game.homeTeam,
+                    snapshot: game.inboxSnapshot(kind: .halftime)
                 )
             )
         }
@@ -1722,7 +1765,11 @@ extension MapViewModel {
                     title: title,
                     body: body,
                     awayTeam: game.awayTeam,
-                    homeTeam: game.homeTeam
+                    homeTeam: game.homeTeam,
+                    snapshot: game.inboxSnapshot(
+                        kind: .score,
+                        scoringTeam: savedProGameScoringTeam(for: game, previous: previous)
+                    )
                 )
             )
         }
@@ -2339,6 +2386,7 @@ extension MapViewModel {
         }
         handleSavedProGameStatusUpdates(from: matches, reason: "favoriteTeamWindowMerge")
         liveMatches = merged
+        seedSportsArtworkFromFetchedLiveMatches()
     }
 
     /// Live tab default forward coverage is ~7 days; reuse that snapshot for Going auto-follow

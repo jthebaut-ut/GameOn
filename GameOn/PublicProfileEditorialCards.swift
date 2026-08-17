@@ -185,7 +185,7 @@ extension PublicUserProfileData {
         Array(openToItems.prefix(PublicProfileContentBuilder.maxPublicOpenToItems))
     }
 
-    /// Authoritative My Team only — never inferred from favorite ordering.
+    /// Authoritative Favorite Team only — never inferred from favorite ordering.
     var primaryFavoriteTeam: FavoriteTeam? {
         explicitPrimaryFavoriteTeam
     }
@@ -1039,7 +1039,7 @@ struct PublicProfileFavoriteTeamsCard: View {
             HStack(alignment: .top, spacing: 10) {
                 SportsIdentityArtworkView(favoriteTeam: team, diameter: 42)
                 Spacer(minLength: 0)
-                // Non-primary keeps an outline trophy affordance; primary uses the MY TEAM label only.
+                // Non-primary keeps an outline trophy affordance; primary uses the Favorite Team label only.
                 if !isPrimary {
                     Image(systemName: "trophy")
                         .font(.system(size: 16, weight: .heavy))

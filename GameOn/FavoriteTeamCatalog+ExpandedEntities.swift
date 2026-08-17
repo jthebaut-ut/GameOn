@@ -2,7 +2,7 @@ import Foundation
 
 /// Global Following expansion entities (competitions, women’s soccer, leagues, multi-sport tournaments).
 /// Official names only; no third-party logos. Stable IDs never rename existing persisted favorites.
-extension FavoriteTeamCatalog {
+nonisolated extension FavoriteTeamCatalog {
     static let expandedGlobalEntities: [FavoriteTeam] =
         expandedMensInternationalSoccer
         + expandedMensClubSoccer
@@ -231,6 +231,7 @@ extension FavoriteTeamCatalog {
 
     private static let expandedFootballTournaments: [FavoriteTeam] = [
         make("tournament-nfl-playoffs", "NFL Playoffs", .football, "Football Tournament", "football.fill", 0.12, 0.32, 0.62, region: "Leagues & Tournaments", kind: .competition, shortCode: "NFLPO", aliases: ["NFL Postseason"]),
+        // Stable competition identity (not Super Bowl LX / a single event edition).
         make("tournament-super-bowl", "Super Bowl", .football, "Football Tournament", "football.fill", 0.78, 0.62, 0.12, region: "Leagues & Tournaments", kind: .competition, shortCode: "SB", aliases: ["NFL Super Bowl"])
     ]
 

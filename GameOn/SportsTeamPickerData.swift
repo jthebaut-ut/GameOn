@@ -1,6 +1,6 @@
 import Foundation
 
-enum TeamPickerSport: String, Hashable {
+nonisolated enum TeamPickerSport: String, Hashable, Sendable {
     case soccer
     case basketball
     case baseball
@@ -19,14 +19,14 @@ enum TeamPickerSport: String, Hashable {
     }
 }
 
-enum TeamPickerMode: String, CaseIterable, Identifiable {
+nonisolated enum TeamPickerMode: String, CaseIterable, Identifiable, Sendable {
     case countries = "Countries"
     case teams = "Teams"
 
     var id: String { rawValue }
 }
 
-struct TeamPickerOption: Identifiable, Hashable {
+nonisolated struct TeamPickerOption: Identifiable, Hashable, Sendable {
     let id: String
     let displayName: String
     let shortName: String?
@@ -51,19 +51,19 @@ struct TeamPickerOption: Identifiable, Hashable {
     }
 }
 
-struct TeamPickerGroup: Identifiable, Hashable {
+nonisolated struct TeamPickerGroup: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let options: [TeamPickerOption]
 }
 
-struct TeamPickerRegionGroup: Identifiable, Hashable {
+nonisolated struct TeamPickerRegionGroup: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let groups: [TeamPickerGroup]
 }
 
-enum SportsTeamPickerData {
+nonisolated enum SportsTeamPickerData {
     /// Canonical country/team options used by business game management. Fan favorite picking reuses this
     /// so both flows speak the same sports identity vocabulary without adding network calls.
     static var favoriteCatalogOptions: [TeamPickerOption] {
@@ -607,7 +607,7 @@ enum SportsTeamPickerData {
 
 }
 
-private extension String {
+nonisolated private extension String {
     var pickerID: String {
         folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
             .components(separatedBy: CharacterSet.alphanumerics.inverted)

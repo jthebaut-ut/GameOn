@@ -48,6 +48,8 @@ struct ChatLocationAttachmentModifier: ViewModifier {
     /// Optional venue favorites for On My Way destination picker.
     var favoriteVenues: [BarVenue] = []
     var recentSharedCoordinate: (name: String, lat: Double, lon: Double)? = nil
+    /// Optional Poll entry in the same composer attach sheet (Team / pickup chats).
+    var onCreatePoll: (() -> Void)? = nil
 
     @ObservedObject private var liveManager = ChatLiveLocationManager.shared
     @State private var showActionSheet = false
@@ -91,6 +93,11 @@ struct ChatLocationAttachmentModifier: ViewModifier {
                 }
                 Button(L10n.t("chat_on_my_way_title", languageCode: languageCode)) {
                     begin(.onMyWay)
+                }
+                if let onCreatePoll {
+                    Button(L10n.t("pickup_poll_create_row", languageCode: languageCode)) {
+                        onCreatePoll()
+                    }
                 }
                 Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
             }
@@ -400,6 +407,7 @@ extension View {
         isEnabled: Bool,
         favoriteVenues: [BarVenue] = [],
         recentSharedCoordinate: (name: String, lat: Double, lon: Double)? = nil,
+        onCreatePoll: (() -> Void)? = nil,
         sendStructuredBody: @escaping (String) async -> String?
     ) -> some View {
         modifier(
@@ -409,7 +417,8 @@ extension View {
                 isEnabled: isEnabled,
                 sendStructuredBody: sendStructuredBody,
                 favoriteVenues: favoriteVenues,
-                recentSharedCoordinate: recentSharedCoordinate
+                recentSharedCoordinate: recentSharedCoordinate,
+                onCreatePoll: onCreatePoll
             )
         )
     }

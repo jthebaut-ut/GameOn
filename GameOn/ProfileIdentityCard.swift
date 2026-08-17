@@ -57,6 +57,7 @@ enum ProfilePhase1PersonalizationCache {
             suggestedFansLoadedAtByAuthId.removeAll()
             suggestedFansByAuthId.removeAll()
             PublicUserProfileProcessCache.clearAll(reason: "personalizationCacheClearedAll")
+            invalidateMyTeams(for: nil)
             return
         }
         incomingPokesLoadedAtByAuthId.removeValue(forKey: authId)
@@ -64,6 +65,7 @@ enum ProfilePhase1PersonalizationCache {
         suggestedFansLoadedAtByAuthId.removeValue(forKey: authId)
         suggestedFansByAuthId.removeValue(forKey: authId)
         PublicUserProfileProcessCache.invalidate(userId: authId, reason: "personalizationCacheCleared")
+        invalidateMyTeams(for: authId)
     }
 }
 
@@ -71,6 +73,9 @@ private enum ProfileAvatarRefreshToken {
 #if DEBUG
     private static var loggedMaterials: Set<String> = []
 #endif
+    private static let lock = NSLock()
+    private static var cache: [String: UUID] = [:]
+    private static let maxCachedEntries = 256
 
     static func stable(
         userId: UUID,
@@ -79,6 +84,13 @@ private enum ProfileAvatarRefreshToken {
         versionSuffix: String = ""
     ) -> UUID {
         let material = "\(userId.uuidString.lowercased())|\(thumbnailURL ?? "")|\(avatarURL ?? "")|\(versionSuffix)"
+        lock.lock()
+        if let cached = cache[material] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
         let digest = Insecure.MD5.hash(data: Data(material.utf8))
         let token = digest.withUnsafeBytes { raw in
             let bytes = raw.bindMemory(to: UInt8.self)
@@ -91,6 +103,12 @@ private enum ProfileAvatarRefreshToken {
                 )
             )
         }
+        lock.lock()
+        if cache.count >= maxCachedEntries {
+            cache.removeAll(keepingCapacity: true)
+        }
+        cache[material] = token
+        lock.unlock()
 #if DEBUG
         if loggedMaterials.insert(material).inserted {
             print("[PerfPhase1] avatarTokenStable userId=\(userId.uuidString.lowercased())")
@@ -137,6 +155,7 @@ struct ProfileIdentityCard: View {
     @State private var editedHomeCountry = ""
     @State private var editedHomeCityDisplay = ""
     @State private var editedShowHomeCity = false
+    @State private var editedMyTeamsVisibility: FanTeamProfileVisibility = .productDefault
     @State private var editedGender: FanProfileGender = .preferNotToSay
     @State private var editedProfileBackgroundKey: ProfileBackgroundKey = .fangeo
     @State private var identityMessage = ""
@@ -146,6 +165,11 @@ struct ProfileIdentityCard: View {
     @State private var isSavingIdentity = false
     @State private var isUploadingAvatar = false
     @State private var localAvatarPreviewImage: UIImage?
+    @State private var profileMyTeamsMemberships: [ProfileFanTeamMembership] = []
+    @State private var cachedPickupOrganizerSummary: PickupOrganizerSummary = .empty
+    @State private var profileMyTeamsSummaries: [FanTeamSummary] = []
+    @State private var profileMyTeamsRefreshFailed = false
+    @State private var profileFanTeamDetail: FanTeamSummary?
     @State private var incomingPokes: [ProfilePokeIncomingItem] = []
     @State private var incomingPokeTotalCount = 0
     @State private var locallyLoadedCommentCount = 0
@@ -182,7 +206,14 @@ struct ProfileIdentityCard: View {
     @AppStorage("profileSponsoredPlacement.lastPlacementId") private var lastSponsoredProfilePlacementIDRaw = ""
     @AppStorage("profileSponsoredPlacement.repeatCount") private var sponsoredProfileVenueRepeatCount = 0
     @State private var profileBelowFoldSectionsReady = false
+    @State private var profileFarFoldSectionsReady = false
+    @State private var profileArtworkPaintRevision: UInt64 = 0
     @State private var lastIncomingPokesFingerprint = ""
+    /// Memoized body inputs so MapViewModel-driven rebuilds do not re-sort / re-resolve.
+    @State private var cachedSelectedTeams: [FavoriteTeam] = []
+    @State private var cachedDisplayedSuggestedFans: [FriendSuggestionProfile] = []
+    @State private var cachedUniqueRecentPokers: [ProfilePokeIncomingItem] = []
+    @State private var cachedPrimaryFavoriteTeamID: String?
 
     private static let bioCharacterLimit = 160
     private static let incomingPokesHighlightsLimit = 50
@@ -194,8 +225,6 @@ struct ProfileIdentityCard: View {
     private static let incomingPokesLiveRefreshIntervalSeconds = 20
     private static let incomingPokesLiveRefreshIntervalNs: UInt64 =
         UInt64(incomingPokesLiveRefreshIntervalSeconds) * 1_000_000_000
-    /// Yields the first Account-tab paint before non-critical profile network extras.
-    private static let profileExtrasFirstPaintDeferNanoseconds: UInt64 = 400_000_000
     private static let profileHeroAvatarDiameter: CGFloat = 133
     private static let profileHeroAvatarRingWidth: CGFloat = 4
     private static let profileHeroAvatarOuterPadding: CGFloat = 4
@@ -232,6 +261,11 @@ struct ProfileIdentityCard: View {
         self.fanUpdatesStore = viewModel.fanUpdatesStore
     }
 
+    private var profileMyTeamsHydrationToken: String {
+        let auth = viewModel.currentUserAuthId?.uuidString ?? "none"
+        return "\(auth)|active=\(isAccountTabActive)|loggedIn=\(viewModel.isLoggedIn)|restoring=\(viewModel.isAuthSessionRestoringForProfilePresentation)|safeLogout=\(viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout)"
+    }
+
     private var profilePersonalizationLoadToken: String {
         let auth = viewModel.currentUserAuthId?.uuidString ?? "anonymous"
         return "\(auth)|active=\(isAccountTabActive)"
@@ -249,9 +283,7 @@ struct ProfileIdentityCard: View {
 
     private var profileStatsLoadToken: String {
         let auth = viewModel.currentUserAuthId?.uuidString ?? "anonymous"
-        let email = viewModel.currentUserEmail.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let teams = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).sorted().joined(separator: ",")
-        return "\(auth)|\(email)|teams=\(teams)|active=\(isAccountTabActive)"
+        return "\(auth)|active=\(isAccountTabActive)"
     }
 
     private var sponsoredPlacementLoadToken: String {
@@ -268,21 +300,30 @@ struct ProfileIdentityCard: View {
     }
 
     private var selectedTeams: [FavoriteTeam] {
-        // Observe hydration generation so AppStorage writes from background login reload refresh this view.
-        _ = viewModel.favoriteTeamsHydrationGeneration
-        return FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
+        if cachedSelectedTeams.isEmpty, !favoriteTeamIDsRaw.isEmpty {
+            // Cold path before onAppear — resolve without mutating @State during body.
+            return FavoriteTeamsStore.resolvedTeams(from: favoriteTeamIDsRaw)
+        }
+        return cachedSelectedTeams
     }
 
     private var selectedIDSet: Set<String> {
-        Set(FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw))
+        if cachedSelectedTeams.isEmpty, !favoriteTeamIDsRaw.isEmpty {
+            return Set(FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw))
+        }
+        return Set(cachedSelectedTeams.map(\.id))
     }
 
     private var selectedTeamIDs: [String] {
-        FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw)
+        if cachedSelectedTeams.isEmpty, !favoriteTeamIDsRaw.isEmpty {
+            return FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw)
+        }
+        return cachedSelectedTeams.map(\.id)
     }
 
     private var primaryFavoriteTeamID: String? {
-        FavoriteTeamsStore.explicitPrimaryTeamID(primaryFavoriteTeamIDRaw, within: selectedTeamIDs)
+        if let cachedPrimaryFavoriteTeamID { return cachedPrimaryFavoriteTeamID }
+        return FavoriteTeamsStore.explicitPrimaryTeamID(primaryFavoriteTeamIDRaw, within: selectedTeamIDs)
     }
 
     private var primaryFavoriteTeam: FavoriteTeam? {
@@ -343,6 +384,18 @@ struct ProfileIdentityCard: View {
         ].joined(separator: "|")
     }
 
+    private var profileHeroAvatarInputs: ProfileIdentityHeroAvatarInputs {
+        ProfileIdentityHeroAvatarInputs(
+            authId: viewModel.currentUserAuthId,
+            avatarURL: viewModel.currentUserAvatarURL,
+            avatarThumbnailURL: viewModel.currentUserAvatarThumbnailURL,
+            avatarDisplayRefreshToken: viewModel.currentUserAvatarDisplayRefreshToken,
+            email: viewModel.currentUserEmail,
+            hasUnseenPokes: viewModel.hasUnseenPokes,
+            totalXP: viewModel.currentUserFanXP.totalXP
+        )
+    }
+
     private var profileHeroIdentityCards: [ProfileHeroIdentityCardItem] {
         // Use the shared hometown formatter line as-is (city, region, country).
         let locationLine = viewModel.currentUserVisibleHomeCityDisplayLine
@@ -358,6 +411,7 @@ struct ProfileIdentityCard: View {
             fanSincePrimary: FanGeoHandleRules.fanSinceMonthYear(from: viewModel.currentUserProfileCreatedAt),
             fanSinceSecondary: nil,
             nationalTeam: viewModel.currentUserNationalTeam,
+            gender: FanProfileGender.rosterDisplayValue(from: viewModel.currentUserGenderRaw),
             languageCode: appLanguageRaw,
             onMyTeam: { showFavoriteTeamsPicker = true },
             onHomeCrowd: {
@@ -401,31 +455,33 @@ struct ProfileIdentityCard: View {
         return viewModel.pickupCreatorTrustStats(for: uid)
     }
 
-    private var ownPickupOrganizerSummary: PickupOrganizerSummary {
+    private func pickupGamesProfileSection(userId: UUID) -> some View {
+        ProfileIdentityPickupGamesSection(
+            userId: userId,
+            summary: cachedPickupOrganizerSummary,
+            languageCode: appLanguageRaw
+        )
+    }
+
+    private func refreshCachedPickupOrganizerSummary() {
+        let next = computedOwnPickupOrganizerSummary()
+        guard next != cachedPickupOrganizerSummary else { return }
+        cachedPickupOrganizerSummary = next
+    }
+
+    private func computedOwnPickupOrganizerSummary() -> PickupOrganizerSummary {
         guard let uid = viewModel.currentUserAuthId else { return .empty }
         if viewModel.myPickupOrganizerSummaryLoadedForUserId == uid {
             return viewModel.myPickupOrganizerSummary
         }
+        let rows = viewModel.myPickupGamesForSettings + viewModel.myRemovedPickupGamesForSettings
         return PickupOrganizerSummary(
-            hostedCount: viewModel.myPickupGamesForSettings.count
-                + viewModel.myRemovedPickupGamesForSettings.count,
+            hostedCount: rows.count,
             stats: currentOrganizerStats,
-            lastPickupGameCreatedAt: {
-                let rows = viewModel.myPickupGamesForSettings + viewModel.myRemovedPickupGamesForSettings
-                return rows.compactMap { row -> Date? in
-                    guard let raw = row.created_at else { return nil }
-                    return PickupGameModels.parseSupabaseTimestamptz(raw)
-                }.max()
-            }()
-        )
-    }
-
-    private func pickupGamesProfileSection(userId: UUID) -> some View {
-        ProfileIdentityPickupGamesSection(
-            viewModel: viewModel,
-            userId: userId,
-            summary: ownPickupOrganizerSummary,
-            languageCode: appLanguageRaw
+            lastPickupGameCreatedAt: rows.compactMap { row -> Date? in
+                guard let raw = row.created_at else { return nil }
+                return PickupGameModels.parseSupabaseTimestamptz(raw)
+            }.max()
         )
     }
 
@@ -474,7 +530,16 @@ struct ProfileIdentityCard: View {
             forceRefresh: false
         )
         await MainActor.run {
-            profileStatsCounts = counts
+            if profileStatsCounts != counts {
+                profileStatsCounts = counts
+#if DEBUG
+                ProfileOpenPerf.statePublished(name: "profileStats")
+#endif
+            } else {
+#if DEBUG
+                ProfileOpenPerf.duplicatePublishSkipped(name: "profileStats")
+#endif
+            }
 #if DEBUG
             print("[ProfileStatsDebug] pickupGamesCount=\(counts.pickupGamesCount)")
             print("[ProfileStatsDebug] venueGamesCount=\(counts.venueGamesCount)")
@@ -498,6 +563,7 @@ struct ProfileIdentityCard: View {
 
     var body: some View {
         let _ = SwiftUIRecompPerf.rootBodyEvaluated(screen: "ProfileIdentity")
+        let _ = ProfileOpenPerf.identityCardBody()
         if shouldBlockFanIdentityCardForBusiness {
             EmptyView()
                 .onAppear {
@@ -512,18 +578,102 @@ struct ProfileIdentityCard: View {
             AnyView(
                 profileIdentityCardContent
                     .onAppear { refreshLocallyLoadedFanUpdateTotals(reason: "appear") }
-                    .onReceive(fanUpdatesStore.$venueEventComments) { _ in
-                        refreshLocallyLoadedFanUpdateTotals(reason: "comments")
+                    // Keep derived-cache hooks off the giant content modifier chain
+                    // so the type-checker stays under the complexity limit.
+                    .onChange(of: favoriteTeamIDsRaw) { _, _ in
+                        refreshCachedSelectedTeams()
                     }
-                    .onReceive(fanUpdatesStore.$venueEventVibeCounts) { _ in
-                        refreshLocallyLoadedFanUpdateTotals(reason: "vibes")
+                    .onChange(of: primaryFavoriteTeamIDRaw) { _, _ in
+                        refreshCachedSelectedTeams()
+                    }
+                    .onChange(of: viewModel.favoriteTeamsHydrationGeneration) { _, _ in
+                        refreshCachedSelectedTeams()
+                    }
+                    .onChange(of: suggestedFans) { _, _ in
+                        refreshCachedDisplayedSuggestedFans()
+                    }
+                    .onChange(of: incomingPokes) { _, _ in
+                        refreshCachedUniqueRecentPokers()
                     }
             )
         }
     }
 
-    private var profileIdentityCardContent: some View {
-            // Shallow LazyVStack: every major section is a dedicated leaf + AnyView chrome.
+    private func makeScrollSnapshot() -> ProfileIdentityScrollSnapshot {
+        let started = CFAbsoluteTimeGetCurrent()
+        let teams = cachedSelectedTeams
+        let artworkFingerprint = ProfileIdentityScrollSnapshotBuilder.compactArtworkFingerprint(
+            teamIDs: teams.map(\.id),
+            paintRevision: profileArtworkPaintRevision
+        )
+        let myTeamsFingerprint = profileMyTeamsMemberships.map { membership in
+            "\(membership.teamId.uuidString.lowercased())|\(membership.role.rawValue)|\(membership.logoThumbnailURL ?? "")|\(membership.logoURL ?? "")"
+        }.joined(separator: ",")
+        let pokeIDs = cachedUniqueRecentPokers.map { $0.id.uuidString }.joined(separator: ",")
+        let pokesFingerprint = "\(pokeIDs)|unseen=\(viewModel.hasUnseenPokes ? 1 : 0)|count=\(incomingPokeTotalCount)"
+        let suggestedFingerprint = cachedDisplayedSuggestedFans.map { $0.userID.uuidString.lowercased() }.joined(separator: ",")
+        let sendingIDs = sendingSuggestedFanRequestIds.map { $0.uuidString.lowercased() }.sorted().joined(separator: ",")
+        let paintFingerprint = [
+            animatedTrophyTeamID ?? "",
+            demotedTrophyTeamID ?? "",
+            String(Int((trophyShimmerProgress * 100).rounded())),
+            String(Int((pokeWaveBadgeIntroScale * 100).rounded())),
+            sendingIDs,
+            localAvatarPreviewImage == nil ? "0" : "1",
+            isLoadingSuggestedFans ? "1" : "0",
+            hasCompletedSuggestedFansLoad ? "1" : "0",
+            isLoadingIncomingPokes ? "1" : "0",
+            profileFarFoldSectionsReady ? "1" : "0",
+            artworkFingerprint
+        ].joined(separator: "§")
+        let crowd = viewModel.currentUserHomeCrowdVenue
+        let avatarIdentity = [
+            viewModel.currentUserAvatarThumbnailURL,
+            viewModel.currentUserAvatarURL,
+            viewModel.currentUserAvatarDisplayRefreshToken.uuidString
+        ].joined(separator: "|")
+        let identityCardsFingerprint = [
+            cachedPrimaryFavoriteTeamID ?? "",
+            crowd?.name ?? "",
+            viewModel.currentUserVisibleHomeCityDisplayLine ?? "",
+            viewModel.currentUserNationalTeam?.countryCode ?? "",
+            FanGeoHandleRules.fanSinceMonthYear(from: viewModel.currentUserProfileCreatedAt) ?? "",
+            viewModel.currentUserGenderRaw
+        ].joined(separator: "|")
+        let favoriteTeamsFingerprint = teams.map(\.id).joined(separator: ",") + "|" + (cachedPrimaryFavoriteTeamID ?? "")
+        let homeCrowdFingerprint = "\(crowd?.venueId.uuidString.lowercased() ?? "")|\(crowd?.thumbnailURL ?? "")|\(crowd?.fanCount ?? 0)"
+        let pickupFingerprint = "\(cachedPickupOrganizerSummary.hostedCount)|\(cachedPickupOrganizerSummary.ratingCount)|\(cachedPickupOrganizerSummary.averageRating ?? -1)"
+        let snapshot = ProfileIdentityScrollSnapshotBuilder.token(
+            authId: viewModel.currentUserAuthId?.uuidString.lowercased() ?? "",
+            displayName: displayName,
+            handleLine: handleLine,
+            bioLine: bioLine,
+            avatarIdentity: avatarIdentity,
+            xp: viewModel.currentUserFanXP.totalXP,
+            backgroundKey: viewModel.currentUserProfileBackgroundKey.rawValue,
+            identityCardsFingerprint: identityCardsFingerprint,
+            handlePrompt: shouldShowHandlePromptBanner,
+            belowFold: profileBelowFoldSectionsReady,
+            myTeamsFingerprint: myTeamsFingerprint,
+            favoriteTeamsFingerprint: favoriteTeamsFingerprint,
+            homeCrowdFingerprint: homeCrowdFingerprint,
+            openToFingerprint: viewModel.currentUserFanIdentityPreferences.resolvedOpenToItemIDs.joined(separator: ","),
+            pickupFingerprint: pickupFingerprint,
+            suggestedFansFingerprint: suggestedFingerprint,
+            suggestedFanChipsFingerprint: sendingIDs,
+            pokesFingerprint: pokesFingerprint,
+            sponsoredIdentity: sponsoredProfileSlotContent?.stableIdentity ?? "",
+            uploadingAvatar: isUploadingAvatar,
+            savingIdentity: isSavingIdentity,
+            languageCode: appLanguageRaw,
+            colorSchemeName: colorScheme == .dark ? "d" : "l",
+            paintFingerprint: paintFingerprint
+        )
+        ProfileOpenPerf.snapshotBuild(durationSeconds: CFAbsoluteTimeGetCurrent() - started)
+        return snapshot
+    }
+
+    private var profileIdentityPaintedSections: some View {
             LazyVStack(alignment: .leading, spacing: Self.profileMajorSectionSpacing) {
                 if shouldShowHandlePromptBanner {
                     AnyView(
@@ -539,7 +689,7 @@ struct ProfileIdentityCard: View {
                         profileBackgroundKey: viewModel.currentUserProfileBackgroundKey
                     ) {
                         ProfileIdentityHeroSection(
-                            viewModel: viewModel,
+                            avatarInputs: profileHeroAvatarInputs,
                             selectedAvatarItem: $selectedAvatarItem,
                             isUploadingAvatar: isUploadingAvatar,
                             isSavingIdentity: isSavingIdentity,
@@ -567,6 +717,31 @@ struct ProfileIdentityCard: View {
                 AnyView(
                     ProfileIdentitySectionChrome(
                         hierarchy: .primary,
+                        accent: [FGColor.accentBlue, Color(red: 0.52, green: 0.38, blue: 0.95)]
+                    ) {
+                        ProfileIdentityMyTeamsSection(
+                            languageCode: appLanguageRaw,
+                            memberships: profileMyTeamsMemberships,
+                            loadFailed: profileMyTeamsRefreshFailed,
+                            onOpenTeam: { membership in
+                                Task { await openOwnProfileFanTeam(membership) }
+                            },
+                            onViewAll: {
+                                NotificationCenter.default.post(name: .fanGeoSelectTeamsTab, object: nil)
+                            },
+                            onCreateTeam: {
+                                NotificationCenter.default.post(name: .fanGeoSelectTeamsTab, object: nil)
+                            },
+                            onRetry: {
+                                Task { await refreshOwnProfileMyTeams(force: true) }
+                            }
+                        )
+                    }
+                )
+
+                AnyView(
+                    ProfileIdentitySectionChrome(
+                        hierarchy: .primary,
                         accent: [FGColor.accentBlue, Self.profileHomeCrowdAccent]
                     ) {
                         ProfileIdentityFavoriteTeamsSection(
@@ -583,7 +758,11 @@ struct ProfileIdentityCard: View {
                         hierarchy: .secondary,
                         accent: [Self.profileHomeCrowdAccent]
                     ) {
-                        ProfileIdentityHomeVenueSection(viewModel: viewModel)
+                        ProfileIdentityHomeVenueSection(
+                            summary: viewModel.currentUserHomeCrowdVenue,
+                            onExploreOrChange: { viewModel.focusDiscoverOnHomeCrowdVenue() },
+                            onChoose: { viewModel.openDiscoverToChooseHomeCrowd() }
+                        )
                     }
                 )
 
@@ -614,7 +793,7 @@ struct ProfileIdentityCard: View {
                     )
                 }
 
-                if profileBelowFoldSectionsReady, canShowSuggestedFans {
+                if profileFarFoldSectionsReady, canShowSuggestedFans {
                     AnyView(
                         ProfileIdentitySectionChrome(
                             hierarchy: .secondary,
@@ -626,7 +805,7 @@ struct ProfileIdentityCard: View {
                     )
                 }
 
-                if profileBelowFoldSectionsReady, let slot = sponsoredProfileSlotContent {
+                if profileFarFoldSectionsReady, let slot = sponsoredProfileSlotContent {
                     AnyView(
                         ProfileIdentitySectionChrome(
                             hierarchy: .secondary,
@@ -635,7 +814,6 @@ struct ProfileIdentityCard: View {
                             sponsoredProfileSlotView(slot)
                                 .id(slot.stableIdentity)
                         }
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
                     )
                 }
             }
@@ -646,6 +824,13 @@ struct ProfileIdentityCard: View {
             .overlay(cardBorder)
             .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.06), radius: 14, y: 8)
             .profileReadableContentWidth()
+    }
+
+    private var profileIdentityCardContent: some View {
+        ProfileIdentityScrollGate(snapshot: makeScrollSnapshot()) {
+            profileIdentityPaintedSections
+        }
+        .equatable()
             .onAppear {
 #if DEBUG
                 print("[SettingsPerf] profileIdentityCard appear isAccountTabActive=\(isAccountTabActive)")
@@ -663,11 +848,18 @@ struct ProfileIdentityCard: View {
 #endif
                 DebugLogGate.debug("[PokesConsolidation] propsUIRemoved")
                 DebugLogGate.debug("[PokesConsolidation] primarySocialSurface=pokes")
+                ProfileOpenPerf.mark(.t2IdentityCardAppear)
+                refreshCachedSelectedTeams()
+                ProfileOpenPerf.mark(.t6FavoriteTeams, detail: "appStorage count=\(cachedSelectedTeams.count)")
+                refreshCachedDisplayedSuggestedFans()
+                refreshCachedUniqueRecentPokers()
+                refreshCachedPickupOrganizerSummary()
                 seedPersonalizationFromProcessCacheIfNeeded()
-#if DEBUG
-                FanReputationEngine.log(evaluateReputationForDebugLog())
-#endif
+                ProfileOpenPerf.mark(.t5MyTeams, detail: "cache count=\(profileMyTeamsMemberships.count)")
+                ProfileOpenPerf.mark(.t7HomeCrowd, detail: viewModel.currentUserHomeCrowdVenue == nil ? "none" : "cached")
+                ProfileOpenPerf.mark(.t4ScrollInteractive, detail: "cachedChromeReady")
                 scheduleProfileBelowFoldSectionsIfNeeded()
+                scheduleProfileDeferredHydrationIfNeeded()
             }
             .onChange(of: viewModel.currentUserBio) { _, newValue in
 #if DEBUG
@@ -677,6 +869,7 @@ struct ProfileIdentityCard: View {
             .onChange(of: viewModel.currentUserAuthId) { oldAuthId, _ in
                 ProfilePhase1PersonalizationCache.invalidateSuggestedFans(for: oldAuthId)
                 resetSuggestedFansLoadStateForAuthChange()
+                refreshCachedDisplayedSuggestedFans()
                 if showIdentityEditor {
                     resetIdentityDraft()
                 }
@@ -704,6 +897,23 @@ struct ProfileIdentityCard: View {
                 identityEditorSheet
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $profileFanTeamDetail) { summary in
+                FanTeamDetailSheet(
+                    summary: summary,
+                    mapViewModel: viewModel,
+                    chatViewModel: chatViewModel,
+                    onOpenChat: { context in
+                        profileFanTeamDetail = nil
+                        chatViewModel.pendingGroupOpenConversationId = context.conversationId
+                    },
+                    onTeamsChanged: {
+                        Task {
+                            ProfilePhase1PersonalizationCache.invalidateMyTeams(for: viewModel.currentUserAuthId)
+                            await refreshOwnProfileMyTeams()
+                        }
+                    }
+                )
             }
             .sheet(isPresented: $showShareOwnProfileSheet) {
                 if let ownShareProfile,
@@ -740,19 +950,34 @@ struct ProfileIdentityCard: View {
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
             }
+            .task(id: profileMyTeamsHydrationToken) {
+                await refreshOwnProfileMyTeams(includePickupOrganizer: false)
+            }
             .task {
+                await Task.yield()
+                await viewModel.loadMyTeamsProfileVisibilityIfNeeded()
                 await viewModel.loadFanIdentityPreferencesFromProfile()
             }
             .task(id: profileStatsLoadToken) {
+                await waitForProfileIdleSecondaryHydration(stage: "profileStats")
+                guard !Task.isCancelled, isAccountTabActive else { return }
                 await loadProfileStatsIfNeeded()
             }
             .task(id: sponsoredPlacementLoadToken) {
 #if DEBUG
                 SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] profileTaskStarted=true token=\(sponsoredPlacementLoadToken)")
 #endif
-                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
+                await waitForProfileIdleSecondaryHydration(stage: "profileSponsored")
                 guard !Task.isCancelled, isAccountTabActive else { return }
                 await loadSponsoredProfileRecommendation(reason: "profileTask")
+                ProfileOpenPerf.mark(.t11Sponsored)
+                if sponsoredProfileRecommendation == nil {
+                    Task(priority: .utility) { @MainActor in
+                        await waitForProfileIdleSecondaryHydration(stage: "profileSponsoredGPS")
+                        guard !Task.isCancelled, isAccountTabActive else { return }
+                        await loadSponsoredProfileRecommendation(reason: "deferredLocation")
+                    }
+                }
                 if Task.isCancelled {
 #if DEBUG
                     SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] taskCancelledAfterLoader=true reason=profileTask")
@@ -771,29 +996,29 @@ struct ProfileIdentityCard: View {
                 .presentationDragIndicator(.visible)
             }
             .sheet(isPresented: $showFavoriteTeamsPicker) {
-                FavoriteTeamsPickerSheet(
-                    selectedIDs: Binding(
-                        get: { selectedIDSet },
-                        set: { newSet in
-                            let previous = selectedIDSet
-                            let addedIDs = newSet.subtracting(previous)
-                            let sorted = Array(newSet).sorted()
-                            let nextPrimary = FavoriteTeamsStore.normalizedPrimaryTeamID(primaryFavoriteTeamIDRaw, within: sorted)
-                            favoriteTeamIDsRaw = FavoriteTeamsStore.encodeIDs(sorted)
-                            primaryFavoriteTeamIDRaw = nextPrimary ?? ""
-                            Task {
-                                let didSync = await viewModel.syncFavoriteTeamsToSupabase(teamIDs: sorted, primaryTeamID: nextPrimary)
-                                guard didSync else { return }
-                                // One toast max per save: prefer lexicographically last added id (stable when
-                                // multi-select order is unavailable from the Binding).
-                                guard let addedID = addedIDs.sorted().last else { return }
-                                let teams = FavoriteTeamsStore.resolvedTeams(fromIDs: [addedID])
-                                guard let team = teams.first else { return }
-                                await MainActor.run {
-                                    viewModel.presentFavoriteTeamWowMoment(team: team, languageCode: appLanguageRaw)
+                AnyView(
+                    FavoriteTeamsPickerSheet(
+                        selectedIDs: Binding(
+                            get: { selectedTeamIDs },
+                            set: { newIDs in
+                                let previous = selectedTeamIDs
+                                let ordered = FavoriteTeamsStore.uniquedIDs(newIDs)
+                                let addedIDs = ordered.filter { !previous.contains($0) }
+                                let nextPrimary = FavoriteTeamsStore.normalizedPrimaryTeamID(primaryFavoriteTeamIDRaw, within: ordered)
+                                favoriteTeamIDsRaw = FavoriteTeamsStore.encodeIDs(ordered)
+                                primaryFavoriteTeamIDRaw = nextPrimary ?? ""
+                                Task {
+                                    let didSync = await viewModel.syncFavoriteTeamsToSupabase(teamIDs: ordered, primaryTeamID: nextPrimary)
+                                    guard didSync else { return }
+                                    guard let addedID = addedIDs.last else { return }
+                                    let teams = FavoriteTeamsStore.resolvedTeams(fromIDs: [addedID])
+                                    guard let team = teams.first else { return }
+                                    await MainActor.run {
+                                        viewModel.presentFavoriteTeamWowMoment(team: team, languageCode: appLanguageRaw)
+                                    }
                                 }
                             }
-                        }
+                        )
                     )
                 )
             }
@@ -831,7 +1056,7 @@ struct ProfileIdentityCard: View {
 #endif
                     return
                 }
-                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
+                await waitForProfileIdleSecondaryHydration(stage: "profilePersonalization")
                 guard !Task.isCancelled, isAccountTabActive else { return }
 #if DEBUG
                 print("[PerfPhase1C] profileLoadStarted reason=accountTabVisible")
@@ -839,6 +1064,7 @@ struct ProfileIdentityCard: View {
                 primeSuggestedFansLoadingStateIfNeeded()
                 await refreshIncomingPokesLive(reason: "accountVisible")
                 await loadSuggestedFans()
+                ProfileOpenPerf.mark(.t8SuggestedFans, detail: "count=\(suggestedFans.count)")
                 // Ensure favorite teams hydrate even if warm preload raced ahead of auth id / cleared AppStorage.
                 let localEmpty = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw).isEmpty
                 if localEmpty, viewModel.currentUserAuthId != nil {
@@ -847,8 +1073,10 @@ struct ProfileIdentityCard: View {
                 } else {
                     rememberSuggestedFansSignalFingerprint()
                 }
+                ProfileOpenPerf.noteSettled(reason: "personalizationTask")
             }
             .onChange(of: favoriteTeamIDsRaw) { _, _ in
+                // Cache refresh is handled by the earlier favoriteTeamIDsRaw onChange.
                 scheduleSuggestedFansRefreshAfterSignalsChanged(reason: "favoriteTeamsChanged")
             }
             .onChange(of: viewModel.currentUserNationalTeam?.countryCode) { _, _ in
@@ -863,7 +1091,7 @@ struct ProfileIdentityCard: View {
             }
             .task(id: pokesLiveRefreshLoopToken) {
                 guard isAccountTabActive else { return }
-                try? await Task.sleep(nanoseconds: Self.profileExtrasFirstPaintDeferNanoseconds)
+                await waitForProfileIdleSecondaryHydration(stage: "profilePokesLoop")
                 while !Task.isCancelled {
                     do {
                         try await Task.sleep(nanoseconds: Self.incomingPokesLiveRefreshIntervalNs)
@@ -898,11 +1126,9 @@ struct ProfileIdentityCard: View {
             }
             .onChange(of: viewModel.currentUserLocation?.latitude) { _, _ in
                 refreshSponsoredPlacementDistanceIfNeeded()
-                refreshSponsoredProfilePlacement(reason: "currentUserLatitudeChanged")
             }
             .onChange(of: viewModel.currentUserLocation?.longitude) { _, _ in
                 refreshSponsoredPlacementDistanceIfNeeded()
-                refreshSponsoredProfilePlacement(reason: "currentUserLongitudeChanged")
             }
             .onChange(of: editedUsername) { _, newValue in
                 let normalized = FanGeoHandleRules.normalizeForStorage(newValue)
@@ -1339,14 +1565,7 @@ struct ProfileIdentityCard: View {
     }
 
     private var uniqueRecentPokersForAvatars: [ProfilePokeIncomingItem] {
-        var seen = Set<UUID>()
-        var ordered: [ProfilePokeIncomingItem] = []
-        for poke in incomingPokes {
-            if seen.insert(poke.pokerUserId).inserted {
-                ordered.append(poke)
-            }
-        }
-        return ordered
+        cachedUniqueRecentPokers
     }
 
     private func pokesAvatar(_ poke: ProfilePokeIncomingItem) -> some View {
@@ -1638,6 +1857,49 @@ struct ProfileIdentityCard: View {
             rememberSuggestedFansSignalFingerprint()
 #if DEBUG
             AccountActivationPerf.log("seededSuggestedFansFromProcessCache count=\(cached.count)")
+            ProfileOpenPerf.cacheHit(name: "suggestedFans")
+#endif
+        }
+        if profileMyTeamsSummaries.isEmpty,
+           let cachedTeams = ProfilePhase1PersonalizationCache.cachedMyTeamsRegardlessOfAge(for: authId),
+           !cachedTeams.isEmpty {
+            profileMyTeamsSummaries = cachedTeams
+            profileMyTeamsMemberships = FanTeamsService.profileMemberships(from: cachedTeams)
+#if DEBUG
+            ProfileOpenPerf.cacheHit(name: "myTeams")
+#endif
+        }
+    }
+
+    @MainActor
+    private func waitForProfileIdleSecondaryHydration(stage: String) async {
+        await Task.yield()
+        _ = await UserInteractionPriorityGate.awaitInteractionQuietWindow(stage: stage)
+    }
+
+    @MainActor
+    private func scheduleProfileDeferredHydrationIfNeeded() {
+        guard isAccountTabActive else { return }
+        Task(priority: .utility) { @MainActor in
+            await waitForProfileIdleSecondaryHydration(stage: "profileArtworkSeed")
+            guard !Task.isCancelled, isAccountTabActive else { return }
+            viewModel.seedSportsArtworkFromFetchedLiveMatches(refreshProviderCatalog: false)
+            let nextRevision = SportsArtworkURLStore.shared.currentPublishedRevision()
+            if profileArtworkPaintRevision != nextRevision {
+                profileArtworkPaintRevision = nextRevision
+#if DEBUG
+                ProfileOpenPerf.statePublished(name: "artworkPaintRevision")
+#endif
+            }
+            ProfileOpenPerf.mark(.t10ArtworkSeed, detail: "rev=\(nextRevision)")
+            await Task.yield()
+            guard !Task.isCancelled, isAccountTabActive else { return }
+            await SportsProviderArtworkService.shared.refreshIfStale()
+            await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
+            refreshCachedPickupOrganizerSummary()
+            ProfileOpenPerf.mark(.t9SecondarySections, detail: "pickupOrganizer")
+#if DEBUG
+            FanReputationEngine.log(evaluateReputationForDebugLog())
 #endif
         }
     }
@@ -1651,10 +1913,13 @@ struct ProfileIdentityCard: View {
             guard !Task.isCancelled, isAccountTabActive else { return }
             guard !viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
             profileBelowFoldSectionsReady = true
-            primeSuggestedFansLoadingStateIfNeeded()
 #if DEBUG
             print("[SettingsPerf] profileBelowFoldSections rendered")
 #endif
+            await waitForProfileIdleSecondaryHydration(stage: "profileFarFold")
+            guard !Task.isCancelled, isAccountTabActive else { return }
+            profileFarFoldSectionsReady = true
+            primeSuggestedFansLoadingStateIfNeeded()
         }
     }
 
@@ -1755,20 +2020,69 @@ struct ProfileIdentityCard: View {
     // MARK: - Suggested fans
 
     private var displayedSuggestedFans: [FriendSuggestionProfile] {
-        guard let viewerId = viewModel.currentUserAuthId else {
-            return Array(suggestedFans.prefix(Self.suggestedFansDisplayLimit))
+        cachedDisplayedSuggestedFans
+    }
+
+    private func refreshCachedSelectedTeams() {
+        _ = viewModel.favoriteTeamsHydrationGeneration
+        let nextIDs = FavoriteTeamsStore.decodeIDs(from: favoriteTeamIDsRaw)
+        if !cachedSelectedTeams.isEmpty,
+           cachedSelectedTeams.map(\.id) == nextIDs {
+            let nextPrimary = FavoriteTeamsStore.explicitPrimaryTeamID(
+                primaryFavoriteTeamIDRaw,
+                within: nextIDs
+            )
+            if cachedPrimaryFavoriteTeamID != nextPrimary {
+                cachedPrimaryFavoriteTeamID = nextPrimary
+            }
+            return
         }
-        // Re-order by score then apply stable 8+2 diversity for the visible 10.
-        // Exact distance is never present on these profiles.
-        let scoreOrdered = suggestedFans.sorted { lhs, rhs in
-            if lhs.score != rhs.score { return lhs.score > rhs.score }
-            return lhs.userID.uuidString < rhs.userID.uuidString
-        }
-        return SuggestedFansRanking.applyControlledDiversity(
-            rankedByScoreDescending: scoreOrdered,
-            displayLimit: Self.suggestedFansDisplayLimit,
-            viewerId: viewerId
+        let nextTeams = FavoriteTeamsStore.resolvedTeams(fromIDs: nextIDs)
+        let resolvedIDs = nextTeams.map(\.id)
+        let nextPrimary = FavoriteTeamsStore.explicitPrimaryTeamID(
+            primaryFavoriteTeamIDRaw,
+            within: resolvedIDs
         )
+        if nextTeams != cachedSelectedTeams {
+            cachedSelectedTeams = nextTeams
+#if DEBUG
+            ProfileOpenPerf.statePublished(name: "favoriteTeams")
+#endif
+        }
+        if cachedPrimaryFavoriteTeamID != nextPrimary {
+            cachedPrimaryFavoriteTeamID = nextPrimary
+        }
+    }
+
+    private func refreshCachedDisplayedSuggestedFans() {
+        let next: [FriendSuggestionProfile]
+        if let viewerId = viewModel.currentUserAuthId {
+            let scoreOrdered = suggestedFans.sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                return lhs.userID.uuidString < rhs.userID.uuidString
+            }
+            next = SuggestedFansRanking.applyControlledDiversity(
+                rankedByScoreDescending: scoreOrdered,
+                displayLimit: Self.suggestedFansDisplayLimit,
+                viewerId: viewerId
+            )
+        } else {
+            next = Array(suggestedFans.prefix(Self.suggestedFansDisplayLimit))
+        }
+        guard next != cachedDisplayedSuggestedFans else { return }
+        cachedDisplayedSuggestedFans = next
+    }
+
+    private func refreshCachedUniqueRecentPokers() {
+        var seen = Set<UUID>()
+        var ordered: [ProfilePokeIncomingItem] = []
+        for poke in incomingPokes {
+            if seen.insert(poke.pokerUserId).inserted {
+                ordered.append(poke)
+            }
+        }
+        guard ordered != cachedUniqueRecentPokers else { return }
+        cachedUniqueRecentPokers = ordered
     }
 
     private var suggestedFansSection: some View {
@@ -1854,7 +2168,16 @@ struct ProfileIdentityCard: View {
            Date().timeIntervalSince(loadedAt) < ProfilePhase1PersonalizationCache.ttlSeconds {
             let cached = ProfilePhase1PersonalizationCache.suggestedFansByAuthId[authId] ?? []
             await MainActor.run {
-                suggestedFans = cached
+                if suggestedFans != cached {
+                    suggestedFans = cached
+#if DEBUG
+                    ProfileOpenPerf.statePublished(name: "suggestedFans")
+#endif
+                } else {
+#if DEBUG
+                    ProfileOpenPerf.duplicatePublishSkipped(name: "suggestedFans")
+#endif
+                }
                 suggestedFansMessage = nil
                 suggestedFansLoadFailed = false
                 isLoadingSuggestedFans = false
@@ -1863,6 +2186,7 @@ struct ProfileIdentityCard: View {
                 rememberSuggestedFansSignalFingerprint()
             }
 #if DEBUG
+            ProfileOpenPerf.cacheHit(name: "suggestedFans")
             print("[PerfPhase1C] profileCacheHit key=suggestedFans")
             print("[SuggestedFansUI] loadCoalescedOrFresh reason=ttlHit")
             SuggestedFansDebug.loadingFinished(count: cached.count)
@@ -1885,7 +2209,7 @@ struct ProfileIdentityCard: View {
 
         suggestedFansLoadGeneration &+= 1
         let generation = suggestedFansLoadGeneration
-        let task = Task { @MainActor in
+        let task = Task(priority: .utility) {
             await self.performSuggestedFansLoad(generation: generation)
         }
         suggestedFansLoadTask = task
@@ -1909,7 +2233,9 @@ struct ProfileIdentityCard: View {
                 suggestedFansLoadStartedAt = Date()
                 SuggestedFansDebug.loadingStarted()
             }
-            isLoadingSuggestedFans = true
+            if suggestedFans.isEmpty {
+                isLoadingSuggestedFans = true
+            }
             suggestedFansMessage = nil
             suggestedFansLoadFailed = false
             SuggestedFansDebug.requestStarted(currentUserId: viewModel.currentUserAuthId)
@@ -1945,7 +2271,16 @@ struct ProfileIdentityCard: View {
                     return
                 }
                 let startedAt = suggestedFansLoadStartedAt
-                suggestedFans = filteredSuggestions
+                if suggestedFans != filteredSuggestions {
+                    suggestedFans = filteredSuggestions
+#if DEBUG
+                    ProfileOpenPerf.statePublished(name: "suggestedFans")
+#endif
+                } else {
+#if DEBUG
+                    ProfileOpenPerf.duplicatePublishSkipped(name: "suggestedFans")
+#endif
+                }
                 suggestedFansMessage = nil
                 suggestedFansLoadFailed = false
                 isLoadingSuggestedFans = false
@@ -1966,6 +2301,9 @@ struct ProfileIdentityCard: View {
                 }
                 suggestedFansLoadStartedAt = nil
                 SuggestedFansDebug.loadingFinished(count: filteredSuggestions.count)
+            }
+            Task(priority: .utility) {
+                await ProfileSuggestedFansSection.prefetchAvatars(filteredSuggestions)
             }
 #if DEBUG
             print("[SuggestedFansUI] load success count=\(filteredSuggestions.count)")
@@ -2201,7 +2539,10 @@ struct ProfileIdentityCard: View {
         guard beginSponsoredPlacementLoadIfAllowed(reason: reason) else { return }
         defer { finishSponsoredPlacementLoad(reason: reason) }
 
-        let userLocation = await currentSponsoredPlacementUserLocation(reason: "profileRecommendationLoad")
+        let userLocation = await currentSponsoredPlacementUserLocation(
+            reason: "profileRecommendationLoad",
+            allowDeviceRefresh: reason != "profileTask"
+        )
         guard !Task.isCancelled else {
             SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=taskCancelledAfterLocation reason=\(reason)")
             return
@@ -2221,7 +2562,9 @@ struct ProfileIdentityCard: View {
             }
             await MainActor.run {
                 let recommendation = activeSponsoredProfileRecommendation(from: placements, userLocation: userLocation)
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
                     sponsoredProfileRecommendation = recommendation
                 }
 #if DEBUG
@@ -2275,24 +2618,30 @@ struct ProfileIdentityCard: View {
         SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] loaderFinished=true reason=\(reason)")
     }
 
-    private func currentSponsoredPlacementUserLocation(reason: String) async -> CLLocationCoordinate2D? {
-        if SponsoredProfileVenueRecommendation.hasValidLocation(viewModel.currentUserLocation) {
-            logSponsoredPlacementUserLocation(viewModel.currentUserLocation, source: "cachedCurrentUserLocation", reason: reason)
-            return viewModel.currentUserLocation
+    private func currentSponsoredPlacementUserLocation(
+        reason: String,
+        allowDeviceRefresh: Bool
+    ) async -> CLLocationCoordinate2D? {
+        if let firstPaint = ProfileSponsoredLocationPolicy.firstPaintLocation(
+            cached: viewModel.currentUserLocation,
+            homeCrowd: sponsoredProfileHomeCrowdCoordinate()
+        ) {
+            let source = SponsoredProfileVenueRecommendation.hasValidLocation(viewModel.currentUserLocation)
+                ? "cachedCurrentUserLocation"
+                : "homeCrowdVenue"
+            logSponsoredPlacementUserLocation(firstPaint, source: source, reason: reason)
+            return firstPaint
+        }
+
+        guard allowDeviceRefresh else {
+            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=deferredDeviceLocationRefresh reason=\(reason)")
+            return nil
         }
 
         let refreshed = await viewModel.refreshCurrentUserLocationIfAuthorized(timeoutSeconds: 4)
         if refreshed, SponsoredProfileVenueRecommendation.hasValidLocation(viewModel.currentUserLocation) {
             logSponsoredPlacementUserLocation(viewModel.currentUserLocation, source: "deviceLocationRefresh", reason: reason)
             return viewModel.currentUserLocation
-        }
-
-        if let homeCrowdCoordinate = sponsoredProfileHomeCrowdCoordinate(),
-           SponsoredProfileVenueRecommendation.hasValidLocation(homeCrowdCoordinate) {
-            logSponsoredPlacementUserLocation(homeCrowdCoordinate, source: "homeCrowdVenue", reason: reason)
-            return homeCrowdCoordinate
-        } else if viewModel.currentUserHomeCrowdVenueId != nil {
-            SponsoredPlacementDebugLog.log("[SponsoredPlacementDebug] exclusionReason=missingVenue reason=homeCrowdVenueCoordinateUnavailable venueId=\(viewModel.currentUserHomeCrowdVenueId?.uuidString.lowercased() ?? "nil")")
         }
 
         logSponsoredPlacementUserLocation(nil, source: refreshed ? "deviceLocationInvalid" : "noAuthorizedDeviceLocation", reason: reason)
@@ -2678,6 +3027,190 @@ struct ProfileIdentityCard: View {
 
     // MARK: - Handle prompt
 
+    @MainActor
+    private func applyOwnProfileMyTeamsIfChanged(_ teams: [FanTeamSummary]) {
+        if MyTeamsRefreshPresentation.shouldPublishSummaries(
+            current: profileMyTeamsSummaries,
+            incoming: teams
+        ) {
+            profileMyTeamsSummaries = teams
+            profileMyTeamsMemberships = FanTeamsService.profileMemberships(from: teams)
+#if DEBUG
+            ProfileOpenPerf.statePublished(name: "myTeams")
+#endif
+        } else {
+#if DEBUG
+            ProfileOpenPerf.duplicatePublishSkipped(name: "myTeams")
+#endif
+        }
+        profileMyTeamsRefreshFailed = false
+        ProfileOpenPerf.mark(.t5MyTeams, detail: "count=\(teams.count)")
+    }
+
+    @MainActor
+    private func refreshOwnProfileMyTeams(
+        includePickupOrganizer: Bool = true,
+        force: Bool = false
+    ) async {
+        let started = Date()
+        guard isAccountTabActive else { return }
+        guard let authId = viewModel.currentUserAuthId else {
+            if !viewModel.isAuthSessionRestoringForProfilePresentation {
+                profileMyTeamsMemberships = []
+                profileMyTeamsSummaries = []
+                profileMyTeamsRefreshFailed = false
+            }
+            MyTeamsRefreshDebug.log(
+                phase: "profile.skip.noAuthUser",
+                sessionState: viewModel.isAuthSessionRestoringForProfilePresentation ? "restoring" : "missing",
+                hasCachedTeams: !profileMyTeamsSummaries.isEmpty
+            )
+            return
+        }
+
+        if let cached = ProfilePhase1PersonalizationCache.cachedMyTeamsRegardlessOfAge(for: authId),
+           profileMyTeamsSummaries.isEmpty {
+            applyOwnProfileMyTeamsIfChanged(cached)
+#if DEBUG
+            ProfileOpenPerf.cacheHit(name: "myTeams")
+#endif
+        }
+
+        let freshCache = ProfilePhase1PersonalizationCache.cachedMyTeamsIfFresh(for: authId)
+        if let fresh = freshCache,
+           !MyTeamsRefreshPresentation.shouldRefetchDespiteCache(hasFreshCache: true, force: force) {
+#if DEBUG
+            ProfileOpenPerf.cacheHit(name: "myTeamsFresh")
+#endif
+            applyOwnProfileMyTeamsIfChanged(fresh)
+            MyTeamsRefreshDebug.log(
+                phase: "profile.freshCache",
+                hasAuthUser: true,
+                elapsedMs: Int(Date().timeIntervalSince(started) * 1000),
+                hasCachedTeams: true
+            )
+            if includePickupOrganizer {
+                await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
+                refreshCachedPickupOrganizerSummary()
+            }
+            return
+        }
+
+        let authReady = MyTeamsRefreshPresentation.shouldStartAutomaticFetch(
+            hasAuthUser: true,
+            isLoggedIn: viewModel.isLoggedIn,
+            isSessionRestoring: viewModel.isAuthSessionRestoringForProfilePresentation,
+            isSafeLogout: viewModel.shouldSuppressAuthenticatedRefreshForSafeLogout
+        )
+        guard authReady else {
+            MyTeamsRefreshDebug.log(
+                phase: "profile.defer.authNotReady",
+                hasAuthUser: true,
+                hasSession: viewModel.isLoggedIn,
+                sessionState: viewModel.isAuthSessionRestoringForProfilePresentation ? "restoring" : "notReady",
+                hasCachedTeams: !profileMyTeamsSummaries.isEmpty
+            )
+            return
+        }
+
+        if let inFlight = ProfilePhase1PersonalizationCache.myTeamsInFlight, !force {
+            do {
+                let teams = try await inFlight.value
+                applyOwnProfileMyTeamsIfChanged(teams)
+            } catch {
+                await handleOwnProfileMyTeamsFailure(error, started: started, authId: authId)
+            }
+            if includePickupOrganizer {
+                await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
+                refreshCachedPickupOrganizerSummary()
+            }
+            return
+        }
+
+#if DEBUG
+        ProfileOpenPerf.cacheMiss(name: "myTeams")
+#endif
+        let task = Task<[FanTeamSummary], Error> {
+            try await FanTeamsService().listMyTeams()
+        }
+        ProfilePhase1PersonalizationCache.myTeamsInFlight = task
+        do {
+            let teams = try await task.value
+            ProfilePhase1PersonalizationCache.storeMyTeams(teams, for: authId)
+            applyOwnProfileMyTeamsIfChanged(teams)
+            MyTeamsRefreshDebug.log(
+                phase: "profile.rpc.success",
+                hasAuthUser: true,
+                hasSession: true,
+                elapsedMs: Int(Date().timeIntervalSince(started) * 1000),
+                hasCachedTeams: !teams.isEmpty
+            )
+            if ProfilePhase1PersonalizationCache.myTeamsInFlight == task {
+                ProfilePhase1PersonalizationCache.myTeamsInFlight = nil
+            }
+        } catch {
+            await handleOwnProfileMyTeamsFailure(error, started: started, authId: authId)
+            let cancelled = Task.isCancelled || FanTeamsLoadErrorPresentation.isCancellation(error)
+            if !cancelled, ProfilePhase1PersonalizationCache.myTeamsInFlight == task {
+                ProfilePhase1PersonalizationCache.myTeamsInFlight = nil
+            }
+        }
+        if includePickupOrganizer {
+            await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
+            refreshCachedPickupOrganizerSummary()
+        }
+    }
+
+    @MainActor
+    private func handleOwnProfileMyTeamsFailure(_ error: Error, started: Date, authId: UUID) async {
+        let cancelled = Task.isCancelled || FanTeamsLoadErrorPresentation.isCancellation(error)
+        let missingAuth = FanTeamsLoadErrorPresentation.isMissingAuthSession(error)
+        let hasCachedTeams = !profileMyTeamsSummaries.isEmpty
+            || !(ProfilePhase1PersonalizationCache.cachedMyTeamsRegardlessOfAge(for: authId) ?? []).isEmpty
+        MyTeamsRefreshDebug.log(
+            phase: cancelled ? "profile.rpc.cancelled" : "profile.rpc.failed",
+            hasAuthUser: true,
+            httpStatus: FanTeamRPCTrace.httpStatus(from: error),
+            supabaseCode: (error as? PostgrestError)?.code,
+            message: FanTeamsLoadErrorPresentation.debugDescription(error),
+            isCancellation: cancelled,
+            elapsedMs: Int(Date().timeIntervalSince(started) * 1000),
+            hasCachedTeams: hasCachedTeams
+        )
+        if cancelled || missingAuth {
+            profileMyTeamsRefreshFailed = false
+            return
+        }
+        if let cached = ProfilePhase1PersonalizationCache.cachedMyTeamsRegardlessOfAge(for: authId),
+           !cached.isEmpty {
+            applyOwnProfileMyTeamsIfChanged(cached)
+            profileMyTeamsRefreshFailed = false
+            return
+        }
+        if hasCachedTeams {
+            profileMyTeamsRefreshFailed = false
+            return
+        }
+        profileMyTeamsRefreshFailed = MyTeamsRefreshPresentation.shouldShowSectionRetry(
+            hasCachedTeams: false,
+            isCancellation: false,
+            isMissingAuth: false,
+            didFail: true
+        )
+    }
+
+    @MainActor
+    private func openOwnProfileFanTeam(_ membership: ProfileFanTeamMembership) async {
+        if let match = profileMyTeamsSummaries.first(where: { $0.id == membership.teamId }) {
+            profileFanTeamDetail = match
+            return
+        }
+        await refreshOwnProfileMyTeams()
+        if let match = profileMyTeamsSummaries.first(where: { $0.id == membership.teamId }) {
+            profileFanTeamDetail = match
+        }
+    }
+
     private var handlePromptBanner: some View {
         Button {
             showHandleSetup = true
@@ -2878,20 +3411,22 @@ struct ProfileIdentityCard: View {
         switch column.id {
         case .myTeam:
             if let team = column.favoriteTeam {
-                SportsIdentityArtworkView(favoriteTeam: team, diameter: 38)
+                SportsIdentityArtworkView(
+                    favoriteTeam: team,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
                 profileHeroIdentitySymbolIcon("trophy.fill", tint: FGColor.accentYellow)
             }
         case .nationalTeam:
-            if let flag = viewModel.currentUserNationalTeam?.flag.trimmingCharacters(in: .whitespacesAndNewlines),
-               !flag.isEmpty {
-                Text(flag)
-                    .font(.system(size: 20))
-                    .frame(width: 38, height: 38)
-                    .background {
-                        Circle()
-                            .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.12))
-                    }
+            if let identity = viewModel.currentUserNationalTeam {
+                SportsIdentityArtworkView(
+                    countryName: identity.countryName,
+                    flag: identity.flag,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
                 profileHeroIdentitySymbolIcon("globe.americas.fill", tint: FGColor.accentGreen)
             }
@@ -3026,7 +3561,7 @@ struct ProfileIdentityCard: View {
     private var identityEditorSheet: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                VStack(alignment: .leading, spacing: 18) {
                     EditProfilePhotoHeader(
                         viewModel: viewModel,
                         selectedAvatarItem: $selectedAvatarItem,
@@ -3086,6 +3621,17 @@ struct ProfileIdentityCard: View {
                         )
                     }
 
+                    // FanGeo membership visibility only — does NOT control hero Favorite Team / Favorite Teams.
+                    EditProfileSection(
+                        title: L10n.t("profile_my_teams_section", languageCode: appLanguageRaw),
+                        accentStroke: FGColor.intentTeams.opacity(colorScheme == .dark ? 0.38 : 0.22)
+                    ) {
+                        EditProfileMyTeamsVisibilityRow(
+                            visibility: $editedMyTeamsVisibility,
+                            languageCode: appLanguageRaw
+                        )
+                    }
+
                     EditProfileSection(title: L10n.t("profile_gender", languageCode: appLanguageRaw)) {
                         EditProfileGenderRow(
                             gender: $editedGender,
@@ -3136,6 +3682,9 @@ struct ProfileIdentityCard: View {
                     Button(L10n.t("close", languageCode: appLanguageRaw)) {
                         showIdentityEditor = false
                     }
+                    .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
                     .disabled(isSavingIdentity || isUploadingAvatar)
                     .accessibilityLabel("Close profile editor")
                 }
@@ -3148,6 +3697,10 @@ struct ProfileIdentityCard: View {
 #endif
                         Task { await saveIdentity() }
                     }
+                    .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
+                    .tint(FGColor.intentTeams)
                     // Presentation-load flags are enforced inside `saveIdentity` with a visible message.
                     // Disabling Done on those flags made taps silently no-op when hydration raced.
                     .disabled(isSavingIdentity || isUploadingAvatar || !identityDraftLooksDirty)
@@ -3254,6 +3807,7 @@ struct ProfileIdentityCard: View {
             languageCode: appLanguageRaw
         ) ?? viewModel.currentUserHomeCity
         editedShowHomeCity = viewModel.currentUserShowHomeCity
+        editedMyTeamsVisibility = viewModel.currentUserMyTeamsProfileVisibility
         editedGender = FanProfileGender.parse(viewModel.currentUserGenderRaw) ?? .preferNotToSay
         editedProfileBackgroundKey = viewModel.currentUserProfileBackgroundKey
         handleStatusMessage = ""
@@ -3281,6 +3835,7 @@ struct ProfileIdentityCard: View {
                 languageCode: appLanguageRaw
             ) ?? viewModel.currentUserHomeCity).trimmingCharacters(in: .whitespacesAndNewlines)
             || editedShowHomeCity != viewModel.currentUserShowHomeCity
+            || editedMyTeamsVisibility != viewModel.currentUserMyTeamsProfileVisibility
         let genderDirty = editedGender.rawValue
             != (FanProfileGender.parse(viewModel.currentUserGenderRaw) ?? .preferNotToSay).rawValue
         let backgroundDirty = editedProfileBackgroundKey != viewModel.currentUserProfileBackgroundKey
@@ -3519,6 +4074,24 @@ struct ProfileIdentityCard: View {
 #if DEBUG
         print("[FanProfileSave] requestSucceeded homeCity")
 #endif
+
+        // Only persist when the picker changed — avoids marking legacy only_me as an intentional choice.
+        if editedMyTeamsVisibility != viewModel.currentUserMyTeamsProfileVisibility {
+            if let err = await viewModel.saveMyTeamsProfileVisibility(editedMyTeamsVisibility) {
+#if DEBUG
+                print("[FanProfileSave] requestFailed=\(err)")
+#endif
+                await MainActor.run {
+                    identityMessage = err
+                    viewModel.showSocialActionToast(err, isError: true)
+                }
+                return
+            }
+
+#if DEBUG
+            print("[FanProfileSave] requestSucceeded myTeamsVisibility")
+#endif
+        }
 
         if let err = await viewModel.saveUserProfileGender(editedGender) {
 #if DEBUG
@@ -3777,8 +4350,8 @@ struct ProfileIdentityCard: View {
                         .tracking(0.78)
                     Text(
                         teams.isEmpty
-                            ? L10n.t("profile_shape_fan_identity", languageCode: appLanguageRaw)
-                            : L10n.t("profile_show_off_fan_colors", languageCode: appLanguageRaw)
+                            ? L10n.t("profile_favorite_teams_subtitle_empty", languageCode: appLanguageRaw)
+                            : L10n.t("profile_favorite_teams_subtitle", languageCode: appLanguageRaw)
                     )
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.82))
@@ -3816,7 +4389,7 @@ struct ProfileIdentityCard: View {
 
     private func favoriteTeamsCardRow(teams: [FavoriteTeam], primaryFavoriteTeamID: String?) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            LazyHStack(alignment: .top, spacing: 10) {
+            LazyHStack(alignment: .top, spacing: FavoriteTeamRichCardStyle.ownProfile.cardSpacing) {
                 ForEach(teams) { team in
                     favoriteTeamSocialCard(
                         team: team,
@@ -3847,8 +4420,7 @@ struct ProfileIdentityCard: View {
             isAnimatingSelection: isAnimatingSelection,
             isAnimatingDemotion: isAnimatingDemotion
         ) {
-            // Single My Team affordance: gold trophy + MY TEAM (selected) or white trophy (others).
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
                 trophyTeamButton(
                     team: team,
                     isPrimary: isPrimary,
@@ -3862,8 +4434,6 @@ struct ProfileIdentityCard: View {
                 trophySelectionShimmer(cornerRadius: FavoriteTeamRichCardStyle.ownProfile.cornerRadius)
             }
         }
-        .animation(trophyVisualTransitionAnimation, value: isPrimary)
-        .animation(trophyVisualTransitionAnimation, value: isAnimatingDemotion)
     }
 
     private func trophyTeamButton(
@@ -3875,48 +4445,20 @@ struct ProfileIdentityCard: View {
             guard !isPrimary else { return }
             promoteTrophyTeam(team)
         } label: {
-            VStack(spacing: 2) {
-                ZStack {
-                    Image(systemName: "trophy")
-                        .opacity(isPrimary ? 0 : 1)
-                        .foregroundStyle(Color.white.opacity(0.92))
-                    Image(systemName: "trophy.fill")
-                        .opacity(isPrimary ? 1 : 0)
-                        .foregroundStyle(FGColor.accentYellow)
-                }
-                .font(.system(size: 14, weight: .heavy))
-                .frame(width: 30, height: 30)
-                .background {
-                    Circle()
-                        .fill(isPrimary ? FGColor.accentYellow.opacity(0.18) : Color.black.opacity(0.18))
-                        .overlay {
-                            Circle()
-                                .strokeBorder(
-                                    isPrimary ? FGColor.accentYellow.opacity(0.64) : Color.white.opacity(0.22),
-                                    lineWidth: 1
-                                )
-                        }
-                }
-                .shadow(color: isPrimary ? FGColor.accentYellow.opacity(0.45) : .clear, radius: 8, y: 2)
-                .scaleEffect(isAnimatingSelection && !reduceMotion ? 1.13 : 1.0)
-
-                if isPrimary {
-                    Text(L10n.t("my_team", languageCode: appLanguageRaw))
-                        .font(.system(size: 8.5, weight: .heavy, design: .rounded))
-                        .textCase(.uppercase)
-                        .tracking(0.2)
-                        .foregroundStyle(FGColor.accentYellow)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
-            }
-            .frame(minWidth: 44, minHeight: 44, alignment: .top)
+            FavoriteTeamRichCardTrophyGlyph(
+                isPrimary: isPrimary,
+                style: .ownProfile,
+                languageCode: appLanguageRaw,
+                showsMyTeamLabel: isPrimary,
+                isAnimatingSelection: isAnimatingSelection,
+                reduceMotion: reduceMotion,
+                colorScheme: colorScheme
+            )
+            .padding(7)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .disabled(isPrimary)
-        .animation(trophyVisualTransitionAnimation, value: isPrimary)
-        .animation(trophyPulseAnimation, value: isAnimatingSelection)
         .accessibilityLabel(
             isPrimary
                 ? MyTeamDisplayModel(team: team).accessibilityLabel(languageCode: appLanguageRaw)
@@ -3934,18 +4476,22 @@ struct ProfileIdentityCard: View {
             removeFavoriteTeam(team)
         } label: {
             Image(systemName: "xmark")
-                .font(.system(size: 8.5, weight: .bold))
-                .foregroundStyle(Color.white.opacity(0.88))
-                .frame(width: 24, height: 24)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .frame(width: 22, height: 22)
                 .background {
                     Circle()
-                        .fill(Color.black.opacity(0.22))
+                        .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.04))
                         .overlay {
                             Circle()
-                                .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.75)
+                                .strokeBorder(
+                                    colorScheme == .dark ? Color.white.opacity(0.12) : Color.black.opacity(0.08),
+                                    lineWidth: 0.75
+                                )
                         }
                 }
-                .contentShape(Circle())
+                .padding(11)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Remove \(team.name) from favorite teams")
@@ -4111,55 +4657,45 @@ struct ProfileIdentityCard: View {
         return Button {
             showFavoriteTeamsPicker = true
         } label: {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(spacing: 12) {
                 ZStack {
                     Circle()
-                        .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.11))
-                        .frame(width: 58, height: 58)
+                        .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.04))
+                        .frame(width: FavoriteTeamRichCardStyle.ownProfile.orbDiameter, height: FavoriteTeamRichCardStyle.ownProfile.orbDiameter)
                     Image(systemName: "plus")
-                        .font(.system(size: 21, weight: .bold))
+                        .font(.system(size: 28, weight: .semibold))
                         .foregroundStyle(FGColor.accentBlue)
                 }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(.system(size: 16, weight: .bold, design: .rounded))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .layoutPriority(1)
-                    Text(subtitle)
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.mutedText(colorScheme))
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .layoutPriority(1)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(title)
+                    .font(.system(size: 16, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+
+                Text(subtitle)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
 
                 Spacer(minLength: 0)
             }
-            .padding(14)
-            .frame(width: cardWidth, alignment: .topLeading)
-            .frame(minHeight: Self.favoriteTeamCardHeight, alignment: .topLeading)
+            .padding(.top, 16)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 14)
+            .frame(width: cardWidth, height: Self.favoriteTeamCardHeight, alignment: .top)
             .background {
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.9))
+                RoundedRectangle(cornerRadius: FavoriteTeamRichCardStyle.ownProfile.cornerRadius, style: .continuous)
+                    .fill(FGAdaptiveSurface.cardElevated(colorScheme))
                     .overlay {
-                        RoundedRectangle(cornerRadius: 24, style: .continuous)
-                            .strokeBorder(
-                                LinearGradient(
-                                    colors: [
-                                        FGColor.accentBlue.opacity(colorScheme == .dark ? 0.22 : 0.16),
-                                        Color.black.opacity(colorScheme == .dark ? 0.0 : 0.05)
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                lineWidth: 1
-                            )
+                        RoundedRectangle(cornerRadius: FavoriteTeamRichCardStyle.ownProfile.cornerRadius, style: .continuous)
+                            .strokeBorder(FGColor.divider(colorScheme).opacity(1.4), lineWidth: 1)
                     }
             }
+            .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.08), radius: 10, y: 5)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(title). \(subtitle)")
@@ -5394,7 +5930,7 @@ struct SuggestedFanCard: View {
                         .accessibilityHidden(true)
 
                     VStack(alignment: .leading, spacing: Metrics.whyRowSpacing) {
-                        ForEach(Array(whyExplanations.enumerated()), id: \.offset) { _, reason in
+                        ForEach(whyExplanations, id: \.self) { reason in
                             whySuggestedRow(reason)
                         }
                     }
@@ -5662,17 +6198,6 @@ private struct ProfileSuggestedFansSection: View {
         "High reputation"
     ]
 
-    private var suggestionsAvatarFingerprint: String {
-        suggestions.map { suggestion in
-            [
-                suggestion.userID.uuidString.lowercased(),
-                suggestion.avatarThumbnailURL ?? "",
-                suggestion.avatarURL ?? ""
-            ].joined(separator: ":")
-        }
-        .joined(separator: "|")
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
@@ -5693,9 +6218,6 @@ private struct ProfileSuggestedFansSection: View {
             }
         }
         .padding(.vertical, 2)
-        .task(id: suggestionsAvatarFingerprint) {
-            await prefetchSuggestedFanAvatars()
-        }
         .sheet(isPresented: $showHowItWorksSheet) {
             SuggestedFansHowItWorksSheet()
         }
@@ -5850,7 +6372,7 @@ private struct ProfileSuggestedFansSection: View {
         .frame(minHeight: CardMetrics.rowMinHeight(for: sizeCategory), alignment: .top)
     }
 
-    private func prefetchSuggestedFanAvatars() async {
+    fileprivate static func prefetchAvatars(_ suggestions: [FriendSuggestionProfile]) async {
         var seen = Set<URL>()
         var urls: [URL] = []
 
@@ -5870,7 +6392,7 @@ private struct ProfileSuggestedFansSection: View {
             urls.append(url)
         }
 
-        for suggestion in suggestions.prefix(8) {
+        for suggestion in suggestions.prefix(4) {
             appendURL(
                 thumbnail: suggestion.avatarThumbnailURL,
                 full: suggestion.avatarURL,
@@ -5878,19 +6400,8 @@ private struct ProfileSuggestedFansSection: View {
             )
         }
 
-        guard !urls.isEmpty else {
-#if DEBUG
-            print("[SmoothPerf] operation=suggestedFansAvatarPrefetch skipped=noURLs durationMs=0 coalesced=false avatarCount=0")
-#endif
-            return
-        }
-
-        let startedAt = Date()
+        guard !urls.isEmpty else { return }
         await DiscoverMapImageCache.shared.prefetch(urls: urls, bucket: .avatar)
-#if DEBUG
-        let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
-        print("[SmoothPerf] operation=suggestedFansAvatarPrefetch skipped=none durationMs=\(ms) coalesced=false avatarCount=\(urls.count)")
-#endif
     }
 
     private func suggestionCard(_ suggestion: FriendSuggestionProfile) -> some View {
@@ -6262,44 +6773,17 @@ struct PremiumTeamIdentityOrb: View {
     let team: FavoriteTeam
     let diameter: CGFloat
 
-    private var nationalTeamFlag: String? {
-        guard team.kind == .nationalTeam,
-              let flag = CountryFlagHelper.flag(for: team.name),
-              !flag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        return flag
-    }
-
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(Color.white.opacity(0.18))
-                .frame(width: diameter, height: diameter)
-                .overlay {
-                    Circle()
-                        .strokeBorder(Color.white.opacity(0.34), lineWidth: 1)
-                }
-
-            if let nationalTeamFlag {
-                Text(nationalTeamFlag)
-                    .font(.system(size: max(24, diameter * 0.54)))
-                    .minimumScaleFactor(0.8)
-                    .lineLimit(1)
-                    .shadow(color: Color.black.opacity(0.18), radius: 1.5, y: 1)
-            } else {
-                Text(team.initials)
-                    .font(.system(size: max(10, diameter * 0.34), weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-            }
-        }
-        .frame(width: diameter, height: diameter)
-        .accessibilityLabel("\(team.name), \(team.sport.chipTitle)")
+        SportsIdentityArtworkView(
+            favoriteTeam: team,
+            diameter: diameter,
+            plate: .lightTranslucent
+        )
+        .accessibilityHidden(true)
     }
 }
 
 struct ProfileIdentityOwnPickupOrganizerSection: View {
-    @ObservedObject var viewModel: MapViewModel
     let userId: UUID
     let summary: PickupOrganizerSummary
     var usesExternalChrome: Bool = false
@@ -6311,9 +6795,6 @@ struct ProfileIdentityOwnPickupOrganizerSection: View {
             compact: true,
             usesExternalChrome: usesExternalChrome
         )
-        .task(id: userId) {
-            await viewModel.refreshMyPickupOrganizerSummaryOnAppearIfStale()
-        }
     }
 }
 

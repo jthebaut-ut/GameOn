@@ -104,6 +104,13 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
 #if DEBUG
         print("[RemoteNotificationDebug] received userInfo=\(userInfo)")
 #endif
+        Task { @MainActor in
+            FanGeoNotificationInboxIngest.ingestIfNeeded(
+                userInfo: userInfo,
+                content: nil,
+                userId: MapViewModel.sharedActionCenterUserIdForNotificationIngest()
+            )
+        }
         completionHandler(.noData)
     }
 
@@ -112,6 +119,13 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         let userInfo = notification.request.content.userInfo
+        await MainActor.run {
+            FanGeoNotificationInboxIngest.ingestIfNeeded(
+                userInfo: userInfo,
+                content: notification.request.content,
+                userId: MapViewModel.sharedActionCenterUserIdForNotificationIngest()
+            )
+        }
         // DM / friend-request pushes: suppress system banner while foregrounded so
         // realtime + in-app UX remain the single in-app path (no duplicate alerts).
         if FanTeamInvitationNotificationDeepLinkBridge.shared
@@ -123,6 +137,15 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         if FanTeamDeletedNotificationDeepLinkBridge.shared
             .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
             FanTeamDeletedNotificationDeepLinkBridge.shared.noteForegroundArrival(userInfo: userInfo)
+            return []
+        }
+        if FanTeamMemberLeftNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
+            FanTeamMemberLeftNotificationDeepLinkBridge.shared.noteForegroundArrival(userInfo: userInfo)
+            return []
+        }
+        if FanTeamMemberChangeNotificationDeepLinkBridge.shared
+            .shouldSuppressForegroundSystemPresentation(userInfo: userInfo) {
             return []
         }
         if DirectMessageNotificationDeepLinkBridge.shared
@@ -143,6 +166,11 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
         didReceive response: UNNotificationResponse
     ) async {
         await MainActor.run {
+            FanGeoNotificationInboxIngest.ingestIfNeeded(
+                userInfo: response.notification.request.content.userInfo,
+                content: response.notification.request.content,
+                userId: MapViewModel.sharedActionCenterUserIdForNotificationIngest()
+            )
             ProGameNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             PickupCreatorRatingNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             PickupGameChangeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
@@ -154,8 +182,11 @@ private final class FanGeoAppDelegate: NSObject, UIApplicationDelegate, UNUserNo
             FriendRequestNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanTeamInvitationNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             FanTeamDeletedNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanTeamMemberLeftNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanTeamMemberChangeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             ChatMessageNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
             PokeNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
+            FanGeoSecuritySessionNotificationDeepLinkBridge.shared.handleNotificationResponse(response)
         }
     }
 }

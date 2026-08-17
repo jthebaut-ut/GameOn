@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Pure string utilities (never MainActor)
 
-enum FavoriteFollowingSearchNormalizer: Sendable {
+nonisolated enum FavoriteFollowingSearchNormalizer: Sendable {
     /// Shared normalization: trim, collapse whitespace, case/diacritic fold, unify punctuation/apostrophes/hyphens.
     /// Does not transliterate non-Latin scripts away — alphanumerics from those scripts remain.
     nonisolated static func normalize(_ value: String) -> String {
@@ -45,7 +45,7 @@ enum FavoriteFollowingSearchNormalizer: Sendable {
 // MARK: - Ranked Following Search
 
 /// Precomputed search haystacks for ``FavoriteTeamCatalog`` so keystrokes do not rebuild normalization work.
-enum FavoriteFollowingSearch {
+nonisolated enum FavoriteFollowingSearch {
     /// Sendable index row — stores team id, not MainActor-bound model references.
     struct IndexedEntry: Sendable {
         let teamID: String
@@ -54,6 +54,7 @@ enum FavoriteFollowingSearch {
         let aliases: [String]
         let canonicalTokens: [String]
         let aliasTokens: [String]
+        let leagueName: String
     }
 
     private static let lock = NSLock()
@@ -70,32 +71,53 @@ enum FavoriteFollowingSearch {
 
     private static func indexed() -> [IndexedEntry] {
         lock.lock()
-        defer { lock.unlock() }
-        if let indexedCache { return indexedCache }
+        if let indexedCache {
+            let cached = indexedCache
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
 
         let catalog = FavoriteTeamCatalog.all
-        let built: [IndexedEntry] = catalog.map { team in
+        let built: [IndexedEntry] = catalog.compactMap { team in
+            let id = team.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { return nil }
             let canonical = normalize(team.name)
             let short = normalize(team.shortCode ?? "")
-            let aliases = ([team.shortCode ?? ""] + team.searchAliases)
+            var aliasSource = ([team.shortCode ?? ""] + team.searchAliases)
+            if team.kind.isProfessionalAthlete {
+                aliasSource.append(team.region)
+                aliasSource.append(team.league)
+            }
+            let aliases = aliasSource
                 .map(normalize)
-                .filter { !$0.isEmpty && $0 != canonical && $0 != short }
+                .filter { !$0.isEmpty && $0 != canonical && $0 != short && $0 != "favorite players" }
             let uniqueAliases = Array(Set(aliases)).sorted()
             return IndexedEntry(
-                teamID: team.id,
+                teamID: id,
                 canonicalName: canonical,
                 shortCode: short,
                 aliases: uniqueAliases,
                 canonicalTokens: tokens(canonical),
-                aliasTokens: uniqueAliases.flatMap(tokens)
+                aliasTokens: uniqueAliases.flatMap(tokens),
+                leagueName: normalize(team.league)
             )
         }
+        lock.lock()
         indexedCache = built
-        byIDCache = Dictionary(uniqueKeysWithValues: catalog.map { ($0.id, $0) })
+        byIDCache = FavoriteFollowingCountryBrowse.dictionaryByUniqueID(catalog)
+        lock.unlock()
         return built
     }
 
-    /// Empty query returns no unbounded dump (picker shelves handle browse mode).
+    static func invalidateCatalogIndex() {
+        lock.lock()
+        indexedCache = nil
+        byIDCache = nil
+        lock.unlock()
+    }
+
+    /// Empty query returns no unbounded dump (country browse / search handle browse mode).
     static func rankedResults(
         query raw: String,
         prioritizingSelectedIDs selectedIDs: Set<String> = []
@@ -152,6 +174,7 @@ enum FavoriteFollowingSearch {
         if tokenPrefixMatch(queryTokens: queryTokens, haystackTokens: entry.aliasTokens) { return 8 }
         if !entry.canonicalName.isEmpty, entry.canonicalName.contains(q) { return 9 }
         if entry.aliases.contains(where: { $0.contains(q) }) { return 10 }
+        if q.count >= 3, !entry.leagueName.isEmpty, entry.leagueName.contains(q) { return 11 }
         return nil
     }
 
@@ -168,7 +191,7 @@ enum FavoriteFollowingSearch {
 
 // MARK: - Catalog Integrity
 
-enum FavoriteCatalogValidation {
+nonisolated enum FavoriteCatalogValidation {
     struct Report: Equatable {
         var duplicateIDs: [String] = []
         var duplicateIdentities: [String] = []

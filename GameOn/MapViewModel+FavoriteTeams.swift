@@ -17,6 +17,7 @@ extension MapViewModel {
             print("[StartupPrefetchDebug] favoriteTeams cacheHit=true")
             print("[FavoriteTeamsHydration] skipped cacheHit authUserId=\(currentUserAuthId?.uuidString.lowercased() ?? "nil")")
 #endif
+            seedSportsArtworkFromFetchedLiveMatches()
             return
         }
 
@@ -60,12 +61,12 @@ extension MapViewModel {
 
         var remote = remoteSelection.teamIDs
         var resolvedSelection = remoteSelection
+        let localRaw = UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
+        let localPrimary = UserDefaults.standard.string(forKey: FavoriteTeamsStore.primaryTeamIDAppStorageKey)
+        let local = FavoriteTeamsStore.decodeIDs(from: localRaw)
+            .filter { FavoriteTeamCatalog.team(id: $0) != nil }
 
         if remote.isEmpty {
-            let localRaw = UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
-            let localPrimary = UserDefaults.standard.string(forKey: FavoriteTeamsStore.primaryTeamIDAppStorageKey)
-            let local = FavoriteTeamsStore.decodeIDs(from: localRaw)
-                .filter { FavoriteTeamCatalog.team(id: $0) != nil }
             if !local.isEmpty {
 #if DEBUG
                 print(
@@ -85,7 +86,7 @@ extension MapViewModel {
             }
         }
 
-        let applied = remote
+        let applied = FavoriteTeamsStore.mergedRemoteIDs(local: local, remote: remote)
         let primary = FavoriteTeamsStore.normalizedPrimaryTeamID(resolvedSelection.primaryTeamID, within: applied)
         let didApply = await MainActor.run { () -> Bool in
             guard currentUserAuthId == uid else {
@@ -96,11 +97,28 @@ extension MapViewModel {
 #endif
                 return false
             }
+            let currentRaw = UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
+            let currentIDs = FavoriteTeamsStore.decodeIDs(from: currentRaw)
+            let currentPrimary = FavoriteTeamsStore.explicitPrimaryTeamID(localPrimary, within: currentIDs)
+            lastFavoriteTeamsLoadAt = Date()
+            if currentIDs == applied {
+                if currentPrimary != primary {
+                    FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(primary)
+                }
+                return true
+            }
             FavoriteTeamsStore.writeToAppStorage(applied)
             FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(primary)
-            lastFavoriteTeamsLoadAt = Date()
             favoriteTeamsHydrationGeneration &+= 1
             return true
+        }
+
+        if didApply {
+            let teams = FavoriteTeamsStore.resolvedTeams(fromIDs: applied)
+            seedSportsArtworkFromFetchedLiveMatches()
+            Task {
+                await SportsArtworkEnrichmentService.shared.enrich(favorites: teams)
+            }
         }
 
 #if DEBUG
@@ -129,5 +147,22 @@ extension MapViewModel {
             teamIDs: teamIDs,
             primaryTeamID: primaryTeamID
         )
+    }
+
+    /// Profile / favorites reuse already-fetched sports rows. Does not call TheSportsDB
+    /// and does not require the Live tab to have been opened.
+    func seedSportsArtworkFromFetchedLiveMatches(refreshProviderCatalog: Bool = true) {
+        SportsArtworkEnrichmentService.shared.ingestFromAlreadyFetchedLiveMatches(liveMatches)
+        let ids = FavoriteTeamsStore.decodeIDs(
+            from: UserDefaults.standard.string(forKey: FavoriteTeamsStore.appStorageKey) ?? ""
+        )
+        SportsFavoriteArtworkHydration.ingest(
+            favorites: FavoriteTeamsStore.resolvedTeams(fromIDs: ids),
+            from: liveMatches
+        )
+        guard refreshProviderCatalog else { return }
+        Task {
+            await SportsProviderArtworkService.shared.refreshIfStale()
+        }
     }
 }

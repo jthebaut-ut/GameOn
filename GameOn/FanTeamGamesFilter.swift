@@ -13,10 +13,12 @@ import Foundation
 /// plus `game_start_at` / `end_time` — not a separate Team completion column.
 enum FanTeamGamesTimeline {
     static func isUpcoming(_ game: FanTeamGame, now: Date = Date()) -> Bool {
+        if game.isScoringFinal { return false }
         let status = game.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if status == "completed" || status == "cancelled" || status == "canceled" || status == "removed" {
             return false
         }
+        if game.isScoringLive { return true }
         let effectiveEnd = game.endsAt ?? game.startsAt
         return effectiveEnd >= now
     }
@@ -25,9 +27,32 @@ enum FanTeamGamesTimeline {
         !isUpcoming(game, now: now)
     }
 
-    /// Past ordering key: most recent finished first uses this descending.
+    /// Past ordering key: finals use completion time; otherwise end/start.
     static func pastSortDate(_ game: FanTeamGame) -> Date {
-        game.endsAt ?? game.startsAt
+        if game.isScoringFinal, let finalized = game.scoringFinalizedAt {
+            return finalized
+        }
+        return game.endsAt ?? game.startsAt
+    }
+}
+
+/// Overview dashboard: one upcoming Team event (not announcements).
+enum FanTeamOverviewNextEvent {
+    static func upcomingEvent(from games: [FanTeamGame], now: Date = Date()) -> FanTeamGame? {
+        games
+            .filter { $0.gameType != .announcement && FanTeamGamesTimeline.isUpcoming($0, now: now) }
+            .min { lhs, rhs in
+                if lhs.startsAt != rhs.startsAt { return lhs.startsAt < rhs.startsAt }
+                return lhs.id.uuidString.lowercased() < rhs.id.uuidString.lowercased()
+            }
+    }
+}
+
+enum TeamOverviewDashboardDebug {
+    static func log(_ message: String) {
+#if DEBUG
+        print("[TeamOverviewDashboard] \(message)")
+#endif
     }
 }
 
@@ -131,13 +156,18 @@ struct FanTeamGamesFilterState: Equatable, Sendable {
             || customEnd != nil
     }
 
-    /// Count of distinct secondary filter dimensions (for Filter badge).
+    /// Count of distinct secondary filter dimensions shown on the funnel badge.
+    /// Event-type is controlled by the horizontal chip row, so it is excluded here.
     var activeSecondaryFilterCount: Int {
         var count = 0
-        if gameType != nil { count += 1 }
         if datePreset != .all { count += 1 }
         if competitionLevel != nil { count += 1 }
         return count
+    }
+
+    /// True when date/competition menu filters are active (not type chips, not Upcoming/Past).
+    var hasActiveMenuFilters: Bool {
+        datePreset != .all || competitionLevel != nil || customStart != nil || customEnd != nil
     }
 
     var isDefault: Bool {
@@ -186,8 +216,8 @@ enum FanTeamGamesSectionKind: String, Hashable, Sendable {
 
     var localizedKey: String {
         switch self {
-        case .upcoming: return "fan_teams_games_filter_upcoming"
-        case .past: return "fan_teams_games_filter_past"
+        case .upcoming: return "fan_teams_schedule_section_upcoming_events"
+        case .past: return "fan_teams_schedule_section_past_events"
         }
     }
 }
@@ -206,9 +236,20 @@ struct FanTeamGamesPresentationResult: Equatable, Sendable {
 }
 
 enum FanTeamGamesFilterEngine {
-    /// Supported `pickup_games.game_format` filters (secondary menu only).
+    /// Supported `pickup_games.game_format` filters (Schedule chips + local filter).
+    /// Order matches Team Schedule chip row (actual stored types — not collapsed groups).
     static let supportedTypeFilters: [FanTeamGameType] = [
-        .league_game, .tournament_game, .match, .practice, .scrimmage, .tryout, .clinic, .pickup
+        .league_game,
+        .practice,
+        .scrimmage,
+        .tournament_game,
+        .tryout,
+        .clinic,
+        .match,
+        .team_meeting,
+        .other,
+        .announcement,
+        .pickup
     ]
 
     static func dateInterval(

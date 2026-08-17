@@ -40,16 +40,31 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
     /// Allows longer tab titles (e.g. Going → Venue Games) to fit without clipping.
     var titleMinimumScaleFactor: CGFloat = 0.74
     var tabHorizontalPadding: CGFloat = 8
+    /// Settings-style density (Team Schedule Visibility). Default keeps existing surfaces unchanged.
+    var isCompact: Bool = false
 
     @Environment(\.colorScheme) private var colorScheme
 
+    private var chromePadding: CGFloat { isCompact ? 3 : 4 }
+    private var interTabSpacing: CGFloat { isCompact ? 4 : 6 }
+    private var tabMinHeight: CGFloat { isCompact ? 28 : 42 }
+    private var tabVerticalPadding: CGFloat { isCompact ? 4 : 7 }
+    private var resolvedTabHorizontalPadding: CGFloat {
+        isCompact ? min(tabHorizontalPadding, 6) : tabHorizontalPadding
+    }
+    private var titleFontSize: CGFloat { isCompact ? 12 : 12.5 }
+    private var iconFontSize: CGFloat { isCompact ? 10 : 11 }
+    private var selectionUnderlineSpacing: CGFloat { isCompact ? 3 : 5 }
+    private var chromeShadowRadius: CGFloat { isCompact ? 4 : 9 }
+    private var chromeShadowY: CGFloat { isCompact ? 1 : 3 }
+
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: interTabSpacing) {
             ForEach(tabs) { tab in
                 tabButton(tab)
             }
         }
-        .padding(4)
+        .padding(chromePadding)
         .background {
             Capsule(style: .continuous)
                 .fill(Color(.secondarySystemGroupedBackground).opacity(colorScheme == .dark ? 0.32 : 0.64))
@@ -58,7 +73,11 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
             Capsule(style: .continuous)
                 .strokeBorder(FGColor.divider(colorScheme).opacity(0.58), lineWidth: 1)
         }
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.045), radius: 9, y: 3)
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.18 : 0.045),
+            radius: chromeShadowRadius,
+            y: chromeShadowY
+        )
         .accessibilityElement(children: .contain)
     }
 
@@ -79,18 +98,18 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
                 }
             }
         } label: {
-            VStack(spacing: 5) {
+            VStack(spacing: selectionUnderlineSpacing) {
                 HStack(spacing: tab.badge == nil ? 6 : 5) {
                     HStack(spacing: tab.systemImage == nil ? 0 : 4) {
                         if let systemImage = tab.systemImage {
                             Image(systemName: systemImage)
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: iconFontSize, weight: .semibold))
                                 .foregroundStyle(isSelected ? tint : FGColor.secondaryText(colorScheme))
                                 .layoutPriority(1)
                         }
 
                         Text(tab.title)
-                            .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium, design: .rounded))
+                            .font(.system(size: titleFontSize, weight: isSelected ? .semibold : .medium, design: .rounded))
                             .lineLimit(1)
                             .minimumScaleFactor(titleMinimumScaleFactor)
                             .allowsTightening(true)
@@ -134,14 +153,14 @@ struct GameOnSegmentedControl<Selection: Hashable>: View {
                     .opacity(isSelected ? 1 : 0)
             }
             .frame(maxWidth: fillsWidth ? .infinity : nil)
-            .frame(minHeight: 42)
-            .padding(.horizontal, tabHorizontalPadding)
-            .padding(.vertical, 7)
+            .frame(minHeight: tabMinHeight)
+            .padding(.horizontal, resolvedTabHorizontalPadding)
+            .padding(.vertical, tabVerticalPadding)
             .background {
                 Capsule(style: .continuous)
                     .fill(isSelected ? tint.opacity(colorScheme == .dark ? 0.11 : 0.08) : Color.clear)
             }
-            .shadow(color: tint.opacity(isSelected ? 0.16 : 0), radius: 10, y: 0)
+            .shadow(color: tint.opacity(isSelected ? 0.16 : 0), radius: isCompact ? 6 : 10, y: 0)
             .contentShape(Capsule(style: .continuous))
         }
         .buttonStyle(FGPremiumPressButtonStyle(pressedScale: 0.985))

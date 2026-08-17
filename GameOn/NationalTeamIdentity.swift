@@ -168,7 +168,7 @@ enum NationalTeamCountryCatalog {
 
 struct NationalTeamIdentityCard: View {
     enum PresentationStyle: Equatable {
-        /// Profile / picker title: "[Country] Fan" + national-identity subtitle (independent of My Team).
+        /// Profile / picker title: "[Country] Fan" + national-identity subtitle (independent of Favorite Team).
         case standard
         /// Onboarding selected-country identity messaging.
         case joiningTeam
@@ -179,7 +179,7 @@ struct NationalTeamIdentityCard: View {
     var compact = false
     var presentationStyle: PresentationStyle = .standard
     /// Optional structured sport from a selected national-team catalog entry.
-    /// Never inferred from My Team. Nil → neutral country subtitle.
+    /// Never inferred from Favorite Team. Nil → neutral country subtitle.
     var nationalTeamSport: FavoriteTeamSport? = nil
     var onTap: (() -> Void)?
 
@@ -198,7 +198,6 @@ struct NationalTeamIdentityCard: View {
     }
     var body: some View {
         let flagFrame: CGFloat = compact ? 58 : 46
-        let flagFont: CGFloat = compact ? 40 : 34
         let cardCorner: CGFloat = compact ? 22 : 20
         let horizontalPadding: CGFloat = compact ? 16 : 13
         let verticalPadding: CGFloat = compact ? 15 : 13
@@ -207,27 +206,20 @@ struct NationalTeamIdentityCard: View {
             onTap?()
         } label: {
             HStack(spacing: compact ? 14 : 12) {
-                Text(identity.flag)
-                    .font(.system(size: flagFont))
-                    .frame(width: flagFrame, height: flagFrame)
-                    .minimumScaleFactor(0.8)
-                    .lineLimit(1)
-                    .background {
-                        Circle()
-                            .fill(Color.white.opacity(compact ? (colorScheme == .dark ? 0.15 : 0.86) : (colorScheme == .dark ? 0.10 : 0.78)))
-                            .overlay {
-                                Circle()
-                                    .strokeBorder(
-                                        Color.white.opacity(compact ? (colorScheme == .dark ? 0.22 : 0.78) : 0),
-                                        lineWidth: compact ? 1 : 0
-                                    )
-                            }
-                    }
-                    .shadow(
-                        color: FGColor.accentBlue.opacity(compact ? (colorScheme == .dark ? 0.18 : 0.12) : 0),
-                        radius: compact ? 10 : 0,
-                        y: compact ? 5 : 0
-                    )
+                SportsIdentityArtworkView(
+                    countryName: identity.countryName,
+                    flag: identity.flag,
+                    diameter: flagFrame
+                )
+                .background {
+                    Circle()
+                        .fill(Color.white.opacity(compact ? (colorScheme == .dark ? 0.15 : 0.86) : (colorScheme == .dark ? 0.10 : 0.78)))
+                }
+                .shadow(
+                    color: FGColor.accentBlue.opacity(compact ? (colorScheme == .dark ? 0.18 : 0.12) : 0),
+                    radius: compact ? 10 : 0,
+                    y: compact ? 5 : 0
+                )
 
                 VStack(alignment: .leading, spacing: compact ? 5 : 4) {
                     Text(primaryTitle)
@@ -583,9 +575,11 @@ struct NationalTeamPickerSheet: View {
             dismiss()
         } label: {
             HStack(spacing: 12) {
-                Text(option.flag)
-                    .font(.title2)
-                    .frame(width: 34)
+                SportsIdentityArtworkView(
+                    countryName: option.name,
+                    flag: option.flag,
+                    diameter: 34
+                )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(option.name)
                         .font(.subheadline.weight(.bold))

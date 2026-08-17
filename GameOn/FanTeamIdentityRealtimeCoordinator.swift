@@ -337,16 +337,36 @@ final class FanTeamIdentityRealtimeCoordinator {
             schema: "public",
             table: "fan_teams"
         )
+        let memberUpdates = channel.postgresChange(
+            UpdateAction.self,
+            schema: "public",
+            table: "fan_team_members"
+        )
 
         do {
             try await channel.subscribeWithError()
 #if DEBUG
             print("[FanTeamIdentityRealtime] subscribed")
 #endif
-            for await action in updates {
-                if Task.isCancelled { break }
-                try Task.checkCancellation()
-                handleUpdate(action)
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in
+                    for await action in updates {
+                        if Task.isCancelled { break }
+                        // Strongify once per event so we never capture the mutable
+                        // weak `self` Optional into a nested concurrent/@Sendable hop.
+                        guard let self else { break }
+                        await self.handleUpdate(action)
+                    }
+                }
+                group.addTask { [weak self] in
+                    for await action in memberUpdates {
+                        if Task.isCancelled { break }
+                        guard let self else { break }
+                        await self.handleMembershipUpdate(action)
+                    }
+                }
+                await group.next()
+                group.cancelAll()
             }
         } catch {
             if !(error is CancellationError) {
@@ -357,6 +377,21 @@ final class FanTeamIdentityRealtimeCoordinator {
         }
 
         await removeChannelOnly()
+    }
+
+    /// Soft-leave / role changes: refresh My Teams counts and invalidate roster caches.
+    private func handleMembershipUpdate(_ action: UpdateAction) {
+        let teamId = Self.uuid(from: action.record["team_id"])
+        let leftAt = Self.string(from: action.record["left_at"])
+#if DEBUG
+        print(
+            "[FanTeamMemberLeaveDebug] realtime_membership_update " +
+            "team_id=\(teamId?.uuidString.lowercased() ?? "nil") " +
+            "left_at=\(leftAt ?? "nil")"
+        )
+#endif
+        Self.postMembershipSnapshotsDidChange()
+        Task { await refreshAndPublishDiffs(reason: "fan_team_members.update") }
     }
 
     private func handleUpdate(_ action: UpdateAction) {
@@ -379,6 +414,9 @@ final class FanTeamIdentityRealtimeCoordinator {
         guard let conversationId else { return }
 
         let previous = snapshotsByTeamId[teamId]
+        // Account-membership identity only: never seed guardian-only Team access into
+        // knownFanTeamIds / conversation membership sets from raw fan_teams realtime.
+        guard previous != nil else { return }
         let next = Snapshot(
             conversationId: conversationId,
             name: name,

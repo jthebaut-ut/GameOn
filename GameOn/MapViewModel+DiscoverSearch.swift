@@ -75,11 +75,45 @@ extension MapViewModel {
 #endif
     }
 
-    /// Guest Discover: switch to Account and present the same ``SettingsUserAuthSheet`` used for fan sign-in / registration.
+    /// Explicit Sign In / Create Account / auth-gate: premium landing over the current tab.
     func discoverPresentFanUserAuthSheet(openRegisterMode: Bool) {
+        presentPremiumAuthLanding(from: .authGate, openRegisterMode: openRegisterMode)
+    }
+
+    /// Canonical signed-out authentication entry. Does not change the selected public tab.
+    /// No-op once a fan or business session is authenticated.
+    func presentPremiumAuthLanding(
+        from source: SignedOutAuthLandingSource,
+        openRegisterMode: Bool = false
+    ) {
+        guard FanGeoAuthLandingRouting.canPresentAuthLanding(
+            isLoggedIn: isLoggedIn,
+            isVenueOwnerLoggedIn: isVenueOwnerLoggedIn,
+            resolvingEmailConfirmation: resolvingEmailConfirmation
+        ) else { return }
+        if presentSignedOutAuthLanding, signedOutAuthLandingSource == .profileTab, source == .authGate {
+            fanUserAuthSheetOpenInRegisterMode = openRegisterMode
+            return
+        }
         fanUserAuthSheetOpenInRegisterMode = openRegisterMode
-        presentFanUserAuthSheetFromDiscover = true
-        discoverNavigateToAccountForUserAuth = true
+        signedOutAuthLandingSource = source
+        presentSignedOutAuthLanding = true
+    }
+
+    func dismissPremiumAuthLanding() {
+        presentSignedOutAuthLanding = false
+        signedOutAuthLandingSource = .none
+    }
+
+    /// Authentication succeeded: drop the landing and every pending signed-out auth-gate
+    /// that could SwiftUI-re-present it. Does not cancel post-login destinations
+    /// (saved-game completion, chat routes, etc.).
+    func dismissSignedOutAuthUIAfterSuccessfulAuthentication() {
+        presentSignedOutAuthLanding = false
+        signedOutAuthLandingSource = .none
+        presentFanUserAuthSheetFromDiscover = false
+        fanUserAuthSheetOpenInRegisterMode = false
+        discoverNavigateToAccountForUserAuth = false
     }
 
     /// Clears the Discover remote-preview pin hold (e.g. when the user dismisses the preview from the UI).

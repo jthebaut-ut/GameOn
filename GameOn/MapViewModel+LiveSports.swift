@@ -235,6 +235,8 @@ extension MapViewModel {
 
         handleSavedProGameStatusUpdates(from: matches, reason: "liveRefresh")
         liveMatches = matches
+        SportsArtworkURLStore.shared.ingestLiveMatches(matches)
+        seedSportsArtworkFromFetchedLiveMatches()
         publishCount += 1
         bumpScheduleLiveMatchesContentRevision(reason: "liveRefresh", rows: matches.count)
         publishCount += 1

@@ -43,7 +43,7 @@ struct FanSignupView: View {
     @State private var displayNameDraft = ""
     @State private var handleDraft = ""
     @State private var bioDraft = ""
-    @State private var favoriteTeamIDs: Set<String> = []
+    @State private var favoriteTeamIDs: [String] = []
     @State private var showFavoriteTeamsPicker = false
     @State private var selectedNationalTeam: NationalTeamIdentity?
     @State private var showNationalTeamPicker = false
@@ -73,8 +73,8 @@ struct FanSignupView: View {
     var body: some View {
         signupBodyCore
             .onChange(of: favoriteTeamIDs) { oldValue, newValue in
-                let added = newValue.subtracting(oldValue)
-                guard let addedID = added.first,
+                let added = newValue.filter { !oldValue.contains($0) }
+                guard let addedID = added.last,
                       let team = FavoriteTeamCatalog.team(id: addedID) else { return }
                 presentOnboardingFavoriteAddedConfirmation(for: team)
             }
@@ -240,7 +240,7 @@ struct FanSignupView: View {
             Task { await loadPendingAvatar(from: item) }
         }
         .sheet(isPresented: $showFavoriteTeamsPicker) {
-            FavoriteTeamsPickerSheet(selectedIDs: $favoriteTeamIDs)
+            AnyView(FavoriteTeamsPickerSheet(selectedIDs: $favoriteTeamIDs))
         }
         .sheet(isPresented: $showNationalTeamPicker) {
             NationalTeamPickerSheet(currentIdentity: selectedNationalTeam) { identity in
@@ -842,9 +842,9 @@ struct FanSignupView: View {
         let isSelected = favoriteTeamIDs.contains(team.id)
         return Button {
             if isSelected {
-                favoriteTeamIDs.remove(team.id)
+                favoriteTeamIDs = FavoriteTeamsStore.removing(team.id, from: favoriteTeamIDs)
             } else {
-                favoriteTeamIDs.insert(team.id)
+                favoriteTeamIDs = FavoriteTeamsStore.adding(team.id, to: favoriteTeamIDs)
             }
         } label: {
             VStack(spacing: 7) {
@@ -1308,9 +1308,7 @@ struct FanSignupView: View {
     }
 
     private var selectedFavoriteTeams: [FavoriteTeam] {
-        favoriteTeamIDs
-            .compactMap { FavoriteTeamCatalog.team(id: $0) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        FavoriteTeamsStore.resolvedTeams(fromIDs: favoriteTeamIDs)
     }
 
     private var fanIdentitySelectionSummaryVisibleText: String? {
@@ -1675,7 +1673,7 @@ struct FanSignupView: View {
             handle: handleDraft,
             bio: bioTrimmed.isEmpty ? MapViewModel.defaultFanSignupBio : bioTrimmed,
             avatarData: pendingAvatarData,
-            favoriteTeamIDs: favoriteTeamIDs.sorted(),
+            favoriteTeamIDs: FavoriteTeamsStore.uniquedIDs(favoriteTeamIDs),
             nationalTeamIdentity: selectedNationalTeam
         )
     }

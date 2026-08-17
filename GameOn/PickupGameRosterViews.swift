@@ -209,6 +209,8 @@ struct PickupGameRosterSheet: View {
     ) -> some View {
         HStack(spacing: 12) {
             Button {
+                // Managed players have no account, so no public profile to open.
+                guard !member.isManagedPlayer else { return }
                 openProfile(member.user_id)
             } label: {
                 HStack(spacing: 12) {
@@ -239,8 +241,9 @@ struct PickupGameRosterSheet: View {
                 }
             }
             .buttonStyle(.plain)
+            .disabled(member.isManagedPlayer)
             .accessibilityLabel("\(member.resolvedDisplayName)\(subtitle.map { ", \($0)" } ?? "")")
-            .accessibilityHint("Opens public profile")
+            .accessibilityHint(member.isManagedPlayer ? "" : "Opens public profile")
 
             if showActions, let requestId = member.request_id {
                 let busy = mutatingRequestIds.contains(requestId)

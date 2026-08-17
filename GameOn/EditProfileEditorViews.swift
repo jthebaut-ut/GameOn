@@ -10,37 +10,68 @@ enum EditProfileFocusField: Hashable {
 
 // MARK: - Section chrome
 
+/// Shared Edit Profile sheet metrics so every grouped card uses the same chrome.
+enum EditProfileSheetLayout {
+    static let cardRadius: CGFloat = 18
+    static let rowHorizontal: CGFloat = 16
+    static let rowVertical: CGFloat = 12
+    static let labelColumnWidth: CGFloat = 118
+    static let sectionHeaderToCard: CGFloat = 8
+    static let chevronOpacity: Double = 0.55
+}
+
 struct EditProfileSection<Content: View>: View {
     let title: String
+    var accentStroke: Color? = nil
     @ViewBuilder var content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: EditProfileSheetLayout.sectionHeaderToCard) {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(FGColor.secondaryText(colorScheme))
                 .textCase(.uppercase)
-                .tracking(0.4)
+                .tracking(0.6)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityAddTraits(.isHeader)
 
             VStack(spacing: 0) {
                 content()
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(FGColor.cardBackground(colorScheme))
+                RoundedRectangle(cornerRadius: EditProfileSheetLayout.cardRadius, style: .continuous)
+                    .fill(colorScheme == .dark ? FGColor.cardBackground(colorScheme) : Color.white)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                if let accentStroke {
+                    RoundedRectangle(cornerRadius: EditProfileSheetLayout.cardRadius, style: .continuous)
+                        .strokeBorder(accentStroke, lineWidth: 1)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: EditProfileSheetLayout.cardRadius, style: .continuous))
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
 struct EditProfileRowDivider: View {
     var body: some View {
         Divider()
-            .padding(.leading, 14)
+            .padding(.leading, EditProfileSheetLayout.rowHorizontal)
+    }
+}
+
+struct EditProfileTrailingChevron: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(EditProfileSheetLayout.chevronOpacity))
+            .accessibilityHidden(true)
     }
 }
 
@@ -167,7 +198,7 @@ struct EditProfileDisplayNameRow: View {
                 Text(L10n.t("display_name", languageCode: languageCode))
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .frame(width: 108, alignment: .leading)
+                    .frame(minWidth: 96, alignment: .leading)
 
                 TextField(L10n.t("display_name", languageCode: languageCode), text: $displayName)
                     .font(.body)
@@ -176,15 +207,17 @@ struct EditProfileDisplayNameRow: View {
                     .textInputAutocapitalization(.words)
                     .autocorrectionDisabled(false)
                     .focused(focusedField, equals: .displayName)
+
+                EditProfileTrailingChevron()
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
+            .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+            .padding(.vertical, EditProfileSheetLayout.rowVertical)
 
             if !errorMessage.isEmpty {
                 Text(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(FGColor.dangerRed)
-                    .padding(.horizontal, 14)
+                    .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
                     .padding(.bottom, 8)
             }
         }
@@ -206,27 +239,27 @@ struct EditProfileHandleRow: View {
                 Text(L10n.t("handle", languageCode: languageCode))
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .frame(width: 108, alignment: .leading)
+                    .frame(minWidth: 96, alignment: .leading)
 
                 HStack(spacing: 6) {
-                    Text("@")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 4)
-                        .background {
-                            Capsule(style: .continuous)
-                                .fill(FGColor.background(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.92))
-                        }
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.55))
                         .accessibilityHidden(true)
 
-                    TextField("handle", text: $username)
+                    Text("@")
+                        .font(.body)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .accessibilityHidden(true)
+
+                    TextField(L10n.t("handle", languageCode: languageCode), text: $username)
                         .font(.body)
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .focused(focusedField, equals: .username)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
 
                     if showsInlineAvailabilityGlyph {
                         Image(systemName: handleStatusIsPositive ? "checkmark.circle.fill" : "xmark.circle.fill")
@@ -239,9 +272,11 @@ struct EditProfileHandleRow: View {
                             .accessibilityHidden(true)
                     }
                 }
+
+                EditProfileTrailingChevron()
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
+            .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+            .padding(.vertical, EditProfileSheetLayout.rowVertical)
 
             if shouldShowStatusFootnote {
                 HandleAvailabilityStatusLabel(
@@ -249,7 +284,7 @@ struct EditProfileHandleRow: View {
                     isPositive: handleStatusIsPositive
                 )
                 .font(.footnote)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
                 .padding(.bottom, 8)
             }
         }
@@ -299,8 +334,8 @@ struct EditProfileBioRow: View {
             Text(L10n.t("bio", languageCode: languageCode))
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-                .padding(.horizontal, 14)
-                .padding(.top, 11)
+                .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+                .padding(.top, EditProfileSheetLayout.rowVertical)
 
             ZStack(alignment: .topLeading) {
                 TextEditor(text: editorBio)
@@ -317,8 +352,7 @@ struct EditProfileBioRow: View {
                     Text(L10n.t("add_a_short_bio", languageCode: languageCode))
                         .font(.body)
                         .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.55))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 8)
+                        .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
                         .allowsHitTesting(false)
                 }
             }
@@ -348,8 +382,8 @@ struct EditProfileBioRow: View {
                             : FGColor.secondaryText(colorScheme)
                     )
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 6)
+            .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+            .padding(.bottom, 10)
         }
     }
 }
@@ -366,25 +400,25 @@ struct EditProfileHomeCityRow: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
             Text(L10n.t("home_city", languageCode: languageCode))
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-                .frame(width: 108, alignment: .leading)
-                .padding(.top, 12)
+                .frame(minWidth: 96, alignment: .leading)
 
             ProfileHomeCityAutocompleteField(
                 city: $city,
                 region: $region,
                 country: $country,
                 displayText: $displayText,
-                usesCompactPillStyle: true,
+                usesCompactPillStyle: false,
+                usesPlainRowStyle: true,
                 languageCode: languageCode
             )
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 4)
+        .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+        .padding(.vertical, 8)
     }
 }
 
@@ -401,9 +435,9 @@ struct EditProfileShowOnProfileRow: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
         }
-        .tint(FGColor.accentGreen)
+        .tint(Color.green)
         .disabled(isDisabled)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
         .padding(.vertical, 10)
     }
 }
@@ -419,23 +453,36 @@ struct EditProfileGenderRow: View {
             Text(L10n.t("profile_gender", languageCode: languageCode))
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
-                .frame(width: 108, alignment: .leading)
+                .frame(minWidth: 96, alignment: .leading)
 
-            Picker("", selection: $gender) {
-                ForEach(FanProfileGender.allCases, id: \.self) { option in
-                    Text(L10n.t(option.localizedKey, languageCode: languageCode))
-                        .tag(option)
+            Spacer(minLength: 8)
+
+            Menu {
+                Picker("", selection: $gender) {
+                    ForEach(FanProfileGender.allCases, id: \.self) { option in
+                        Text(L10n.t(option.localizedKey, languageCode: languageCode))
+                            .tag(option)
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(L10n.t(gender.localizedKey, languageCode: languageCode))
+                        .font(.body)
+                        .foregroundStyle(FGColor.intentTeams)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                        .minimumScaleFactor(0.85)
+                    EditProfileTrailingChevron()
                 }
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(maxWidth: .infinity, alignment: .trailing)
+            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+        .padding(.vertical, EditProfileSheetLayout.rowVertical)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(L10n.t("profile_gender", languageCode: languageCode))
         .accessibilityValue(L10n.t(gender.localizedKey, languageCode: languageCode))
+        .accessibilityAddTraits(.isButton)
     }
 }
 
@@ -458,9 +505,9 @@ struct EditProfileBackgroundRow: View {
                 Image(option.thumbnailAssetName)
                     .resizable()
                     .scaledToFill()
-                    .frame(width: 44, height: 28)
+                    .frame(width: 52, height: 32)
                     .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.t("profile_background", languageCode: languageCode))
@@ -478,10 +525,10 @@ struct EditProfileBackgroundRow: View {
 
                 Image(systemName: "chevron.right")
                     .font(.footnote.weight(.semibold))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.7))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(EditProfileSheetLayout.chevronOpacity))
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
+            .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+            .padding(.vertical, EditProfileSheetLayout.rowVertical)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -518,17 +565,19 @@ struct EditProfileAccountRow: View {
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
                 Text(displayEmail)
-                    .font(.body)
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .font(.footnote)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .textSelection(.enabled)
                     .lineLimit(2)
                     .minimumScaleFactor(0.85)
             }
 
             Spacer(minLength: 0)
+
+            EditProfileTrailingChevron()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.horizontal, EditProfileSheetLayout.rowHorizontal)
+        .padding(.vertical, EditProfileSheetLayout.rowVertical)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(L10n.t("email", languageCode: languageCode)). \(displayEmail)")
     }

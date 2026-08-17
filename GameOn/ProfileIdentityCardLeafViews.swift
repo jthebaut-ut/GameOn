@@ -48,7 +48,14 @@ struct ProfileIdentitySectionChrome: View {
                 }
             }
             .overlay(sectionBorder)
-            .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: shadowY)
+            .modifier(
+                ProfileIdentitySectionShadowModifier(
+                    hierarchy: hierarchy,
+                    shadowColor: shadowColor,
+                    shadowRadius: shadowRadius,
+                    shadowY: shadowY
+                )
+            )
             // Hero uses parent adaptive outer inset so the card spans nearly full width;
             // other sections keep their existing internal chrome inset (unchanged).
             .padding(.horizontal, hierarchy == .hero ? 0 : 16)
@@ -221,6 +228,28 @@ struct ProfileIdentitySectionChrome: View {
     }
 }
 
+/// Applies section elevation. Hero/utility flatten before the soft shadow (no nested
+/// ScrollViews). Primary/secondary keep a plain shadow so horizontal carousels do not
+/// re-rasterize an entire compositing group while scrolling.
+private struct ProfileIdentitySectionShadowModifier: ViewModifier {
+    let hierarchy: ProfileIdentitySectionHierarchy
+    let shadowColor: Color
+    let shadowRadius: CGFloat
+    let shadowY: CGFloat
+
+    func body(content: Content) -> some View {
+        switch hierarchy {
+        case .hero, .utility:
+            content
+                .compositingGroup()
+                .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: shadowY)
+        case .primary, .secondary:
+            content
+                .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: shadowY)
+        }
+    }
+}
+
 // MARK: - Hero
 
 struct ProfileIdentityHeroStripColumn: Identifiable {
@@ -244,8 +273,18 @@ struct ProfileIdentityHeroStripColumn: Identifiable {
 
 /// Hero leaf: avatar, identity text, Fan XP, edit affordances, identity strip.
 /// Kept outside `ProfileIdentityCard` so its generic type graph stays shallow.
+struct ProfileIdentityHeroAvatarInputs: Equatable {
+    var authId: UUID?
+    var avatarURL: String
+    var avatarThumbnailURL: String
+    var avatarDisplayRefreshToken: UUID
+    var email: String
+    var hasUnseenPokes: Bool
+    var totalXP: Int
+}
+
 struct ProfileIdentityHeroSection: View {
-    @ObservedObject var viewModel: MapViewModel
+    let avatarInputs: ProfileIdentityHeroAvatarInputs
     @Binding var selectedAvatarItem: PhotosPickerItem?
     let isUploadingAvatar: Bool
     let isSavingIdentity: Bool
@@ -276,7 +315,7 @@ struct ProfileIdentityHeroSection: View {
     private var heroContent: some View {
         VStack(alignment: .leading, spacing: ProfileHeroMetrics.identityToCardsSpacing) {
             ProfileIdentityHeroHeaderRow(
-                viewModel: viewModel,
+                avatarInputs: avatarInputs,
                 selectedAvatarItem: $selectedAvatarItem,
                 isUploadingAvatar: isUploadingAvatar,
                 isSavingIdentity: isSavingIdentity,
@@ -301,7 +340,7 @@ struct ProfileIdentityHeroSection: View {
 }
 
 private struct ProfileIdentityHeroHeaderRow: View {
-    @ObservedObject var viewModel: MapViewModel
+    let avatarInputs: ProfileIdentityHeroAvatarInputs
     @Binding var selectedAvatarItem: PhotosPickerItem?
     let isUploadingAvatar: Bool
     let isSavingIdentity: Bool
@@ -322,7 +361,7 @@ private struct ProfileIdentityHeroHeaderRow: View {
             HStack(alignment: .top, spacing: 14) {
                 PhotosPicker(selection: $selectedAvatarItem, matching: .images) {
                     ProfileIdentityHeroAvatarStack(
-                        viewModel: viewModel,
+                        avatarInputs: avatarInputs,
                         localAvatarPreviewImage: localAvatarPreviewImage,
                         displayName: displayName,
                         isUploadingAvatar: isUploadingAvatar
@@ -338,7 +377,7 @@ private struct ProfileIdentityHeroHeaderRow: View {
                     displayName: displayName,
                     handleLine: handleLine,
                     bioLine: bioLine,
-                    totalXP: viewModel.currentUserFanXP.totalXP,
+                    totalXP: avatarInputs.totalXP,
                     languageCode: appLanguageRaw,
                     onEditDisplayName: onEditDisplayName,
                     onEditBio: onEditBio
@@ -476,7 +515,11 @@ private struct ProfileIdentityHeroActionRow: View {
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .leading)
         }
         .frame(height: rowHeight)
-        .onPreferenceChange(ProfileHeroActionShareWidthKey.self) { shareIntrinsicWidth = $0 }
+        .onPreferenceChange(ProfileHeroActionShareWidthKey.self) { width in
+            // Ignore sub-point noise that would otherwise thrash Edit width during scroll.
+            guard abs(width - shareIntrinsicWidth) > 0.5 else { return }
+            shareIntrinsicWidth = width
+        }
     }
 
     /// Edit takes its share of the row, minus whatever Share actually needs —
@@ -590,7 +633,7 @@ private struct ProfileIdentityHeroShareButton: View {
 }
 
 private struct ProfileIdentityHeroAvatarStack: View {
-    @ObservedObject var viewModel: MapViewModel
+    let avatarInputs: ProfileIdentityHeroAvatarInputs
     let localAvatarPreviewImage: UIImage?
     let displayName: String
     let isUploadingAvatar: Bool
@@ -604,22 +647,22 @@ private struct ProfileIdentityHeroAvatarStack: View {
     private static let cameraIconSize: CGFloat = 11.5
 
     private var pokesBadgeVisible: Bool {
-        viewModel.hasUnseenPokes
+        avatarInputs.hasUnseenPokes
     }
 
     private var avatarPresentationIdentity: String {
         [
-            viewModel.currentUserAuthId?.uuidString ?? "none",
-            viewModel.currentUserAvatarURL,
-            viewModel.currentUserAvatarThumbnailURL,
-            viewModel.currentUserAvatarDisplayRefreshToken.uuidString
+            avatarInputs.authId?.uuidString ?? "none",
+            avatarInputs.avatarURL,
+            avatarInputs.avatarThumbnailURL,
+            avatarInputs.avatarDisplayRefreshToken.uuidString
         ].joined(separator: "|")
     }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
             ProfileIdentityHeroAvatarCore(
-                viewModel: viewModel,
+                avatarInputs: avatarInputs,
                 localAvatarPreviewImage: localAvatarPreviewImage,
                 displayName: displayName,
                 isUploadingAvatar: isUploadingAvatar,
@@ -641,7 +684,7 @@ private struct ProfileIdentityHeroAvatarStack: View {
 }
 
 private struct ProfileIdentityHeroAvatarCore: View {
-    @ObservedObject var viewModel: MapViewModel
+    let avatarInputs: ProfileIdentityHeroAvatarInputs
     let localAvatarPreviewImage: UIImage?
     let displayName: String
     let isUploadingAvatar: Bool
@@ -658,12 +701,12 @@ private struct ProfileIdentityHeroAvatarCore: View {
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
             UserAvatarView(
-                avatarThumbnailURL: viewModel.currentUserAvatarThumbnailURL,
-                avatarURL: viewModel.currentUserAvatarURL,
-                avatarDisplayRefreshToken: viewModel.currentUserAvatarDisplayRefreshToken,
+                avatarThumbnailURL: avatarInputs.avatarThumbnailURL,
+                avatarURL: avatarInputs.avatarURL,
+                avatarDisplayRefreshToken: avatarInputs.avatarDisplayRefreshToken,
                 localPreviewImage: localAvatarPreviewImage,
                 displayName: displayName,
-                email: viewModel.currentUserEmail,
+                email: avatarInputs.email,
                 size: Self.avatarDiameter,
                 fallbackStyle: .lightOnWhiteChrome,
                 imagePlaceholderTint: FGColor.accentBlue
@@ -691,20 +734,20 @@ private struct ProfileIdentityHeroAvatarCore: View {
 #if DEBUG
                 ProfileAvatarDebug.avatarViewResolved(
                     context: "ProfileIdentityHeroAvatarCore",
-                    thumbnailInput: viewModel.currentUserAvatarThumbnailURL,
-                    fullInput: viewModel.currentUserAvatarURL,
+                    thumbnailInput: avatarInputs.avatarThumbnailURL,
+                    fullInput: avatarInputs.avatarURL,
                     displayURLString: ImageDisplayURL.forListDisplay(
-                        thumbnail: viewModel.currentUserAvatarThumbnailURL,
-                        full: viewModel.currentUserAvatarURL,
-                        refreshToken: viewModel.currentUserAvatarDisplayRefreshToken
+                        thumbnail: avatarInputs.avatarThumbnailURL,
+                        full: avatarInputs.avatarURL,
+                        refreshToken: avatarInputs.avatarDisplayRefreshToken
                     ),
                     urlParseSucceeded: ImageDisplayURL.forListDisplay(
-                        thumbnail: viewModel.currentUserAvatarThumbnailURL,
-                        full: viewModel.currentUserAvatarURL,
-                        refreshToken: viewModel.currentUserAvatarDisplayRefreshToken
+                        thumbnail: avatarInputs.avatarThumbnailURL,
+                        full: avatarInputs.avatarURL,
+                        refreshToken: avatarInputs.avatarDisplayRefreshToken
                     ).flatMap { URL(string: $0) } != nil,
-                    fallbackReason: viewModel.currentUserAvatarURL.isEmpty
-                        && viewModel.currentUserAvatarThumbnailURL.isEmpty
+                    fallbackReason: avatarInputs.avatarURL.isEmpty
+                        && avatarInputs.avatarThumbnailURL.isEmpty
                         ? "view_model_avatar_urls_empty"
                         : "awaiting_UserAvatarView_image_layer"
                 )
@@ -858,20 +901,29 @@ private struct ProfileIdentityHeroIdentityIcon: View {
         switch kind {
         case .myTeam:
             if let favoriteTeam {
-                SportsIdentityArtworkView(favoriteTeam: favoriteTeam, diameter: 38)
+                SportsIdentityArtworkView(
+                    favoriteTeam: favoriteTeam,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
                 symbolIcon("trophy.fill", tint: FGColor.accentYellow)
             }
         case .nationalTeam:
-            if let flag = nationalTeamFlag?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !flag.isEmpty {
-                Text(flag)
-                    .font(.system(size: 20))
-                    .frame(width: 38, height: 38)
-                    .background {
-                        Circle()
-                            .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.12))
-                    }
+            if let favoriteTeam {
+                SportsIdentityArtworkView(
+                    favoriteTeam: favoriteTeam,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
+            } else if let flag = nationalTeamFlag?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !flag.isEmpty {
+                SportsIdentityArtworkView(
+                    countryName: "",
+                    flag: flag,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
                 symbolIcon("globe.americas.fill", tint: FGColor.accentGreen)
             }
@@ -924,8 +976,8 @@ struct ProfileIdentityFavoriteTeamsSection: View {
                         .tracking(0.78)
                     Text(
                         teamsEmpty
-                            ? L10n.t("profile_shape_fan_identity", languageCode: languageCode)
-                            : L10n.t("profile_show_off_fan_colors", languageCode: languageCode)
+                            ? L10n.t("profile_favorite_teams_subtitle_empty", languageCode: languageCode)
+                            : L10n.t("profile_favorite_teams_subtitle", languageCode: languageCode)
                     )
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(FGColor.mutedText(colorScheme).opacity(0.82))
@@ -956,22 +1008,18 @@ struct ProfileIdentityFavoriteTeamsSection: View {
 }
 
 struct ProfileIdentityHomeVenueSection: View {
-    @ObservedObject var viewModel: MapViewModel
+    let summary: HomeCrowdVenueSummary?
+    let onExploreOrChange: () -> Void
+    let onChoose: () -> Void
 
     var body: some View {
         AnyView(
             HomeCrowdProfileCardView(
-                summary: viewModel.currentUserHomeCrowdVenue,
+                summary: summary,
                 isSelfProfile: true,
-                onExploreVenue: viewModel.currentUserHomeCrowdVenue != nil
-                    ? { viewModel.focusDiscoverOnHomeCrowdVenue() }
-                    : nil,
-                onChangeHomeCrowd: viewModel.currentUserHomeCrowdVenue != nil
-                    ? { viewModel.focusDiscoverOnHomeCrowdVenue() }
-                    : nil,
-                onChooseHomeCrowd: viewModel.currentUserHomeCrowdVenue == nil
-                    ? { viewModel.openDiscoverToChooseHomeCrowd() }
-                    : nil
+                onExploreVenue: summary != nil ? onExploreOrChange : nil,
+                onChangeHomeCrowd: summary != nil ? onExploreOrChange : nil,
+                onChooseHomeCrowd: summary == nil ? onChoose : nil
             )
         )
     }
@@ -1033,7 +1081,6 @@ struct ProfileIdentityOpenToSection: View {
 }
 
 struct ProfileIdentityPickupGamesSection: View {
-    @ObservedObject var viewModel: MapViewModel
     let userId: UUID
     let summary: PickupOrganizerSummary
     let languageCode: String
@@ -1051,7 +1098,6 @@ struct ProfileIdentityPickupGamesSection: View {
                 .tracking(0.78)
 
             ProfileIdentityOwnPickupOrganizerSection(
-                viewModel: viewModel,
                 userId: userId,
                 summary: summary,
                 usesExternalChrome: true

@@ -275,6 +275,7 @@ struct GroupChatView: View {
     @State private var groupRealtimeSubscriptionTask: Task<Void, Never>?
     @State private var subscribedConversationId: UUID?
     @State private var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting
+    @State private var realtimeStatusEnteredAt: Date = Date()
     @State private var chatRealtimeLifecycleGeneration: Int = 0
     @State private var ownedGroupChannelGeneration: Int = 0
     @State private var groupRealtimeStopTask: Task<Void, Never>?
@@ -311,9 +312,14 @@ struct GroupChatView: View {
     @FocusState private var composerFocused: Bool
     /// Suppress eligibility/status animations while the first open `.task` hydrates membership.
     @State private var isThreadOpening = true
+    /// Authoritative Team Chat poll access from `get_fan_team_poll_access`.
+    @State private var teamPollAccess: FanTeamPollAccessSnapshot?
+    @State private var teamPollPermissionChannel: RealtimeChannelV2?
+    @State private var teamPollPermissionListenTask: Task<Void, Never>?
 
     private let service = GroupChatService()
     private let pollService = PickupGamePollService()
+    private let teamPollService = FanTeamPollService()
     private let identityService = SocialIdentityService()
     private let maxBodyLength = 1000
 
@@ -354,9 +360,25 @@ struct GroupChatView: View {
             && effectivePickupGameId != nil
     }
 
+    private var canCreateTeamPoll: Bool {
+        guard isFanTeamChat, viewerIsActiveMember, !sendingDisabled else { return false }
+        if let access = teamPollAccess {
+            return access.viewerCanCreate
+        }
+        return false
+    }
+
+    private var canManageTeamPolls: Bool {
+        teamPollAccess?.viewerCanManage == true
+    }
+
+    private var canCreateChatPoll: Bool {
+        canCreatePickupPoll || canCreateTeamPoll
+    }
+
     /// Newest open poll message in this thread (for Group Info → scroll-to).
-    private var activePickupPollMessageId: UUID? {
-        guard isPickupGameChat else { return nil }
+    private var activeChatPollMessageId: UUID? {
+        guard isPickupGameChat || isFanTeamChat else { return nil }
         for message in messages.reversed() {
             guard let payload = PickupGamePollMessage.decode(from: message.body) else { continue }
             if PickupGamePollLocalHide.isHidden(
@@ -711,9 +733,17 @@ struct GroupChatView: View {
                 pollCreatePermission: pickupPollCreatePermission,
                 canEditPollPermission: viewerIsPickupOrganizer && viewerIsActiveMember,
                 isApprovedPickupParticipant: viewerIsActiveMember && isPickupGameChat,
-                activePollMessageId: activePickupPollMessageId,
+                isFanTeamChat: isFanTeamChat,
+                fanTeamPollCreatePermission: teamPollAccess?.permission ?? .managementOnly,
+                canEditFanTeamPollPermission: canManageTeamPolls && viewerIsActiveMember,
+                isActiveTeamChatMember: viewerIsActiveMember && isFanTeamChat,
+                activePollMessageId: activeChatPollMessageId,
                 onCreatePoll: {
                     showInfo = false
+                    TeamChatPollDebug.log(
+                        "pollCreateTapped",
+                        detail: "teamID=\(resolvedFanTeamContext?.teamId.uuidString.lowercased() ?? "nil") source=groupInfo"
+                    )
                     showPollCreateSheet = true
                 },
                 onChangePollPermission: { permission in
@@ -724,6 +754,25 @@ struct GroupChatView: View {
                         try await mapViewModel.updatePickupGamePollCreatePermission(
                             id: gameId,
                             permission: permission
+                        )
+                        return nil
+                    } catch {
+                        return error.localizedDescription
+                    }
+                },
+                onChangeFanTeamPollPermission: { permission in
+                    guard let teamId = (resolvedFanTeamContext ?? fanTeamContext)?.teamId else {
+                        return L10n.t("pickup_poll_error_create_not_allowed", languageCode: languageCode)
+                    }
+                    do {
+                        _ = try await teamPollService.setCreatePermission(
+                            teamId: teamId,
+                            permission: permission
+                        )
+                        teamPollAccess = try await teamPollService.fetchAccess(teamId: teamId)
+                        TeamChatPollDebug.log(
+                            "canCreatePoll",
+                            detail: "teamID=\(teamId.uuidString.lowercased()) canCreate=\(teamPollAccess?.viewerCanCreate == true)"
                         )
                         return nil
                     } catch {
@@ -802,10 +851,15 @@ struct GroupChatView: View {
                 chatViewModel.pendingOpenHighlightMessageId = nil
                 jumpToGroupRepliedMessage(highlightId)
             }
-            PickupGamePollStore.shared.bind(conversationId: conversationId)
+            PickupGamePollStore.shared.bind(
+                conversationId: conversationId,
+                scope: isFanTeamChat ? .fanTeam : .pickup
+            )
             groupRealtimeStopTask?.cancel()
             // Fire owned subscribe lifecycle; do not bind subscribeWithError to this SwiftUI `.task`.
             await subscribeGroupRealtime(reason: "open", beginNewLifecycle: true)
+            await refreshTeamPollAccessIfNeeded()
+            await subscribeTeamPollPermissionRealtimeIfNeeded()
             isThreadOpening = false
         }
         .onAppear {
@@ -816,7 +870,10 @@ struct GroupChatView: View {
             // Initial load + realtime owned by `.task`.
             groupRealtimeStopTask?.cancel()
             chatViewModel.setActiveVisibleGroupConversationId(conversationId, reason: "group_chat_appear")
-            PickupGamePollStore.shared.bind(conversationId: conversationId)
+            PickupGamePollStore.shared.bind(
+                conversationId: conversationId,
+                scope: isFanTeamChat ? .fanTeam : .pickup
+            )
             ChatRealtimeAudit.log(
                 conversationId: conversationId,
                 generation: chatRealtimeLifecycleGeneration,
@@ -872,6 +929,7 @@ struct GroupChatView: View {
                     statusAfter: .connecting,
                     expectedGeneration: disappearGen
                 )
+                await tearDownTeamPollPermissionRealtime()
                 await PickupGamePollStore.shared.stop()
             }
         }
@@ -955,9 +1013,18 @@ struct GroupChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            ChatRealtimeConnectionStatusView(status: realtimeConnectionStatus)
-                .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
-                .padding(.bottom, FGSpacing.xs)
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                if let chrome = ChatRealtimeConnectionPresentation.chrome(
+                    status: realtimeConnectionStatus,
+                    statusEnteredAt: realtimeStatusEnteredAt,
+                    now: context.date,
+                    threadContentReady: !isLoading
+                ) {
+                    ChatRealtimeConnectionStatusView(status: chrome)
+                        .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
+                        .padding(.bottom, FGSpacing.xs)
+                }
+            }
 
             if let reply = validatedGroupReplyDraft() {
                 ChatReplyComposerBanner(
@@ -1030,6 +1097,19 @@ struct GroupChatView: View {
             isEnabled: viewerIsActiveMember && !sendingDisabled,
             favoriteVenues: mapViewModel.followingTabSavedVenues,
             recentSharedCoordinate: recentSharedLocationInGroupThread,
+            onCreatePoll: canCreateChatPoll
+                ? {
+                    TeamChatPollDebug.log(
+                        "pollCreateTapped",
+                        detail: "teamID=\(resolvedFanTeamContext?.teamId.uuidString.lowercased() ?? "nil") source=composer"
+                    )
+                    TeamChatPollDebug.log(
+                        "pollCreateAuthorized",
+                        detail: "canCreate=\(true) isFanTeam=\(isFanTeamChat)"
+                    )
+                    showPollCreateSheet = true
+                }
+                : nil,
             sendStructuredBody: { body in
                 await sendStructuredBody(body)
             }
@@ -1037,9 +1117,18 @@ struct GroupChatView: View {
         .sheet(isPresented: $showPollCreateSheet) {
             PickupGamePollCreateSheet(
                 languageCode: languageCode,
+                showsAutoCloseAtGameStart: !isFanTeamChat,
                 onCancel: { showPollCreateSheet = false },
                 onCreate: { question, options, allowMultiple, isAnonymous, autoClose in
-                    await createPickupPoll(
+                    if isFanTeamChat {
+                        return await createTeamPoll(
+                            question: question,
+                            options: options,
+                            allowMultiple: allowMultiple,
+                            isAnonymous: isAnonymous
+                        )
+                    }
+                    return await createPickupPoll(
                         question: question,
                         options: options,
                         allowMultiple: allowMultiple,
@@ -1164,6 +1253,156 @@ struct GroupChatView: View {
         } catch {
             AgeAccessBackendDenial.handle(error, requestUserId: nil)
             return error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func createTeamPoll(
+        question: String,
+        options: [String],
+        allowMultiple: Bool,
+        isAnonymous: Bool
+    ) async -> String? {
+        let teamId = (resolvedFanTeamContext ?? fanTeamContext)?.teamId
+        TeamChatPollDebug.log(
+            "pollCreateTapped",
+            detail: "teamID=\(teamId?.uuidString.lowercased() ?? "nil") authenticatedUserID=\(chatViewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil")"
+        )
+        guard canCreateTeamPoll else {
+            TeamChatPollDebug.log(
+                "pollCreateDenied",
+                detail: "teamID=\(teamId?.uuidString.lowercased() ?? "nil") reason=clientGate"
+            )
+            return L10n.t("team_poll_create_management_only_hint", languageCode: languageCode)
+        }
+        if let issue = PickupGamePollValidation.validate(question: question, options: options) {
+            return PickupGamePollValidation.userMessage(for: issue, languageCode: languageCode)
+        }
+
+        isSending = true
+        errorText = nil
+        defer { isSending = false }
+
+        do {
+            TeamChatPollDebug.log(
+                "pollCreateAuthorized",
+                detail: "teamID=\(teamId?.uuidString.lowercased() ?? "nil") conversationID=\(conversationId.uuidString.lowercased())"
+            )
+            let pollId = try await teamPollService.createPoll(
+                conversationId: conversationId,
+                question: question,
+                options: options,
+                allowMultiple: allowMultiple,
+                isAnonymous: isAnonymous
+            )
+
+            let senderName = mapViewModel.currentUserDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let payload = PickupGamePollPayload(
+                pollId: pollId,
+                question: question,
+                allowMultiple: allowMultiple,
+                isAnonymous: isAnonymous,
+                autoCloseAtGameStart: false,
+                closesAt: nil,
+                createdByName: senderName.isEmpty ? nil : senderName
+            )
+            let body = PickupGamePollMessage.encodeBody(payload: payload)
+            let messageId = try await service.sendMessage(conversationId: conversationId, body: body)
+            try? await pollService.attachMessage(pollId: pollId, messageId: messageId)
+            await PickupGamePollStore.shared.refresh(pollId)
+            TeamChatPollDebug.log(
+                "pollCreated",
+                detail: "teamID=\(teamId?.uuidString.lowercased() ?? "nil") pollID=\(pollId.uuidString.lowercased()) messageID=\(messageId.uuidString.lowercased())"
+            )
+
+            if !seenMessageIds.contains(messageId) {
+                await refreshAfterGroupSend(body: body)
+            } else {
+                await chatViewModel.refreshInboxSummaries()
+            }
+            showPollCreateSheet = false
+            return nil
+        } catch {
+            AgeAccessBackendDenial.handle(error, requestUserId: nil)
+            TeamChatPollDebug.log(
+                "pollCreateDenied",
+                detail: "teamID=\(teamId?.uuidString.lowercased() ?? "nil") error=\(error.localizedDescription)"
+            )
+            return error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func refreshTeamPollAccessIfNeeded() async {
+        guard isFanTeamChat,
+              let teamId = (resolvedFanTeamContext ?? fanTeamContext)?.teamId else {
+            teamPollAccess = nil
+            return
+        }
+        do {
+            let access = try await teamPollService.fetchAccess(teamId: teamId)
+            teamPollAccess = access
+            TeamChatPollDebug.log(
+                "canCreatePoll",
+                detail: "teamID=\(teamId.uuidString.lowercased()) canCreate=\(access.viewerCanCreate) permission=\(access.permission.rawValue)"
+            )
+        } catch {
+            TeamChatPollDebug.log(
+                "pollPermissionLoaded",
+                detail: "teamID=\(teamId.uuidString.lowercased()) failed=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    @MainActor
+    private func subscribeTeamPollPermissionRealtimeIfNeeded() async {
+        await tearDownTeamPollPermissionRealtime()
+        guard isFanTeamChat,
+              let teamId = (resolvedFanTeamContext ?? fanTeamContext)?.teamId else { return }
+
+        let (channel, updates) = teamPollService.teamPermissionUpdatesChannel(teamId: teamId)
+        teamPollPermissionChannel = channel
+        teamPollPermissionListenTask = Task { @MainActor in
+            for await action in updates {
+                if let raw = action.record["poll_create_permission"],
+                   case .string(let token) = raw {
+                    let permission = FanTeamPollCreatePermission.resolved(token)
+                    if let existing = teamPollAccess {
+                        teamPollAccess = FanTeamPollAccessSnapshot(
+                            teamId: existing.teamId,
+                            conversationId: existing.conversationId,
+                            permission: permission,
+                            viewerCanManage: existing.viewerCanManage,
+                            viewerCanCreate: FanTeamPollAccess.canCreate(
+                                canManageTeam: existing.viewerCanManage,
+                                permission: permission,
+                                isActiveTeamChatMember: true
+                            )
+                        )
+                    }
+                    TeamChatPollDebug.log(
+                        "pollPermissionChanged",
+                        detail: "teamID=\(teamId.uuidString.lowercased()) permission=\(permission.rawValue)"
+                    )
+                }
+                await refreshTeamPollAccessIfNeeded()
+            }
+        }
+        do {
+            try await channel.subscribeWithError()
+        } catch {
+            teamPollPermissionChannel = nil
+        }
+    }
+
+    @MainActor
+    private func tearDownTeamPollPermissionRealtime() async {
+        teamPollPermissionListenTask?.cancel()
+        teamPollPermissionListenTask = nil
+        let channel = teamPollPermissionChannel
+        teamPollPermissionChannel = nil
+        if let channel {
+            await teamPollService.removeRealtimeChannel(channel)
         }
     }
 
@@ -1560,7 +1799,7 @@ struct GroupChatView: View {
                             languageCode: languageCode,
                             memberPreviews: memberPreviews,
                             currentUserId: chatViewModel.currentUserAuthId,
-                            isOrganizer: viewerIsPickupOrganizer,
+                            isOrganizer: viewerIsPickupOrganizer || canManageTeamPolls,
                             onReport: {
                                 if reportedMessageIds.contains(message.id) {
                                     reportBanner = L10n.t(
@@ -1878,6 +2117,7 @@ struct GroupChatView: View {
         let old = realtimeConnectionStatus
         guard old != next else { return }
         realtimeConnectionStatus = next
+        realtimeStatusEnteredAt = Date()
         ChatRealtimeAudit.statusTransition(
             conversationId: conversationId,
             generation: gen,
@@ -2763,9 +3003,14 @@ struct GroupChatInfoView: View {
     var pollCreatePermission: PickupPollCreatePermission = .organizerOnly
     var canEditPollPermission: Bool = false
     var isApprovedPickupParticipant: Bool = false
+    var isFanTeamChat: Bool = false
+    var fanTeamPollCreatePermission: FanTeamPollCreatePermission = .managementOnly
+    var canEditFanTeamPollPermission: Bool = false
+    var isActiveTeamChatMember: Bool = false
     var activePollMessageId: UUID? = nil
     var onCreatePoll: (() -> Void)? = nil
     var onChangePollPermission: ((PickupPollCreatePermission) async -> String?)? = nil
+    var onChangeFanTeamPollPermission: ((FanTeamPollCreatePermission) async -> String?)? = nil
     var onViewActivePoll: ((UUID) -> Void)? = nil
     /// Dismiss Group Info first, then open Discover + existing pickup detail (owned by caller).
     var onViewPickupGame: ((UUID) -> Void)? = nil
@@ -2796,8 +3041,10 @@ struct GroupChatInfoView: View {
     @State private var memberReportTarget: GroupMemberReportTarget?
     @State private var reportedMemberIdsThisSession: Set<UUID> = []
     @State private var localPollCreatePermission: PickupPollCreatePermission = .organizerOnly
+    @State private var localFanTeamPollCreatePermission: FanTeamPollCreatePermission = .managementOnly
     @State private var isUpdatingPollPermission = false
     @State private var showPollPermissionPicker = false
+    @State private var showFanTeamPollPermissionPicker = false
     @State private var pickupSummaryRow: PickupGameRow?
     @State private var pickupSummaryLoadCompleted = false
     @State private var pickupSummaryUnavailable = false
@@ -2841,12 +3088,27 @@ struct GroupChatInfoView: View {
         effectiveIsPickupGameChat && pickupGameId != nil && viewerIsActiveMember
     }
 
+    private var showsFanTeamPollsSection: Bool {
+        isFanTeamChat && isActiveTeamChatMember && viewerIsActiveMember
+    }
+
+    private var showsChatPollsSection: Bool {
+        showsPickupPollsSection || showsFanTeamPollsSection
+    }
+
     private var showsPickupGameSummarySection: Bool {
         effectiveIsPickupGameChat && pickupGameId != nil
     }
 
     private var effectiveCanCreatePoll: Bool {
-        PickupGamePollAccess.canCreate(
+        if showsFanTeamPollsSection {
+            return FanTeamPollAccess.canCreate(
+                canManageTeam: canEditFanTeamPollPermission,
+                permission: localFanTeamPollCreatePermission,
+                isActiveTeamChatMember: isActiveTeamChatMember
+            )
+        }
+        return PickupGamePollAccess.canCreate(
             isOrganizer: canEditPollPermission,
             permission: localPollCreatePermission,
             isApprovedParticipant: isApprovedPickupParticipant
@@ -2854,7 +3116,14 @@ struct GroupChatInfoView: View {
     }
 
     private var createPollDisabledReason: String? {
-        guard showsPickupPollsSection, !effectiveCanCreatePoll else { return nil }
+        guard showsChatPollsSection, !effectiveCanCreatePoll else { return nil }
+        if showsFanTeamPollsSection {
+            guard isActiveTeamChatMember, !canEditFanTeamPollPermission else { return nil }
+            if localFanTeamPollCreatePermission == .managementOnly {
+                return L10n.t("team_poll_create_management_only_hint", languageCode: languageCode)
+            }
+            return nil
+        }
         guard isApprovedPickupParticipant, !canEditPollPermission else { return nil }
         if localPollCreatePermission == .organizerOnly {
             return L10n.t("pickup_poll_create_organizer_only_hint", languageCode: languageCode)
@@ -2864,6 +3133,18 @@ struct GroupChatInfoView: View {
 
     private var showsDisabledCreatePollRow: Bool {
         createPollDisabledReason != nil
+    }
+
+    private var canEditChatPollPermission: Bool {
+        if showsFanTeamPollsSection { return canEditFanTeamPollPermission }
+        return canEditPollPermission
+    }
+
+    private var chatPollPermissionSubtitle: String {
+        if showsFanTeamPollsSection {
+            return localFanTeamPollCreatePermission.title(languageCode: languageCode)
+        }
+        return localPollCreatePermission.title(languageCode: languageCode)
     }
 
     var body: some View {
@@ -2918,7 +3199,7 @@ struct GroupChatInfoView: View {
                     }
                 }
 
-                if showsPickupPollsSection {
+                if showsChatPollsSection {
                     Section {
                         if effectiveCanCreatePoll {
                             Button {
@@ -2962,9 +3243,13 @@ struct GroupChatInfoView: View {
                             .accessibilityHint(reason)
                         }
 
-                        if canEditPollPermission {
+                        if canEditChatPollPermission {
                             Button {
-                                showPollPermissionPicker = true
+                                if showsFanTeamPollsSection {
+                                    showFanTeamPollPermissionPicker = true
+                                } else {
+                                    showPollPermissionPicker = true
+                                }
                             } label: {
                                 HStack(spacing: 12) {
                                     Image(systemName: "person.badge.shield.checkmark")
@@ -2974,7 +3259,7 @@ struct GroupChatInfoView: View {
                                         Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
                                             .font(.body)
                                             .foregroundStyle(FGColor.primaryText(colorScheme))
-                                        Text(localPollCreatePermission.title(languageCode: languageCode))
+                                        Text(chatPollPermissionSubtitle)
                                             .font(.caption)
                                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                                     }
@@ -2995,7 +3280,7 @@ struct GroupChatInfoView: View {
                             .buttonStyle(.plain)
                             .disabled(isUpdatingPollPermission)
                             .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
-                            .accessibilityValue(localPollCreatePermission.title(languageCode: languageCode))
+                            .accessibilityValue(chatPollPermissionSubtitle)
                             .accessibilityHint(L10n.t("pickup_poll_permission_edit_a11y_hint", languageCode: languageCode))
                         } else {
                             HStack(spacing: 12) {
@@ -3006,7 +3291,7 @@ struct GroupChatInfoView: View {
                                     Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
                                         .font(.body)
                                         .foregroundStyle(FGColor.primaryText(colorScheme))
-                                    Text(localPollCreatePermission.title(languageCode: languageCode))
+                                    Text(chatPollPermissionSubtitle)
                                         .font(.caption)
                                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                                 }
@@ -3016,7 +3301,7 @@ struct GroupChatInfoView: View {
                             .frame(minHeight: 44)
                             .accessibilityElement(children: .combine)
                             .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
-                            .accessibilityValue(localPollCreatePermission.title(languageCode: languageCode))
+                            .accessibilityValue(chatPollPermissionSubtitle)
                         }
 
                         if let activePollMessageId {
@@ -3194,9 +3479,13 @@ struct GroupChatInfoView: View {
                 localPreviews = memberPreviews
                 isMuted = details.first?.viewer_is_muted == true
                 localPollCreatePermission = pollCreatePermission
+                localFanTeamPollCreatePermission = fanTeamPollCreatePermission
             }
             .onChange(of: pollCreatePermission) { _, newValue in
                 localPollCreatePermission = newValue
+            }
+            .onChange(of: fanTeamPollCreatePermission) { _, newValue in
+                localFanTeamPollCreatePermission = newValue
             }
             .confirmationDialog(
                 L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode),
@@ -3206,6 +3495,18 @@ struct GroupChatInfoView: View {
                 ForEach(PickupPollCreatePermission.allCases) { option in
                     Button(option.title(languageCode: languageCode)) {
                         Task { await commitPollCreatePermission(option) }
+                    }
+                }
+                Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
+            }
+            .confirmationDialog(
+                L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode),
+                isPresented: $showFanTeamPollPermissionPicker,
+                titleVisibility: .visible
+            ) {
+                ForEach(FanTeamPollCreatePermission.allCases) { option in
+                    Button(option.title(languageCode: languageCode)) {
+                        Task { await commitFanTeamPollCreatePermission(option) }
                     }
                 }
                 Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
@@ -3261,6 +3562,21 @@ struct GroupChatInfoView: View {
         localPollCreatePermission = permission
         if let err = await onChangePollPermission(permission) {
             localPollCreatePermission = previous
+            errorText = err
+        }
+    }
+
+    @MainActor
+    private func commitFanTeamPollCreatePermission(_ permission: FanTeamPollCreatePermission) async {
+        guard canEditFanTeamPollPermission, permission != localFanTeamPollCreatePermission else { return }
+        guard let onChangeFanTeamPollPermission else { return }
+        isUpdatingPollPermission = true
+        errorText = nil
+        defer { isUpdatingPollPermission = false }
+        let previous = localFanTeamPollCreatePermission
+        localFanTeamPollCreatePermission = permission
+        if let err = await onChangeFanTeamPollPermission(permission) {
+            localFanTeamPollCreatePermission = previous
             errorText = err
         }
     }
@@ -3825,7 +4141,7 @@ private struct GroupInfoPickupGameSummaryCard: View {
 
     private var sportLabel: String {
         if let row {
-            return AppSportCatalog.displayLabel(forSportToken: row.sport)
+            return row.sportIdentityLabel()
         }
         return fallbackContext?.sportLabel.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }

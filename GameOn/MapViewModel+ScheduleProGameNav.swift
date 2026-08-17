@@ -55,7 +55,7 @@ extension MapViewModel {
         pendingScheduleProGameNav = intent
         scheduleProGameHighlightStableKey = nil
         calendarTabSelectedDate = Calendar.current.startOfDay(for: match.startTime)
-        calendarTabGameFilter = .proGames
+        requestScheduleHubSurface(.pro)
         requestedMainTabRaw = MainTabView.AppTab.calendar.rawValue
 #if DEBUG
         print(

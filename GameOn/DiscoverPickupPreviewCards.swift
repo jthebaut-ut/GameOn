@@ -341,7 +341,7 @@ struct DiscoverTeamLinkedPickupPreviewCard: View {
             .filter { !$0.isEmpty }
             .joined(separator: ", ")
         let metadataLine =
-            "\(AppSportCatalog.displayLabel(forSportToken: row.sport)) • \(row.skillLevelEnum.displayTitle) • \(row.playEnvironmentEnum.shortLabel)"
+            "\(row.sportIdentityLabel()) • \(row.skillLevelEnum.displayTitle) • \(row.playEnvironmentEnum.shortLabel)"
         let mainInk = colorScheme == .dark ? Color.white.opacity(0.92) : FGColor.primaryText(colorScheme)
         let subInk = colorScheme == .dark ? Color.white.opacity(0.72) : FGColor.secondaryText(colorScheme)
         let dismissIcon = colorScheme == .dark ? Color.white.opacity(0.72) : Color.secondary
@@ -804,6 +804,7 @@ struct DiscoverStandalonePickupPreviewCard: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @EnvironmentObject private var chatViewModel: ChatViewModel
+    @ScaledMetric(relativeTo: .title2) private var emblemSize: CGFloat = 76
 
     private let previewCorner: CGFloat = 30
 
@@ -813,6 +814,7 @@ struct DiscoverStandalonePickupPreviewCard: View {
             gameId: row.id,
             extra: "variant=standalone guest=\(guestMapsActionsToLogin)"
         )
+        let _ = cardBorder
         let locationLine: String = {
             guard !guestMapsActionsToLogin else { return "" }
             return [row.address, row.city, row.state]
@@ -824,14 +826,12 @@ struct DiscoverStandalonePickupPreviewCard: View {
             if guestMapsActionsToLogin {
                 return "Sign in to see schedule, location, and roster details"
             }
-            return "\(AppSportCatalog.displayLabel(forSportToken: row.sport)) • \(row.skillLevelEnum.displayTitle) • \(row.playEnvironmentEnum.shortLabel)"
+            return "\(row.sportIdentityLabel()) • \(row.gameFormat.displayTitle(languageCode: languageCode)) • \(row.playEnvironmentEnum.shortLabel)"
         }()
-        let sportTint = viewModel.colorForSport(row.sport)
-        let sportEmoji = viewModel.emojiForSport(row.sport)
-        let sportIconName = viewModel.iconForSport(row.sport)
         let mainInk = colorScheme == .dark ? Color.white.opacity(0.92) : FGColor.primaryText(colorScheme)
         let subInk = colorScheme == .dark ? Color.white.opacity(0.72) : FGColor.secondaryText(colorScheme)
         let dismissIcon = colorScheme == .dark ? Color.white.opacity(0.72) : Color.secondary
+        let pickupOrange = FGColor.intentPlay
         let detailTitle: String = {
             if guestMapsActionsToLogin {
                 return L10n.t("pickup_preview_login_signup", languageCode: languageCode)
@@ -845,199 +845,185 @@ struct DiscoverStandalonePickupPreviewCard: View {
                 onOpenDetails()
             }
         }
-        let showStarted = !guestMapsActionsToLogin && row.hasPickupGameStarted()
+        let emblemStatus = guestMapsActionsToLogin ? nil : FanGeoPickupEmblemStatus.resolve(row: row)
 
-        return VStack(alignment: .leading, spacing: FGSpacing.md) {
-            HStack(alignment: .top, spacing: FGSpacing.md) {
-                PickupGameStartedSportGlyphFrame(showStarted: showStarted) {
-                    ZStack {
-                        Circle()
-                            .fill(.ultraThinMaterial)
-                            .frame(width: 58, height: 58)
-                            .overlay {
-                                Circle()
-                                    .strokeBorder(
-                                        LinearGradient(
-                                            colors: [
-                                                Color.white.opacity(colorScheme == .dark ? 0.35 : 0.65),
-                                                sportTint.opacity(0.55)
-                                            ],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        ),
-                                        lineWidth: 1.25
-                                    )
-                            }
-                            .shadow(color: sportTint.opacity(0.35), radius: 10, y: 4)
+        return ZStack(alignment: .bottomTrailing) {
+            FanGeoPickupEmblemWatermark(
+                sport: row.sport,
+                subtype: row.sport_subtype,
+                size: 156
+            )
+            .offset(x: 28, y: 18)
 
-                        if !sportEmoji.isEmpty {
-                            Text(sportEmoji)
-                                .font(.system(size: 30))
-                                .accessibilityHidden(true)
-                        } else {
-                            Image(systemName: sportIconName)
-                                .font(.system(size: 26, weight: .semibold))
-                                .foregroundStyle(sportTint)
-                                .accessibilityHidden(true)
-                        }
-                    }
-                }
+            VStack(alignment: .leading, spacing: FGSpacing.md) {
+                HStack(alignment: .top, spacing: FGSpacing.md) {
+                    FanGeoPickupEmblem(
+                        sport: row.sport,
+                        subtype: row.sport_subtype,
+                        size: emblemSize,
+                        status: emblemStatus,
+                        languageCode: languageCode
+                    )
 
-                VStack(alignment: .leading, spacing: 7) {
-                    GameFormatBadgeView(format: row.gameFormat, colorScheme: colorScheme)
-                    Text(guestMapsActionsToLogin ? AppSportCatalog.displayLabel(forSportToken: row.sport) : row.title)
-                        .font(FGTypography.sectionTitle)
-                        .foregroundStyle(mainInk)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(detailSubtitle)
-                        .font(FGTypography.metadata.weight(.medium))
-                        .foregroundStyle(subInk)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.88)
+                    VStack(alignment: .leading, spacing: 7) {
+                        FanGeoPickupGameFormatPill(languageCode: languageCode)
+                        Text(guestMapsActionsToLogin ? row.sportIdentityLabel() : row.title)
+                            .font(FGTypography.sectionTitle)
+                            .foregroundStyle(mainInk)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(detailSubtitle)
+                            .font(FGTypography.metadata.weight(.medium))
+                            .foregroundStyle(subInk)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.88)
 
-                    if !guestMapsActionsToLogin, let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) {
-                        let visible = row.pickupDateWithCompactTimeRangeAndDuration(languageCode: languageCode)
-                            ?? start.formatted(
-                                Date.FormatStyle.dateTime
-                                    .month(.abbreviated)
-                                    .day()
-                                    .year()
-                                    .hour()
-                                    .minute()
-                                    .locale(
-                                        Locale(
-                                            identifier: L10n.normalizedLanguageCode(languageCode)
-                                                .replacingOccurrences(of: "-", with: "_")
+                        if !guestMapsActionsToLogin, let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) {
+                            let visible = row.pickupDateWithCompactTimeRangeAndDuration(languageCode: languageCode)
+                                ?? start.formatted(
+                                    Date.FormatStyle.dateTime
+                                        .month(.abbreviated)
+                                        .day()
+                                        .year()
+                                        .hour()
+                                        .minute()
+                                        .locale(
+                                            Locale(
+                                                identifier: L10n.normalizedLanguageCode(languageCode)
+                                                    .replacingOccurrences(of: "-", with: "_")
+                                            )
                                         )
-                                    )
-                            )
-                        let a11y = row.pickupDateTimeDurationAccessibilityLabel(languageCode: languageCode) ?? visible
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "clock.fill")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(subInk)
-                            Text(visible)
-                                .font(FGTypography.metadata.weight(.semibold))
-                                .foregroundStyle(mainInk)
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.82)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .accessibilityLabel(a11y)
+                                )
+                            let a11y = row.pickupDateTimeDurationAccessibilityLabel(languageCode: languageCode) ?? visible
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Image(systemName: "clock.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(pickupOrange)
+                                Text(visible)
+                                    .font(FGTypography.metadata.weight(.semibold))
+                                    .foregroundStyle(mainInk)
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.82)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityLabel(a11y)
+                            }
                         }
-                        if showStarted {
-                            PickupGameStartedLineCaption()
-                                .padding(.top, 2)
-                        }
-                    }
 
-                    if !guestMapsActionsToLogin {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "person.2.fill")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(FGColor.accentGreen)
-                            Text(row.participantAudienceDisplayTitle)
-                                .font(FGTypography.caption.weight(.medium))
-                                .foregroundStyle(subInk)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
+                        if !guestMapsActionsToLogin {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: "person.2.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(pickupOrange)
+                                Text(row.participantAudienceDisplayTitle)
+                                    .font(FGTypography.caption.weight(.medium))
+                                    .foregroundStyle(subInk)
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
-                    }
 
-                    if !locationLine.isEmpty {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "mappin.circle.fill")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(FGColor.accentBlue)
-                            Text(locationLine)
-                                .font(FGTypography.caption)
-                                .foregroundStyle(subInk)
-                                .lineLimit(2)
-                                .fixedSize(horizontal: false, vertical: true)
+                        if !locationLine.isEmpty {
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: "mappin.circle.fill")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(pickupOrange)
+                                Text(locationLine)
+                                    .font(FGTypography.caption)
+                                    .foregroundStyle(subInk)
+                                    .lineLimit(2)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
-                    }
 
-                    if !guestMapsActionsToLogin {
-                        // Duration is on the date/time line — spots chip only.
-                        HStack(spacing: FGSpacing.sm) {
+                        if !guestMapsActionsToLogin {
                             let playersNeeded = max(0, row.playersNeededClamped - row.approvedJoinCount)
-                            DiscoverPickupPreviewMetricCapsule(
-                                text: pickupLocalizedSpotsLeft(playersNeeded, languageCode: languageCode),
-                                mainInk: mainInk,
-                                colorScheme: colorScheme
+                            FanGeoPickupSpotsPill(
+                                text: pickupLocalizedSpotsLeft(playersNeeded, languageCode: languageCode)
                             )
+                            .padding(.top, 2)
                         }
-                        .padding(.top, 2)
                     }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.trailing, 4)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
-                        openDetailAction()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.trailing, 4)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
+                            openDetailAction()
+                        }
                     }
-                }
-                .accessibilityAddTraits(.isButton)
+                    .accessibilityAddTraits(.isButton)
 
-                HStack(spacing: 6) {
-                    if !guestMapsActionsToLogin, row.isEligibleForInAppShare() {
-                        PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
+                    HStack(spacing: 6) {
+                        if !guestMapsActionsToLogin, row.isEligibleForInAppShare() {
+                            PickupGameShareActionButton(game: row, mapViewModel: viewModel) {
+                                DiscoverPickupPreviewTrailingControl(
+                                    systemImage: "square.and.arrow.up",
+                                    icon: dismissIcon,
+                                    colorScheme: colorScheme
+                                )
+                            }
+                            .environmentObject(chatViewModel)
+                            .fixedSize()
+                        }
+
+                        Button {
+                            withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                                onDismiss()
+                            }
+                        } label: {
                             DiscoverPickupPreviewTrailingControl(
-                                systemImage: "square.and.arrow.up",
+                                systemImage: "xmark",
                                 icon: dismissIcon,
                                 colorScheme: colorScheme
                             )
                         }
-                        .environmentObject(chatViewModel)
-                        .fixedSize()
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss pickup preview")
                     }
-
-                    Button {
-                        withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
-                            onDismiss()
-                        }
-                    } label: {
-                        DiscoverPickupPreviewTrailingControl(
-                            systemImage: "xmark",
-                            icon: dismissIcon,
-                            colorScheme: colorScheme
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Dismiss pickup preview")
                 }
-            }
 
-            if !guestMapsActionsToLogin {
-                PickupOrganizerPreviewIdentityRow(
-                    viewModel: viewModel,
-                    organizerUserId: row.creator_user_id,
-                    colorScheme: colorScheme
+                if !guestMapsActionsToLogin {
+                    PickupOrganizerPreviewIdentityRow(
+                        viewModel: viewModel,
+                        organizerUserId: row.creator_user_id,
+                        colorScheme: colorScheme
+                    )
+                }
+
+                FanGeoPickupPreviewActionRow(
+                    row: row,
+                    guestMapsActionsToLogin: guestMapsActionsToLogin,
+                    detailTitle: detailTitle,
+                    showsDetailsButton: viewModel.discoverMapContentMode == .pickupGames,
+                    colorScheme: colorScheme,
+                    openDetailAction: openDetailAction,
+                    openDirections: openDirections
                 )
             }
-
-            DiscoverPickupPreviewActionRow(
-                row: row,
-                guestMapsActionsToLogin: guestMapsActionsToLogin,
-                detailTitle: detailTitle,
-                showsDetailsButton: viewModel.discoverMapContentMode == .pickupGames,
-                colorScheme: colorScheme,
-                openDetailAction: openDetailAction,
-                openDirections: openDirections
-            )
         }
         .padding(FGSpacing.lg)
         .background {
-            DiscoverPickupPreviewCardBackground(cornerRadius: previewCorner, colorScheme: colorScheme)
+            ZStack {
+                RoundedRectangle(cornerRadius: previewCorner, style: .continuous)
+                    .fill(colorScheme == .dark ? Color(red: 0.12, green: 0.10, blue: 0.08) : Color.white)
+                LinearGradient(
+                    colors: [
+                        FGColor.intentPlay.opacity(colorScheme == .dark ? 0.18 : 0.10),
+                        Color.clear
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .clipShape(RoundedRectangle(cornerRadius: previewCorner, style: .continuous))
+            }
         }
         .clipShape(RoundedRectangle(cornerRadius: previewCorner, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: previewCorner, style: .continuous)
-                .strokeBorder(cardBorder, lineWidth: 1)
+                .strokeBorder(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.32 : 0.18), lineWidth: 1)
         }
-        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.42 : 0.16), radius: colorScheme == .dark ? 28 : 18, x: 0, y: colorScheme == .dark ? 16 : 10)
-        .shadow(color: FGColor.accentBlue.opacity(colorScheme == .dark ? 0.1 : 0.05), radius: 14, x: 0, y: 3)
+        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.42 : 0.14), radius: colorScheme == .dark ? 28 : 18, x: 0, y: colorScheme == .dark ? 16 : 10)
+        .shadow(color: FGColor.intentPlay.opacity(colorScheme == .dark ? 0.16 : 0.10), radius: 14, x: 0, y: 4)
         .task(id: row.id) {
             guard !guestMapsActionsToLogin else { return }
             PickupOrganizerTrustDebug.lifecycle("selected pickup card opened")

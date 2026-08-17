@@ -84,10 +84,11 @@ struct ProfileHeroIdentityCardItem: Identifiable {
         case homeCrowd
         case location
         case fanSince
+        case gender
     }
 
     let id: Kind
-    /// Section label (e.g. "My Team", "National Team", "Member Since").
+    /// Section label (e.g. "Favorite Team", "National Team", "Member Since").
     let title: String
     /// Primary detail under the label.
     let primaryLine: String
@@ -110,6 +111,7 @@ enum ProfileHeroIdentityCardsBuilder {
         fanSinceSecondary: String?,
         nationalTeam: NationalTeamIdentity?,
         nationalTeamSport: FavoriteTeamSport? = nil,
+        gender: FanProfileGender? = nil,
         languageCode: String,
         onMyTeam: (() -> Void)? = nil,
         onHomeCrowd: (() -> Void)? = nil,
@@ -118,6 +120,7 @@ enum ProfileHeroIdentityCardsBuilder {
         _ = homeCrowdSubtitle
         _ = fanSinceSecondary
 
+        // Authoritative primary favorite club (e.g. Utah Jazz) — NOT FanGeo Team memberships.
         let myTeamItem: ProfileHeroIdentityCardItem = {
             if let myTeam {
                 return ProfileHeroIdentityCardItem(
@@ -152,6 +155,9 @@ enum ProfileHeroIdentityCardsBuilder {
                         languageCode: languageCode
                     ),
                     nationalTeamFlag: nationalTeam.flag,
+                    favoriteTeam: FavoriteTeamCatalog.nationalTeam(
+                        matchingCountryName: country.isEmpty ? nationalTeam.countryName : country
+                    ),
                     action: onNationalTeam
                 )
             }
@@ -197,7 +203,18 @@ enum ProfileHeroIdentityCardsBuilder {
         )
 
         // Order matches approved two-row layout lookups (not a single carousel order).
-        return [myTeamItem, nationalItem, homeCrowdItem, locationItem, fanSinceItem]
+        var items = [myTeamItem, nationalItem, homeCrowdItem, locationItem, fanSinceItem]
+        if let gender, gender.isDisplayableOnRoster {
+            items.append(
+                ProfileHeroIdentityCardItem(
+                    id: .gender,
+                    title: L10n.t("profile_gender", languageCode: languageCode),
+                    primaryLine: L10n.t(gender.localizedKey, languageCode: languageCode),
+                    secondaryLine: nil
+                )
+            )
+        }
+        return items
     }
 
     static func cards(from data: PublicUserProfileData, languageCode: String) -> [ProfileHeroIdentityCardItem] {
@@ -212,6 +229,7 @@ enum ProfileHeroIdentityCardsBuilder {
             fanSincePrimary: FanGeoHandleRules.fanSinceMonthYear(from: data.profileCreatedAt),
             fanSinceSecondary: nil,
             nationalTeam: data.nationalTeam,
+            gender: FanProfileGender.rosterDisplayValue(from: data.genderRaw),
             languageCode: languageCode
         )
     }
@@ -225,54 +243,57 @@ enum ProfileHeroIdentityCardsBuilder {
     }
 }
 
-/// Approved two-row identity container — shared by own + public profile heroes.
+enum ProfileHeroIdentityCardsLayout {
+    static func rows(from cards: [ProfileHeroIdentityCardItem]) -> [[ProfileHeroIdentityCardItem]] {
+        func item(_ kind: ProfileHeroIdentityCardItem.Kind) -> ProfileHeroIdentityCardItem? {
+            cards.first { $0.id == kind }
+        }
+        if item(.gender) != nil {
+            return [
+                [item(.myTeam), item(.nationalTeam)].compactMap { $0 },
+                [item(.homeCrowd), item(.location)].compactMap { $0 },
+                [item(.fanSince), item(.gender)].compactMap { $0 }
+            ].filter { !$0.isEmpty }
+        }
+        return [
+            [item(.myTeam), item(.nationalTeam)].compactMap { $0 },
+            [item(.homeCrowd), item(.location), item(.fanSince)].compactMap { $0 }
+        ].filter { !$0.isEmpty }
+    }
+}
+
+/// Identity information container — shared by own + public profile heroes.
 ///
-/// Top: My Team | National Team
-/// Bottom: Home Crowd | Location | Member Since
+/// With Gender: My Team | National Team / Home Crowd | Location / Member Since | Gender
+/// Without Gender: My Team | National Team / Home Crowd | Location | Member Since
 struct ProfileHeroIdentityCardsRow: View {
     let cards: [ProfileHeroIdentityCardItem]
     @Environment(\.colorScheme) private var colorScheme
 
-    private var myTeam: ProfileHeroIdentityCardItem? { cards.first(where: { $0.id == .myTeam }) }
-    private var nationalTeam: ProfileHeroIdentityCardItem? { cards.first(where: { $0.id == .nationalTeam }) }
-    private var homeCrowd: ProfileHeroIdentityCardItem? { cards.first(where: { $0.id == .homeCrowd }) }
-    private var location: ProfileHeroIdentityCardItem? { cards.first(where: { $0.id == .location }) }
-    private var memberSince: ProfileHeroIdentityCardItem? { cards.first(where: { $0.id == .fanSince }) }
+    private var rows: [[ProfileHeroIdentityCardItem]] {
+        ProfileHeroIdentityCardsLayout.rows(from: cards)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .top, spacing: 0) {
-                if let myTeam {
-                    ProfileHeroIdentityCellView(card: myTeam, prominence: .top)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                if index > 0 {
+                    horizontalDivider
                 }
-                verticalDivider
-                if let nationalTeam {
-                    ProfileHeroIdentityCellView(card: nationalTeam, prominence: .top)
+                HStack(alignment: .top, spacing: 0) {
+                    ForEach(Array(row.enumerated()), id: \.element.id) { cellIndex, card in
+                        if cellIndex > 0 {
+                            verticalDivider
+                        }
+                        ProfileHeroIdentityCellView(
+                            card: card,
+                            prominence: index == 0 ? .top : .bottom
+                        )
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
+                .padding(.vertical, 12)
             }
-            .padding(.vertical, 12)
-
-            horizontalDivider
-
-            HStack(alignment: .top, spacing: 0) {
-                if let homeCrowd {
-                    ProfileHeroIdentityCellView(card: homeCrowd, prominence: .bottom)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                verticalDivider
-                if let location {
-                    ProfileHeroIdentityCellView(card: location, prominence: .bottom)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                verticalDivider
-                if let memberSince {
-                    ProfileHeroIdentityCellView(card: memberSince, prominence: .bottom)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .padding(.vertical, 12)
         }
         .padding(.horizontal, 10)
         .background {
@@ -283,7 +304,6 @@ struct ProfileHeroIdentityCardsRow: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(containerBorder, lineWidth: 1)
         }
-        // Size to both rows — never clip or scroll the five identity items.
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
     }
@@ -376,22 +396,28 @@ private struct ProfileHeroIdentityCellView: View {
         switch card.id {
         case .myTeam:
             if let team = card.favoriteTeam {
-                SportsIdentityArtworkView(favoriteTeam: team, diameter: prominence == .top ? 34 : 28)
+                SportsIdentityArtworkView(
+                    favoriteTeam: team,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
                 symbolBadge("trophy.fill", tint: FGColor.accentYellow)
             }
         case .nationalTeam:
-            if let flag = card.nationalTeamFlag?.trimmingCharacters(in: .whitespacesAndNewlines), !flag.isEmpty {
-                Text(flag)
-                    .font(.system(size: prominence == .top ? 18 : 15))
-                    .frame(width: prominence == .top ? 34 : 28, height: prominence == .top ? 34 : 28)
-                    .background {
-                        Circle()
-                            .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.18 : 0.12))
-                    }
-                    .accessibilityHidden(true)
+            if let team = card.favoriteTeam {
+                SportsIdentityArtworkView(
+                    favoriteTeam: team,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             } else {
-                symbolBadge("flag.fill", tint: FGColor.accentGreen)
+                SportsIdentityArtworkView(
+                    countryName: card.primaryLine,
+                    flag: card.nationalTeamFlag,
+                    diameter: SportsIdentityArtworkMetrics.profileHeroIdentitySlot,
+                    opticalInset: .profileHero
+                )
             }
         case .homeCrowd:
             symbolBadge("sportscourt.fill", tint: Color(red: 0.58, green: 0.42, blue: 0.92))
@@ -399,17 +425,21 @@ private struct ProfileHeroIdentityCellView: View {
             symbolBadge("mappin.and.ellipse", tint: Color(red: 0.22, green: 0.48, blue: 0.96))
         case .fanSince:
             symbolBadge("calendar", tint: Color(red: 0.22, green: 0.48, blue: 0.96))
+        case .gender:
+            symbolBadge("person.fill", tint: Color(red: 0.42, green: 0.45, blue: 0.52))
         }
     }
 
     private func symbolBadge(_ name: String, tint: Color) -> some View {
-        let side: CGFloat = prominence == .top ? 34 : 28
+        let side: CGFloat = prominence == .top
+            ? SportsIdentityArtworkMetrics.profileHeroIdentitySlot
+            : 28
         return Image(systemName: name)
-            .font(.system(size: prominence == .top ? 14 : 12, weight: .semibold))
+            .font(.system(size: prominence == .top ? 22 : 12, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: side, height: side)
             .background {
-                RoundedRectangle(cornerRadius: prominence == .top ? 10 : 8, style: .continuous)
+                RoundedRectangle(cornerRadius: prominence == .top ? 16 : 8, style: .continuous)
                     .fill(tint.opacity(colorScheme == .dark ? 0.20 : 0.12))
             }
             .accessibilityHidden(true)
@@ -425,8 +455,196 @@ private struct ProfileHeroIdentityCellView: View {
             return "\(L10n.t("my_team", languageCode: appLanguageRaw)), " + parts.dropFirst().joined(separator: ", ")
         case .nationalTeam:
             return "\(L10n.t("national_team", languageCode: appLanguageRaw)), " + parts.dropFirst().joined(separator: ", ")
+        case .gender:
+            return "\(L10n.t("profile_gender", languageCode: appLanguageRaw)), \(card.primaryLine)"
         default:
             return parts.joined(separator: ", ")
         }
     }
 }
+
+#if DEBUG
+enum ProfileHeroIdentityCardsSelfTests {
+    static func runAll() {
+        testGenderTileRequiresDisplayableValue()
+        testGenderHiddenRemovesTile()
+        testPreferredThreeByTwoLayoutWhenGenderVisible()
+        testExistingLayoutWhenGenderHidden()
+        testGenderCopyResolves()
+        testGenderAccessibilityCopy()
+        testProfileHeroIdentityMarkSize()
+        testNationalTeamPrefersCatalogCrestIdentity()
+        testLongPrimaryLineRemainsTwoLineSafe()
+        testSurroundingInfoCellsUnchanged()
+        print("[ProfileHeroIdentityCardsSelfTests] all passed")
+    }
+
+    private static func sampleCards(gender: FanProfileGender?) -> [ProfileHeroIdentityCardItem] {
+        ProfileHeroIdentityCardsBuilder.cards(
+            myTeam: nil,
+            homeCrowdName: "Delta Center",
+            homeCrowdSubtitle: nil,
+            locationPrimary: "Lehi",
+            locationSecondary: "UT",
+            fanSincePrimary: "Jan 2024",
+            fanSinceSecondary: nil,
+            nationalTeam: nil,
+            gender: gender,
+            languageCode: "en"
+        )
+    }
+
+    private static func testGenderTileRequiresDisplayableValue() {
+        let shown = sampleCards(gender: .male)
+        precondition(shown.contains(where: { $0.id == .gender }))
+        precondition(shown.first(where: { $0.id == .gender })?.primaryLine == "Male")
+        precondition(shown.first(where: { $0.id == .gender })?.title == "Gender")
+    }
+
+    private static func testGenderHiddenRemovesTile() {
+        precondition(!sampleCards(gender: nil).contains(where: { $0.id == .gender }))
+        precondition(!sampleCards(gender: .preferNotToSay).contains(where: { $0.id == .gender }))
+        precondition(FanProfileGender.rosterDisplayValue(from: nil) == nil)
+        precondition(FanProfileGender.rosterDisplayValue(from: "prefer_not_to_say") == nil)
+        precondition(FanProfileGender.rosterDisplayValue(from: "female") == .female)
+    }
+
+    private static func testPreferredThreeByTwoLayoutWhenGenderVisible() {
+        let rows = ProfileHeroIdentityCardsLayout.rows(from: sampleCards(gender: .nonBinary))
+        precondition(rows.count == 3)
+        precondition(rows[0].map(\.id) == [.myTeam, .nationalTeam])
+        precondition(rows[1].map(\.id) == [.homeCrowd, .location])
+        precondition(rows[2].map(\.id) == [.fanSince, .gender])
+        precondition(rows.allSatisfy { !$0.isEmpty })
+    }
+
+    private static func testExistingLayoutWhenGenderHidden() {
+        let rows = ProfileHeroIdentityCardsLayout.rows(from: sampleCards(gender: nil))
+        precondition(rows.count == 2)
+        precondition(rows[0].map(\.id) == [.myTeam, .nationalTeam])
+        precondition(rows[1].map(\.id) == [.homeCrowd, .location, .fanSince])
+        precondition(!rows.flatMap { $0 }.contains(where: { $0.id == .gender }))
+    }
+
+    private static func testGenderCopyResolves() {
+        for key in [
+            "profile_gender",
+            "profile_gender_male",
+            "profile_gender_female",
+            "profile_gender_non_binary",
+            "profile_gender_prefer_not_to_say"
+        ] {
+            let value = L10n.t(key, languageCode: "en")
+            precondition(value != key)
+            precondition(!value.isEmpty)
+        }
+        precondition(L10n.t("profile_gender", languageCode: "en") == "Gender")
+        precondition(L10n.t("profile_gender_male", languageCode: "en") == "Male")
+        precondition(L10n.t("profile_gender_female", languageCode: "en") == "Female")
+        precondition(L10n.t("profile_gender_non_binary", languageCode: "en") == "Non-binary")
+        precondition(L10n.t("profile_gender_prefer_not_to_say", languageCode: "en") == "Prefer not to say")
+    }
+
+    private static func testGenderAccessibilityCopy() {
+        let card = sampleCards(gender: .male).first { $0.id == .gender }!
+        let label = "\(card.title), \(card.primaryLine)"
+        precondition(label == "Gender, Male")
+        precondition(!label.localizedCaseInsensitiveContains("person"))
+        precondition(!label.contains("♂"))
+        precondition(!label.contains("♀"))
+    }
+
+    private static func testProfileHeroIdentityMarkSize() {
+        let slot = SportsIdentityArtworkMetrics.profileHeroIdentitySlot
+        let visible = SportsIdentityArtworkMetrics.visibleArtworkSize(
+            container: slot,
+            optical: .profileHero
+        )
+        precondition(slot >= 52 && slot <= 60)
+        precondition(visible >= 44 && visible <= 52)
+        precondition(slot == 56)
+        precondition(visible == 48)
+        precondition(DiscoverMapImageCache.Bucket.forPointSize(slot) == .avatar)
+        precondition(DiscoverMapImageCache.Bucket.forPointSize(slot) != .venue)
+        let small = SportsArtworkURLStore.displayURL(
+            from: "https://www.thesportsdb.com/images/media/team/badge/inter.png",
+            diameter: slot
+        )
+        precondition(small?.absoluteString.hasSuffix("/small") == true)
+        precondition(small?.absoluteString.hasSuffix("/tiny") != true)
+    }
+
+    private static func testNationalTeamPrefersCatalogCrestIdentity() {
+        let italy = NationalTeamIdentity(
+            countryCode: "IT",
+            countryName: "Italy",
+            flag: "🇮🇹",
+            supporterLabel: "Italy Fan"
+        )
+        let cards = ProfileHeroIdentityCardsBuilder.cards(
+            myTeam: nil,
+            homeCrowdName: "Delta Center",
+            homeCrowdSubtitle: nil,
+            locationPrimary: "Lehi",
+            locationSecondary: "UT",
+            fanSincePrimary: "Jan 2024",
+            fanSinceSecondary: nil,
+            nationalTeam: italy,
+            languageCode: "en"
+        )
+        let national = cards.first { $0.id == .nationalTeam }
+        precondition(national?.favoriteTeam?.id == "soccer-italy")
+        precondition(national?.favoriteTeam?.kind == .nationalTeam)
+        precondition(national?.nationalTeamFlag == "🇮🇹")
+        precondition(national?.primaryLine == "Italy")
+
+        let flagOnly = SportsIdentityArtworkResolver.resolveNationalTeam(
+            countryName: "Unknownlandia",
+            flag: "🏳️"
+        )
+        if case .countryFlag(let flag) = flagOnly.kind {
+            precondition(flag == "🏳️")
+        } else {
+            precondition(false, "flag fallback still works when no crest is cached")
+        }
+    }
+
+    private static func testLongPrimaryLineRemainsTwoLineSafe() {
+        let longName = FavoriteTeam(
+            id: "test-long-club",
+            name: "Royal Sporting Club of the Northern United Athletic Association",
+            sport: .soccer,
+            league: "Serie A",
+            region: "Europe",
+            kind: .team,
+            shortCode: "RSC",
+            searchAliases: [],
+            fallbackSymbol: "soccerball",
+            badgeRed: 0.1,
+            badgeGreen: 0.2,
+            badgeBlue: 0.7
+        )
+        let cards = ProfileHeroIdentityCardsBuilder.cards(
+            myTeam: longName,
+            homeCrowdName: nil,
+            homeCrowdSubtitle: nil,
+            locationPrimary: nil,
+            locationSecondary: nil,
+            fanSincePrimary: nil,
+            fanSinceSecondary: nil,
+            nationalTeam: nil,
+            languageCode: "en"
+        )
+        let myTeam = cards.first { $0.id == .myTeam }
+        precondition(myTeam?.primaryLine == longName.name)
+        precondition(myTeam?.favoriteTeam?.id == longName.id)
+    }
+
+    private static func testSurroundingInfoCellsUnchanged() {
+        let rows = ProfileHeroIdentityCardsLayout.rows(from: sampleCards(gender: nil))
+        precondition(rows[0].map(\.id) == [.myTeam, .nationalTeam])
+        precondition(rows[1].map(\.id) == [.homeCrowd, .location, .fanSince])
+        precondition(rows[1].allSatisfy { $0.favoriteTeam == nil })
+    }
+}
+#endif

@@ -88,7 +88,7 @@ nonisolated enum FavoriteTeamSport: String, CaseIterable, Identifiable, Codable,
     }
 }
 
-private extension FavoriteTeamSport {
+nonisolated private extension FavoriteTeamSport {
     init?(teamPickerSport: TeamPickerSport) {
         switch teamPickerSport {
         case .soccer:
@@ -240,14 +240,22 @@ nonisolated enum FavoriteTeamKind: String, CaseIterable, Identifiable, Codable, 
         default: return false
         }
     }
+
+    /// Catalog player / driver / fighter — not a FanGeo user and not a club/national team.
+    var isProfessionalAthlete: Bool {
+        switch self {
+        case .player, .driver, .fighter: return true
+        default: return false
+        }
+    }
 }
 
-struct FavoriteTeamCategory: Identifiable, Hashable {
+nonisolated struct FavoriteTeamCategory: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
 }
 
-/// Local catalog entry (text names only; logos are generated initials / SF Symbols — no third-party marks).
+/// Local catalog entry. Professional artwork is resolved at display time via ``SportsIdentityArtworkResolver`` (TheSportsDB URLs when cached). Logos are never bundled into Assets.
 nonisolated struct FavoriteTeam: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let name: String
@@ -319,7 +327,11 @@ nonisolated enum FavoritePlayerTeamRelationships {
     }
 
     static func associatedTeamIDs(forFavoriteID id: String) -> [String] {
-        table[id] ?? []
+        if let mapped = table[id], !mapped.isEmpty { return mapped }
+        return SportsProviderAthleteCatalog.associatedCatalogTeamIDs(
+            forPlayerID: id,
+            curated: FavoriteTeamCatalog.curatedCatalog
+        )
     }
 
     /// Nonisolated alias seeds for associated teams (mirrors catalog entries).
@@ -524,7 +536,7 @@ nonisolated enum FavoritePlayerTeamRelationships {
 
 // MARK: - Catalog
 
-enum FavoriteTeamCatalog {
+nonisolated enum FavoriteTeamCatalog {
     /// Canonical merged catalog: curated local + global expansion + business picker entities.
     /// Dedupes by sport|kind|normalized name while preserving every unique persisted ID.
     private static let localCatalog: [FavoriteTeam] =
@@ -532,9 +544,14 @@ enum FavoriteTeamCatalog {
         + combat + dance + ncaa + favoritePlayers + favoriteTournaments + expandedGlobalEntities
     private static let businessGameManagementCatalog = businessGameManagementFavorites(excluding: localCatalog)
 
+    /// Curated bundled catalog (no roster overlay). Tests that audit seed IDs should use this.
+    static let curatedCatalog: [FavoriteTeam] = localCatalog + businessGameManagementCatalog
+
     /// Single access layer for Following / favorites. Screens must not merge picker arrays independently.
-    /// Includes curated locals + ``expandedGlobalEntities`` (worldwide coverage) + business picker extras.
-    static let all: [FavoriteTeam] = localCatalog + businessGameManagementCatalog
+    /// Includes curated locals + ``expandedGlobalEntities`` + business picker extras + roster athletes.
+    static var all: [FavoriteTeam] {
+        SportsProviderAthleteCatalog.merged(with: curatedCatalog)
+    }
 
     /// Canonical expanded Following catalog alias — same collection as ``all``.
     /// Prefer this name in new call sites to make the worldwide source explicit.
@@ -559,6 +576,22 @@ enum FavoriteTeamCatalog {
 
     static func team(id: String) -> FavoriteTeam? {
         FavoriteFollowingSearch.team(id: id) ?? all.first { $0.id == id }
+    }
+
+    /// Soccer national side first when a country has multiple sport entries.
+    static func nationalTeam(matchingCountryName name: String) -> FavoriteTeam? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let matches = all.filter { team in
+            guard team.kind == .nationalTeam else { return false }
+            if team.name.localizedCaseInsensitiveCompare(trimmed) == .orderedSame {
+                return true
+            }
+            return team.searchAliases.contains {
+                $0.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+            }
+        }
+        return matches.first(where: { $0.sport == .soccer }) ?? matches.first
     }
 
     static func teams(
@@ -716,6 +749,7 @@ enum FavoriteTeamCatalog {
             return [
                 FavoriteTeamCategory(id: "hockey-clubs", title: "Teams"),
                 FavoriteTeamCategory(id: "hockey-national-teams", title: "National Teams"),
+                FavoriteTeamCategory(id: "hockey-players", title: "Featured Athletes"),
                 FavoriteTeamCategory(id: "hockey-tournaments", title: "Competitions & Tournaments")
             ]
         case .golf:
@@ -817,6 +851,8 @@ enum FavoriteTeamCatalog {
             return team.sport == .hockey && team.kind == .team
         case "hockey-national-teams":
             return team.sport == .hockey && team.kind == .nationalTeam
+        case "hockey-players":
+            return team.sport == .hockey && team.kind == .player
         case "hockey-tournaments":
             return team.sport == .hockey && team.kind.isCompetitionLike
         case "golf-players":
@@ -976,6 +1012,10 @@ enum FavoriteTeamCatalog {
         var aliases = [option.shortName, option.themeHint, option.emoji].compactMap { $0 }
         aliases.append(option.leagueGroup)
         aliases.append(option.region)
+        if let slug = option.id.split(separator: "-").last.map(String.init),
+           slug.count >= 4 {
+            aliases.append(slug)
+        }
         if option.mode == .countries {
             aliases.append("\(option.displayName) national team")
         }
@@ -1068,7 +1108,7 @@ enum FavoriteTeamCatalog {
         team("nba-lakers", "Los Angeles Lakers", .basketball, "NBA", "basketball.fill", 0.42, 0.18, 0.62, region: "North America"),
         team("nba-celtics", "Boston Celtics", .basketball, "NBA", "basketball.fill", 0.12, 0.48, 0.28, region: "North America"),
         team("nba-warriors", "Golden State Warriors", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72, region: "North America"),
-        team("nba-bulls", "Chicago Bulls", .basketball, "NBA", "basketball.fill", 0.78, 0.12, 0.18, region: "North America"),
+        team("nba-bulls", "Chicago Bulls", .basketball, "NBA", "basketball.fill", 0.78, 0.12, 0.18, region: "North America", aliases: ["Bulls"]),
         team("nba-heat", "Miami Heat", .basketball, "NBA", "basketball.fill", 0.78, 0.32, 0.18, region: "North America"),
         team("nba-knicks", "New York Knicks", .basketball, "NBA", "basketball.fill", 0.22, 0.42, 0.72, region: "North America"),
         team("nba-mavericks", "Dallas Mavericks", .basketball, "NBA", "basketball.fill", 0.12, 0.42, 0.62, region: "North America"),
@@ -1293,6 +1333,11 @@ enum FavoriteTeamCatalog {
 
 // MARK: - Live tab team matching
 
+nonisolated enum LiveMatchTeamSide: Sendable {
+    case home
+    case away
+}
+
 /// Pure string/alias matching for Live + Going favorite-team cards.
 /// Explicitly nonisolated so snapshot index builds can stay off MainActor.
 nonisolated enum FavoriteTeamLiveMatcher {
@@ -1334,6 +1379,42 @@ nonisolated enum FavoriteTeamLiveMatcher {
         }
 
         return unique.sorted { $0.count > $1.count }
+    }
+
+    /// Artwork-only aliases: catalog names plus the last significant token
+    /// ("Lakers" from "Los Angeles Lakers") so live payload names match favorites.
+    /// Does not expand players to clubs and does not affect game discovery.
+    static func artworkMatchAliases(for team: FavoriteTeam) -> [String] {
+        var unique = matchAliases(for: team)
+        func add(_ raw: String) {
+            let normalized = normalizedSearchText(raw)
+            guard !normalized.isEmpty, !unique.contains(normalized) else { return }
+            unique.append(normalized)
+        }
+        let parts = team.name.split(separator: " ").map(String.init).filter { !$0.isEmpty }
+        if parts.count >= 2 {
+            let last = parts[parts.count - 1]
+            let token = normalizedSearchText(last)
+            if token.count >= 4, !genericTokens.contains(token) {
+                add(last)
+            }
+        }
+        return unique.sorted { $0.count > $1.count }
+    }
+
+    /// Which side of a live row matches this favorite identity, if any.
+    static func matchingSide(for team: FavoriteTeam, match: LiveMatch) -> LiveMatchTeamSide? {
+        let aliases = artworkMatchAliases(for: team)
+        guard !aliases.isEmpty else { return nil }
+        let home = normalizedParticipantName(match.homeTeam)
+        let away = normalizedParticipantName(match.awayTeam)
+        if aliases.contains(where: { matchesNormalizedAlias($0, inParticipantName: home) }) {
+            return .home
+        }
+        if aliases.contains(where: { matchesNormalizedAlias($0, inParticipantName: away) }) {
+            return .away
+        }
+        return nil
     }
 
     /// Aliases used for Live/Going game discovery.
@@ -1616,27 +1697,78 @@ nonisolated struct FavoriteTeamLiveSnapshotIndex {
 
 // MARK: - Local persistence (AppStorage)
 
-enum FavoriteTeamsStore {
+nonisolated enum FavoriteTeamsStore {
     static let appStorageKey = "gameon.profile.favoriteTeamIDs"
     static let primaryTeamIDAppStorageKey = "gameon.profile.primaryFavoriteTeamID"
 
     static func decodeIDs(from raw: String) -> [String] {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        return trimmed
-            .split(separator: ",")
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        uniquedIDs(
+            raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(separator: ",")
+                .map { String($0) }
+        )
     }
 
     static func encodeIDs(_ ids: [String]) -> String {
-        ids.joined(separator: ",")
+        uniquedIDs(ids).joined(separator: ",")
+    }
+
+    /// Stable follow order: first-seen ID wins. Never `Set`/`Dictionary` iteration.
+    static func uniquedIDs(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        out.reserveCapacity(ids.count)
+        for raw in ids {
+            let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, seen.insert(id).inserted else { continue }
+            out.append(id)
+        }
+        return out
+    }
+
+    static func adding(_ id: String, to ids: [String]) -> [String] {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return uniquedIDs(ids) }
+        var out = uniquedIDs(ids)
+        if !out.contains(trimmed) {
+            out.append(trimmed)
+        }
+        return out
+    }
+
+    static func removing(_ id: String, from ids: [String]) -> [String] {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return uniquedIDs(ids) }
+        return uniquedIDs(ids).filter { $0 != trimmed }
+    }
+
+    static func toggling(_ id: String, in ids: [String]) -> [String] {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return uniquedIDs(ids) }
+        if uniquedIDs(ids).contains(trimmed) {
+            return removing(trimmed, from: ids)
+        }
+        return adding(trimmed, to: ids)
+    }
+
+    /// Keep local follow order when the ID set is unchanged. Append newly followed IDs; drop removed ones.
+    static func mergedRemoteIDs(local: [String], remote: [String]) -> [String] {
+        let localIDs = uniquedIDs(local)
+        let remoteIDs = uniquedIDs(remote)
+        let remoteSet = Set(remoteIDs)
+        var out = localIDs.filter { remoteSet.contains($0) }
+        let seen = Set(out)
+        for id in remoteIDs where !seen.contains(id) {
+            out.append(id)
+        }
+        return out
     }
 
     static func resolvedTeams(from raw: String) -> [FavoriteTeam] {
         resolvedTeams(fromIDs: decodeIDs(from: raw))
     }
 
+    /// Hydrate catalog rows in persisted follow order. Lookup is by ID; never rebuild from catalog/provider iteration.
     static func resolvedTeams(fromIDs ids: [String]) -> [FavoriteTeam] {
         var seen = Set<String>()
         var out: [FavoriteTeam] = []
@@ -1655,7 +1787,7 @@ enum FavoriteTeamsStore {
     }
 
     /// Display-only: returns the stored primary only when it is still among favorites.
-    /// Does **not** invent a My Team from favorite ordering.
+    /// Does **not** invent a Favorite Team from favorite ordering.
     static func explicitPrimaryTeamID(_ raw: String?, within ids: [String]) -> String? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty, ids.contains(trimmed), FavoriteTeamCatalog.team(id: trimmed) != nil else {

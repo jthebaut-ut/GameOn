@@ -18,6 +18,11 @@
 
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import {
+  applyPushArtwork,
+  pickProGameFinalArtwork,
+  pickProGameScoreArtwork,
+} from "../_shared/push_artwork.ts"
 
 type SupabaseClient = ReturnType<typeof createClient>
 
@@ -116,6 +121,7 @@ type LiveMatchRow = {
   updated_at: string | null
   timeline_updated_at: string | null
   timeline_events: TimelineEventRow[] | null
+  payload?: unknown
 }
 
 type TimelineEventRow = {
@@ -170,6 +176,7 @@ type PushAlertContent = {
   subtitle?: string
   body: string
   goalDebug?: GoalNotificationDebugContext
+  inboxFields?: Record<string, string>
 }
 
 type GoalNotificationDebugContext = {
@@ -511,7 +518,7 @@ async function loadLiveMatches(
 ): Promise<LiveMatchRow[]> {
   const { data, error } = await supabase
     .from("live_matches")
-    .select("id,source,external_id,sport,home_team,away_team,score_home,score_away,match_status,league,start_time,minute,updated_at,timeline_updated_at,timeline_events")
+    .select("id,source,external_id,sport,home_team,away_team,score_home,score_away,match_status,league,start_time,minute,updated_at,timeline_updated_at,timeline_events,payload")
     .gte("start_time", windowStart)
     .lte("start_time", windowEnd)
     .limit(2000)
@@ -592,10 +599,6 @@ async function maybeSendKickoffUpdate(
   }
 
   const tokens = tokensByUser.get(game.userId) ?? []
-  if (tokens.length === 0) {
-    counts.kickoffSkippedNoToken += 1
-    return
-  }
 
   const duplicate = await deliveryDedupeExists(supabase, game, "kickoff", "kickoff")
   if (duplicate) {
@@ -603,7 +606,14 @@ async function maybeSendKickoffUpdate(
     return
   }
 
-  const sent = await sendToUserTokens(supabase, apns, tokens, kickoffNotificationContent(game), counts)
+  const alert = enrichProGameInboxAlert(kickoffNotificationContent(game), game, null, "kickoff")
+  await upsertProGameInbox(supabase, game, alert)
+  if (tokens.length === 0) {
+    counts.kickoffSkippedNoToken += 1
+    return
+  }
+
+  const sent = await sendToUserTokens(supabase, apns, tokens, alert, counts)
   if (sent > 0) {
     const recorded = await insertDeliveryDedupe(supabase, game, "kickoff", "kickoff")
     logDeliveryRecorded("kickoff", game, "kickoff", recorded)
@@ -647,10 +657,6 @@ async function maybeSendScoreUpdate(
 
   counts.scoreChangesFound += 1
   const tokens = tokensByUser.get(game.userId) ?? []
-  if (tokens.length === 0) {
-    counts.scoreSkippedNoToken += 1
-    return
-  }
 
   const duplicate = await deliveryDedupeExists(supabase, game, "score", latestScoreline)
   if (duplicate) {
@@ -660,8 +666,18 @@ async function maybeSendScoreUpdate(
   }
 
   const liveWithTimeline = await hydrateLiveMatchWithTimeline(supabase, game, live)
-  const alert = scoringNotificationContent(game, liveWithTimeline, previousScoreline)
+  const alert = enrichProGameInboxAlert(
+    scoringNotificationContent(game, liveWithTimeline, previousScoreline),
+    game,
+    liveWithTimeline,
+    "score",
+  )
   logGoalNotificationApnsPayload(alert)
+  await upsertProGameInbox(supabase, game, alert)
+  if (tokens.length === 0) {
+    counts.scoreSkippedNoToken += 1
+    return
+  }
   const sent = await sendToUserTokens(supabase, apns, tokens, alert, counts)
   console.log(`[ProScorePushWorker] score notification sent=${sent}`)
   if (sent > 0) {
@@ -708,10 +724,6 @@ async function maybeSendHalftimeUpdate(
 
   const halftimeToken = "halftime"
   const tokens = tokensByUser.get(game.userId) ?? []
-  if (tokens.length === 0) {
-    counts.halftimeSkippedNoToken += 1
-    return
-  }
 
   const duplicate = await deliveryDedupeExists(supabase, game, "halftime", halftimeToken)
   if (duplicate) {
@@ -719,7 +731,14 @@ async function maybeSendHalftimeUpdate(
     return
   }
 
-  const sent = await sendToUserTokens(supabase, apns, tokens, halftimeNotificationContent(game, live), counts)
+  const alert = enrichProGameInboxAlert(halftimeNotificationContent(game, live), game, live, "halftime")
+  await upsertProGameInbox(supabase, game, alert)
+  if (tokens.length === 0) {
+    counts.halftimeSkippedNoToken += 1
+    return
+  }
+
+  const sent = await sendToUserTokens(supabase, apns, tokens, alert, counts)
   if (sent > 0) {
     const recorded = await insertDeliveryDedupe(supabase, game, "halftime", halftimeToken)
     logDeliveryRecorded("halftime", game, halftimeToken, recorded)
@@ -1539,10 +1558,6 @@ async function maybeSendFinalUpdate(
   counts.finalChangesFound += 1
   const finalScoreline = scoreline(live.score_away, live.score_home)
   const tokens = tokensByUser.get(game.userId) ?? []
-  if (tokens.length === 0) {
-    counts.finalSkippedNoToken += 1
-    return
-  }
 
   const duplicate = await deliveryDedupeExists(supabase, game, "final", finalScoreline)
   if (duplicate) {
@@ -1550,7 +1565,14 @@ async function maybeSendFinalUpdate(
     return
   }
 
-  const sent = await sendToUserTokens(supabase, apns, tokens, finalNotificationContent(game, live), counts)
+  const alert = enrichProGameInboxAlert(finalNotificationContent(game, live), game, live, "final")
+  await upsertProGameInbox(supabase, game, alert)
+  if (tokens.length === 0) {
+    counts.finalSkippedNoToken += 1
+    return
+  }
+
+  const sent = await sendToUserTokens(supabase, apns, tokens, alert, counts)
   if (sent > 0) {
     const recorded = await insertDeliveryDedupe(supabase, game, "final", finalScoreline)
     logDeliveryRecorded("final", game, finalScoreline, recorded)
@@ -1569,6 +1591,191 @@ async function maybeSendFinalUpdate(
     }
   } else {
     logDeliveryRecorded("final", game, finalScoreline, false)
+  }
+}
+
+type ProGameInboxKind = "score" | "final" | "kickoff" | "halftime"
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  return null
+}
+
+function payloadField(payload: unknown, keys: string[]): string | null {
+  const rec = asRecord(payload)
+  if (!rec) return null
+  for (const key of keys) {
+    const value = rec[key]
+    if (typeof value === "string") {
+      const trimmed = value.trim()
+      if (trimmed) return trimmed
+    }
+    if (typeof value === "number" && Number.isFinite(value)) return String(value)
+  }
+  return null
+}
+
+function sanitizeInboxKey(raw: string): string {
+  const filtered = raw.toLowerCase().replace(/[^a-z0-9_\-:.]/g, "")
+  return filtered.slice(0, 180)
+}
+
+function inboxNotificationType(kind: ProGameInboxKind): string {
+  switch (kind) {
+    case "score":
+      return "pro_game_score"
+    case "final":
+      return "pro_game_final"
+    case "kickoff":
+      return "pro_game_kickoff"
+    case "halftime":
+      return "pro_game_halftime"
+  }
+}
+
+function inboxClock(live: LiveMatchRow | null, sport: string | null): string | null {
+  if (!live || live.minute == null || !Number.isFinite(live.minute)) return null
+  const sportToken = (sport ?? live.sport ?? "").toLowerCase()
+  const isSoccer = sportToken.includes("soccer")
+    || (sportToken.includes("football") && !sportToken.includes("american"))
+  if (!isSoccer) return null
+  return `${live.minute}'`
+}
+
+function scoringTeamFromAlert(alert: PushAlertContent): string | null {
+  const raw = alert.goalDebug?.scoringTeam?.trim() ?? ""
+  if (!raw || raw === "unknown") return null
+  return raw
+}
+
+function buildProGameInboxFields(
+  game: TrackedGame,
+  live: LiveMatchRow | null,
+  kind: ProGameInboxKind,
+  scoringTeam: string | null,
+): Record<string, string> {
+  const homeTeam = (live?.home_team || game.homeTeam || "").trim()
+  const awayTeam = (live?.away_team || game.awayTeam || "").trim()
+  const homeScore = live?.score_home ?? game.snapshotScoreHome ?? 0
+  const awayScore = live?.score_away ?? game.snapshotScoreAway ?? 0
+  const league = (live?.league || game.league || "").trim()
+  const sport = (live?.sport || game.sport || "").trim()
+  const matchStatus = (live?.match_status || "").trim()
+  const payload = live?.payload
+  const fields: Record<string, string> = {
+    source: "pro_game_notification",
+    match_id: game.liveMatchId,
+    notification_type: inboxNotificationType(kind),
+    home_team: homeTeam,
+    away_team: awayTeam,
+    home_score: String(homeScore),
+    away_score: String(awayScore),
+    inbox_dedupe_key: sanitizeInboxKey(`pro_game:${kind}:${game.liveMatchId}:${awayScore}-${homeScore}`),
+  }
+  if (scoringTeam) fields.scoring_team = scoringTeam
+  if (league) fields.league = league
+  if (sport) fields.sport = sport
+  if (matchStatus) fields.match_status = matchStatus
+  const clock = inboxClock(live, sport || null)
+  if (clock) fields.clock = clock
+  if (live?.minute != null && Number.isFinite(live.minute) && clock) {
+    fields.minute = String(live.minute)
+  }
+  const homeBadge = payloadField(payload, ["strHomeTeamBadge", "homeTeamBadge", "strHomeBadge", "strHomeTeamLogo"])
+  const awayBadge = payloadField(payload, ["strAwayTeamBadge", "awayTeamBadge", "strAwayBadge", "strAwayTeamLogo"])
+  const homeProvider = payloadField(payload, ["idHomeTeam", "idHome", "homeTeamId"])
+  const awayProvider = payloadField(payload, ["idAwayTeam", "idAway", "awayTeamId"])
+  if (homeBadge) fields.home_badge_url = homeBadge
+  if (awayBadge) fields.away_badge_url = awayBadge
+  if (homeProvider) fields.home_provider_id = homeProvider
+  if (awayProvider) fields.away_provider_id = awayProvider
+  if (kind === "score" || kind === "halftime") {
+    applyPushArtwork(
+      fields,
+      pickProGameScoreArtwork({
+        scoringTeam,
+        homeTeam,
+        awayTeam,
+        homeBadgeURL: homeBadge,
+        awayBadgeURL: awayBadge,
+      }),
+      "pro_team",
+      scoringTeam,
+    )
+  } else if (kind === "final") {
+    const winner = homeScore === awayScore
+      ? null
+      : homeScore > awayScore
+      ? homeTeam
+      : awayTeam
+    applyPushArtwork(
+      fields,
+      pickProGameFinalArtwork({
+        homeTeam,
+        awayTeam,
+        homeScore,
+        awayScore,
+        homeBadgeURL: homeBadge,
+        awayBadgeURL: awayBadge,
+      }),
+      "pro_team",
+      winner,
+    )
+  }
+  return fields
+}
+
+function enrichProGameInboxAlert(
+  alert: PushAlertContent,
+  game: TrackedGame,
+  live: LiveMatchRow | null,
+  kind: ProGameInboxKind,
+): PushAlertContent {
+  return {
+    ...alert,
+    inboxFields: buildProGameInboxFields(game, live, kind, scoringTeamFromAlert(alert)),
+  }
+}
+
+async function upsertProGameInbox(
+  supabase: SupabaseClient,
+  game: TrackedGame,
+  alert: PushAlertContent,
+) {
+  const fields = alert.inboxFields
+  if (!fields) return
+  const payload: Record<string, unknown> = { ...fields }
+  const homeScore = Number(fields.home_score)
+  const awayScore = Number(fields.away_score)
+  if (Number.isFinite(homeScore)) payload.home_score = homeScore
+  if (Number.isFinite(awayScore)) payload.away_score = awayScore
+  try {
+    const { error } = await supabase.rpc("upsert_fan_notification_inbox", {
+      p_user_id: game.userId,
+      p_notification_type: fields.notification_type,
+      p_title: alert.title,
+      p_body: alert.body,
+      p_kind_raw: "scheduleChange",
+      p_destination_raw: "scheduleActivity",
+      p_deduplication_key: fields.inbox_dedupe_key,
+      p_source_type: "pro_game_notification",
+      p_source_id: game.liveMatchId,
+      p_team_id: null,
+      p_event_id: null,
+      p_actor_user_id: null,
+      p_payload: payload,
+    })
+    if (error) {
+      console.warn(`[ProScorePushWorker] inbox upsert failed live_match_id=${game.liveMatchId} error=${error.message}`)
+    }
+  } catch (error) {
+    console.warn(
+      `[ProScorePushWorker] inbox upsert threw live_match_id=${game.liveMatchId} error=${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    )
   }
 }
 
@@ -3227,7 +3434,9 @@ class ApnsClient {
         aps: {
           alert: apsAlert,
           sound: "default",
+          ...(alert.inboxFields?.artwork_url ? { "mutable-content": 1 } : {}),
         },
+        ...(alert.inboxFields ?? {}),
       }),
     })
 

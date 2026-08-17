@@ -6,7 +6,8 @@ import SwiftUI
 struct PickupGameMapLocationPickerSheet: View {
     @ObservedObject var viewModel: MapViewModel
     let onCancel: () -> Void
-    let onConfirm: (CLLocationCoordinate2D, String?, String?, String?, String?) -> Void
+    /// street, city, state/region, postal, ISO country code
+    let onConfirm: (CLLocationCoordinate2D, String?, String?, String?, String?, String?) -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
@@ -18,6 +19,7 @@ struct PickupGameMapLocationPickerSheet: View {
     @State private var resolvedCity: String?
     @State private var resolvedState: String?
     @State private var resolvedPostalCode: String?
+    @State private var resolvedCountryCode: String?
     @State private var resolveHint: String?
     @State private var resolveTask: Task<Void, Never>?
 
@@ -25,7 +27,7 @@ struct PickupGameMapLocationPickerSheet: View {
         viewModel: MapViewModel,
         initialCoordinate: CLLocationCoordinate2D,
         onCancel: @escaping () -> Void,
-        onConfirm: @escaping (CLLocationCoordinate2D, String?, String?, String?, String?) -> Void
+        onConfirm: @escaping (CLLocationCoordinate2D, String?, String?, String?, String?, String?) -> Void
     ) {
         self.viewModel = viewModel
         self.onCancel = onCancel
@@ -144,7 +146,14 @@ struct PickupGameMapLocationPickerSheet: View {
     private var confirmFloating: some View {
         Button {
             resolveTask?.cancel()
-            onConfirm(pinCoordinate, resolvedStreet, resolvedCity, resolvedState, resolvedPostalCode)
+            onConfirm(
+                pinCoordinate,
+                resolvedStreet,
+                resolvedCity,
+                resolvedState,
+                resolvedPostalCode,
+                resolvedCountryCode
+            )
             dismiss()
         } label: {
             Text("Confirm Location")
@@ -186,17 +195,20 @@ struct PickupGameMapLocationPickerSheet: View {
             resolvedCity = fields.city
             resolvedState = fields.state
             resolvedPostalCode = fields.postalCode
-            let stateLine = [fields.state, fields.postalCode]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
-            let parts = [fields.street, fields.city, stateLine].compactMap { $0 }.filter { !$0.isEmpty }
-            if parts.isEmpty {
+            resolvedCountryCode = fields.countryCode
+            let hint = FanTeamLocationPresentation.formattedAddress(
+                placeName: nil,
+                street: fields.street,
+                city: fields.city ?? "",
+                region: fields.state ?? "",
+                postalCode: fields.postalCode ?? "",
+                countryCode: fields.countryCode ?? ""
+            )
+            if hint.isEmpty {
                 resolveHint = "Could not resolve address — you can still confirm and edit fields manually."
             } else {
-                resolveHint = parts.joined(separator: ", ")
+                resolveHint = hint
             }
         }
     }
 }
-

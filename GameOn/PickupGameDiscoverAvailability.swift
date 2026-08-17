@@ -221,7 +221,7 @@ enum PickupGameAvailabilityResolver {
         }
 
         let sport = context.selectedSport.trimmingCharacters(in: .whitespacesAndNewlines)
-        if sport != "All", candidate.sport != sport {
+        if sport != "All", !AppSportCatalog.sport(candidate.sport, matchesDiscoverSelection: sport) {
             return PickupGameAvailabilityEvaluation(
                 discoverEligible: false,
                 decodedStart: decodedStart,

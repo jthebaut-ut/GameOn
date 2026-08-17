@@ -1,3 +1,5 @@
+import CoreLocation
+import MapKit
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -23,6 +25,10 @@ struct EditFanTeamSheet: View {
     @State private var isSaving = false
     @State private var isLoadingPhoto = false
     @State private var errorText: String?
+    @State private var discovery = FanTeamDiscoverySettings.hidden
+    @State private var isLoadingDiscovery = false
+    @State private var discoveryDidLoad = false
+    @State private var showDiscoveryLocationPicker = false
 
     private let service = FanTeamsService()
 
@@ -89,6 +95,19 @@ struct EditFanTeamSheet: View {
                     EditProfileSection(title: L10n.t("fan_teams_edit_section_appearance", languageCode: languageCode)) {
                         colorSection
                     }
+                    FanTeamDiscoveryEditorSection(
+                        discovery: $discovery,
+                        team: team,
+                        draftName: trimmedName,
+                        draftSport: sport,
+                        draftColorHex: colorHex,
+                        logoURL: effectiveLogoURL,
+                        logoThumbnailURL: effectiveLogoThumbnailURL,
+                        localPreviewImage: localPreviewImage,
+                        isLoading: isLoadingDiscovery,
+                        languageCode: languageCode,
+                        onChooseLocation: { showDiscoveryLocationPicker = true }
+                    )
                     if let errorText {
                         Text(errorText)
                             .font(.footnote)
@@ -122,6 +141,32 @@ struct EditFanTeamSheet: View {
                 if !sportOptions.contains(sport), let first = sportOptions.first {
                     sport = first
                 }
+                Task { await loadDiscoverySettings() }
+            }
+            .onChange(of: sport) { _, newSport in
+                if SportSubtypeCatalog.hasSubtypes(forSport: newSport) {
+                    discovery.sportSubtype = SportSubtypeCatalog.normalizedSubtype(
+                        sport: newSport,
+                        subtype: discovery.sportSubtype
+                    ) ?? SportSubtypeCatalog.defaultSubtype(forSport: newSport)
+                } else {
+                    discovery.sportSubtype = nil
+                }
+            }
+            .sheet(isPresented: $showDiscoveryLocationPicker) {
+                FanTeamChooseLocationSheet(
+                    viewModel: mapViewModel,
+                    teamId: team.id,
+                    canManageLocations: team.canEditIdentity,
+                    initialCoordinate: discoveryMapSeedCoordinate,
+                    titleKey: "team_discovery_location_title",
+                    onCancel: { showDiscoveryLocationPicker = false },
+                    onSelect: { selection in
+                        discovery.apply(selection: selection)
+                        showDiscoveryLocationPicker = false
+                        errorText = nil
+                    }
+                )
             }
             .onChange(of: selectedPhotoItem) { _, item in
                 Task { await loadPickedPhoto(item) }
@@ -193,6 +238,7 @@ struct EditFanTeamSheet: View {
         .accessibilityElement(children: .combine)
     }
 
+    @ViewBuilder
     private var sportRow: some View {
         HStack {
             Text(L10n.t("fan_teams_sport", languageCode: languageCode))
@@ -209,6 +255,10 @@ struct EditFanTeamSheet: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+        if SportSubtypeCatalog.hasSubtypes(forSport: sport) {
+            EditProfileRowDivider()
+            sportSubtypeRow
+        }
     }
 
     private var competitionLevelRow: some View {
@@ -295,6 +345,76 @@ struct EditFanTeamSheet: View {
         }
     }
 
+    private var sportSubtypeRow: some View {
+        HStack {
+            Text(SportSubtypeCatalog.pickerTitle(forSport: sport, languageCode: languageCode))
+                .font(.body)
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+            Spacer(minLength: 12)
+            Menu {
+                ForEach(SportSubtypeCatalog.subtypes(forSport: sport)) { option in
+                    Button {
+                        discovery.sportSubtype = option.id
+                    } label: {
+                        Text(L10n.t(option.labelKey, languageCode: languageCode))
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(
+                        SportSubtypeCatalog.displayLabel(
+                            forSubtype: discovery.sportSubtype ?? "",
+                            sport: sport,
+                            languageCode: languageCode
+                        )
+                    )
+                    .font(.body)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(SportSubtypeCatalog.pickerTitle(forSport: sport, languageCode: languageCode))
+    }
+
+    private var discoveryMapSeedCoordinate: CLLocationCoordinate2D {
+        if let selection = discovery.selection, CLLocationCoordinate2DIsValid(selection.coordinate) {
+            return selection.coordinate
+        }
+        if let center = mapViewModel.cameraPosition.region?.center,
+           CLLocationCoordinate2DIsValid(center),
+           !(center.latitude == 0 && center.longitude == 0) {
+            return center
+        }
+        return CLLocationCoordinate2D(latitude: 40.7608, longitude: -111.8910)
+    }
+
+    private func loadDiscoverySettings() async {
+        isLoadingDiscovery = true
+        defer { isLoadingDiscovery = false }
+        do {
+            var loaded = try await service.getMyFanTeamDiscovery(teamId: team.id)
+            if SportSubtypeCatalog.hasSubtypes(forSport: sport) {
+                loaded.sportSubtype = SportSubtypeCatalog.normalizedSubtype(
+                    sport: sport,
+                    subtype: loaded.sportSubtype
+                ) ?? SportSubtypeCatalog.defaultSubtype(forSport: sport)
+            } else {
+                loaded.sportSubtype = nil
+            }
+            discovery = loaded
+            discoveryDidLoad = true
+        } catch {
+            discoveryDidLoad = false
+        }
+    }
+
     private func loadPickedPhoto(_ item: PhotosPickerItem?) async {
         guard let item else { return }
         isLoadingPhoto = true
@@ -317,6 +437,10 @@ struct EditFanTeamSheet: View {
         guard canSave else { return }
         if ModerationService.containsProfanity(trimmedName) {
             errorText = ModerationService.profanityRejectionUserMessage()
+            return
+        }
+        if !FanTeamDiscoveryLocationPolicy.canSave(settings: discovery) {
+            errorText = L10n.t("team_discovery_location_required", languageCode: languageCode)
             return
         }
         isSaving = true
@@ -348,6 +472,9 @@ struct EditFanTeamSheet: View {
                 competitionLevel: competitionLevel,
                 updateCompetitionLevel: true
             )
+            if discoveryDidLoad {
+                try await service.updateFanTeamDiscovery(discovery, teamId: team.id)
+            }
 
             let updated = team.applyingIdentity(
                 name: trimmedName,
@@ -368,7 +495,8 @@ struct EditFanTeamSheet: View {
                 logoURL: updated.logoURL,
                 logoThumbnailURL: updated.logoThumbnailURL,
                 previousLogoURL: previousLogo,
-                previousLogoThumbnailURL: previousThumb
+                previousLogoThumbnailURL: previousThumb,
+                artworkReplaced: pendingImageData != nil || removeLogoRequested
             )
             FanTeamIdentityChangeCenter.postIdentityChange(change)
 

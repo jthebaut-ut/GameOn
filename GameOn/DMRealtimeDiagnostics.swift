@@ -75,3 +75,29 @@ enum ChatRealtimeAudit {
 #endif
     }
 }
+
+/// Direct-chat connect timeline (DEBUG). Elapsed ms are since ``open``.
+enum ChatConnectPerf {
+    private static var openAt: CFAbsoluteTime?
+
+    static func open() {
+#if DEBUG
+        openAt = CFAbsoluteTimeGetCurrent()
+        print("[ChatConnectPerf] open elapsedMs=0.0")
+#endif
+    }
+
+    static func log(_ event: String, extra: String? = nil) {
+#if DEBUG
+        let ms: String
+        if let openAt {
+            ms = String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - openAt) * 1000)
+        } else {
+            ms = "nil"
+        }
+        var line = "[ChatConnectPerf] \(event) elapsedMs=\(ms)"
+        if let extra, !extra.isEmpty { line += " \(extra)" }
+        print(line)
+#endif
+    }
+}

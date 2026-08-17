@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { applyPushArtwork, pickTeamLogo } from "../_shared/push_artwork.ts"
 import {
   authorizeSportsWorkerRequest,
   describeAuthCandidateClasses,
@@ -222,6 +223,17 @@ Deno.serve(async (req) => {
   }
 
   const alert = buildDeletedTeamAlert(row.team_name ?? "")
+
+  const { data: teamArt } = await admin
+    .from("fan_teams")
+    .select("logo_url,logo_thumbnail_url")
+    .eq("id", row.team_id)
+    .maybeSingle()
+  const teamLogoURL = pickTeamLogo(
+    (teamArt as { logo_thumbnail_url?: string | null } | null)?.logo_thumbnail_url,
+    (teamArt as { logo_url?: string | null } | null)?.logo_url,
+  )
+
   let apns: ApnsClient
   try {
     apns = await ApnsClient.fromEnvironment()
@@ -289,6 +301,7 @@ Deno.serve(async (req) => {
       event_id: eventId,
       team_name: row.team_name ?? "Team",
     }
+    applyPushArtwork(customData, teamLogoURL, "team", row.team_id)
 
     let sent = 0
     let invalidated = 0

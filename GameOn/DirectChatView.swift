@@ -129,7 +129,14 @@ private final class DirectChatPresenter: ObservableObject {
     @Published private(set) var isManuallyRefreshingMessages = false
     @Published private(set) var peerIsDeleted: Bool
     @Published private(set) var headerConnectionStatusText: String = "Syncing messages"
-    @Published private(set) var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting
+    @Published private(set) var realtimeConnectionStatus: ChatRealtimeConnectionStatus = .connecting {
+        didSet {
+            if oldValue != realtimeConnectionStatus {
+                realtimeStatusEnteredAt = Date()
+            }
+        }
+    }
+    private(set) var realtimeStatusEnteredAt: Date = Date()
     /// Monotonic open/ensure generation. Stale stop/watchdog/subscribe callbacks must not mutate state.
     private(set) var chatRealtimeLifecycleGeneration: Int = 0
     /// Alias used by DEBUG audit call sites.
@@ -370,6 +377,7 @@ private final class DirectChatPresenter: ObservableObject {
         do {
             let me = try await service.currentUserId()
             currentUserId = me
+            ChatConnectPerf.log("authReady")
 
             if conversationId == nil {
                 if friend.isBusinessVenueConversation {
@@ -434,6 +442,7 @@ private final class DirectChatPresenter: ObservableObject {
 #if DEBUG
             DirectChatOpenPerf.messageFetchEnd(publishedCount: rows.count)
 #endif
+            ChatConnectPerf.log("composerReady", extra: "messages=\(rows.count)")
         } catch {
             initialLatestFetchInFlight = false
             loadError = error.localizedDescription
@@ -909,10 +918,17 @@ private final class DirectChatPresenter: ObservableObject {
                 return (true, "subscribeStuck")
             }
             if isThreadRealtimeSubscribing {
+                if let started = realtimeSubscribeAttemptStartedAt,
+                   Date().timeIntervalSince(started) >= Self.watchdogSubscribeGrace {
+                    return (true, "subscribeHungBeforeChannel")
+                }
                 return (false, "subscribeInFlight")
             }
             if threadRealtimeSubscriptionTask != nil || threadRealtimeSubscriptionLoopActive {
-                // Previously treated as healthy forever — that left Connecting… when removeChannel hung.
+                if let started = realtimeSubscribeAttemptStartedAt,
+                   Date().timeIntervalSince(started) >= Self.watchdogSubscribeGrace {
+                    return (true, "subscribeTaskActiveNoChannel")
+                }
                 return (false, "subscribeTaskActive")
             }
             if let started = realtimeSubscribeAttemptStartedAt,
@@ -1068,6 +1084,7 @@ private final class DirectChatPresenter: ObservableObject {
             status: String(describing: realtimeConnectionStatus),
             extra: "reason=\(reason)"
         )
+        ChatConnectPerf.log("reconnectScheduled", extra: "reason=\(reason)")
         forceThreadRealtimeReconnectRequested = true
         await tearDownRealtimeChannelIfNeeded(expectedGeneration: gen, statusAfter: .reconnecting)
         guard isCurrentRealtimeGeneration(gen) else { return }
@@ -1350,6 +1367,7 @@ private final class DirectChatPresenter: ObservableObject {
             status: String(describing: realtimeConnectionStatus),
             extra: "topic=\(topic) reason=\(subscriptionReason ?? "nil")"
         )
+        ChatConnectPerf.log("subscribeStarted", extra: "topic=\(topic)")
 #if DEBUG
         print("[DirectChatRealtime] subscribe start thread=\(tid)")
         print("[DirectChatRealtime] subscribing conversationId=\(tid)")
@@ -1397,6 +1415,7 @@ private final class DirectChatPresenter: ObservableObject {
             event: "channelCreated",
             extra: "topic=\(channel.topic)"
         )
+        ChatConnectPerf.log("channelCreated", extra: "topic=\(channel.topic)")
         if subscriptionReason == "foregroundForceRebuild" {
             DMRealtimeDiagnostics.debug("freshChannelCreated=true channelObjectId=\(threadRealtimeChannelObjectId(channel)) channelName=\(channel.topic)")
         }
@@ -1505,6 +1524,7 @@ private final class DirectChatPresenter: ObservableObject {
                 status: String(describing: realtimeConnectionStatus),
                 extra: "ok=false error=\(errLabel)"
             )
+            ChatConnectPerf.log("failed", extra: "reason=\(errLabel)")
 #if DEBUG
             DMRealtimeDiagnostics.log("phase=thread_realtime_subscribe_failed conversation=\(tid) error=\(errLabel)")
             RealtimeHealthDiagnostics.log("subscribeError=\(errLabel) channelName=\(channel.topic)")
@@ -1537,6 +1557,7 @@ private final class DirectChatPresenter: ObservableObject {
         DMRealtimeDiagnostics.debug("channelCount=\(threadRealtimeActiveChannelObjectIds.count) context=subscribed")
         stopThreadFallbackPolling(reason: "realtimeSubscribed")
         realtimeConnectionStatus = .connected
+        ChatConnectPerf.log("subscribed", extra: "topic=\(channel.topic)")
         await backfillAfterRealtimeResubscribe(conversationId: cid, reason: "realtime_resubscribe")
 
         let decoder = JSONDecoder()
@@ -1712,14 +1733,14 @@ private final class DirectChatPresenter: ObservableObject {
                 }
             }
 
-            if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
-                await tearDownRealtimeChannelIfNeeded(
-                    expectedGeneration: loopGen,
-                    statusAfter: attempt == 0 ? .connecting : .reconnecting
-                )
-            }
             if forceThreadRealtimeReconnectRequested {
                 forceThreadRealtimeReconnectRequested = false
+                if messagesRealtimeChannel != nil || establishingRealtimeChannel != nil {
+                    await tearDownRealtimeChannelIfNeeded(
+                        expectedGeneration: loopGen,
+                        statusAfter: .reconnecting
+                    )
+                }
             }
 
             let hadLiveBefore = lastThreadRealtimeSubscribeAt != nil
@@ -2582,6 +2603,16 @@ private final class DirectChatPresenter: ObservableObject {
             && draft.trimmingCharacters(in: .whitespacesAndNewlines).count <= maxBodyLength
     }
 
+    /// Composer chrome derived from realtime status. Hidden while Connecting over cached history.
+    func composerRealtimeChrome(now: Date = Date()) -> ChatRealtimeConnectionStatus? {
+        ChatRealtimeConnectionPresentation.chrome(
+            status: realtimeConnectionStatus,
+            statusEnteredAt: realtimeStatusEnteredAt,
+            now: now,
+            threadContentReady: !isLoadingInitial
+        )
+    }
+
     var lastMessageId: UUID? {
         messages.last?.id
     }
@@ -3013,6 +3044,7 @@ struct DirectChatView: View {
             )
             print("[ChatNav] destination.taskBegin kind=dm")
 #endif
+            ChatConnectPerf.open()
             isThreadOpening = true
             presenter.bindChatViewModel(chatViewModel)
             // Ordered open path: shell is already on screen.
@@ -3108,9 +3140,12 @@ struct DirectChatView: View {
                 await presenter.sendStructuredBody(body)
             }
         )
-        .onChange(of: presenter.conversationId) { _, cid in
+        .onChange(of: presenter.conversationId) { oldId, cid in
             chatViewModel.setActiveVisibleConversationIdIfAllowed(cid, reason: "conversation_id_changed")
             presenter.clearInvalidReplyDraftIfNeeded(source: "conversationId_onChange")
+            // First assignment is owned by `.task` after the message page loads.
+            // A second beginNewLifecycle here raced the open subscribe and pinned Connecting…
+            guard oldId != nil, oldId != cid else { return }
             Task {
                 await presenter.ensureRealtimeSubscriptionIfReady(
                     reason: "conversation_id_changed",
@@ -4759,9 +4794,13 @@ struct DirectChatView: View {
             composerEligibilityBanners
 
             if presenter.loadError == nil, presenter.conversationId != nil {
-                ChatRealtimeConnectionStatusView(status: presenter.realtimeConnectionStatus)
-                    .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
-                    .padding(.bottom, FGSpacing.xs)
+                TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                    if let chrome = presenter.composerRealtimeChrome(now: context.date) {
+                        ChatRealtimeConnectionStatusView(status: chrome)
+                            .padding(.top, showEmojiQuickTray ? 0 : FGSpacing.xs)
+                            .padding(.bottom, FGSpacing.xs)
+                    }
+                }
             }
 
             if let reply = presenter.validatedReplyDraft() {

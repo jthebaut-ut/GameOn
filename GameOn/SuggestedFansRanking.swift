@@ -125,7 +125,7 @@ enum SuggestedFansRanking {
         return 0
     }
 
-    /// Same MY TEAM (+600) wins over primary↔favorite affinity (+450). Never both.
+    /// Same Favorite Team (+600) wins over primary↔favorite affinity (+450). Never both.
     static func myTeamScores(
         viewerPrimaryTeamId: String?,
         candidatePrimaryTeamId: String?,

@@ -141,14 +141,17 @@ final class ChatViewModel: ObservableObject {
             tabBadgeState.setPendingBadgeCount(pendingBadgeCount)
         }
     }
-    /// Chat → My Teams segment badge: pending Team invitations addressed to **me**
+    /// Root Teams tab badge: pending Team invitations addressed to **me**
     /// (`list_my_pending_fan_team_invitations`). Distinct from manager Team-card
     /// `pendingInvitationCount` (invites I sent).
     @Published private(set) var pendingFanTeamInvitationCount: Int = 0 {
         didSet {
             MainTabObservationPerf.chatPublished(category: "myTeamsInvitationBadge")
+            tabBadgeState.setPendingFanTeamInvitationCount(pendingFanTeamInvitationCount)
         }
     }
+    /// Cached invitee invitation rows for Action Center enrichment (same RPC as badge count).
+    @Published private(set) var pendingFanTeamInvitations: [FanTeamInvitation] = []
     /// Unread peer DMs for the signed-in user (MainTabView private chat tab badge + ``AppIconBadgeSync``). Server source: inbox RPC unread totals / `get_dm_unread_total`; not friend-request counts.
     @Published private(set) var unreadDirectMessageCount: Int = 0 {
         didSet {
@@ -178,15 +181,17 @@ final class ChatViewModel: ObservableObject {
             mainTabState.setPendingOpenFriendRequestsSection(pendingOpenFriendRequestsSection)
         }
     }
-    /// When true, ``MainTabView`` selects Chat and ``FriendsTabView`` selects My Teams (invitations).
+    /// When true, ``MainTabView`` selects the root Teams tab (invitations / management).
     @Published var pendingOpenMyTeamsInvitations: Bool = false {
         didSet {
             MainTabObservationPerf.chatPublished(category: "deepLink")
             mainTabState.setPendingOpenMyTeamsInvitations(pendingOpenMyTeamsInvitations)
         }
     }
-    /// Optional invitation id to highlight after opening My Teams from a Team invitation push.
+    /// Optional invitation id to highlight after opening Teams from a Team invitation push.
     @Published var pendingHighlightFanTeamInvitationId: UUID?
+    /// Open Teams → Team Detail → Roster after a `member_left_team` push tap.
+    @Published var pendingOpenFanTeamRosterTeamId: UUID?
     /// Optional message id to scroll/highlight after opening a DM or group from global search.
     @Published var pendingOpenHighlightMessageId: UUID?
     /// Newly created venue-scoped DM threads that should show the one-time intro banner.
@@ -511,6 +516,7 @@ final class ChatViewModel: ObservableObject {
         outgoingRequests = []
         pendingBadgeCount = 0
         pendingFanTeamInvitationCount = 0
+        pendingFanTeamInvitations = []
         unreadDirectMessageCount = 0
         pendingGroupInvitations = []
         pendingGroupInvitationPreviews = [:]
@@ -1564,7 +1570,7 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
-    /// Remote APNs Fan Team invitation tap: open Chat → My Teams after auth is ready.
+    /// Remote APNs Fan Team invitation tap: open Teams tab after auth is ready.
     func enqueueFanTeamInvitationNotificationDeepLink(_ request: FanTeamInvitationNotificationDeepLinkRequest) {
 #if DEBUG
         PushDeepLinkLog.received(type: "team_invitation", conversation: nil)
@@ -1633,7 +1639,7 @@ final class ChatViewModel: ObservableObject {
         return id
     }
 
-    /// Remote APNs Team-deleted tap: open Chat → My Teams (never a dead Team Detail).
+    /// Remote APNs Team-deleted tap: open Teams tab (never a dead Team Detail).
     func enqueueFanTeamDeletedNotificationDeepLink(_ request: FanTeamDeletedNotificationDeepLinkRequest) {
 #if DEBUG
         PushDeepLinkLog.received(type: "team_deleted", conversation: nil)
@@ -1650,6 +1656,7 @@ final class ChatViewModel: ObservableObject {
         pendingGroupOpenConversationId = nil
         pendingOpenFriendRequestsSection = false
         pendingHighlightFanTeamInvitationId = nil
+        pendingOpenFanTeamRosterTeamId = nil
         // Reuse My Teams section open (no invitation highlight).
         if !pendingOpenMyTeamsInvitations {
             pendingOpenMyTeamsInvitations = true
@@ -1658,6 +1665,79 @@ final class ChatViewModel: ObservableObject {
         PushDeepLinkLog.queued(type: "team_deleted", conversation: nil)
 #endif
         _ = request
+    }
+
+    /// Remote APNs member_left_team tap: open Teams → Team Detail → Roster.
+    func enqueueFanTeamMemberLeftNotificationDeepLink(_ request: FanTeamMemberLeftNotificationDeepLinkRequest) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "member_left_team", conversation: nil)
+        print(
+            "[FanTeamMemberLeaveDebug] enqueue teamId=\(request.teamID?.uuidString.lowercased() ?? "nil") " +
+            "eventId=\(request.eventID?.uuidString.lowercased() ?? "nil") " +
+            "leftUserId=\(request.leftUserID?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingChatMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
+        pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
+        pendingOpenFriendRequestsSection = false
+        pendingHighlightFanTeamInvitationId = nil
+        pendingOpenFanTeamRosterTeamId = request.teamID
+        if !pendingOpenMyTeamsInvitations {
+            pendingOpenMyTeamsInvitations = true
+        }
+#if DEBUG
+        PushDeepLinkLog.queued(type: "member_left_team", conversation: nil)
+#endif
+    }
+
+    func consumePendingOpenFanTeamRosterTeamId() -> UUID? {
+        let id = pendingOpenFanTeamRosterTeamId
+        pendingOpenFanTeamRosterTeamId = nil
+        return id
+    }
+
+    /// Remote APNs member_change tap: Team Detail/Roster, or My Teams fallback after removal.
+    func enqueueFanTeamMemberChangeNotificationDeepLink(
+        _ request: FanTeamMemberChangeNotificationDeepLinkRequest
+    ) {
+#if DEBUG
+        PushDeepLinkLog.received(type: "member_change", conversation: nil)
+        print(
+            "[FanTeamMemberChangeDebug] enqueue kind=\(request.kind ?? "nil") " +
+            "teamId=\(request.teamID?.uuidString.lowercased() ?? "nil") " +
+            "pickupGameId=\(request.pickupGameID?.uuidString.lowercased() ?? "nil")"
+        )
+#endif
+        pendingDirectMessageNotificationDeepLink = nil
+        pendingChatMessageNotificationDeepLink = nil
+        pendingFriendRequestNotificationDeepLink = nil
+        pendingFanTeamInvitationNotificationDeepLink = nil
+        pendingDmOpenPreview = nil
+        pendingGroupOpenConversationId = nil
+        pendingOpenFriendRequestsSection = false
+        pendingHighlightFanTeamInvitationId = nil
+
+        let kind = (request.kind ?? "").lowercased()
+        if kind == "removed_from_team" || kind == "team_admin_removed" {
+            // Safe fallback — Team Detail may no longer be accessible.
+            pendingOpenFanTeamRosterTeamId = nil
+            pendingHighlightFanTeamInvitationId = nil
+            if !pendingOpenMyTeamsInvitations {
+                pendingOpenMyTeamsInvitations = true
+            }
+        } else {
+            pendingOpenFanTeamRosterTeamId = request.teamID
+            if !pendingOpenMyTeamsInvitations {
+                pendingOpenMyTeamsInvitations = true
+            }
+        }
+#if DEBUG
+        PushDeepLinkLog.queued(type: "member_change", conversation: nil)
+#endif
     }
 
     /// Remote APNs unified chat_message tap: open Chat → exact DM or group/pickup conversation.
@@ -2845,8 +2925,17 @@ final class ChatViewModel: ObservableObject {
 #endif
     }
 
+    func applyPendingFanTeamInvitations(_ invitations: [FanTeamInvitation]) {
+        pendingFanTeamInvitations = invitations
+        applyPendingFanTeamInvitationCount(invitations.count)
+    }
+
     /// Authoritative refresh from `list_my_pending_fan_team_invitations` (invitee-only pending).
     func refreshPendingFanTeamInvitationCount(force: Bool = false) async {
+        guard currentUserAuthId != nil, !requiresSignIn else {
+            applyPendingFanTeamInvitations([])
+            return
+        }
         if let inFlight = pendingFanTeamInvitationCountRefreshTask {
             await inFlight.value
             if !force { return }
@@ -2856,13 +2945,20 @@ final class ChatViewModel: ObservableObject {
            Date().timeIntervalSince(last) < 2 {
             return
         }
+        let expectedAuthId = currentUserAuthId
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 let invitations = try await FanTeamsService().listMyPendingInvitations()
-                self.applyPendingFanTeamInvitationCount(invitations.count)
+                guard self.currentUserAuthId == expectedAuthId, !self.requiresSignIn else { return }
+                self.applyPendingFanTeamInvitations(invitations)
                 self.lastPendingFanTeamInvitationCountRefreshAt = Date()
             } catch {
+                if FanTeamsLoadErrorPresentation.isMissingAuthSession(error) {
+                    guard self.currentUserAuthId == expectedAuthId else { return }
+                    self.applyPendingFanTeamInvitations([])
+                    return
+                }
 #if DEBUG
                 print("[ChatMyTeamsBadge] refresh failed error=\(error.localizedDescription)")
 #endif
@@ -3232,9 +3328,16 @@ final class ChatViewModel: ObservableObject {
 #endif
             guard stillCurrentChatAccount(me, context: "inboxSummariesAfterFetch") else { return }
 
+            let teamLinkedPickupIds = await groupChatService.teamLinkedPickupGameIds(
+                among: groupRows.compactMap(\.pickup_game_id)
+            )
             let fastBuildStartedAt = CFAbsoluteTimeGetCurrent()
             let dmVisible = buildInboxFriendDisplays(from: rows, me: me, participantPreviews: [:], profileLookupAttempted: false)
-            let groupVisible = buildGroupInboxDisplays(from: groupRows, me: me)
+            let groupVisible = buildGroupInboxDisplays(
+                from: groupRows,
+                me: me,
+                teamLinkedPickupGameIds: teamLinkedPickupIds
+            )
             // Fast path is conversation-only. Preserve previously published accepted friends that
             // do not yet have a DM thread so the Friends tab does not flicker 4 → 3 → 4 while
             // enrichment re-merges them (see ``preservingAcceptedFriendsDirectoryRows``).
@@ -3435,8 +3538,18 @@ final class ChatViewModel: ObservableObject {
         return visible
     }
 
-    private func buildGroupInboxDisplays(from rows: [GroupInboxSummaryRow], me: UUID) -> [FriendDisplay] {
-        let displays = rows.map { row -> FriendDisplay in
+    private func buildGroupInboxDisplays(
+        from rows: [GroupInboxSummaryRow],
+        me: UUID,
+        teamLinkedPickupGameIds: Set<UUID> = []
+    ) -> [FriendDisplay] {
+        let displays = rows.compactMap { row -> FriendDisplay? in
+            guard TeamEventChatConsolidation.shouldShowInGroupInbox(
+                pickupGameId: row.pickup_game_id,
+                teamLinkedPickupGameIds: teamLinkedPickupGameIds
+            ) else {
+                return nil
+            }
             let fallbackTitle = row.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? L10n.t("group_chat_default_title")
                 : row.title
@@ -3715,7 +3828,14 @@ final class ChatViewModel: ObservableObject {
             guard stillCurrentChatAccount(me, context: "inboxEnrichmentBeforeApply") else { return }
 
             let buildStartedAt = CFAbsoluteTimeGetCurrent()
-            let groups = buildGroupInboxDisplays(from: groupRows, me: me)
+            let teamLinkedPickupIds = await groupChatService.teamLinkedPickupGameIds(
+                among: groupRows.compactMap(\.pickup_game_id)
+            )
+            let groups = buildGroupInboxDisplays(
+                from: groupRows,
+                me: me,
+                teamLinkedPickupGameIds: teamLinkedPickupIds
+            )
             let visible = mergeInboxDisplays(direct: direct, groups: groups)
             ChatActivationPerf.snapshotBuildMs(
                 (CFAbsoluteTimeGetCurrent() - buildStartedAt) * 1000,
@@ -4357,7 +4477,14 @@ final class ChatViewModel: ObservableObject {
             friendDisplays = applyHiddenInboxPeerFilter(friendDisplays)
             ChatActivationPerf.groupInboxRPCStarted()
             let groupRows = (try? await groupChatService.fetchInboxSummaries()) ?? []
-            let groupDisplays = buildGroupInboxDisplays(from: groupRows, me: me)
+            let teamLinkedPickupIds = await groupChatService.teamLinkedPickupGameIds(
+                among: groupRows.compactMap(\.pickup_game_id)
+            )
+            let groupDisplays = buildGroupInboxDisplays(
+                from: groupRows,
+                me: me,
+                teamLinkedPickupGameIds: teamLinkedPickupIds
+            )
             let fullRefreshVisible = mergeInboxDisplays(direct: friendDisplays, groups: groupDisplays)
             applyInboxFriendsSnapshot(fullRefreshVisible, source: "fullRefresh")
             ChatActivationPerf.stableInboxReady(
@@ -5907,6 +6034,7 @@ final class ChatMainTabState: ObservableObject {
 final class ChatTabBadgeState: ObservableObject {
     @Published private(set) var unreadDirectMessageCount = 0
     @Published private(set) var pendingBadgeCount = 0
+    @Published private(set) var pendingFanTeamInvitationCount = 0
     @Published private(set) var requiresSignIn = false
 
     func setUnreadDirectMessageCount(_ value: Int) {
@@ -5919,6 +6047,12 @@ final class ChatTabBadgeState: ObservableObject {
         guard pendingBadgeCount != value else { return }
         pendingBadgeCount = value
         MainTabObservationPerf.projectionPublished(scope: "badgeLeaf", category: "requestBadge")
+    }
+
+    func setPendingFanTeamInvitationCount(_ value: Int) {
+        guard pendingFanTeamInvitationCount != value else { return }
+        pendingFanTeamInvitationCount = value
+        MainTabObservationPerf.projectionPublished(scope: "badgeLeaf", category: "myTeamsInvitationBadge")
     }
 
     func setRequiresSignIn(_ value: Bool) {

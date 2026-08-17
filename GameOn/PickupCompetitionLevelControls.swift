@@ -43,10 +43,10 @@ enum FanTeamMetaLine {
         )
         if let memberCount {
             parts.append(
-                String(
-                    format: L10n.t("fan_teams_members_count_format", languageCode: languageCode),
-                    locale: Locale(identifier: languageCode),
-                    memberCount
+                TeamDetailLocalizedFormat.format(
+                    "fan_teams_members_count_format",
+                    languageCode: languageCode,
+                    int64Args: [Int64(memberCount)]
                 )
             )
         }

@@ -57,6 +57,10 @@ nonisolated enum SportFilterCatalog {
             return ChipVisual(emoji: "🥎", systemImage: "circle.fill", accent: Color(red: 0.95, green: 0.55, blue: 0.2))
         case "cycling":
             return ChipVisual(emoji: "🚴", systemImage: "bicycle", accent: Color(red: 0.1, green: 0.52, blue: 0.78))
+        case "electricscooter":
+            return ChipVisual(emoji: "🛴", systemImage: "scooter", accent: Color(red: 0.12, green: 0.68, blue: 0.52))
+        case "inlineskating":
+            return ChipVisual(emoji: "⛸️", systemImage: "figure.skating", accent: Color(red: 0.46, green: 0.36, blue: 0.86))
         case "running":
             return ChipVisual(emoji: "🏃", systemImage: "figure.run", accent: Color(red: 0.22, green: 0.62, blue: 0.42))
         case "pickleball":
@@ -138,6 +142,11 @@ nonisolated enum SportFilterCatalog {
         canonicalSportKey(for: raw) == nil
     }
 
+    /// Public alias of the catalog key used by chip visuals and FanGeo sport marks.
+    static func canonicalKey(for raw: String) -> String? {
+        canonicalSportKey(for: raw)
+    }
+
     private static func canonicalSportKey(for raw: String) -> String? {
         let normalized = normalizedSportText(raw)
         guard !normalized.isEmpty else { return nil }
@@ -173,6 +182,17 @@ nonisolated enum SportFilterCatalog {
         if normalized.contains("ping pong") || normalized.contains("pingpong") { return "pingpong" }
         if normalized.contains("wrestling") { return "wrestling" }
         if normalized.contains("nascar") || normalized.contains("stock car") { return "nascar" }
+        if normalized.contains("electric scooter")
+            || normalized.contains("e scooter")
+            || normalized.contains("escooter")
+            || normalized == "scooter" {
+            return "electricscooter"
+        }
+        if normalized.contains("inline skat")
+            || normalized.contains("rollerblad")
+            || normalized.contains("roller blad") {
+            return "inlineskating"
+        }
         if normalized.contains("cycling")
             || normalized.contains("bicycle")
             || normalized.contains("biking")
@@ -266,7 +286,18 @@ nonisolated enum SportFilterCatalog {
         case "cricket": return ["cricket"]
         case "rugby": return ["rugby"]
         case "softball": return ["softball"]
-        case "cycling": return ["cycling", "bicycle", "biking", "bike race", "tour de france", "giro", "vuelta", "bmx", "mountain biking", "mountainbiking"]
+        case "cycling": return [
+            "cycling", "bicycle", "biking", "bike race", "tour de france", "giro", "vuelta",
+            "bmx", "mountain biking", "mountainbiking", "mtb", "road cycling", "road bike",
+            "gravel", "e-bike", "ebike", "electric bike", "casual ride"
+        ]
+        case "electricscooter": return [
+            "electric scooter", "e-scooter", "escooter", "e scooter", "scooter"
+        ]
+        case "inlineskating": return [
+            "inline skating", "inline skates", "rollerblading", "rollerblades",
+            "roller blades", "rollerblade"
+        ]
         case "running": return ["running", "run", "jogging", "road race", "marathon"]
         case "pickleball": return ["pickleball"]
         case "lacrosse": return ["lacrosse"]

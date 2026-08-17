@@ -123,46 +123,21 @@ struct LiveCompactMatchupRow: View {
     }
 
     private func teamCluster(name: String, badgeURL: String?, alignment: HorizontalAlignment) -> some View {
-        let identity = ProGameTeamScoreIdentity.resolve(teamName: name, badgeURL: badgeURL, source: "Live")
-        return HStack(spacing: 5) {
+        HStack(spacing: 5) {
             if alignment == .trailing { Spacer(minLength: 0) }
-            emblem(identity)
-            Text(identity.displayName)
+            SportsIdentityArtworkView(
+                teamName: name,
+                badgeURL: badgeURL,
+                source: "Live",
+                diameter: 18
+            )
+            Text(ProGameTeamScoreIdentity.cleanTeamName(name))
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
             if alignment == .leading { Spacer(minLength: 0) }
         }
-    }
-
-    @ViewBuilder
-    private func emblem(_ identity: ProGameTeamScoreIdentity) -> some View {
-        switch identity.leading {
-        case let .flag(flag):
-            Text(flag)
-                .font(.system(size: 14))
-                .accessibilityHidden(true)
-        case let .logoURL(url):
-            DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
-                initialsFallback(identity.displayName)
-            }
-            .frame(width: 18, height: 18)
-            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-            .accessibilityHidden(true)
-        case .none:
-            initialsFallback(identity.displayName)
-        }
-    }
-
-    private func initialsFallback(_ name: String) -> some View {
-        let initials = name.split(separator: " ").prefix(2).compactMap { $0.first }.map(String.init).joined()
-        return Text(initials.isEmpty ? String(name.prefix(2)) : initials)
-            .font(.system(size: 9, weight: .bold, design: .rounded))
-            .foregroundStyle(FGColor.secondaryText(colorScheme))
-            .frame(width: 18, height: 18)
-            .background(Circle().fill(FGColor.divider(colorScheme).opacity(0.35)))
-            .accessibilityHidden(true)
     }
 
     private var accessibilityMatchupLabel: String {

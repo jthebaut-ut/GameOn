@@ -46,6 +46,8 @@ struct PickupBulkImportPreparedRow: Identifiable, Equatable {
     let gameType: GameType
     /// Optional CSV `competition_level` (nil when omitted / unspecified).
     let competitionLevel: PickupCompetitionLevel?
+    /// Optional free-text opponent (`opponent_name` / `opponent` / competitive `away_team`).
+    let opponentName: String?
     let leagueName: String?
     let homeTeam: String?
     let awayTeam: String?
@@ -84,6 +86,30 @@ struct PickupBulkImportSummary: Equatable {
 
     var totalCount: Int {
         validCount + warningCount + failedCount
+    }
+}
+
+enum PickupImportEntryFeeParsing {
+    nonisolated static let invalidNumberMessage = "entry_fee_amount must be a valid number."
+    nonisolated static let requiredWhenPaidMessage = "entry_fee_amount is required when is_free is FALSE."
+
+    /// Missing, blank, and whitespace-only fees are nil. Nonblank values must be numeric.
+    /// Paid events (`isFree == false`) still require a positive fee.
+    nonisolated static func parse(raw: String, isFree: Bool?) -> (amount: Double?, errors: [String]) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var amount: Double?
+        var errors: [String] = []
+        if !trimmed.isEmpty {
+            if let parsed = Double(trimmed), parsed >= 0, parsed <= 999_999 {
+                amount = (parsed * 100.0).rounded() / 100.0
+            } else {
+                errors.append(invalidNumberMessage)
+            }
+        }
+        if isFree == false && (amount ?? 0) <= 0 {
+            errors.append(requiredWhenPaidMessage)
+        }
+        return (amount, errors)
     }
 }
 
@@ -169,6 +195,13 @@ enum PickupBulkImportValidator {
         let awayTeam = raw.value("away_team")
         let season = raw.value("season")
         let division = raw.value("division")
+        let opponentNameRaw = {
+            let direct = raw.value("opponent_name")
+            if !direct.isEmpty { return direct }
+            let short = raw.value("opponent")
+            if !short.isEmpty { return short }
+            return ""
+        }()
 
         appendMissing("title", title, to: &errors)
         // Sport: normal requires CSV value; Team may omit and inherit Team sport.
@@ -303,17 +336,9 @@ enum PickupBulkImportValidator {
             errors.append(invalidValueMessage(field: "is_free", value: isFreeRaw, guidance: "Use: TRUE or FALSE."))
         }
 
-        var entryFeeAmount: Double?
-        if !entryFeeRaw.isEmpty {
-            if let parsed = Double(entryFeeRaw), parsed >= 0, parsed <= 999_999 {
-                entryFeeAmount = (parsed * 100.0).rounded() / 100.0
-            } else {
-                errors.append("entry_fee_amount must be a valid number.")
-            }
-        }
-        if isFree == false && (entryFeeAmount ?? 0) <= 0 {
-            errors.append("entry_fee_amount is required when is_free is FALSE.")
-        }
+        let feeParse = PickupImportEntryFeeParsing.parse(raw: entryFeeRaw, isFree: isFree)
+        errors.append(contentsOf: feeParse.errors)
+        let entryFeeAmount = feeParse.amount
 
         let ageRange = parseImportAgeRange(
             minRaw: minAgeCell.normalizedValue,
@@ -382,6 +407,19 @@ enum PickupBulkImportValidator {
             }
         }
 
+        // Optional opponent: never required for historical CSV compatibility.
+        // Prefer opponent_name/opponent; for competitive Team rows, away_team may carry opponent.
+        let resolvedOpponentName: String? = {
+            if let trimmed = FanTeamScheduleMatchup.trimmedOpponent(opponentNameRaw) {
+                return trimmed
+            }
+            if FanTeamEventPresentation.policy(for: gameFormat).requiresOpponent,
+               let away = FanTeamScheduleMatchup.trimmedOpponent(awayTeam) {
+                return away
+            }
+            return nil
+        }()
+
         return PickupBulkImportPreparedRow(
             rowNumber: raw.rowNumber,
             title: title,
@@ -404,6 +442,7 @@ enum PickupBulkImportValidator {
             coordinate: coordinate,
             gameType: gameFormat,
             competitionLevel: competitionLevel,
+            opponentName: resolvedOpponentName,
             leagueName: leagueName.isEmpty ? nil : leagueName,
             homeTeam: homeTeam.isEmpty ? nil : homeTeam,
             awayTeam: awayTeam.isEmpty ? nil : awayTeam,

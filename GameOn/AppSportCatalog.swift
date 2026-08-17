@@ -34,6 +34,8 @@ public nonisolated enum AppSportCatalog {
             Category(id: "action", title: "Action", rows: [
                 ("Climbing", "Climbing"),
                 ("Skateboarding", "Skateboarding"),
+                ("Electric Scooter", "Electric Scooter"),
+                ("Inline Skating", "Inline Skating"),
                 ("Paragliding", "paragliding"),
                 ("Hang Gliding", "hang_gliding"),
                 ("Paramotoring", "paramotoring"),
@@ -150,6 +152,19 @@ public nonisolated enum AppSportCatalog {
             case "padel":
                 // Typo / FR-identical display alias only — never a canonical stored ID.
                 return ["padle"]
+            case "cycling":
+                return [
+                    "biking", "bike", "bicycle", "road cycling", "road bike", "road biking",
+                    "mountain biking", "mountain bike", "mtb", "gravel", "bmx",
+                    "e-bike", "ebike", "electric bike", "casual ride"
+                ]
+            case "electric scooter":
+                return ["electric scooter", "e-scooter", "escooter", "e scooter", "scooter"]
+            case "inline skating":
+                return [
+                    "inline skating", "inline skates", "rollerblading", "rollerblades",
+                    "roller blades", "rollerblade"
+                ]
             default:
                 return []
             }
@@ -199,6 +214,18 @@ public nonisolated enum AppSportCatalog {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
+        let lowered = trimmed.lowercased()
+        if lowered == "biking" || lowered == "bike" || lowered == "bicycle" {
+            return "Cycling"
+        }
+        if lowered == "e-scooter" || lowered == "escooter" || lowered == "e scooter" {
+            return "Electric Scooter"
+        }
+        if lowered == "rollerblading" || lowered == "rollerblades" || lowered == "rollerblade"
+            || lowered == "roller blades" || lowered == "inline skates" {
+            return "Inline Skating"
+        }
+
         for category in SportCatalog.groupedCategories {
             if let row = category.rows.first(where: {
                 $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
@@ -218,14 +245,47 @@ public nonisolated enum AppSportCatalog {
         return trimmed
     }
 
+    /// Stored sport tokens that should match a Discover/Going sport chip, including legacy aliases.
+    public static func storedTokensMatchingDiscoverFilter(_ selected: String) -> [String] {
+        let trimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.caseInsensitiveCompare("All") == .orderedSame {
+            return []
+        }
+        let canonical = canonicalFormPickerToken(for: trimmed)
+        var tokens = [canonical, trimmed]
+        if canonical.caseInsensitiveCompare("Cycling") == .orderedSame {
+            tokens.append(contentsOf: ["Biking", "biking"])
+        }
+        var seen = Set<String>()
+        return tokens.filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    public static func sport(_ stored: String, matchesDiscoverSelection selected: String) -> Bool {
+        let selectedTrimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selectedTrimmed.isEmpty || selectedTrimmed.caseInsensitiveCompare("All") == .orderedSame {
+            return true
+        }
+        let storedTrimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        if storedTrimmed.isEmpty { return false }
+        let allowed = storedTokensMatchingDiscoverFilter(selectedTrimmed)
+        if allowed.contains(where: { $0.caseInsensitiveCompare(storedTrimmed) == .orderedSame }) {
+            return true
+        }
+        let storedCanonical = canonicalFormPickerToken(for: storedTrimmed)
+        return allowed.contains(where: { $0.caseInsensitiveCompare(storedCanonical) == .orderedSame })
+    }
+
     /// English catalog label for a stored token (no localization) — used for dedupe keys / DEBUG asserts.
     public static func catalogEnglishLabel(forSportToken token: String) -> String {
         let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
+        let canonical = canonicalFormPickerToken(for: trimmed)
 
         for category in SportCatalog.groupedCategories {
             if let row = category.rows.first(where: {
-                $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+                $0.selection.localizedCaseInsensitiveCompare(canonical) == .orderedSame
+                    || $0.label.localizedCaseInsensitiveCompare(canonical) == .orderedSame
+                    || $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
                     || $0.label.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
             }) {
                 return row.label
@@ -233,13 +293,15 @@ public nonisolated enum AppSportCatalog {
         }
 
         if let pair = discoverMapDefaultPopularPairs.first(where: {
-            $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
+            $0.selection.localizedCaseInsensitiveCompare(canonical) == .orderedSame
+                || $0.display.localizedCaseInsensitiveCompare(canonical) == .orderedSame
+                || $0.selection.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
                 || $0.display.localizedCaseInsensitiveCompare(trimmed) == .orderedSame
         }) {
             return pair.display
         }
 
-        return trimmed
+        return canonical
     }
 
     /// Stored sport strings for pickup + venue owner game forms and Open To.
@@ -268,9 +330,13 @@ public nonisolated enum AppSportCatalog {
 
     /// Friendly label for a stored sport token, e.g. `NBA` -> `Basketball`.
     /// Uses ``L10n`` so catalog English labels resolve to the active app language (e.g. Parapente).
-    public static func displayLabel(forSportToken token: String) -> String {
+    /// `compact` uses a shorter chip label where one exists (`Electric Scooter` → `E-Scooter`).
+    public static func displayLabel(forSportToken token: String, compact: Bool = false) -> String {
         let english = catalogEnglishLabel(forSportToken: token)
         guard !english.isEmpty else { return "" }
+        if compact, english.caseInsensitiveCompare("Electric Scooter") == .orderedSame {
+            return L10n.t("E-Scooter")
+        }
         return L10n.t(english)
     }
 

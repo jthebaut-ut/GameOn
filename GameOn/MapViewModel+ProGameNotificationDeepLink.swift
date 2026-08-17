@@ -9,7 +9,25 @@ extension MapViewModel {
             id: UUID(),
             matchID: trimmed
         )
-        requestedMainTabRaw = "following"
+        requestScheduleHubSurface(.pro)
+        requestedMainTabRaw = MainTabView.AppTab.calendar.rawValue
+        // Prefer Schedule → Pro highlight path when we can resolve timing.
+        if let match = resolveLiveMatchForProGameNotificationDeepLink(matchID: trimmed) {
+            pendingScheduleProGameNav = ScheduleProGameNavIntent(
+                matchId: match.id,
+                stableKey: SavedProGame.stableKey(for: match),
+                startTime: match.startTime
+            )
+        } else if let saved = savedProGames.first(where: { saved in
+            SavedProGame.normalizedHydrationToken(saved.id) == SavedProGame.normalizedHydrationToken(trimmed)
+                || SavedProGame.normalizedHydrationToken(saved.stableKey) == SavedProGame.normalizedHydrationToken(trimmed)
+        }) {
+            pendingScheduleProGameNav = ScheduleProGameNavIntent(
+                matchId: saved.id,
+                stableKey: saved.stableKey,
+                startTime: saved.startTime
+            )
+        }
     }
 
     @MainActor

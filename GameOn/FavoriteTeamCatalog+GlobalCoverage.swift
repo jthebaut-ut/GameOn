@@ -2,7 +2,7 @@ import Foundation
 
 /// Worldwide Following catalog expansion: clubs, national teams, leagues, and competitions
 /// across continents. Official names only; no third-party logos. New stable IDs only.
-extension FavoriteTeamCatalog {
+nonisolated extension FavoriteTeamCatalog {
     static let expandedWorldwideCoverage: [FavoriteTeam] =
         globalBasketballClubs
         + globalBasketballNationalTeams

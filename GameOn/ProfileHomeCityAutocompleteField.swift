@@ -9,6 +9,8 @@ struct ProfileHomeCityAutocompleteField: View {
     @Binding var displayText: String
     /// Compact pill field used inside Edit Profile Location rows.
     var usesCompactPillStyle: Bool = false
+    /// Trailing value on a grouped card row (no nested pill).
+    var usesPlainRowStyle: Bool = false
     var languageCode: String = L10n.defaultLanguageCode
 
     @Environment(\.colorScheme) private var colorScheme
@@ -25,8 +27,14 @@ struct ProfileHomeCityAutocompleteField: View {
                     .textInputAutocapitalization(.words)
                     .disableAutocorrection(true)
                     .focused($isFocused)
-                    .font(usesCompactPillStyle ? .body : .system(size: 16, weight: .semibold, design: .rounded))
-                    .modifier(ProfileHomeCityFieldChrome(colorScheme: colorScheme, compact: usesCompactPillStyle))
+                    .multilineTextAlignment(usesPlainRowStyle ? .trailing : .leading)
+                    .font(usesPlainRowStyle || usesCompactPillStyle ? .body : .system(size: 16, weight: .semibold, design: .rounded))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .modifier(ProfileHomeCityFieldChrome(
+                        colorScheme: colorScheme,
+                        compact: usesCompactPillStyle,
+                        plain: usesPlainRowStyle
+                    ))
                     .onChange(of: displayText) { _, newValue in
                         controller.refresh(query: newValue, isFocused: isFocused)
                     }
@@ -42,13 +50,20 @@ struct ProfileHomeCityAutocompleteField: View {
                         clearSelection()
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: usesCompactPillStyle ? 15 : 16, weight: .semibold))
+                            .font(.system(size: usesCompactPillStyle || usesPlainRowStyle ? 15 : 16, weight: .semibold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.72))
-                            .frame(minWidth: 44, minHeight: 44)
+                            .frame(minWidth: usesPlainRowStyle ? 28 : 44, minHeight: 44)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Clear home city")
+                }
+
+                if usesPlainRowStyle {
+                    Image(systemName: "chevron.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.55))
+                        .accessibilityHidden(true)
                 }
             }
 
@@ -210,9 +225,12 @@ private final class ProfileHomeCitySearchController: NSObject, ObservableObject,
 private struct ProfileHomeCityFieldChrome: ViewModifier {
     let colorScheme: ColorScheme
     let compact: Bool
+    var plain: Bool = false
 
     func body(content: Content) -> some View {
-        if compact {
+        if plain {
+            content
+        } else if compact {
             content
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)

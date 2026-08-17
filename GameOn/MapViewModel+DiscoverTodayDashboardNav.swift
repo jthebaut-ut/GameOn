@@ -25,7 +25,7 @@ extension MapViewModel {
         switch intent {
         case .goingVenueGamesToday, .goingPickupGamesToday,
              .goingVenueGamesUpcoming, .goingPickupGamesUpcoming:
-            requestedMainTabRaw = MainTabView.AppTab.following.rawValue
+            requestGoingRootTab()
         case .accountSuggestedFans:
             requestedMainTabRaw = MainTabView.AppTab.account.rawValue
         case .chatFansLiveNow:

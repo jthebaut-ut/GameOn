@@ -827,13 +827,13 @@ extension MapViewModel {
         }
 
         if !profile.favoriteTeamIDs.isEmpty {
-            let sorted = profile.favoriteTeamIDs.sorted()
+            let ordered = FavoriteTeamsStore.uniquedIDs(profile.favoriteTeamIDs)
             await MainActor.run {
-                FavoriteTeamsStore.writeToAppStorage(sorted)
-                FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(sorted.first)
+                FavoriteTeamsStore.writeToAppStorage(ordered)
+                FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(ordered.first)
             }
-            let synced = await syncFavoriteTeamsToSupabase(teamIDs: sorted, primaryTeamID: sorted.first)
-            print("[SignupUX] favoriteTeamsSaved count=\(sorted.count) synced=\(synced)")
+            let synced = await syncFavoriteTeamsToSupabase(teamIDs: ordered, primaryTeamID: ordered.first)
+            print("[SignupUX] favoriteTeamsSaved count=\(ordered.count) synced=\(synced)")
         } else {
             print("[SignupUX] favoriteTeamsSaved count=0")
         }

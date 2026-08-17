@@ -2,6 +2,11 @@ import Combine
 import Foundation
 import Supabase
 
+enum ChatPollRealtimeScope: Equatable, Sendable {
+    case pickup
+    case fanTeam
+}
+
 /// In-memory poll snapshots with Realtime-driven refresh (no REST polling loop).
 @MainActor
 final class PickupGamePollStore: ObservableObject {
@@ -11,7 +16,9 @@ final class PickupGamePollStore: ObservableObject {
     @Published private(set) var loadingPollIds: Set<UUID> = []
 
     private let service = PickupGamePollService()
+    private let teamPollService = FanTeamPollService()
     private var conversationId: UUID?
+    private var scope: ChatPollRealtimeScope = .pickup
     private var pollChannel: RealtimeChannelV2?
     private var listenTask: Task<Void, Never>?
     private var trackedPollIds: Set<UUID> = []
@@ -19,10 +26,11 @@ final class PickupGamePollStore: ObservableObject {
 
     private init() {}
 
-    func bind(conversationId: UUID) {
-        if self.conversationId == conversationId { return }
+    func bind(conversationId: UUID, scope: ChatPollRealtimeScope = .pickup) {
+        if self.conversationId == conversationId, self.scope == scope { return }
         let previous = self.conversationId
         self.conversationId = conversationId
+        self.scope = scope
         if previous != nil {
             Task { await tearDownRealtime() }
         }
@@ -30,6 +38,7 @@ final class PickupGamePollStore: ObservableObject {
 
     func stop() async {
         conversationId = nil
+        scope = .pickup
         trackedPollIds.removeAll()
         await tearDownRealtime()
     }
@@ -144,8 +153,9 @@ final class PickupGamePollStore: ObservableObject {
             await ChatRealtimeChannelSerializer.shared.removeExclusive(
                 topic: channel.topic,
                 channel: channel
-            ) { [service] ch in
+            ) { [service, teamPollService] ch in
                 await service.removeRealtimeChannel(ch)
+                await teamPollService.removeRealtimeChannel(ch)
             }
         }
     }
@@ -155,12 +165,20 @@ final class PickupGamePollStore: ObservableObject {
         if pollChannel != nil { return }
 
         let gen = refreshGeneration
-        let topic = "pickup-polls-\(conversationId.uuidString.lowercased())"
+        let topicPrefix = scope == .fanTeam ? "fan-team-polls" : "pickup-polls"
+        let topic = "\(topicPrefix)-\(conversationId.uuidString.lowercased())"
         await ChatRealtimeChannelSerializer.shared.waitForTopicIdle(topic)
 
         guard refreshGeneration == gen, self.conversationId == conversationId else { return }
 
-        let (channel, updates) = service.pollUpdatesChannel(conversationId: conversationId)
+        let channel: RealtimeChannelV2
+        let updates: AsyncStream<UpdateAction>
+        switch scope {
+        case .pickup:
+            (channel, updates) = service.pollUpdatesChannel(conversationId: conversationId)
+        case .fanTeam:
+            (channel, updates) = teamPollService.teamPollUpdatesChannel(conversationId: conversationId)
+        }
         pollChannel = channel
         listenTask = Task { [weak self] in
             for await action in updates {
@@ -169,6 +187,14 @@ final class PickupGamePollStore: ObservableObject {
                     guard self.trackedPollIds.contains(pollId) || self.snapshots[pollId] != nil else {
                         continue
                     }
+#if DEBUG
+                    if self.scope == .fanTeam {
+                        TeamChatPollDebug.log(
+                            "realtimePollUpdated",
+                            detail: "pollID=\(pollId.uuidString.lowercased()) conversationID=\(conversationId.uuidString.lowercased())"
+                        )
+                    }
+#endif
                     await self.refresh(pollId)
                 }
             }
@@ -204,6 +230,7 @@ extension PickupGamePollSnapshot {
         PickupGamePollSnapshot(
             id: id,
             pickupGameId: pickupGameId,
+            teamId: teamId,
             conversationId: conversationId,
             messageId: messageId,
             createdBy: createdBy,

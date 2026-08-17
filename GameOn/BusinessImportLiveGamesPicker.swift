@@ -335,8 +335,8 @@ struct BusinessImportLiveGameCard: View {
                         )
                     } else {
                         VStack(alignment: .leading, spacing: 7) {
-                            teamLine(match.awayTeam, badgeURL: match.awayTeamBadgeURL)
-                            teamLine(match.homeTeam, badgeURL: match.homeTeamBadgeURL)
+                            teamLine(match.awayTeam, badgeURL: match.awayTeamBadgeURL, match: match)
+                            teamLine(match.homeTeam, badgeURL: match.homeTeamBadgeURL, match: match)
                         }
                     }
                 }
@@ -371,6 +371,9 @@ struct BusinessImportLiveGameCard: View {
                     awayBadgeURL: match.awayTeamBadgeURL,
                     homeBadgeURL: match.homeTeamBadgeURL,
                     source: "BusinessImport",
+                    league: match.sourceLeagueName ?? match.league,
+                    awayEntityID: match.awayTeamProviderId,
+                    homeEntityID: match.homeTeamProviderId,
                     isFinal: match.matchStatus == .fullTime,
                     isLive: match.matchStatus.isHappeningNow,
                     accentColor: accent,
@@ -414,31 +417,21 @@ struct BusinessImportLiveGameCard: View {
     }
 
     @ViewBuilder
-    private func teamLine(_ team: String, badgeURL: String?) -> some View {
+    private func teamLine(_ team: String, badgeURL: String?, match: LiveMatch) -> some View {
         HStack(spacing: 8) {
-            teamLeadingContent(for: team, badgeURL: badgeURL)
+            SportsIdentityArtworkView(
+                teamName: team,
+                badgeURL: badgeURL,
+                entityID: team == match.awayTeam ? match.awayTeamProviderId : match.homeTeamProviderId,
+                league: match.sourceLeagueName ?? match.league,
+                source: "BusinessImport",
+                diameter: 22
+            )
             Text(CalendarProGamesFilterSupport.teamDisplayName(team))
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
-        }
-    }
-
-    @ViewBuilder
-    private func teamLeadingContent(for team: String, badgeURL: String?) -> some View {
-        switch ProGameTeamScoreIdentity.resolve(teamName: team, badgeURL: badgeURL, source: "BusinessImport").leading {
-        case let .flag(flag):
-            Text(flag)
-                .font(.title3)
-        case let .logoURL(url):
-            DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
-                Color.clear
-            }
-            .frame(width: 22, height: 22)
-            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-        case .none:
-            EmptyView()
         }
     }
 }

@@ -271,6 +271,7 @@ extension MapViewModel {
         selectedBar = nil
         selectedEvent = nil
         selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
 
         guard let coordinate = await followingPickupCoordinate(for: row) else {
 #if DEBUG
@@ -405,7 +406,14 @@ extension MapViewModel {
             cleanup_delay_hours: row.cleanup_delay_hours,
             remove_after_at: row.remove_after_at,
             created_at: row.created_at,
-            updated_at: row.updated_at
+            updated_at: row.updated_at,
+            poll_create_permission: row.poll_create_permission,
+            opponent_name: row.opponent_name,
+            arrival_time: row.arrival_time,
+            team_score: row.team_score,
+            opponent_score: row.opponent_score,
+            scoring_status: row.scoring_status,
+            scoring_finalized_at: row.scoring_finalized_at
         )
     }
 

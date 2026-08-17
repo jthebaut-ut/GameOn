@@ -1052,19 +1052,20 @@ extension MapViewModel {
         return countryCodeFromFormattedAddress(trimmedNonEmpty(representations.regionName))
     }
 
-    /// Reverse geocode for pickup map pin (street line, city, state, postal code); all nil if lookup fails.
+    /// Reverse geocode for pickup map pin (street line, city, state, postal code, country); all nil if lookup fails.
     func reverseGeocodeAddressFields(for coordinate: CLLocationCoordinate2D) async -> (
         street: String?,
         city: String?,
         state: String?,
-        postalCode: String?
+        postalCode: String?,
+        countryCode: String?
     ) {
 #if DEBUG
         print("[PickupLocationDebug] reverseGeocodeStarted coordinate=\(coordinate.latitude),\(coordinate.longitude)")
 #endif
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
         do {
-            let fields: (street: String?, city: String?, state: String?, postalCode: String?)
+            let fields: (street: String?, city: String?, state: String?, postalCode: String?, countryCode: String?)
             if #available(iOS 26.0, *) {
                 fields = try await Self.reverseGeocodedAddressFieldsUsingMapKit(for: location)
             } else {
@@ -1075,6 +1076,7 @@ extension MapViewModel {
             print("[PickupLocationDebug] reverseGeocodeResult city=\(fields.city ?? "")")
             print("[PickupLocationDebug] reverseGeocodeResult state=\(fields.state ?? "")")
             print("[PickupLocationDebug] reverseGeocodeResult postalCode=\(fields.postalCode ?? "")")
+            print("[PickupLocationDebug] reverseGeocodeResult countryCode=\(fields.countryCode ?? "")")
 #endif
             return fields
         } catch {
@@ -1083,19 +1085,20 @@ extension MapViewModel {
             print("[PickupLocationDebug] reverseGeocodeResult city=")
             print("[PickupLocationDebug] reverseGeocodeResult state=")
             print("[PickupLocationDebug] reverseGeocodeResult postalCode=")
+            print("[PickupLocationDebug] reverseGeocodeResult countryCode=")
 #endif
-            return (nil, nil, nil, nil)
+            return (nil, nil, nil, nil, nil)
         }
     }
 
     @available(iOS, deprecated: 26.0, message: "Use MKReverseGeocodingRequest on iOS 26+")
     nonisolated private static func reverseGeocodedAddressFieldsUsingLegacyCLGeocoder(
         for location: CLLocation
-    ) async -> (street: String?, city: String?, state: String?, postalCode: String?) {
+    ) async -> (street: String?, city: String?, state: String?, postalCode: String?, countryCode: String?) {
         // Inactive while deployment target is iOS 26+; keeps the availability branch shape without
         // referencing deprecated CLGeocoder APIs in the modern build.
         _ = location
-        return (nil, nil, nil, nil)
+        return (nil, nil, nil, nil, nil)
     }
 
     /// iOS 26+ reverse geocoding via ``MKReverseGeocodingRequest``.
@@ -1105,10 +1108,11 @@ extension MapViewModel {
         street: String?,
         city: String?,
         state: String?,
-        postalCode: String?
+        postalCode: String?,
+        countryCode: String?
     ) {
         guard let request = MKReverseGeocodingRequest(location: location) else {
-            return (nil, nil, nil, nil)
+            return (nil, nil, nil, nil, nil)
         }
 
         let item = try await request.mapItems.first
@@ -1120,8 +1124,11 @@ extension MapViewModel {
         let statePostal = Self.stateAndPostalCode(from: lines, city: city)
         let state = Self.stateAbbreviation(from: cityContext, city: city) ?? statePostal.state
         let postalCode = statePostal.postalCode
+        let countryCode = Self.mapKitRegionCountryCode(from: representations)
+            ?? Self.countryCodeFromFormattedAddress(Self.formattedBusinessVenueAddress(from: item))
+            ?? Self.countryCodeFromAddressLines(lines)
 
-        return (street, city, state, postalCode)
+        return (street, city, state, postalCode, countryCode)
     }
 
     @available(iOS 26.0, *)

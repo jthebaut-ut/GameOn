@@ -14,6 +14,8 @@ struct CalendarScreen: View {
     @Binding var selectedTab: MainTabView.AppTab
     /// False while Calendar is preserved off-screen (defers tab-only pickup refresh at launch).
     var isCalendarTabSelected: Bool = false
+    /// When true, ScheduleHubView owns the Schedule title + Live/Watch/Play/Pro chrome.
+    var suppressesScheduleChrome: Bool = false
     @EnvironmentObject private var chatViewModel: ChatViewModel
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
     @AppStorage(LiveLeagueCountryFilterPreference.appStorageKey) private var calendarLeagueCountryFilterRaw: String = ""
@@ -1014,8 +1016,10 @@ struct CalendarScreen: View {
         ZStack {
             Color(.systemGroupedBackground).ignoresSafeArea()
             VStack(alignment: .leading, spacing: 10) {
-                header
-                gameTypeFilter
+                if !suppressesScheduleChrome {
+                    header
+                    gameTypeFilter
+                }
                 Spacer(minLength: 0)
             }
             .padding(.top, 14)
@@ -1152,7 +1156,7 @@ struct CalendarScreen: View {
     private var calendarNavigationRoot: some View {
         calendarLifecycleRoot
             .sheet(item: $calendarPickupDetailToken) { token in
-                DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                DiscoverPickupGameDetailSheet(viewModel: viewModel, token: token)
                     .environmentObject(chatViewModel)
             }
             .sheet(item: $calendarProGamePredictionSheet) { context in
@@ -1214,8 +1218,10 @@ struct CalendarScreen: View {
 
     private var fanCalendarContentStack: some View {
         VStack(alignment: .leading, spacing: 10) {
-            header
-            gameTypeFilter
+            if !suppressesScheduleChrome {
+                header
+                gameTypeFilter
+            }
             calendarTopControls
             calendarSearchSuggestionsSlot
             eventsHeader
@@ -1225,7 +1231,7 @@ struct CalendarScreen: View {
             }
             eventsList
         }
-        .padding(.top, 14)
+        .padding(.top, suppressesScheduleChrome ? 6 : 14)
     }
 
     @ViewBuilder
@@ -2190,10 +2196,13 @@ struct CalendarScreen: View {
     }
 
     private var header: some View {
-        FanGeoPagePurposeHeader(
-            title: L10n.t("Schedule", languageCode: appLanguageRaw),
-            subtitle: ""
-        )
+        HStack(alignment: .center, spacing: 12) {
+            FanGeoPagePurposeHeader(
+                title: L10n.t("Schedule", languageCode: appLanguageRaw),
+                subtitle: ""
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
         .padding(.horizontal)
     }
 
@@ -2793,7 +2802,7 @@ struct CalendarScreen: View {
             return L10n.t("schedule_noun_watch_parties", languageCode: calendarScheduleLanguageCode)
         case .pickupGames:
             if viewModel.discoverPickupTeamScope == .myTeams {
-                return L10n.t("schedule_noun_team_games", languageCode: calendarScheduleLanguageCode)
+                return L10n.t("schedule_noun_team_events", languageCode: calendarScheduleLanguageCode)
             }
             return L10n.t("schedule_noun_pickup_games", languageCode: calendarScheduleLanguageCode)
         case .proGames:
@@ -2831,7 +2840,7 @@ struct CalendarScreen: View {
 
     private var calendarPickupGamesEmptyStateTitle: String {
         if viewModel.discoverPickupTeamScope == .myTeams {
-            return L10n.t("no_team_games_found", languageCode: calendarScheduleLanguageCode)
+            return L10n.t("no_team_events_found", languageCode: calendarScheduleLanguageCode)
         }
         return L10n.t("no_pickup_games_found", languageCode: calendarScheduleLanguageCode)
     }
@@ -2841,14 +2850,14 @@ struct CalendarScreen: View {
             if let sport = calendarMyTeamsEmptySportLabel {
                 return String(
                     format: L10n.t(
-                        "no_team_games_found_supporting_sport_format",
+                        "no_team_events_found_supporting_sport_format",
                         languageCode: calendarScheduleLanguageCode
                     ),
                     locale: Locale(identifier: calendarScheduleLanguageCode),
                     sport
                 )
             }
-            return L10n.t("no_team_games_found_supporting", languageCode: calendarScheduleLanguageCode)
+            return L10n.t("no_team_events_found_supporting", languageCode: calendarScheduleLanguageCode)
         }
         return L10n.t("no_pickup_games_found_supporting", languageCode: calendarScheduleLanguageCode)
     }
@@ -3537,8 +3546,8 @@ struct CalendarScreen: View {
                     )
                 } else {
                     VStack(alignment: .leading, spacing: 7) {
-                        calendarTeamLine(match.awayTeam, score: nil, badgeURL: match.awayTeamBadgeURL)
-                        calendarTeamLine(match.homeTeam, score: nil, badgeURL: match.homeTeamBadgeURL)
+                        calendarTeamLine(match.awayTeam, score: nil, badgeURL: match.awayTeamBadgeURL, match: match)
+                        calendarTeamLine(match.homeTeam, score: nil, badgeURL: match.homeTeamBadgeURL, match: match)
                     }
                 }
             }
@@ -3585,6 +3594,9 @@ struct CalendarScreen: View {
                     awayBadgeURL: match.awayTeamBadgeURL,
                     homeBadgeURL: match.homeTeamBadgeURL,
                     source: "Calendar",
+                    league: match.sourceLeagueName ?? match.league,
+                    awayEntityID: match.awayTeamProviderId,
+                    homeEntityID: match.homeTeamProviderId,
                     isFinal: match.matchStatus == .fullTime,
                     isLive: match.matchStatus.isHappeningNow,
                     accentColor: accent,
@@ -3749,10 +3761,16 @@ struct CalendarScreen: View {
     }
 
     @ViewBuilder
-    private func calendarTeamLine(_ team: String, score: Int?, badgeURL: String?) -> some View {
+    private func calendarTeamLine(_ team: String, score: Int?, badgeURL: String?, match: LiveMatch) -> some View {
         if let score {
             ProGameScoreRowView(
-                identity: ProGameTeamScoreIdentity.resolve(teamName: team, badgeURL: badgeURL, source: "Calendar"),
+                identity: ProGameTeamScoreIdentity.resolve(
+                    teamName: team,
+                    badgeURL: badgeURL,
+                    source: "Calendar",
+                    entityID: team == match.awayTeam ? match.awayTeamProviderId : match.homeTeamProviderId,
+                    league: match.sourceLeagueName ?? match.league
+                ),
                 score: score,
                 scoreFont: .headline.weight(.black).monospacedDigit(),
                 nameFont: .headline.weight(.bold),
@@ -3761,30 +3779,20 @@ struct CalendarScreen: View {
             )
         } else {
             HStack(spacing: 8) {
-                calendarTeamLeadingContent(for: team, badgeURL: badgeURL)
+                SportsIdentityArtworkView(
+                    teamName: team,
+                    badgeURL: badgeURL,
+                    entityID: team == match.awayTeam ? match.awayTeamProviderId : match.homeTeamProviderId,
+                    league: match.sourceLeagueName ?? match.league,
+                    source: "Calendar",
+                    diameter: 22
+                )
                 Text(ProGameTeamScoreIdentity.cleanTeamName(team))
                     .font(.headline.weight(.bold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
             }
-        }
-    }
-
-    @ViewBuilder
-    private func calendarTeamLeadingContent(for team: String, badgeURL: String?) -> some View {
-        switch ProGameTeamScoreIdentity.resolve(teamName: team, badgeURL: badgeURL, source: "Calendar").leading {
-        case let .flag(flag):
-            Text(flag)
-                .font(.title3)
-        case let .logoURL(url):
-            DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
-                Color.clear
-            }
-            .frame(width: 22, height: 22)
-            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
-        case .none:
-            EmptyView()
         }
     }
 
@@ -3900,96 +3908,193 @@ struct CalendarScreen: View {
     private func pickupCalendarEventCard(_ event: SportsEvent) -> some View {
         let now = Date()
         let pickupRow = viewModel.resolvedPickupGameRow(for: event.id)
+        let teamIdentity = viewModel.pickupDiscoverTeamIdentityByGameId[event.id]
+        let isTeamLinked = PickupDiscoverTeamPresentation.isTeamLinked(teamIdentity)
         let pickupStarted = pickupRow?.hasPickupGameStarted(now: now) ?? false
         let addressLine = pickupRow.map { viewModel.pickupGameCalendarAddressLine($0) } ?? ""
-        let spotsLine = pickupRow.flatMap { viewModel.pickupGameCalendarSpotsLine($0) }
+        let dateTimeLine = pickupRow.map { viewModel.pickupGameCalendarDateTimeLine($0) } ?? ""
+        let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
+        let showSpots = pickupRow.map {
+            CalendarPlayPickupCardPresentation.shouldShowSpotsLine(identity: teamIdentity, game: $0)
+        } ?? false
+        let spotsLine = showSpots ? pickupRow.flatMap { viewModel.pickupGameCalendarSpotsLine($0) } : nil
         let capacityMeta = pickupCalendarCapacityPillText(for: pickupRow)
         let rosterState = pickupRow.map { $0.isPickupFullForDiscover ? "full" : "open" } ?? "unknown"
+        let primaryTitle = CalendarPlayPickupCardPresentation.primaryTitle(
+            eventTitle: event.title,
+            identity: teamIdentity
+        )
+        let eventTypeLabel: String? = {
+            guard isTeamLinked, let row = pickupRow else { return nil }
+            return CalendarPlayPickupCardPresentation.eventTypeLabel(for: row, languageCode: languageCode)
+        }()
+        let teamAccent = isTeamLinked
+            ? CalendarPlayPickupCardPresentation.teamAccent(identity: teamIdentity, colorScheme: calendarColorScheme)
+            : nil
+        let a11yLabel = CalendarPlayPickupCardPresentation.accessibilityLabel(
+            eventTitle: event.title,
+            identity: teamIdentity,
+            game: pickupRow,
+            dateTimeLine: dateTimeLine,
+            addressLine: addressLine,
+            capacityMeta: capacityMeta,
+            languageCode: languageCode
+        )
 
         return Button {
             if viewModel.isGuestDiscoverMode {
                 viewModel.discoverNavigateToAccountForUserAuth = true
                 return
             }
-            calendarPickupDetailToken = PickupDetailNavigationToken(id: event.id)
+            calendarPickupDetailToken = {
+                if let identity = teamIdentity {
+                    return .teamEvent(
+                        gameId: event.id,
+                        team: PickupGameTeamCreationContext(
+                            teamId: identity.teamId,
+                            teamName: identity.teamName,
+                            teamSport: identity.teamSport,
+                            logoURL: identity.logoURL,
+                            logoThumbnailURL: identity.logoThumbnailURL,
+                            colorHex: identity.colorHex
+                        )
+                    )
+                }
+                return .standalone(event.id)
+            }()
         } label: {
-            HStack(alignment: .center, spacing: 14) {
-                PickupGameStartedSportGlyphFrame(showStarted: pickupStarted) {
-                    SportArtworkIconView(sport: event.sport, diameter: 46)
+            HStack(alignment: .center, spacing: 0) {
+                if let teamAccent {
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(teamAccent)
+                        .frame(width: 4)
+                        .padding(.trailing, 12)
+                        .accessibilityHidden(true)
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(event.title)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-                        .lineLimit(1)
+                HStack(alignment: .center, spacing: 14) {
+                    if let identity = teamIdentity {
+                        PickupGameStartedSportGlyphFrame(showStarted: pickupStarted) {
+                            FanTeamMarkView(
+                                sport: identity.teamSport.isEmpty ? event.sport : identity.teamSport,
+                                logoURL: identity.logoURL,
+                                logoThumbnailURL: identity.logoThumbnailURL,
+                                colorHex: identity.colorHex,
+                                size: 46,
+                                displayRefreshToken: identity.displayRefreshToken
+                            )
+                        }
+                    } else {
+                        PickupGameStartedSportGlyphFrame(showStarted: pickupStarted) {
+                            SportArtworkIconView(sport: event.sport, diameter: 46)
+                        }
+                    }
 
-                    if let row = pickupRow {
-                        Text(viewModel.pickupGameCalendarDateTimeLine(row))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        if let eventTypeLabel, let teamAccent {
+                            Text(eventTypeLabel.uppercased(with: Locale(identifier: languageCode)))
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(teamAccent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule(style: .continuous)
+                                        .fill(teamAccent.opacity(calendarColorScheme == .dark ? 0.22 : 0.14))
+                                )
+                                .lineLimit(1)
+                                .accessibilityHidden(true)
+                        }
+
+                        Text(primaryTitle)
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
                             .lineLimit(1)
 
-                        if !addressLine.isEmpty {
-                            Text(addressLine)
+                        if let row = pickupRow {
+                            Text(viewModel.pickupGameCalendarDateTimeLine(row))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
+
+                            if !addressLine.isEmpty {
+                                Text(addressLine)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+
+                            if let spots = spotsLine {
+                                Text(spots)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                            }
+                        } else {
+                            Text("Pickup details loading…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
 
-                        if let spots = spotsLine {
-                            Text(spots)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.primary)
+                        if pickupStarted {
+                            PickupGameStartedLineCaption()
                         }
-                    } else {
-                        Text("Pickup details loading…")
+                    }
+
+                    Spacer(minLength: 0)
+
+                    VStack(alignment: .trailing, spacing: 8) {
+                        Text(capacityMeta)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(capacityMeta == "Full" ? FGColor.secondaryText(calendarColorScheme) : FGColor.accentGreen)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill((capacityMeta == "Full" ? Color.primary : FGColor.accentGreen).opacity(calendarColorScheme == .dark ? 0.16 : 0.10))
+                            )
+                            .accessibilityLabel(capacityMeta == "Full" ? "Roster full" : "Spots available")
+
+                        Image(systemName: "chevron.right")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-
-                    if pickupStarted {
-                        PickupGameStartedLineCaption()
-                    }
-                }
-
-                Spacer(minLength: 0)
-
-                VStack(alignment: .trailing, spacing: 8) {
-                    Text(capacityMeta)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(capacityMeta == "Full" ? FGColor.secondaryText(calendarColorScheme) : FGColor.accentGreen)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill((capacityMeta == "Full" ? Color.primary : FGColor.accentGreen).opacity(calendarColorScheme == .dark ? 0.16 : 0.10))
-                        )
-                        .accessibilityLabel(capacityMeta == "Full" ? "Roster full" : "Spots available")
-
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
-            .padding(14)
+            .padding(.leading, isTeamLinked ? 10 : 14)
+            .padding(.trailing, 14)
+            .padding(.vertical, 14)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground))
+            .background {
+                ZStack {
+                    Color(.secondarySystemGroupedBackground)
+                    if let teamAccent {
+                        teamAccent.opacity(FanTeamColorTheme.tintOpacity(for: calendarColorScheme))
+                    }
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(calendarColorScheme == .dark ? 0.12 : 0.08), lineWidth: 1)
+                    .strokeBorder(
+                        teamAccent.map {
+                            $0.opacity(FanTeamColorTheme.strokeOpacity(for: calendarColorScheme))
+                        } ?? Color.primary.opacity(calendarColorScheme == .dark ? 0.12 : 0.08),
+                        lineWidth: 1
+                    )
             )
             .shadow(color: Color.black.opacity(calendarColorScheme == .dark ? 0.14 : 0.04), radius: 7, y: 3)
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityLabel(a11yLabel)
         .onAppear {
 #if DEBUG
             print("[CalendarPickupPublicMode] personalStateHidden=true")
             print("[CalendarPickupPublicMode] badgeRemoved=true")
             print("[CalendarPickupPublicMode] gameId=\(event.id.uuidString.lowercased())")
             print("[CalendarPickupPublicMode] rosterState=\(rosterState)")
+            print("[CalendarPickupPublicMode] teamLinked=\(isTeamLinked)")
 #endif
             if let r = pickupRow {
                 PickupGameStartedStateDebug.log(row: r, now: now, allowedActions: "calendar_tab_public_row")
@@ -4169,11 +4274,21 @@ struct CalendarScreen: View {
 
             if presentation.hasTeamMatchup {
                 HStack(spacing: 4) {
-                    calendarTeamLeadingContent(for: presentation.awayTeam ?? "", badgeURL: nil)
+                    SportsIdentityArtworkView(
+                        teamName: presentation.awayTeam ?? "",
+                        badgeURL: nil,
+                        source: "CalendarVenue",
+                        diameter: 18
+                    )
                     Text("vs")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(.secondary)
-                    calendarTeamLeadingContent(for: presentation.homeTeam ?? "", badgeURL: nil)
+                    SportsIdentityArtworkView(
+                        teamName: presentation.homeTeam ?? "",
+                        badgeURL: nil,
+                        source: "CalendarVenue",
+                        diameter: 18
+                    )
                 }
                 .layoutPriority(1)
             }

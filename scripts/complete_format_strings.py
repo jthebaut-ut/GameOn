@@ -46,7 +46,8 @@ WORD_MAP = {
     "Organizer": {"es": "Organizador", "fr": "Organisateur", "pt": "Organizador", "de": "Organisator", "it": "Organizzatore", "pl": "Organizator", "ru": "Организатор", "sq": "Organizues", "zh-Hans": "组织者"},
     "club crest": {"es": "escudo del club", "fr": "blason du club", "pt": "brasão do clube", "de": "Vereinswappen", "it": "stemma del club", "pl": "herb klubu", "ru": "эмблема клуба", "sq": "stemë klubi", "zh-Hans": "俱乐部徽章"},
     "Watch Spot": {"es": "Watch Spot", "fr": "Watch Spot", "pt": "Watch Spot", "de": "Watch Spot", "it": "Watch Spot", "pl": "Watch Spot", "ru": "Watch Spot", "sq": "Watch Spot", "zh-Hans": "观赛点"},
-    "is My Team": {"es": "es mi equipo", "fr": "est mon équipe", "pt": "é meu time", "de": "ist mein Team", "it": "è la mia squadra", "pl": "to moja drużyna", "ru": "— моя команда", "sq": "është ekipi im", "zh-Hans": "是我的球队"},
+    "is Favorite Team": {"es": "es equipo favorito", "fr": "est l’équipe favorite", "pt": "é equipe favorita", "de": "ist Lieblingsteam", "it": "è la squadra preferita", "pl": "to ulubiona drużyna", "ru": "— любимая команда", "sq": "është ekipi i preferuar", "zh-Hans": "是收藏球队"},
+    "is My Team": {"es": "es equipo favorito", "fr": "est l’équipe favorite", "pt": "é equipe favorita", "de": "ist Lieblingsteam", "it": "è la squadra preferita", "pl": "to ulubiona drużyna", "ru": "— любимая команда", "sq": "është ekipi i preferuar", "zh-Hans": "是收藏球队"},
     "players waiting": {"es": "jugadores en espera", "fr": "joueurs en attente", "pt": "jogadores aguardando", "de": "wartende Spieler", "it": "giocatori in attesa", "pl": "graczy czeka", "ru": "игроков ждут", "sq": "lojtarë në pritje", "zh-Hans": "名球员等待中"},
     "players waiting. Tap to review.": {
         "es": "jugadores en espera. Toca para revisar.", "fr": "joueurs en attente. Touchez pour examiner.",

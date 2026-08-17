@@ -1348,6 +1348,11 @@ struct DiscoverScreen: View {
     @State private var discoverEmptyCreatePickupFormMode: PickupGameFormMode?
     @State private var pickupPostCreateInviteGame: PickupGameRow?
     @State private var pickupPlaceClusterForSheet: PickupPlaceCluster?
+    @State private var pickupGameClusterForSheet: PickupGameCluster?
+    @State private var discoverFanTeamClusterForSheet: DiscoverableFanTeamCluster?
+    @State private var discoverPublicFanTeamForSheet: DiscoverableFanTeamMapRow?
+    @State private var discoverMemberFanTeamForSheet: FanTeamSummary?
+    @State private var pendingPickupGameDetailFromClusterId: UUID?
     @State private var pendingPickupPlaceHostFromClusterDismiss: PickupPlaceRow?
     @State private var discoverWeather: DiscoverWeatherSnapshot?
     @State private var discoverWeatherRefreshTask: Task<Void, Never>?
@@ -1385,15 +1390,17 @@ struct DiscoverScreen: View {
         let barsFingerprint: String
         let pickupGamesFingerprint: String
         let pickupPlacesFingerprint: String
+        let fanTeamsFingerprint: String
     }
 
     private struct DiscoverAnnotationCounts: Equatable {
         let venue: Int
         let pickupGames: Int
         let pickupPlaces: Int
+        let fanTeams: Int
 
         var pickupTotal: Int {
-            pickupGames + pickupPlaces
+            pickupGames + pickupPlaces + fanTeams
         }
 
         func renderedCount(mode: DiscoverMapContentMode) -> Int {
@@ -1406,6 +1413,7 @@ struct DiscoverScreen: View {
         let venueClusters: [VenueCluster]
         let pickupGameClusters: [PickupGameCluster]
         let pickupPlaceClusters: [PickupPlaceCluster]
+        let fanTeamClusters: [DiscoverableFanTeamCluster]
         let counts: DiscoverAnnotationCounts
 
         static let empty = DiscoverAnnotationCache(
@@ -1413,7 +1421,8 @@ struct DiscoverScreen: View {
             venueClusters: [],
             pickupGameClusters: [],
             pickupPlaceClusters: [],
-            counts: DiscoverAnnotationCounts(venue: 0, pickupGames: 0, pickupPlaces: 0)
+            fanTeamClusters: [],
+            counts: DiscoverAnnotationCounts(venue: 0, pickupGames: 0, pickupPlaces: 0, fanTeams: 0)
         )
     }
 
@@ -2824,6 +2833,14 @@ struct DiscoverScreen: View {
         discoverScreenWithToolbar
             .onAppear {
                 refreshAcceptedFriendUserIDs(reason: "appear")
+#if DEBUG
+                DiscoverClusterVisualQA.applyIfNeeded(to: viewModel)
+#endif
+            }
+            .onChange(of: viewModel.discoverBannerAnnouncements.count) { _, _ in
+#if DEBUG
+                DiscoverClusterVisualQA.applyIfNeeded(to: viewModel)
+#endif
             }
             .onChange(of: viewModel.canUseFanSocialFeatures) { _, _ in
                 refreshAcceptedFriendUserIDs(reason: "socialGate")
@@ -2924,7 +2941,7 @@ struct DiscoverScreen: View {
         discoverScreenWithClusterSheet
             .sheet(item: $pickupGameDetailNav) { token in
                 let _ = PickupDetailCrashTrace.log("detailSheetInit", gameId: token.id)
-                DiscoverPickupGameDetailSheet(viewModel: viewModel, gameId: token.id)
+                DiscoverPickupGameDetailSheet(viewModel: viewModel, token: token)
                     .environmentObject(chatViewModel)
                     .onAppear {
                         PickupDetailCrashTrace.log("sheetOnAppear", gameId: token.id)
@@ -3022,6 +3039,53 @@ struct DiscoverScreen: View {
                 )
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+            }
+            .sheet(
+                item: $pickupGameClusterForSheet,
+                onDismiss: openPendingPickupGameDetailFromClusterIfNeeded
+            ) { cluster in
+                DiscoverPickupGameClusterSheet(
+                    rows: DiscoverPickupGameClusterSelection.sorted(
+                        cluster.rows.compactMap { viewModel.resolvedPickupGameRow(for: $0.id) }
+                    ),
+                    teamIdentityByGameId: viewModel.pickupDiscoverTeamIdentityByGameId,
+                    languageCode: appLanguageRaw,
+                    onSelectGameId: selectPickupGameFromClusterSheet
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $discoverFanTeamClusterForSheet) { cluster in
+                DiscoverFanTeamClusterSheet(
+                    cluster: cluster,
+                    currentUserLocation: viewModel.currentUserLocation,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                    onSelect: { team in
+                        withAnimation(.spring(response: 0.45, dampingFraction: 0.86)) {
+                            viewModel.selectDiscoverableFanTeamOnMap(team)
+                        }
+                    }
+                )
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+            }
+            .sheet(item: $discoverPublicFanTeamForSheet) { team in
+                FanTeamPublicDiscoveryView(
+                    team: team,
+                    distanceMiles: viewModel.distanceMiles(to: team)
+                )
+            }
+            .sheet(item: $discoverMemberFanTeamForSheet) { summary in
+                FanTeamDetailSheet(
+                    summary: summary,
+                    mapViewModel: viewModel,
+                    chatViewModel: chatViewModel,
+                    onOpenChat: { context in
+                        discoverMemberFanTeamForSheet = nil
+                        chatViewModel.pendingGroupOpenConversationId = context.conversationId
+                    },
+                    onTeamsChanged: {}
+                )
             }
     }
 
@@ -3183,6 +3247,7 @@ struct DiscoverScreen: View {
                 } else if isPickupPlacesMode {
                     Task {
                         await viewModel.refreshPickupPlacesForDiscoverMap(force: true)
+                        await viewModel.refreshDiscoverableFanTeamsForMap(force: true)
                     }
                 }
             }
@@ -3247,6 +3312,7 @@ struct DiscoverScreen: View {
             } else {
                 viewModel.selectedBar = nil
                 viewModel.selectedPickupPlaceForMap = nil
+                viewModel.selectedDiscoverableFanTeamForMap = nil
                 Task { @MainActor in
                     await ensureDiscoverDatasetConsistency(trigger: "pickupSubModeSwitch")
                 }
@@ -4146,6 +4212,7 @@ struct DiscoverScreen: View {
                     skippedReason: nil
                 )
                 await viewModel.refreshPickupPlacesForDiscoverMap(force: forceCurrentModeReload || viewModel.pickupPlacesForDiscoverMap.isEmpty)
+                await viewModel.refreshDiscoverableFanTeamsForMap(force: forceCurrentModeReload || viewModel.discoverableFanTeamsForMap.isEmpty)
                 rebuildDiscoverAnnotationCache(reason: "venueReloadConsistency_\(trigger)_pickupPlaces")
                 logVenueReloadConsistency(
                     trigger: trigger,
@@ -4766,6 +4833,10 @@ struct DiscoverScreen: View {
         discoverAnnotationCache.pickupPlaceClusters
     }
 
+    private var discoverFanTeamClustersForMap: [DiscoverableFanTeamCluster] {
+        discoverAnnotationCache.fanTeamClusters
+    }
+
     private var discoverVenueClustersForMap: [VenueCluster] {
         discoverAnnotationCache.venueClusters
     }
@@ -4785,6 +4856,13 @@ struct DiscoverScreen: View {
         guard isPickupPlacesMode else { return [] }
         return viewModel.clusteredPickupPlacesForDiscoverMap(
             rows: viewModel.pickupPlacesVisibleAsMapPins(for: viewModel.currentMapRegionBounds())
+        )
+    }
+
+    private func buildDiscoverFanTeamClustersForMap() -> [DiscoverableFanTeamCluster] {
+        guard isPickupPlacesMode else { return [] }
+        return viewModel.clusteredDiscoverableFanTeamsForMap(
+            rows: viewModel.discoverableFanTeamsVisibleAsMapPins(for: viewModel.currentMapRegionBounds())
         )
     }
 
@@ -4832,11 +4910,27 @@ struct DiscoverScreen: View {
 
         let venueClusters = buildDiscoverVenueClustersForMap()
         let pickupGameClusters = buildDiscoverPickupClustersForMap()
-        let pickupPlaceClusters = buildDiscoverPickupPlaceClustersForMap()
+        let pickupPlaceClustersRaw = buildDiscoverPickupPlaceClustersForMap()
+        let fanTeamClustersRaw = buildDiscoverFanTeamClustersForMap()
+        let separated = DiscoverPlacesClusterSeparation.separateOverlapping(
+            teams: fanTeamClustersRaw,
+            places: pickupPlaceClustersRaw,
+            visibleLatitudeDelta: viewModel.visibleLatitudeDelta
+        )
+        let pickupPlaceClusters = separated.places
+        let fanTeamClusters = separated.teams
+#if DEBUG
+        if isPickupPlacesMode {
+            print(
+                "[DiscoverClusterQA] zoomDelta=\(viewModel.visibleLatitudeDelta) placeClusters=\(pickupPlaceClusters.count) teamClusters=\(fanTeamClusters.count) placeSingles=\(pickupPlaceClusters.filter { $0.count == 1 }.count) teamSingles=\(fanTeamClusters.filter { $0.count == 1 }.count)"
+            )
+        }
+#endif
         let counts = DiscoverAnnotationCounts(
             venue: venueClusters.count,
             pickupGames: pickupGameClusters.count,
-            pickupPlaces: pickupPlaceClusters.count
+            pickupPlaces: pickupPlaceClusters.count,
+            fanTeams: fanTeamClusters.count
         )
 
         discoverAnnotationCache = DiscoverAnnotationCache(
@@ -4844,6 +4938,7 @@ struct DiscoverScreen: View {
             venueClusters: venueClusters,
             pickupGameClusters: pickupGameClusters,
             pickupPlaceClusters: pickupPlaceClusters,
+            fanTeamClusters: fanTeamClusters,
             counts: counts
         )
 
@@ -4883,7 +4978,8 @@ struct DiscoverScreen: View {
             barsCount: viewModel.bars.count,
             barsFingerprint: barsAnnotationFingerprint(),
             pickupGamesFingerprint: pickupGamesAnnotationFingerprint(),
-            pickupPlacesFingerprint: pickupPlacesAnnotationFingerprint()
+            pickupPlacesFingerprint: pickupPlacesAnnotationFingerprint(),
+            fanTeamsFingerprint: fanTeamsAnnotationFingerprint()
         )
     }
 
@@ -4907,7 +5003,8 @@ struct DiscoverScreen: View {
             "\(key.barsCount)",
             key.barsFingerprint,
             key.pickupGamesFingerprint,
-            key.pickupPlacesFingerprint
+            key.pickupPlacesFingerprint,
+            key.fanTeamsFingerprint
         ].joined(separator: "|")
     }
 
@@ -4971,6 +5068,13 @@ struct DiscoverScreen: View {
                 FanGeoFixedFloatFormat.d4(place.longitude),
                 place.sportTags.joined(separator: ",")
             ].joined(separator: ":")
+        }
+        .joined(separator: "|")
+    }
+
+    private func fanTeamsAnnotationFingerprint() -> String {
+        viewModel.discoverableFanTeamsForMap.prefix(96).map { team in
+            FanTeamArtworkPropagation.annotationFingerprint(for: team)
         }
         .joined(separator: "|")
     }
@@ -5134,18 +5238,53 @@ struct DiscoverScreen: View {
             if isPickupPlacesMode {
                 ForEach(pickupPlaceClusters) { cluster in
                     Annotation(
-                        cluster.count == 1 ? cluster.rows.first?.name ?? "Pickup place" : "\(cluster.count) pickup places",
+                        discoverPlaceClusterAnnotationTitle(cluster),
                         coordinate: cluster.coordinate
                     ) {
                         if cluster.count == 1, let place = cluster.rows.first {
                             pickupPlaceMapPinButton(place: place)
+                                .transition(.scale(scale: 0.86).combined(with: .opacity))
                         } else {
                             multiPickupPlaceClusterAnnotation(cluster: cluster)
+                                .transition(.scale(scale: 0.9).combined(with: .opacity))
+                        }
+                    }
+                }
+
+                ForEach(discoverFanTeamClustersForMap) { cluster in
+                    Annotation(
+                        discoverTeamClusterAnnotationTitle(cluster),
+                        coordinate: cluster.coordinate
+                    ) {
+                        if cluster.count == 1, let team = cluster.rows.first {
+                            DiscoverFanTeamMapMarker(
+                                team: team,
+                                isSelected: viewModel.selectedDiscoverableFanTeamForMap?.id == team.id,
+                                languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                            ) {
+                                FGInteractionHaptics.selection()
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.86)) {
+                                    viewModel.selectDiscoverableFanTeamOnMap(team)
+                                }
+                            }
+                            .id(FanTeamArtworkPropagation.annotationFingerprint(for: team))
+                            .transition(.scale(scale: 0.86).combined(with: .opacity))
+                        } else {
+                            DiscoverFanTeamClusterMarker(
+                                cluster: cluster,
+                                languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                            ) {
+                                FGInteractionHaptics.selection()
+                                viewModel.selectedDiscoverableFanTeamForMap = nil
+                                discoverFanTeamClusterForSheet = cluster
+                            }
+                            .transition(.scale(scale: 0.9).combined(with: .opacity))
                         }
                     }
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.22), value: viewModel.visibleLatitudeDelta)
         .simultaneousGesture(
             TapGesture().onEnded {
                 dismissDiscoverSearchKeyboard()
@@ -5247,6 +5386,13 @@ struct DiscoverScreen: View {
     }
     
     private var showDiscoverVisibleSearchEmptyHint: Bool {
+        if isPickupPlacesMode {
+            if viewModel.isLoadingPickupPlacesForMap || viewModel.isLoadingDiscoverableFanTeamsForMap {
+                return false
+            }
+            return viewModel.discoverVisiblePickupPlaceCount == 0
+                && viewModel.discoverVisibleFanTeamCount == 0
+        }
         let counts = discoverAnnotationCache.counts
         let pickupAnnotationsCount = counts.pickupTotal
         let venueAnnotationsCount = counts.venue
@@ -5297,7 +5443,11 @@ struct DiscoverScreen: View {
                 }
                 return L10n.t("discover_empty_pickup_games_nearby", languageCode: languageCode)
             case .places:
-                return L10n.t("discover_empty_pickup_places_nearby", languageCode: languageCode)
+                return FanTeamDiscoveryCopy.emptyTitle(
+                    placeCount: viewModel.discoverVisiblePickupPlaceCount,
+                    teamCount: viewModel.discoverVisibleFanTeamCount,
+                    languageCode: languageCode
+                ) ?? L10n.t("discover_empty_places_or_teams_nearby", languageCode: languageCode)
             }
         }
     }
@@ -5328,7 +5478,7 @@ struct DiscoverScreen: View {
                     ? L10n.t("discover_empty_recovery_pickup_games_date_sport", languageCode: languageCode)
                     : L10n.t("discover_empty_recovery_pickup_games_date", languageCode: languageCode)
             case .places:
-                return L10n.t("discover_empty_recovery_zoom", languageCode: languageCode)
+                return FanTeamDiscoveryCopy.emptySupporting(languageCode: languageCode)
             }
         }
     }
@@ -5549,7 +5699,7 @@ struct DiscoverScreen: View {
                 .discoverLightGlassCard(style: .overlay)
             }
 
-            discoverFloatingSearchBar
+            discoverFloatingSearchBarRow
             discoverSearchAssistPanel(layoutHeight: layoutHeight)
             if !isSearchFocused {
                 discoverSportsFilterGlassCard
@@ -5663,7 +5813,7 @@ struct DiscoverScreen: View {
                     }
                 }
 
-                if viewModel.selectedBar != nil || viewModel.selectedPickupGameForMap != nil || viewModel.selectedPickupPlaceForMap != nil {
+                if viewModel.selectedBar != nil || viewModel.selectedPickupGameForMap != nil || viewModel.selectedPickupPlaceForMap != nil || viewModel.selectedDiscoverableFanTeamForMap != nil {
                     discoverBottomLeadingCard
                         .padding(.bottom, 2)
                 }
@@ -6183,6 +6333,17 @@ struct DiscoverScreen: View {
 #endif
     }
 
+    private var discoverFloatingSearchBarRow: some View {
+        HStack(alignment: .center, spacing: 8) {
+            discoverFloatingSearchBar
+                .frame(maxWidth: .infinity)
+
+            FanGeoActionCenterHeaderButton()
+                .frame(height: 52, alignment: .center)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
     private var discoverFloatingSearchBar: some View {
         GeometryReader { geo in
             let languageCode = L10n.normalizedLanguageCode(appLanguageRaw)
@@ -6363,7 +6524,21 @@ struct DiscoverScreen: View {
             PickupDetailCrashTrace.log("sheetItemAlreadyPresenting", gameId: id, title: title)
             return
         }
-        pickupGameDetailNav = PickupDetailNavigationToken(id: id)
+        if let identity = viewModel.pickupDiscoverTeamIdentityByGameId[id] {
+            pickupGameDetailNav = .teamEvent(
+                gameId: id,
+                team: PickupGameTeamCreationContext(
+                    teamId: identity.teamId,
+                    teamName: identity.teamName,
+                    teamSport: identity.teamSport,
+                    logoURL: identity.logoURL,
+                    logoThumbnailURL: identity.logoThumbnailURL,
+                    colorHex: identity.colorHex
+                )
+            )
+        } else {
+            pickupGameDetailNav = .standalone(id)
+        }
         PickupDetailCrashTrace.log("sheetItemAssigned", gameId: id, title: title)
     }
 
@@ -7141,12 +7316,24 @@ struct DiscoverScreen: View {
         var rows: [DiscoverSearchSuggestion] = []
 
         for game in viewModel.pickupGamesForDiscoverMap.prefix(24) {
-            let haystacks = [game.title, game.sport, game.city ?? "", game.address ?? ""]
+            let haystacks = [
+                game.title,
+                game.sportIdentityLabel(languageCode: languageCode),
+                game.sport,
+                game.sport_subtype ?? "",
+                game.city ?? "",
+                game.address ?? ""
+            ]
                 .map(DiscoverSearchSuggestion.normalizedText)
-            guard haystacks.contains(where: { !$0.isEmpty && ($0 == query || $0.hasPrefix(query) || $0.contains(query)) }) else {
+            let aliasHit = SportSubtypeCatalog.matchesSearch(
+                sport: game.sport,
+                subtype: game.sport_subtype,
+                query: trimmed
+            )
+            guard aliasHit || haystacks.contains(where: { !$0.isEmpty && ($0 == query || $0.hasPrefix(query) || $0.contains(query)) }) else {
                 continue
             }
-            let subtitleParts = [game.sport, game.city ?? ""]
+            let subtitleParts = [game.sportIdentityLabel(languageCode: languageCode), game.city ?? ""]
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
             rows.append(
@@ -7400,6 +7587,9 @@ struct DiscoverScreen: View {
                   let match = resolveDiscoverProGameMatch(for: suggestion) {
             discoverProGameCrestPair(for: match)
                 .accessibilityHidden(true)
+        } else if let catalogTeam = discoverSearchCatalogTeam(for: suggestion) {
+            SportsIdentityArtworkView(favoriteTeam: catalogTeam, diameter: 36)
+                .accessibilityHidden(true)
         } else {
             Image(systemName: discoverSearchSuggestionIcon(for: suggestion))
                 .font(.system(size: 18, weight: .semibold))
@@ -7414,19 +7604,21 @@ struct DiscoverScreen: View {
     }
 
     /// Crest priority: both displayable crests → pair; one → that crest alone;
-    /// none → ONE league/sport icon. Never renders two generic placeholder shields.
-    /// (Club logos resolve to `.none` unless verified licensed, so the sport icon
-    /// is the common displayable fallback for pro clubs.)
+    /// none → ONE league/sport icon. Uses canonical SportsIdentityArtworkResolver.
     private func discoverProGameCrestPair(for match: LiveMatch) -> some View {
         let homeIdentity = ProGameTeamScoreIdentity.resolve(
             teamName: match.homeTeam,
             badgeURL: match.homeTeamBadgeURL,
-            source: "DiscoverSearch"
+            source: "DiscoverSearch",
+            entityID: match.homeTeamProviderId,
+            league: match.sourceLeagueName ?? match.league
         )
         let awayIdentity = ProGameTeamScoreIdentity.resolve(
             teamName: match.awayTeam,
             badgeURL: match.awayTeamBadgeURL,
-            source: "DiscoverSearch"
+            source: "DiscoverSearch",
+            entityID: match.awayTeamProviderId,
+            league: match.sourceLeagueName ?? match.league
         )
         let sportVisual = discoverProGameSportVisual(for: match)
         return HStack(spacing: -6) {
@@ -7481,7 +7673,7 @@ struct DiscoverScreen: View {
         Group {
             switch identity.leading {
             case .logoURL(let url):
-                DiscoverCachedRemoteImage(url: url, contentMode: .fit) {
+                DiscoverCachedRemoteImage(url: url, contentMode: .fit, bucket: .avatar) {
                     // Loading/failure placeholder: sport icon, not a generic shield.
                     Image(systemName: sportVisual.systemImage)
                         .font(.system(size: 11, weight: .semibold))
@@ -7535,6 +7727,18 @@ struct DiscoverScreen: View {
                 return L10n.t("discover_search_pro_game_result_hint", languageCode: languageCode)
             }
             return ""
+        }
+    }
+
+    private func discoverSearchCatalogTeam(for suggestion: DiscoverSearchSuggestion) -> FavoriteTeam? {
+        guard suggestion.source == .team || suggestion.kind == .team
+            || suggestion.source == .league || suggestion.kind == .league else {
+            return nil
+        }
+        let title = suggestion.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+        return FavoriteTeamCatalog.searchTeams(title).first {
+            $0.name.compare(title, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
         }
     }
 
@@ -7985,6 +8189,27 @@ struct DiscoverScreen: View {
                         removal: .opacity
                     )
                 )
+        } else if let team = viewModel.selectedDiscoverableFanTeamForMap {
+            DiscoverFanTeamPreviewCard(
+                team: team,
+                distanceMiles: viewModel.distanceMiles(to: team),
+                languageCode: L10n.normalizedLanguageCode(appLanguageRaw),
+                onDismiss: {
+                    withAnimation(.spring(response: 0.42, dampingFraction: 0.88)) {
+                        viewModel.selectedDiscoverableFanTeamForMap = nil
+                    }
+                },
+                onViewTeam: {
+                    Task { await openDiscoverFanTeamDestination(team) }
+                }
+            )
+            .id(team.id)
+            .transition(
+                .asymmetric(
+                    insertion: .scale(scale: 0.94, anchor: .leading).combined(with: .opacity),
+                    removal: .opacity
+                )
+            )
         }
     }
 
@@ -8065,8 +8290,11 @@ struct DiscoverScreen: View {
         }
 
         if isPickupPlacesMode {
-            let allPlaces = viewModel.pickupPlacesForDiscoverMap
-            guard viewModel.discoverVisiblePickupPlaceCount == 0, !allPlaces.isEmpty else { return false }
+            let visiblePlaces = viewModel.discoverVisiblePickupPlaceCount
+            let visibleTeams = viewModel.discoverVisibleFanTeamCount
+            let hasAnyLoaded = !viewModel.pickupPlacesForDiscoverMap.isEmpty
+                || !viewModel.discoverableFanTeamsForMap.isEmpty
+            guard (visiblePlaces + visibleTeams) == 0, hasAnyLoaded else { return false }
         } else {
             let bounds = viewModel.currentMapRegionBounds()
             let allPickupPins = viewModel.pickupGamesVisibleAsMapPins(for: bounds)
@@ -8110,6 +8338,7 @@ struct DiscoverScreen: View {
                 case .pickupGames:
                     if isPickupPlacesMode {
                         return !viewModel.pickupPlacesVisibleAsMapPins(for: viewModel.currentMapRegionBounds()).isEmpty
+                            || !viewModel.discoverableFanTeamsVisibleAsMapPins(for: viewModel.currentMapRegionBounds()).isEmpty
                     }
                     return discoverPickupPinsInBoundsMatchingSearch > 0
                 case .venues:
@@ -8126,18 +8355,12 @@ struct DiscoverScreen: View {
 
         if viewModel.discoverMapContentMode == .pickupGames {
             if isPickupPlacesMode {
-                let count = viewModel.discoverVisiblePickupPlaceCount
-                if count > 0 {
-                    if let sport = discoverStatusSportDescriptor() {
-                        return count == 1
-                            ? String(format: L10n.t("discover_status_sport_place_one_format", languageCode: languageCode), locale: Locale(identifier: languageCode), sport)
-                            : String(format: L10n.t("discover_status_sport_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count), sport)
-                    }
-                    return count == 1
-                        ? L10n.t("discover_status_pickup_place_one", languageCode: languageCode)
-                        : String(format: L10n.t("discover_status_pickup_place_other_format", languageCode: languageCode), locale: Locale(identifier: languageCode), Int64(count))
-                }
-                return L10n.t("discover_status_no_pickup_places", languageCode: languageCode)
+                return FanTeamDiscoveryCopy.statusLine(
+                    placeCount: viewModel.discoverVisiblePickupPlaceCount,
+                    teamCount: viewModel.discoverVisibleFanTeamCount,
+                    sport: discoverStatusSportDescriptor(),
+                    languageCode: languageCode
+                )
             }
             let count = discoverPickupPinsInBoundsMatchingSearch
             if count > 0 {
@@ -8586,7 +8809,7 @@ struct DiscoverScreen: View {
         switch viewModel.discoverMapContentMode {
         case .pickupGames:
             if isPickupPlacesMode {
-                return viewModel.isLoadingPickupPlacesForMap
+                return viewModel.isLoadingPickupPlacesForMap || viewModel.isLoadingDiscoverableFanTeamsForMap
             }
             return viewModel.isLoadingPickupGamesForMap
         case .venues:
@@ -8622,15 +8845,17 @@ struct DiscoverScreen: View {
     private var discoverNearbySummarySubtitle: String {
         if viewModel.discoverMapContentMode == .pickupGames {
             if isPickupPlacesMode {
-                if viewModel.isLoadingPickupPlacesForMap {
+                if viewModel.isLoadingPickupPlacesForMap || viewModel.isLoadingDiscoverableFanTeamsForMap {
                     return "Updating places…"
                 }
-                let n = viewModel.discoverVisiblePickupPlaceCount
-                let q = viewModel.effectiveDiscoverSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !q.isEmpty {
-                    return n > 0 ? "\(n) pickup places match your search in this area." : "No pickup places match your search in this area."
-                }
-                return n > 0 ? "Physical places to play in this map area." : "No pickup places in this area."
+                let nPlaces = viewModel.discoverVisiblePickupPlaceCount
+                let nTeams = viewModel.discoverVisibleFanTeamCount
+                return FanTeamDiscoveryCopy.statusLine(
+                    placeCount: nPlaces,
+                    teamCount: nTeams,
+                    sport: nil,
+                    languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+                )
             }
             if viewModel.isLoadingPickupGamesForMap {
                 return "Updating map…"
@@ -8754,7 +8979,7 @@ struct DiscoverScreen: View {
     private func pickupGameMapPinButton(row: PickupGameRow) -> some View {
         let display = pickupMapMarkerDisplayValues(for: row)
         logPickupBadgeDebug(row: row, playersNeeded: display.needed, badgeValue: display.badgeValue ?? "none")
-        let sportLabel = AppSportCatalog.displayLabel(forSportToken: row.sport)
+        let sportLabel = row.sportIdentityLabel(languageCode: appLanguageRaw)
         return Button {
             FGInteractionHaptics.selection()
             withAnimation(.spring(response: 0.45, dampingFraction: 0.86)) {
@@ -8823,55 +9048,61 @@ struct DiscoverScreen: View {
         } label: {
             ZStack {
                 Circle()
-                    .fill(Color.gray.opacity(colorScheme == .dark ? 0.22 : 0.16))
-                    .frame(width: isSelected ? 46 : 40, height: isSelected ? 46 : 40)
-                    .blur(radius: isSelected && isDiscoverTabSelected ? 3 : 0)
+                    .fill(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.38 : 0.26))
+                    .frame(width: isSelected ? 48 : 42, height: isSelected ? 48 : 42)
+                    .blur(radius: isSelected && isDiscoverTabSelected ? 4 : 2)
 
                 Circle()
-                    .fill(colorScheme == .dark ? Color.black.opacity(0.82) : Color.white.opacity(0.92))
+                    .fill(colorScheme == .dark ? Color.black.opacity(0.82) : Color.white.opacity(0.96))
                     .frame(width: isSelected ? 36 : 32, height: isSelected ? 36 : 32)
                     .overlay {
                         Circle()
-                            .strokeBorder(Color.gray.opacity(isSelected ? 0.86 : 0.48), lineWidth: isSelected ? 2 : 1)
+                            .strokeBorder(Color.white, lineWidth: 2)
                     }
-                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.12), radius: 5, y: 2)
+                    .overlay {
+                        Circle()
+                            .strokeBorder(FGColor.intentPlay.opacity(isSelected ? 0.95 : 0.82), lineWidth: isSelected ? 2.25 : 1.75)
+                            .padding(2.25)
+                    }
+                    .shadow(color: FGColor.intentPlay.opacity(colorScheme == .dark ? 0.42 : 0.28), radius: 6, y: 2)
+                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.14), radius: 5, y: 2)
 
                 Image(systemName: symbolName)
                     .font(.system(size: isSelected ? 16 : 14, weight: .semibold, design: .rounded))
-                    .foregroundStyle(colorScheme == .dark ? Color.white.opacity(0.82) : Color.gray.opacity(0.86))
+                    .foregroundStyle(FGColor.intentPlay)
             }
+            .frame(width: 48, height: 48)
+            .contentShape(Circle())
             .animation(isDiscoverTabSelected ? .spring(response: 0.28, dampingFraction: 0.78) : nil, value: isSelected)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(sportLabel) pickup place, \(place.name)")
     }
 
+    private func discoverPlaceClusterAnnotationTitle(_ cluster: PickupPlaceCluster) -> String {
+        // Titles are hidden on the branded cluster chrome; VoiceOver uses the marker a11y label.
+        if cluster.count == 1 {
+            return cluster.rows.first?.name ?? "Pickup place"
+        }
+        return ""
+    }
+
+    private func discoverTeamClusterAnnotationTitle(_ cluster: DiscoverableFanTeamCluster) -> String {
+        if cluster.count == 1 {
+            return cluster.rows.first?.name ?? L10n.t("Team", languageCode: appLanguageRaw)
+        }
+        return ""
+    }
+
     @ViewBuilder
     private func multiPickupPlaceClusterAnnotation(cluster: PickupPlaceCluster) -> some View {
-        Button {
+        DiscoverPickupPlaceClusterMarker(
+            count: cluster.count,
+            languageCode: L10n.normalizedLanguageCode(appLanguageRaw)
+        ) {
             FGInteractionHaptics.selection()
             openPickupPlaceClusterSheet(cluster)
-        } label: {
-            ZStack {
-                Circle()
-                    .fill(Color.gray.opacity(colorScheme == .dark ? 0.24 : 0.16))
-                    .frame(width: 48, height: 48)
-                    .blur(radius: 0)
-                Circle()
-                    .fill(colorScheme == .dark ? Color.black.opacity(0.82) : Color.white.opacity(0.92))
-                    .frame(width: 36, height: 36)
-                    .overlay {
-                        Circle()
-                            .strokeBorder(Color.gray.opacity(0.56), lineWidth: 1.25)
-                    }
-                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.22 : 0.12), radius: 5, y: 2)
-                Text("\(cluster.count)")
-                    .font(.system(size: 13, weight: .heavy, design: .rounded))
-                    .foregroundStyle(colorScheme == .dark ? Color.white.opacity(0.82) : Color.gray.opacity(0.9))
-            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(cluster.count) pickup places")
     }
 
     @ViewBuilder
@@ -8879,10 +9110,7 @@ struct DiscoverScreen: View {
         let sportHint = dominantPickupClusterSport(cluster.rows)
         let activity = pickupMarkerActivity(for: cluster.rows)
         Button {
-            FGInteractionHaptics.selection()
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
-                viewModel.zoomTowardCluster(center: cluster.coordinate)
-            }
+            handlePickupGameClusterTap(cluster)
         } label: {
             PickupGameMapMarker(
                 sport: sportHint ?? "",
@@ -8896,7 +9124,51 @@ struct DiscoverScreen: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(cluster.count) pickup games")
+        .accessibilityLabel(DiscoverPickupGameClusterSelection.accessibilityLabel(forCount: cluster.count))
+    }
+
+    private func handlePickupGameClusterTap(_ cluster: PickupGameCluster) {
+        FGInteractionHaptics.selection()
+        let decision = DiscoverPickupGameClusterSelection.resolveTap(clusterRows: cluster.rows) { id in
+            viewModel.resolvedPickupGameRow(for: id)
+                ?? viewModel.pickupGamesForDiscoverMap.first(where: { $0.id == id })
+        }
+        switch decision {
+        case .none:
+            return
+        case .openDirect(let gameId):
+            openPickupGameFromClusterDecision(gameId: gameId)
+        case .showSelector(let rows):
+            viewModel.clearPickupMapSelection()
+            pickupGameClusterForSheet = PickupGameCluster(
+                id: cluster.id,
+                rows: rows,
+                coordinate: cluster.coordinate
+            )
+        }
+    }
+
+    private func selectPickupGameFromClusterSheet(_ gameId: UUID) {
+        pendingPickupGameDetailFromClusterId = gameId
+        pickupGameClusterForSheet = nil
+    }
+
+    private func openPendingPickupGameDetailFromClusterIfNeeded() {
+        guard let gameId = pendingPickupGameDetailFromClusterId else { return }
+        pendingPickupGameDetailFromClusterId = nil
+        openPickupGameFromClusterDecision(gameId: gameId)
+    }
+
+    private func openPickupGameFromClusterDecision(gameId: UUID) {
+        guard let row = viewModel.resolvedPickupGameRow(for: gameId)
+            ?? viewModel.pickupGamesForDiscoverMap.first(where: { $0.id == gameId })
+        else {
+            return
+        }
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.86)) {
+            viewModel.selectPickupGameOnMap(row)
+        }
+        presentPickupGameDetailIfNeeded(id: row.id)
     }
 
     private func discoverPickupPlacePreviewCard(_ place: PickupPlaceRow) -> some View {
@@ -9009,6 +9281,41 @@ struct DiscoverScreen: View {
 #endif
         viewModel.selectedPickupPlaceForMap = nil
         pickupPlaceClusterForSheet = cluster
+    }
+
+    @MainActor
+    private func openDiscoverFanTeamDestination(_ team: DiscoverableFanTeamMapRow) async {
+        let isAuthenticated = viewModel.isAuthenticatedForSocialFeatures
+        var myTeams: [FanTeamSummary] = []
+        if isAuthenticated {
+            do {
+                myTeams = try await FanTeamsService().listMyTeams()
+                FanTeamIdentityRealtimeCoordinator.shared.seed(from: myTeams)
+                viewModel.syncDiscoverMyActiveFanTeamIdsFromCoordinator()
+            } catch {
+#if DEBUG
+                print("[DiscoverFanTeams] viewTeam list_my_fan_teams failed error=\(error.localizedDescription)")
+#endif
+                myTeams = []
+            }
+        }
+        if let summary = FanTeamDiscoverWorkspaceRouting.workspaceSummary(
+            teamId: team.id,
+            isAuthenticated: isAuthenticated,
+            myTeams: myTeams
+        ) {
+#if DEBUG
+            print(
+                "[DiscoverFanTeams] viewTeam destination=privateWorkspace team=\(team.id.uuidString.lowercased()) accessVia=\(summary.accessVia.rawValue)"
+            )
+#endif
+            discoverMemberFanTeamForSheet = summary
+            return
+        }
+#if DEBUG
+        print("[DiscoverFanTeams] viewTeam destination=publicProfile team=\(team.id.uuidString.lowercased()) authenticated=\(isAuthenticated)")
+#endif
+        discoverPublicFanTeamForSheet = team
     }
 
     private func hostPickupGameFromPickupPlaceClusterSheet(_ place: PickupPlaceRow) {
@@ -14683,21 +14990,22 @@ private struct DiscoverHelpCarouselPage: Identifiable {
             style: .feature,
             welcomeLineKey: "",
             taglineKey: "",
-            titleKey: "live",
+            titleKey: "guide_schedule_live_title",
             titleForcesUppercase: false,
-            primaryTextKey: "guide_live_primary",
+            primaryTextKey: "guide_schedule_live_primary",
             secondaryTextKey: "",
             bulletKeys: [
-                "guide_live_bullet_1",
-                "guide_live_bullet_2",
-                "guide_live_bullet_3"
+                "guide_schedule_live_bullet_1",
+                "guide_schedule_live_bullet_2",
+                "guide_schedule_live_bullet_3",
+                "guide_schedule_live_bullet_4"
             ],
             featureHighlights: [],
             heroCallouts: [],
             proTipTitleKey: "",
             proTipBodyKey: "",
             footerTextKey: "",
-            systemImage: "dot.radiowaves.left.and.right",
+            systemImage: "calendar.badge.clock",
             accentColor: FGColor.dangerRed,
             gradientColors: [Color(red: 0.98, green: 0.42, blue: 0.32), FGColor.dangerRed]
         ),
@@ -14706,37 +15014,16 @@ private struct DiscoverHelpCarouselPage: Identifiable {
             style: .feature,
             welcomeLineKey: "",
             taglineKey: "",
-            titleKey: "calendar",
-            titleForcesUppercase: false,
-            primaryTextKey: "guide_calendar_primary",
-            secondaryTextKey: "",
-            bulletKeys: [
-                "guide_calendar_bullet_1",
-                "guide_calendar_bullet_2",
-                "guide_calendar_bullet_3"
-            ],
-            featureHighlights: [],
-            heroCallouts: [],
-            proTipTitleKey: "",
-            proTipBodyKey: "",
-            footerTextKey: "",
-            systemImage: "calendar.badge.clock",
-            accentColor: Color(red: 0.58, green: 0.42, blue: 0.94),
-            gradientColors: [Color(red: 0.58, green: 0.42, blue: 0.94), Color(red: 0.72, green: 0.48, blue: 0.98)]
-        ),
-        DiscoverHelpCarouselPage(
-            id: 4,
-            style: .feature,
-            welcomeLineKey: "",
-            taglineKey: "",
-            titleKey: "going",
+            titleKey: "going_tab_title",
             titleForcesUppercase: false,
             primaryTextKey: "guide_going_primary",
             secondaryTextKey: "",
             bulletKeys: [
                 "guide_going_bullet_1",
                 "guide_going_bullet_2",
-                "guide_going_bullet_3"
+                "guide_going_bullet_3",
+                "guide_going_bullet_4",
+                "guide_going_bullet_5"
             ],
             featureHighlights: [],
             heroCallouts: [],
@@ -14746,6 +15033,30 @@ private struct DiscoverHelpCarouselPage: Identifiable {
             systemImage: "heart.fill",
             accentColor: FGColor.accentGreen,
             gradientColors: [FGColor.accentGreen, Color(red: 0.16, green: 0.62, blue: 0.48)]
+        ),
+        DiscoverHelpCarouselPage(
+            id: 4,
+            style: .feature,
+            welcomeLineKey: "",
+            taglineKey: "",
+            titleKey: "teams",
+            titleForcesUppercase: false,
+            primaryTextKey: "guide_teams_primary",
+            secondaryTextKey: "",
+            bulletKeys: [
+                "guide_teams_bullet_1",
+                "guide_teams_bullet_2",
+                "guide_teams_bullet_3",
+                "guide_teams_bullet_4"
+            ],
+            featureHighlights: [],
+            heroCallouts: [],
+            proTipTitleKey: "",
+            proTipBodyKey: "",
+            footerTextKey: "",
+            systemImage: "person.3.fill",
+            accentColor: FGColor.accentBlue,
+            gradientColors: [FGColor.accentBlue, Color(red: 0.16, green: 0.62, blue: 0.48)]
         ),
         DiscoverHelpCarouselPage(
             id: 5,
@@ -14796,6 +15107,31 @@ private struct DiscoverHelpCarouselPage: Identifiable {
             systemImage: "person.crop.circle.fill",
             accentColor: FGColor.accentGreen,
             gradientColors: [FGColor.accentGreen, Color(red: 0.16, green: 0.62, blue: 0.48)]
+        ),
+        DiscoverHelpCarouselPage(
+            id: 7,
+            style: .feature,
+            welcomeLineKey: "",
+            taglineKey: "",
+            titleKey: "action_center_title",
+            titleForcesUppercase: false,
+            primaryTextKey: "guide_inbox_primary",
+            secondaryTextKey: "",
+            bulletKeys: [
+                "guide_inbox_bullet_1",
+                "guide_inbox_bullet_2",
+                "guide_inbox_bullet_3",
+                "guide_inbox_bullet_4",
+                "guide_inbox_bullet_5"
+            ],
+            featureHighlights: [],
+            heroCallouts: [],
+            proTipTitleKey: "",
+            proTipBodyKey: "",
+            footerTextKey: "",
+            systemImage: "tray.full.fill",
+            accentColor: FGColor.accentBlue,
+            gradientColors: [FGColor.intentTeams, FGColor.accentBlue]
         )
     ]
 }
@@ -15231,6 +15567,8 @@ private struct DiscoverHelpCarouselCard: View {
             return L10n.t("guide_welcome_hero_a11y", languageCode: languageCode)
         case 1:
             return L10n.t("guide_discover_hero_a11y", languageCode: languageCode)
+        case 7:
+            return L10n.t("guide_inbox_hero_a11y", languageCode: languageCode)
         default:
             return page.title(languageCode: languageCode)
         }
@@ -15342,6 +15680,11 @@ private struct DiscoverHelpCarouselCard: View {
             .padding(.horizontal, 12)
             .padding(.top, 4)
             .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                page.id == 7
+                    ? L10n.t("guide_inbox_bullets_a11y", languageCode: languageCode)
+                    : bullets.joined(separator: ". ")
+            )
         }
     }
 
@@ -15492,11 +15835,12 @@ private struct DiscoverHelpHeroIllustration: View {
         } else {
             Group {
                 switch page.id {
-                case 2: liveHero
-                case 3: calendarHero
-                case 4: goingHero
+                case 2: scheduleLiveHero
+                case 3: goingHero
+                case 4: teamsHero
                 case 5: chatHero
                 case 6: profileHero
+                case 7: inboxHero
                 default: profileHero
                 }
             }
@@ -15561,48 +15905,55 @@ private struct DiscoverHelpHeroIllustration: View {
         .accessibilityLabel(L10n.t("guide_discover_hero_a11y", languageCode: languageCode))
     }
 
-    private var liveHero: some View {
+    private var scheduleLiveHero: some View {
         bundledHeroImage(
             named: "LiveOnboardingIllustration",
-            accessibilityLabel: L10n.t("guide_live_hero_a11y", languageCode: languageCode)
+            accessibilityLabel: L10n.t("guide_schedule_live_hero_a11y", languageCode: languageCode)
         )
     }
 
     @ViewBuilder
     private var goingHero: some View {
-        if UIImage(named: "GoingOnboardingIllustration") != nil {
-            bundledHeroImage(
-                named: "GoingOnboardingIllustration",
-                accessibilityLabel: L10n.t("guide_going_hero_a11y", languageCode: languageCode)
-            )
-        } else {
-            goingProgrammaticHero
-        }
+        goingProgrammaticHero
+            .accessibilityLabel(L10n.t("guide_going_hero_a11y", languageCode: languageCode))
     }
 
     private var goingProgrammaticHero: some View {
         let designWidth: CGFloat = 260
-        let designHeight: CGFloat = 200
+        let designHeight: CGFloat = 228
         let scale = min(preferredWidth / designWidth, preferredHeight / designHeight)
 
         return ZStack {
             Ellipse()
-                .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.14 : 0.10))
-                .frame(width: 240, height: 120)
+                .fill(FGColor.accentGreen.opacity(colorScheme == .dark ? 0.16 : 0.12))
+                .frame(width: 240, height: 132)
                 .blur(radius: 18)
 
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Color.white)
-                .frame(width: 210, height: 156)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(FGColor.cardBackground(colorScheme))
+                .frame(width: 222, height: 196)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(page.accentColor.opacity(0.18), lineWidth: 1)
+                }
                 .overlay(alignment: .topLeading) {
-                    VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "heart.fill")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(page.accentColor)
+                            Text(L10n.t("going_tab_title", languageCode: languageCode))
+                                .font(.system(size: 11, weight: .bold, design: .rounded))
+                                .foregroundStyle(FGColor.primaryText(colorScheme))
+                            Spacer(minLength: 0)
+                        }
                         goingEventRow(
-                            symbol: "building.2.fill",
+                            symbol: "figure.run",
                             title: L10n.t("guide_going_demo_event_1", languageCode: languageCode),
                             detail: L10n.t("guide_going_demo_detail_1", languageCode: languageCode)
                         )
                         goingEventRow(
-                            symbol: "figure.run",
+                            symbol: "shield.checkered",
                             title: L10n.t("guide_going_demo_event_2", languageCode: languageCode),
                             detail: L10n.t("guide_going_demo_detail_2", languageCode: languageCode)
                         )
@@ -15611,123 +15962,65 @@ private struct DiscoverHelpHeroIllustration: View {
                             title: L10n.t("guide_going_demo_event_3", languageCode: languageCode),
                             detail: L10n.t("guide_going_demo_detail_3", languageCode: languageCode)
                         )
+                        goingEventRow(
+                            symbol: "building.2.fill",
+                            title: L10n.t("guide_going_demo_event_4", languageCode: languageCode),
+                            detail: L10n.t("guide_going_demo_detail_4", languageCode: languageCode)
+                        )
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 16)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
                 }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.12), radius: 14, y: 7)
+                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.12), radius: 14, y: 7)
 
             Image(systemName: "heart.circle.fill")
                 .font(.system(size: 28, weight: .semibold))
                 .symbolRenderingMode(.palette)
                 .foregroundStyle(.white, page.accentColor)
-                .offset(x: 84, y: 62)
+                .offset(x: 92, y: 86)
         }
         .frame(width: designWidth, height: designHeight)
         .scaleEffect(scale)
+        .accessibilityHidden(true)
     }
 
     private func goingEventRow(symbol: String, title: String, detail: String) -> some View {
-        HStack(spacing: 10) {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(page.accentColor.opacity(0.14))
-                .frame(width: 34, height: 34)
+                .frame(width: 26, height: 26)
                 .overlay {
                     Image(systemName: symbol)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(page.accentColor)
                 }
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(title)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(1)
                 Text(detail)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
             }
             Spacer(minLength: 0)
         }
     }
 
-    private var calendarHero: some View {
-        let designWidth: CGFloat = 260
-        let designHeight: CGFloat = 200
-        let scale = min(preferredWidth / designWidth, preferredHeight / designHeight)
-
-        return ZStack {
-            Ellipse()
-                .fill(Color(red: 0.58, green: 0.42, blue: 0.94).opacity(colorScheme == .dark ? 0.14 : 0.10))
-                .frame(width: 240, height: 120)
-                .blur(radius: 18)
-
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Color.white)
-                .frame(width: 190, height: 148)
-                .overlay(alignment: .top) {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: page.gradientColors,
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .frame(height: 34)
-                        .overlay {
-                            HStack(spacing: 6) {
-                                ForEach(0..<3, id: \.self) { _ in
-                                    Circle()
-                                        .fill(Color.white.opacity(0.85))
-                                        .frame(width: 5, height: 5)
-                                }
-                            }
-                        }
-                }
-                .overlay(alignment: .topLeading) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        calendarEventRow(
-                            title: L10n.t("guide_calendar_demo_event_1", languageCode: languageCode),
-                            detail: L10n.t("guide_calendar_demo_time_1", languageCode: languageCode)
-                        )
-                        calendarEventRow(
-                            title: L10n.t("guide_calendar_demo_event_2", languageCode: languageCode),
-                            detail: L10n.t("guide_calendar_demo_time_2", languageCode: languageCode)
-                        )
-                        calendarEventRow(
-                            title: L10n.t("guide_calendar_demo_event_3", languageCode: languageCode),
-                            detail: L10n.t("guide_calendar_demo_time_3", languageCode: languageCode)
-                        )
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 44)
-                }
-                .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.12), radius: 14, y: 7)
-
-            Image(systemName: "star.circle.fill")
-                .font(.system(size: 28, weight: .semibold))
-                .symbolRenderingMode(.palette)
-                .foregroundStyle(.white, page.accentColor)
-                .offset(x: 78, y: 58)
-        }
-        .frame(width: designWidth, height: designHeight)
-        .scaleEffect(scale)
-    }
-
-    private func calendarEventRow(title: String, detail: String) -> some View {
-        HStack(spacing: 8) {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(page.accentColor.opacity(0.85))
-                .frame(width: 3, height: 24)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                Text(detail)
-                    .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-            }
-            Spacer(minLength: 0)
+    @ViewBuilder
+    private var teamsHero: some View {
+        if UIImage(named: "TeamsOnboardingIllustration") != nil {
+            bundledHeroImage(
+                named: "TeamsOnboardingIllustration",
+                accessibilityLabel: L10n.t("guide_teams_hero_a11y", languageCode: languageCode)
+            )
+        } else {
+            bundledHeroImage(
+                named: "ChatOnboardingIllustration",
+                accessibilityLabel: L10n.t("guide_teams_hero_a11y", languageCode: languageCode)
+            )
         }
     }
 
@@ -15754,6 +16047,80 @@ private struct DiscoverHelpHeroIllustration: View {
             }
         }
         .accessibilityLabel(L10n.t("guide_profile_hero_a11y", languageCode: languageCode))
+    }
+
+    @ViewBuilder
+    private var inboxHero: some View {
+        if UIImage(named: "InboxOnboardingIllustration") != nil {
+            bundledHeroImage(
+                named: "InboxOnboardingIllustration",
+                accessibilityLabel: L10n.t("guide_inbox_hero_a11y", languageCode: languageCode)
+            )
+        } else {
+            inboxProgrammaticHero
+        }
+    }
+
+    private var inboxProgrammaticHero: some View {
+        let designWidth: CGFloat = 260
+        let designHeight: CGFloat = 200
+        let scale = min(preferredWidth / designWidth, preferredHeight / designHeight)
+        let rows: [(symbol: String, titleKey: String, accent: Color)] = [
+            ("person.3.fill", "guide_inbox_demo_team_invite", FGColor.intentTeams),
+            ("figure.run", "guide_inbox_demo_game_invite", FGColor.intentPlay),
+            ("person.badge.plus", "guide_inbox_demo_friend", FGColor.accentBlue),
+            ("megaphone.fill", "guide_inbox_demo_announcement", FGColor.intentTeams),
+            ("calendar.badge.clock", "guide_inbox_demo_reminder", FGColor.dangerRed)
+        ]
+
+        return ZStack {
+            Ellipse()
+                .fill(FGColor.accentBlue.opacity(colorScheme == .dark ? 0.16 : 0.10))
+                .frame(width: 236, height: 118)
+                .blur(radius: 16)
+
+            VStack(spacing: 7) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    HStack(spacing: 10) {
+                        RoundedRectangle(cornerRadius: 2, style: .continuous)
+                            .fill(row.accent)
+                            .frame(width: 4, height: 28)
+                        Image(systemName: row.symbol)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(row.accent)
+                            .frame(width: 22)
+                        Text(L10n.t(row.titleKey, languageCode: languageCode))
+                            .font(.system(size: 11, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Circle()
+                            .fill(FGColor.accentBlue)
+                            .frame(width: 7, height: 7)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(FGColor.cardBackground(colorScheme))
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(row.accent.opacity(0.22), lineWidth: 1)
+                    }
+                }
+            }
+            .padding(12)
+            .frame(width: 228)
+            .background(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 1))
+                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.24 : 0.10), radius: 14, y: 7)
+            )
+        }
+        .frame(width: designWidth, height: designHeight)
+        .scaleEffect(scale)
+        .accessibilityLabel(L10n.t("guide_inbox_hero_a11y", languageCode: languageCode))
     }
 }
 

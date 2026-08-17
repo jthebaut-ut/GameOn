@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { applyPushArtwork, pickUserAvatar } from "../_shared/push_artwork.ts"
 import {
   authorizeSportsWorkerRequest,
   describeAuthCandidateClasses,
@@ -43,6 +44,8 @@ type ProfileRow = {
   id: string
   display_name: string | null
   username: string | null
+  avatar_url?: string | null
+  avatar_thumbnail_url?: string | null
   is_deleted: boolean | null
 }
 
@@ -218,7 +221,7 @@ Deno.serve(async (req) => {
 
   const { data: senderProfile } = await admin
     .from("user_profiles")
-    .select("id,display_name,username,is_deleted")
+    .select("id,display_name,username,avatar_url,avatar_thumbnail_url,is_deleted")
     .eq("id", requesterId)
     .maybeSingle()
 
@@ -264,6 +267,15 @@ Deno.serve(async (req) => {
     requester_id: requesterId,
     event_id: eventId,
   }
+  applyPushArtwork(
+    customData,
+    pickUserAvatar(
+      (senderProfile as ProfileRow | null)?.avatar_thumbnail_url,
+      (senderProfile as ProfileRow | null)?.avatar_url,
+    ) ?? requesterIdentity.avatarURL,
+    "user",
+    requesterId,
+  )
 
   let sent = 0
   let invalidated = 0

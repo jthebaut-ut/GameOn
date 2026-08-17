@@ -800,6 +800,7 @@ enum FanGeoAnnouncementCTAAction {
     /// Maps stored `cta_action` values to ``MainTabView/AppTab`` raw values.
     /// Includes admin canonical values (`discover`, `live`, `calendar`, `going`, `profile`)
     /// and legacy aliases saved before dashboard normalization.
+    /// `live` / `going` remain aliases; MainTabView remaps them to Schedule hub surfaces.
     private static let tabDestinationByAction: [String: String] = [
         "discover": "discover",
         "explore": "discover",
@@ -812,6 +813,9 @@ enum FanGeoAnnouncementCTAAction {
         "going": "following",
         "following": "following",
         "open_pickup": "following",
+        "teams": "teams",
+        "my_teams": "teams",
+        "fan_teams": "teams",
         "profile": "account",
         "account": "account",
         "open_profile": "account"

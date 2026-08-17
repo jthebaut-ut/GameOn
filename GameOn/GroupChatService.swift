@@ -25,6 +25,29 @@ final class GroupChatService {
             .value
     }
 
+    /// Pickup game ids among `ids` that are linked to a Fan Team (client-side inbox hide fallback).
+    func teamLinkedPickupGameIds(among ids: [UUID]) async -> Set<UUID> {
+        let unique = Array(Set(ids))
+        guard !unique.isEmpty else { return [] }
+        struct LinkRow: Decodable {
+            let pickup_game_id: UUID
+        }
+        do {
+            let links: [LinkRow] = try await client
+                .from("fan_team_game_links")
+                .select("pickup_game_id")
+                .in("pickup_game_id", values: unique.map { $0.uuidString.lowercased() })
+                .execute()
+                .value
+            return Set(links.map(\.pickup_game_id))
+        } catch {
+#if DEBUG
+            print("[TeamEventChat] teamLinkedPickupLookupFailed error=\(error.localizedDescription)")
+#endif
+            return []
+        }
+    }
+
     func createGroup(title: String, memberIds: [UUID]) async throws -> UUID {
         struct Params: Encodable {
             let p_title: String

@@ -47,6 +47,7 @@ actor LiveSportsService {
 #if DEBUG
             print("[LiveDebug] cache_hit=true cached_count=\(cachedMatches.matches.count)")
 #endif
+            SportsArtworkURLStore.shared.ingestLiveMatches(cachedMatches.matches)
             return cachedMatches.matches
         }
 
@@ -677,6 +678,7 @@ actor LiveSportsService {
             if lhs.startTime != rhs.startTime { return lhs.startTime < rhs.startTime }
             return lhs.league.localizedCaseInsensitiveCompare(rhs.league) == .orderedAscending
         }
+        SportsArtworkURLStore.shared.ingestLiveMatches(matches)
 
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
@@ -1236,11 +1238,31 @@ private nonisolated struct LiveMatchRow: Decodable {
             featuredEventSlug: Self.clean(featured_event_slug),
             homeTeamBadgeURL: Self.firstString(
                 in: payload,
-                keys: ["strHomeTeamBadge", "homeTeamBadge", "strHomeBadge"]
+                keys: ["strHomeTeamBadge", "homeTeamBadge", "strHomeBadge", "strHomeTeamLogo"],
+                paths: [
+                    ["hometeam", "strbadge"],
+                    ["home", "strbadge"]
+                ]
             ),
             awayTeamBadgeURL: Self.firstString(
                 in: payload,
-                keys: ["strAwayTeamBadge", "awayTeamBadge", "strAwayBadge"]
+                keys: ["strAwayTeamBadge", "awayTeamBadge", "strAwayBadge", "strAwayTeamLogo"],
+                paths: [
+                    ["awayteam", "strbadge"],
+                    ["away", "strbadge"]
+                ]
+            ),
+            homeTeamProviderId: Self.firstString(
+                in: payload,
+                keys: ["idHomeTeam", "idHome", "homeTeamId"]
+            ),
+            awayTeamProviderId: Self.firstString(
+                in: payload,
+                keys: ["idAwayTeam", "idAway", "awayTeamId"]
+            ),
+            leagueBadgeURL: Self.firstString(
+                in: payload,
+                keys: ["strLeagueBadge", "leagueBadge"]
             )
         )
     }

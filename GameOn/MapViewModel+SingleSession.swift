@@ -7,15 +7,14 @@ extension MapViewModel {
 
     private static let activeSessionSelect = "active_session_id,active_session_updated_at"
 
-    /// Fan email/password session only — not venue-owner or admin surfaces.
+    /// Fan and business single-device session enforcement (`user_profiles.active_session_id`).
     var isEligibleForFanSingleSessionEnforcement: Bool {
-        isLoggedIn
-            && !isVenueOwnerLoggedIn
-            && !venueOwnerMode
+        (isLoggedIn || isVenueOwnerLoggedIn)
+            && !isAdminLoggedIn
             && currentUserAuthId != nil
     }
 
-    /// After successful fan login / sign-up: claim this device as the active session.
+    /// After successful fan or business login / sign-up: claim this device as the active session.
     func registerFanActiveSessionOnLogin() async {
         guard !shouldSuppressAuthenticatedRefreshForSafeLogout else { return }
         guard isEligibleForFanSingleSessionEnforcement else { return }
@@ -28,9 +27,14 @@ extension MapViewModel {
 #if DEBUG
         print("[SingleSessionDebug] loginSessionId=\(sessionId.uuidString.lowercased())")
         print("[SingleSessionDebug] localSessionId=\(sessionId.uuidString.lowercased())")
+        print("[SingleSessionDebug] installationId=\(PushNotificationRegistrationService.installationID.uuidString.lowercased())")
 #endif
 
-        let wrote = await writeRemoteActiveSession(userId: userId, sessionId: sessionId)
+        let wrote = await claimRemoteActiveSession(
+            userId: userId,
+            sessionId: sessionId,
+            accountKind: isVenueOwnerLoggedIn ? "business" : "fan"
+        )
         if wrote {
 #if DEBUG
             print("[SingleSessionDebug] remoteSessionId=\(sessionId.uuidString.lowercased())")
@@ -180,7 +184,11 @@ extension MapViewModel {
         let sessionId = UUID()
         FanSingleSessionStore.saveLocalSessionId(sessionId)
         singleSessionIgnoreRealtimeUntil = Date().addingTimeInterval(3)
-        _ = await writeRemoteActiveSession(userId: userId, sessionId: sessionId)
+        _ = await claimRemoteActiveSession(
+            userId: userId,
+            sessionId: sessionId,
+            accountKind: isVenueOwnerLoggedIn ? "business" : "fan"
+        )
 #if DEBUG
         print("[SingleSessionDebug] loginSessionId=\(sessionId.uuidString.lowercased()) source=\(source)_claim")
         print("[SingleSessionDebug] localSessionId=\(sessionId.uuidString.lowercased())")
@@ -250,7 +258,17 @@ extension MapViewModel {
 
         await forceLogout(reason: "singleSessionMismatch", source: "MapViewModel.logoutDueToSingleSessionMismatch")
         await MainActor.run {
-            authErrorMessage = Self.fanSingleDeviceLogoutMessage
+            authErrorMessage = L10n.t("security_session_replaced_signed_out_notice")
+        }
+    }
+
+    func handleSecuritySessionReplacedDeepLink() {
+        if isLoggedIn || isVenueOwnerLoggedIn {
+            pendingOpenActionCenterForSecurityEvent = true
+            return
+        }
+        if authErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            authErrorMessage = L10n.t("security_session_replaced_signed_out_notice")
         }
     }
 
@@ -291,6 +309,41 @@ extension MapViewModel {
             print("[SingleSessionDebug] fetch_failed error=\(error.localizedDescription)")
 #endif
             return .networkFailure
+        }
+    }
+
+    @discardableResult
+    private func claimRemoteActiveSession(
+        userId: UUID,
+        sessionId: UUID,
+        accountKind: String
+    ) async -> Bool {
+        struct ClaimParams: Encodable {
+            let p_session_id: String
+            let p_installation_id: UUID
+            let p_device_family: String
+            let p_account_kind: String
+        }
+        let installationId = PushNotificationRegistrationService.installationID
+        let params = ClaimParams(
+            p_session_id: sessionId.uuidString.lowercased(),
+            p_installation_id: installationId,
+            p_device_family: FanGeoSecuritySessionReplacement.currentDeviceFamily,
+            p_account_kind: accountKind
+        )
+        do {
+            try await supabase
+                .rpc("claim_active_session", params: params)
+                .execute()
+#if DEBUG
+            print("[SecuritySessionReplaced] claim_ok installation=\(installationId.uuidString.lowercased()) kind=\(accountKind)")
+#endif
+            return true
+        } catch {
+#if DEBUG
+            print("[SecuritySessionReplaced] claim_rpc_failed error=\(error.localizedDescription)")
+#endif
+            return await writeRemoteActiveSession(userId: userId, sessionId: sessionId)
         }
     }
 

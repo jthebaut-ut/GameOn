@@ -19,7 +19,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
         case .venueEnergy: return "Venue Energy"
         case .live: return "Live"
         case .calendar: return "Calendar"
-        case .going: return "Going"
+        case .going: return L10n.t("going_tab_title")
         case .chat: return "Chat"
         case .profile: return "Profile"
         }
@@ -36,7 +36,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
         case .calendar:
             return "Save games and plan ahead."
         case .going:
-            return "Keep track of games and events you're attending."
+            return L10n.t("guide_going_primary")
         case .chat:
             return "Connect with fans, friends, and venues."
         case .profile:
@@ -55,7 +55,7 @@ enum FanGeoQuickGuideTopic: String, Identifiable, CaseIterable {
         case .calendar:
             return "Save games, watch parties, and pickup events to your FanGeo calendar. Plan ahead and get reminders so you never miss a game."
         case .going:
-            return "See all the professional games, watch parties, and pickup games you're planning to attend. Your personal sports agenda lives in one place."
+            return L10n.t("guide_going_body")
         case .chat:
             return "Chat with fans and coordinate watch parties in FanGeo without sharing your phone number."
         case .profile:

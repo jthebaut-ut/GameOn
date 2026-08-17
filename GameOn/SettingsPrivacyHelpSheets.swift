@@ -37,24 +37,33 @@ struct ProfileDiscoveryHelpSheet: View {
                         .font(.system(size: 15, weight: .regular, design: .rounded))
                         .foregroundStyle(FGColor.secondaryText(colorScheme))
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel(L10n.t("profile_discovery_help_intro", languageCode: languageCode))
 
                     helpSection(
                         title: L10n.t("profile_discovery_help_when_on", languageCode: languageCode),
                         rows: [
+                            L10n.t("profile_discovery_help_on_search", languageCode: languageCode),
                             L10n.t("profile_discovery_help_on_suggested", languageCode: languageCode),
                             L10n.t("profile_discovery_help_on_nearby", languageCode: languageCode),
-                            L10n.t("profile_discovery_help_on_signals", languageCode: languageCode),
-                            L10n.t("profile_discovery_help_on_no_exact_location", languageCode: languageCode)
+                            L10n.t("profile_discovery_help_on_signals", languageCode: languageCode)
                         ]
                     )
 
                     helpSection(
                         title: L10n.t("profile_discovery_help_when_off", languageCode: languageCode),
                         rows: [
+                            L10n.t("profile_discovery_help_off_search", languageCode: languageCode),
                             L10n.t("profile_discovery_help_off_suggested", languageCode: languageCode),
                             L10n.t("profile_discovery_help_off_nearby", languageCode: languageCode),
                             L10n.t("profile_discovery_help_off_friends", languageCode: languageCode),
                             L10n.t("profile_discovery_help_off_unchanged", languageCode: languageCode)
+                        ]
+                    )
+
+                    helpSection(
+                        title: L10n.t("profile_discovery_help_privacy_section", languageCode: languageCode),
+                        rows: [
+                            L10n.t("profile_discovery_help_on_no_exact_location", languageCode: languageCode)
                         ]
                     )
                 }
@@ -111,6 +120,8 @@ struct ProfileDiscoveryHelpSheet: View {
                     .strokeBorder(SettingsPremiumChrome.cardStroke(colorScheme), lineWidth: 0.75)
             }
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(title)
     }
 }
 

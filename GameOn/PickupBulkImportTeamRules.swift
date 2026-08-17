@@ -51,12 +51,12 @@ enum PickupBulkImportTeamRules {
 
     static func gameFormatErrorMessage(for format: GameType, isTeamSourced: Bool) -> String? {
         guard isTeamSourced, !allowsGameFormat(format, isTeamSourced: true) else { return nil }
-        return "Team games must use practice, scrimmage, league_game, tournament_game, tryout, clinic, or match. This row uses \(format.rawValue)."
+        return "Team events must use practice, scrimmage, league_game, tournament_game, tryout, clinic, match, team_meeting, other, or announcement. This row uses \(format.rawValue)."
     }
 
     static func gameFormatGuidance(isTeamSourced: Bool) -> String {
         isTeamSourced
-            ? "Use: practice, scrimmage, league_game, tournament_game, tryout, clinic, or match."
+            ? "Use: practice, scrimmage, league_game, tournament_game, tryout, clinic, match, team_meeting, other, or announcement."
             : "Use: pickup, practice, scrimmage, league_game, tournament_game, tryout, or clinic."
     }
 

@@ -4,6 +4,7 @@ enum GoingProGamesAdSection: String, Hashable {
     case savedGames
     case favoriteTeamGames
     case businessMyTeams
+    case unified
 }
 
 struct GoingNativeAdSlot: Hashable, Identifiable {
@@ -55,6 +56,20 @@ enum GoingBusinessMyTeamFeedItem: Identifiable {
             return "going-business-saved-game-\(game.stableKey)"
         case .autoGame(let item):
             return "going-business-auto-game-\(item.game.stableKey)"
+        case .nativeAd(let slot):
+            return slot.id
+        }
+    }
+}
+
+enum GoingUnifiedProGameFeedItem: Identifiable {
+    case game(GoingProGameItem)
+    case nativeAd(GoingNativeAdSlot)
+
+    var id: String {
+        switch self {
+        case .game(let item):
+            return "going-unified-game-\(item.game.stableKey)"
         case .nativeAd(let slot):
             return slot.id
         }
@@ -276,6 +291,39 @@ enum GoingProGamesAdPlacement {
             }
         }
 
+        return items
+    }
+
+    static func unifiedFeedItems(games: [GoingProGameItem]) -> [GoingUnifiedProGameFeedItem] {
+        guard FanGeoAdPolicy.shouldInsertAdsInFeeds() else {
+            return games.map { .game($0) }
+        }
+        let positions = insertionPositions(
+            cardCount: games.count,
+            maxAdsToInsert: min(1, maxAdsInProTab)
+        )
+        guard !positions.isEmpty else {
+            return games.map { .game($0) }
+        }
+        let positionsByCard = Set(positions)
+        var items: [GoingUnifiedProGameFeedItem] = []
+        items.reserveCapacity(games.count + positions.count)
+        var slotOrdinal = 0
+        for (index, game) in games.enumerated() {
+            items.append(.game(game))
+            let cardPosition = index + 1
+            guard positionsByCard.contains(cardPosition) else { continue }
+            items.append(
+                .nativeAd(
+                    GoingNativeAdSlot(
+                        slotIndex: baseNativeAdSlotIndex + slotOrdinal,
+                        section: .unified,
+                        insertedAfterCardPosition: cardPosition
+                    )
+                )
+            )
+            slotOrdinal += 1
+        }
         return items
     }
 

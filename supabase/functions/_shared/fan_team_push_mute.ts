@@ -5,6 +5,11 @@ import type { SupabaseClient } from "npm:@supabase/supabase-js@2"
  *
  * Critical lifecycle pushes (Team deleted) must NOT call these filters.
  * Pending Team invitation push must NOT call these (invitee is not a member).
+ * member_left_team DOES call these — respect each Owner/Manager recipient mute.
+ * Never use the departed member's mute preference for leadership recipients.
+ * member_change: informational kinds (number/position/role) respect mute;
+ *   removed_from_team / removed_from_event / added_back_to_event /
+ *   team_admin_granted / team_admin_removed ignore mute.
  */
 
 /** Pure: build a Set of muted user ids from membership rows. */

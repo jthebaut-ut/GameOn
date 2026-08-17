@@ -7,7 +7,7 @@ struct BusinessFavoriteTeamsManagementSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
 
-    @State private var selectedIDs: Set<String> = []
+    @State private var selectedIDs: [String] = []
     @State private var showTeamPicker = false
     @State private var isLoading = false
     @State private var isSaving = false
@@ -18,7 +18,7 @@ struct BusinessFavoriteTeamsManagementSheet: View {
     }
 
     private var selectedTeams: [FavoriteTeam] {
-        FavoriteTeamsStore.resolvedTeams(fromIDs: Array(selectedIDs).sorted())
+        FavoriteTeamsStore.resolvedTeams(fromIDs: selectedIDs)
             .sorted { lhs, rhs in
                 lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
             }
@@ -62,10 +62,12 @@ struct BusinessFavoriteTeamsManagementSheet: View {
             .sheet(isPresented: $showTeamPicker, onDismiss: {
                 Task { await saveSelection(selectedIDs) }
             }) {
-                FavoriteTeamsPickerSheet(selectedIDs: $selectedIDs)
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.visible)
-                    .presentationBackground(FGAdaptiveSurface.sheetRoot)
+                AnyView(
+                    FavoriteTeamsPickerSheet(selectedIDs: $selectedIDs)
+                        .presentationDetents([.large])
+                        .presentationDragIndicator(.visible)
+                        .presentationBackground(FGAdaptiveSurface.sheetRoot)
+                )
             }
         }
     }
@@ -203,20 +205,24 @@ struct BusinessFavoriteTeamsManagementSheet: View {
         }
         isLoading = true
         await viewModel.loadBusinessFavoriteTeams(businessId: resolvedBusinessId, force: true)
-        selectedIDs = viewModel.businessFavoriteTeamIDs
+        selectedIDs = FavoriteTeamsStore.uniquedIDs(Array(viewModel.businessFavoriteTeamIDs))
         isLoading = false
     }
 
     private func removeTeam(_ team: FavoriteTeam) {
-        selectedIDs.remove(team.id)
+        selectedIDs = FavoriteTeamsStore.removing(team.id, from: selectedIDs)
         Task { await saveSelection(selectedIDs) }
     }
 
-    private func saveSelection(_ ids: Set<String>) async {
+    private func saveSelection(_ ids: [String]) async {
         guard let resolvedBusinessId else { return }
         isSaving = true
-        let saved = await viewModel.replaceBusinessFavoriteTeams(businessId: resolvedBusinessId, teamIDs: ids)
-        selectedIDs = viewModel.businessFavoriteTeamIDs
+        let ordered = FavoriteTeamsStore.uniquedIDs(ids)
+        let saved = await viewModel.replaceBusinessFavoriteTeams(
+            businessId: resolvedBusinessId,
+            teamIDs: Set(ordered)
+        )
+        selectedIDs = ordered
         banner = saved ? "Favorite teams updated." : "Could not update favorite teams. Please try again."
         isSaving = false
     }

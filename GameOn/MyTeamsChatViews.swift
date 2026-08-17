@@ -1,5 +1,6 @@
 import Combine
 import PhotosUI
+import Supabase
 import SwiftUI
 import UIKit
 
@@ -9,6 +10,8 @@ struct MyTeamsChatSectionView: View {
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var chatViewModel: ChatViewModel
     var onOpenTeamChat: (FanTeamChatContext) -> Void
+    /// When false (preserved off-screen), alerts must not cover Profile / other tabs.
+    var isTeamsTabSelected: Bool = true
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
@@ -18,158 +21,183 @@ struct MyTeamsChatSectionView: View {
     @State private var searchText = ""
     @State private var showingCreate = false
     @State private var selectedTeam: FanTeamSummary?
+    @State private var selectedTeamInitialTab: FanTeamDetailTab = .overview
     @State private var errorText: String?
     @State private var teamMarkRefreshTokens: [UUID: UUID] = [:]
     @State private var highlightedInvitationId: UUID?
     @State private var deletedTeamBanner: String?
     @State private var createTeamInfoBanner: String?
-    @State private var myTeamsAdLayoutWidth: CGFloat = 320
+    @State private var showingMyPlayers = false
+    /// Managed players the viewer guards. Empty for almost everyone.
+    @State private var myManagedPlayers: [FanManagedPlayer] = []
+    @State private var invitationPendingPlayerChoice: FanTeamInvitation?
+    /// Nested Add Player from invitation join sheet (keeps invite sheet alive).
+    @State private var showingInviteAddPlayer = false
+    @State private var invitePreselectManagedPlayerId: UUID?
+    @State private var homeSegment: TeamsHomeSegment = .myTeams
+    /// Session-local My Teams relationship filter (not persisted to backend).
+    @State private var relationshipFilter: FanTeamHomeFilter = .all
 
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
     }
 
-    private var filteredTeams: [FanTeamSummary] {
-        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return store.teams }
-        return store.teams.filter {
-            $0.name.lowercased().contains(q)
-                || $0.sport.lowercased().contains(q)
-        }
+    /// Teams home chrome accent (mockup purple) — cards still use per-team color.
+    private var teamsChromeAccent: Color {
+        FGColor.intentTeams
     }
 
-    private var myTeamsFeedItems: [ChatMyTeamsListItem] {
-        ChatMyTeamsAdPlacement.listItems(for: filteredTeams)
+    private var filteredHomeItems: [FanTeamHomeItem] {
+        FanTeamHomeCatalog.displayItems(
+            from: store.homeItems,
+            filter: relationshipFilter,
+            searchText: searchText
+        )
+    }
+
+    /// Teams home My Teams feed after relationship filter + search, with native ads inserted last.
+    /// Invites segment never uses this (ad-free). Empty filtered lists yield no ads.
+    private var myTeamsFeedListItems: [ChatMyTeamsListItem] {
+        ChatMyTeamsAdPlacement.listItems(for: filteredHomeItems.map(\.team))
+    }
+
+    private var homeFilterCounts: FanTeamHomeFilterCounts {
+        store.homeFilterCounts
+    }
+
+    /// Authoritative Teams gate — same social session used by MainTab / Going / Chat.
+    private var isSignedInForTeams: Bool {
+        mapViewModel.isAuthenticatedForSocialFeatures
+    }
+
+    private var inviteBadgeText: String? {
+        guard isSignedInForTeams else { return nil }
+        let count = store.invitations.count
+        guard count > 0 else { return nil }
+        return count > 99 ? "99+" : "\(count)"
     }
 
     var body: some View {
+        applyTeamsHomeAlerts(
+            to: applyTeamsHomeSheets(
+                to: applyTeamsHomeLifecycle(to: teamsHomeStack)
+            )
+        )
+    }
+
+    private var teamsHomeStack: some View {
         VStack(spacing: 0) {
             header
-            if store.isLoading && store.teams.isEmpty && store.invitations.isEmpty {
+                .onChange(of: mapViewModel.pendingTeamScheduleJoinApproval) { _, pending in
+                    guard isSignedInForTeams, pending != nil else { return }
+                    Task { await fulfillPendingTeamScheduleJoinApprovalIfNeeded() }
+                }
+                .onChange(of: mapViewModel.pendingTeamScheduleEventDeepLink) { _, pending in
+                    guard isSignedInForTeams, pending != nil else { return }
+                    Task { await fulfillPendingTeamScheduleEventDeepLinkIfNeeded() }
+                }
+            if !isSignedInForTeams {
+                signedOutLanding
+            } else if store.isLoading && store.homeItems.isEmpty && store.invitations.isEmpty {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if filteredTeams.isEmpty && store.invitations.isEmpty {
-                emptyState
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        if !store.invitations.isEmpty {
-                            Text(L10n.t("fan_teams_invitations_section", languageCode: languageCode))
-                                .font(.subheadline.weight(.bold))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .padding(.horizontal, 2)
-
-                            ForEach(store.invitations) { invitation in
-                                FanTeamInvitationCardView(
-                                    invitation: invitation,
-                                    languageCode: languageCode,
-                                    isBusy: store.busyInvitationIds.contains(invitation.id),
-                                    isHighlighted: highlightedInvitationId == invitation.id,
-                                    onAccept: {
-                                        Task {
-                                            do {
-                                                _ = try await store.acceptInvitation(invitation)
-                                                syncMyTeamsInvitationBadge()
-                                            } catch {
-                                                if let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
-                                                    errorText = message
-                                                }
-                                            }
-                                        }
-                                    },
-                                    onDecline: {
-                                        Task {
-                                            do {
-                                                try await store.declineInvitation(invitation)
-                                                syncMyTeamsInvitationBadge()
-                                            } catch {
-                                                if let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
-                                                    errorText = message
-                                                }
-                                            }
-                                        }
-                                    }
-                                )
-                                .id(invitation.id)
-                            }
-                        }
-
-                        if !filteredTeams.isEmpty || !store.invitations.isEmpty {
-                            Text(L10n.t("fan_teams_your_teams", languageCode: languageCode))
-                                .font(.subheadline.weight(.bold))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .padding(.horizontal, 2)
-                                .padding(.top, store.invitations.isEmpty ? 0 : 8)
-                        }
-
-                        if filteredTeams.isEmpty {
-                            Text(L10n.t("fan_teams_empty_body", languageCode: languageCode))
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .padding(.vertical, 8)
-                        } else {
-                            ForEach(myTeamsFeedItems) { item in
-                                myTeamsFeedRow(item)
-                            }
-                            .onAppear {
-                                logMyTeamsAdPlacementIfNeeded()
-                            }
-                            .onChange(of: filteredTeams.map(\.id)) { _, _ in
-                                logMyTeamsAdPlacementIfNeeded()
-                            }
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 10)
-                    .padding(.bottom, 28)
-                    .background {
-                        GeometryReader { geometry in
-                            Color.clear
-                                .onAppear {
-                                    updateMyTeamsAdLayoutWidth(geometry.size.width)
-                                }
-                                .onChange(of: geometry.size.width) { _, newWidth in
-                                    updateMyTeamsAdLayoutWidth(newWidth)
-                                }
-                        }
-                    }
-                }
-                .scrollIndicators(.hidden)
+                authenticatedTeamsScroll
             }
         }
         .background(colorScheme == .dark ? Color.black : Color(.systemBackground))
-        .task {
-            await store.refresh(source: "section.task")
-            syncMyTeamsInvitationBadge()
-            await applyPendingInvitationHighlightIfNeeded()
+    }
+
+    private var authenticatedTeamsScroll: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                homeSegmentControl
+                    .padding(.bottom, 2)
+
+                switch homeSegment {
+                case .myTeams:
+                    myTeamsSegmentContent
+                case .invites:
+                    invitesSegmentContent
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 28)
         }
+        .scrollIndicators(.hidden)
         .refreshable {
-            await store.refresh(source: "section.refreshable")
+            guard isSignedInForTeams else { return }
+            await store.refresh(source: "section.refreshable", surfaceError: false)
             syncMyTeamsInvitationBadge()
+        }
+    }
+
+    private func applyTeamsHomeLifecycle<V: View>(to view: V) -> some View {
+        view
+            .task(id: mapViewModel.currentUserAuthId) {
+                guard isTeamsTabSelected else { return }
+                await handleTeamsAuthSessionChanged(source: "section.task")
+            }
+        .onChange(of: isTeamsTabSelected) { _, selected in
+            if selected {
+                Task { await handleTeamsAuthSessionChanged(source: "section.tabSelected") }
+            } else {
+                errorText = nil
+                store.errorText = nil
+            }
+        }
+        .onChange(of: mapViewModel.isAuthenticatedForSocialFeatures) { _, signedIn in
+            if signedIn {
+                guard isTeamsTabSelected else { return }
+                Task { await handleTeamsAuthSessionChanged(source: "section.authBecameAvailable") }
+            } else {
+                applySignedOutTeamsState()
+            }
+        }
+        .onChange(of: mapViewModel.currentUserAuthId) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            if newValue == nil {
+                applySignedOutTeamsState()
+            } else if oldValue != nil {
+                store.resetAccountScopedState()
+                store.prepareForAuthenticatedRefresh()
+                selectedTeam = nil
+                errorText = nil
+                myManagedPlayers = []
+            }
         }
         .onChange(of: scenePhase) { _, phase in
-            guard phase == .active else { return }
+            guard phase == .active, isSignedInForTeams, isTeamsTabSelected else { return }
             FanTeamIdentityRealtimeCoordinator.shared.handleSceneBecameActive()
             Task {
-                await store.refresh(source: "section.sceneActive")
+                await store.refresh(source: "section.sceneActive", surfaceError: false)
                 syncMyTeamsInvitationBadge()
             }
         }
         .onAppear {
+            guard isSignedInForTeams else { return }
+            store.prepareForAuthenticatedRefresh()
+            guard isTeamsTabSelected else { return }
             // Invitation-only soft refresh; full list refresh is owned by `.task` / scene / pull.
             Task {
                 await store.refreshInvitations(source: "section.onAppear")
                 syncMyTeamsInvitationBadge()
                 await applyPendingInvitationHighlightIfNeeded()
+                await applyPendingOpenFanTeamRosterIfNeeded()
+                await fulfillPendingTeamScheduleJoinApprovalIfNeeded()
+                await fulfillPendingTeamScheduleEventDeepLinkIfNeeded()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .fanTeamInvitationPushArrivedInForeground)) { _ in
+            guard isSignedInForTeams else { return }
             Task {
                 await store.refreshInvitations(source: "push.invitationForeground")
                 syncMyTeamsInvitationBadge()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .fanTeamDeletedPushArrivedInForeground)) { note in
+            guard isSignedInForTeams else { return }
             let teamIdRaw = (note.userInfo?[FanTeamDeletedNotificationDeepLinkPayload.teamIDKey] as? String) ?? ""
             let teamId = UUID(uuidString: teamIdRaw)
             let teamName = (note.userInfo?[FanTeamDeletedNotificationDeepLinkPayload.teamNameKey] as? String)?
@@ -189,15 +217,102 @@ struct MyTeamsChatSectionView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .fanTeamMemberLeftPushArrivedInForeground)) { _ in
+            guard isSignedInForTeams else { return }
+            Task {
+                await store.refresh(source: "push.memberLeftForeground")
+                mapViewModel.clearPickupGameRosterCaches()
+                syncMyTeamsInvitationBadge()
+            }
+        }
         .onChange(of: chatViewModel.pendingHighlightFanTeamInvitationId) { _, _ in
+            guard isSignedInForTeams else { return }
             Task { await applyPendingInvitationHighlightIfNeeded() }
+        }
+        .onChange(of: chatViewModel.pendingOpenMyTeamsInvitations) { _, open in
+            guard isSignedInForTeams, open else { return }
+            // Invitation taps highlight an invite. Removal / role / deleted-Team
+            // reuse this flag only to select the Teams tab — stay on the list.
+            if chatViewModel.pendingHighlightFanTeamInvitationId != nil {
+                homeSegment = .invites
+            }
+        }
+            .onChange(of: chatViewModel.pendingOpenFanTeamRosterTeamId) { _, _ in
+                guard isSignedInForTeams else { return }
+                Task { await applyPendingOpenFanTeamRosterIfNeeded() }
+            }
+    }
+
+    private func applyTeamsHomeSheets<V: View>(to view: V) -> some View {
+        view
+            .sheet(isPresented: $showingMyPlayers) {
+            NavigationStack {
+                MyPlayersView(
+                    languageCode: languageCode,
+                    mapViewModel: mapViewModel,
+                    chatViewModel: chatViewModel,
+                    knownTeams: store.homeItems.map(\.team),
+                    onOpenTeamChat: { context in
+                        showingMyPlayers = false
+                        onOpenTeamChat(context)
+                    },
+                    onTeamsChanged: {
+                        Task { await store.refresh(source: "myPlayers.teamsChanged") }
+                    }
+                )
+            }
+            .onDisappear { Task { await refreshMyManagedPlayers() } }
+        }
+        .sheet(item: $invitationPendingPlayerChoice) { invitation in
+            NavigationStack {
+                TeamInvitationJoinSheet(
+                    teamName: invitation.teamName,
+                    selfDisplayName: mapViewModel.currentUserDisplayName.trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    ),
+                    selfAvatarURL: mapViewModel.currentUserAvatarURL,
+                    selfAvatarThumbnailURL: mapViewModel.currentUserAvatarThumbnailURL,
+                    managedPlayers: myManagedPlayers,
+                    languageCode: languageCode,
+                    initiallySelectedManagedPlayerId: invitePreselectManagedPlayerId,
+                    onJoin: { includeSelf, managedIds in
+                        Task {
+                            await acceptInvitation(
+                                invitation,
+                                includeSelf: includeSelf,
+                                managedPlayerIds: managedIds
+                            )
+                        }
+                    },
+                    onAddPlayer: {
+                        showingInviteAddPlayer = true
+                    }
+                )
+                .sheet(isPresented: $showingInviteAddPlayer) {
+                    NavigationStack {
+                        ManagedPlayerEditorSheet(
+                            existing: nil,
+                            languageCode: languageCode,
+                            onSaved: { newId in
+                                invitePreselectManagedPlayerId = newId
+                                await refreshMyManagedPlayers()
+                            }
+                        )
+                    }
+                }
+                .onDisappear {
+                    invitePreselectManagedPlayerId = nil
+                }
+            }
         }
         .sheet(isPresented: $showingCreate) {
             CreateFanTeamSheet(mapViewModel: mapViewModel, chatViewModel: chatViewModel) { teamId, logoWarning in
                 Task {
                     await store.refresh(source: "createTeam.completed")
                     if let team = store.teams.first(where: { $0.id == teamId }) {
+                        selectedTeamInitialTab = .overview
                         selectedTeam = team
+                        TeamDetailCrashTrace.teamOpen(teamID: team.id, teamName: team.name)
                     }
                     if let logoWarning, !logoWarning.isEmpty {
                         createTeamInfoBanner = logoWarning
@@ -210,6 +325,7 @@ struct MyTeamsChatSectionView: View {
                 summary: team,
                 mapViewModel: mapViewModel,
                 chatViewModel: chatViewModel,
+                initialTab: selectedTeamInitialTab,
                 onOpenChat: { context in
                     selectedTeam = nil
                     onOpenTeamChat(context)
@@ -220,16 +336,28 @@ struct MyTeamsChatSectionView: View {
                 onTeamDeleted: {
                     selectedTeam = nil
                     Task { await store.refresh(source: "detail.teamDeleted") }
+                },
+                onQuietTeamsRefresh: {
+                    Task { await store.refresh(source: "detail.playerMembership", surfaceError: false) }
                 }
             )
         }
-        .alert(
-            L10n.t("fan_teams_error_title", languageCode: languageCode),
-            isPresented: Binding(
-                get: { errorText != nil || store.errorText != nil },
-                set: { if !$0 { errorText = nil; store.errorText = nil } }
-            )
-        ) {
+    }
+
+    private func applyTeamsHomeAlerts<V: View>(to view: V) -> some View {
+        view
+            .alert(
+                L10n.t("fan_teams_error_title", languageCode: languageCode),
+                isPresented: Binding(
+                    get: {
+                        guard isTeamsTabSelected else { return false }
+                        if let errorText, !errorText.isEmpty { return true }
+                        // Automatic list_my_fan_teams failures never cover Profile / Teams with a modal.
+                        return false
+                    },
+                    set: { if !$0 { errorText = nil; store.errorText = nil } }
+                )
+            ) {
             Button(L10n.t("OK", languageCode: languageCode), role: .cancel) {}
         } message: {
             Text(errorText ?? store.errorText ?? "")
@@ -260,21 +388,145 @@ struct MyTeamsChatSectionView: View {
             guard let change = FanTeamIdentityChangeCenter.identityChange(from: note) else { return }
             store.applyIdentityChange(change)
             teamMarkRefreshTokens[change.teamId] = change.displayRefreshToken
-            if selectedTeam?.id == change.teamId {
-                selectedTeam = selectedTeam?.applying(change)
+            // Do not replace `selectedTeam` while the detail sheet is presented.
+            // Mutating the `.sheet(item:)` value mid-presentation recreates FanTeamDetailSheet
+            // (detailSheetInit again) and has caused AttributeGraph / render termination.
+            // FanTeamDetailSheet already applies identity changes via its own onReceive.
+        }
+        .onReceive(NotificationCenter.default.publisher(for: FanManagedPlayerChangeCenter.avatarDidChangeNotification)) { note in
+            guard let change = FanManagedPlayerChangeCenter.avatarChange(from: note) else { return }
+            // Local patch first — avoid immediate full list_my_fan_teams refresh storm.
+            store.applyManagedPlayerAvatarChange(change)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: FanManagedPlayerChangeCenter.teamMembershipDidChangeNotification)) { _ in
+            guard isSignedInForTeams else { return }
+            Task { await store.refresh(source: "managedPlayer.teamMembershipChanged") }
+        }
+    }
+
+    /// Accepts an invitation for Myself and/or one-or-more managed players in one RPC.
+    @MainActor
+    private func acceptInvitation(
+        _ invitation: FanTeamInvitation,
+        includeSelf: Bool,
+        managedPlayerIds: [UUID]
+    ) async {
+        do {
+#if DEBUG
+            print(
+                "[ManagedPlayerTeamAccess] inviteAcceptanceStart " +
+                "invitation_id=\(invitation.invitationId.uuidString.lowercased()) " +
+                "team_id=\(invitation.teamId.uuidString.lowercased()) " +
+                "directUserSelected=\(includeSelf) " +
+                "selectedJoiningPlayerIDs=\(managedPlayerIds.map { $0.uuidString.lowercased() }.joined(separator: ","))"
+            )
+#endif
+            _ = try await FanManagedPlayerService().acceptInvitationForParticipants(
+                invitationId: invitation.invitationId,
+                includeSelf: includeSelf,
+                managedPlayerIds: managedPlayerIds
+            )
+            for managedId in managedPlayerIds {
+                FanManagedPlayerChangeCenter.postTeamMembershipChange(
+                    FanManagedPlayerTeamMembershipChange(
+                        managedPlayerId: managedId,
+                        teamId: invitation.teamId,
+                        membershipId: nil,
+                        added: true
+                    )
+                )
+#if DEBUG
+                print(
+                    "[ManagedPlayerTeamAccess] managedPlayerMembershipCreated " +
+                    "managed_player_id=\(managedId.uuidString.lowercased()) " +
+                    "team_id=\(invitation.teamId.uuidString.lowercased())"
+                )
+#endif
+            }
+            invitationPendingPlayerChoice = nil
+            await store.refresh(source: "invitation.acceptedForParticipants")
+            syncMyTeamsInvitationBadge()
+            await refreshMyManagedPlayers()
+#if DEBUG
+            print(
+                "[ManagedPlayerTeamAccess] myTeamsRefresh " +
+                "team_id=\(invitation.teamId.uuidString.lowercased()) " +
+                "homeItems=\(store.homeItems.count) " +
+                "containsTeam=\(store.homeItems.contains(where: { $0.id == invitation.teamId })) " +
+                "managed_added=\(managedPlayerIds.count)"
+            )
+#endif
+        } catch {
+#if DEBUG
+            print(
+                "[ManagedPlayerTeamDebug] invite_accept_failed " +
+                "team_id=\(invitation.teamId.uuidString.lowercased()) " +
+                "error=\(error.localizedDescription)"
+            )
+#endif
+            if let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
+                errorText = message
             }
         }
     }
 
-    /// Keep Chat → My Teams segment badge aligned with invitee pending list (not manager-sent counts).
+    /// Silent on failure: a missing RPC (pre-20260960 backend) must not surface
+    /// an error to a user who has never heard of managed players.
+    @MainActor
+    private func refreshMyManagedPlayers() async {
+        guard isSignedInForTeams else {
+            myManagedPlayers = []
+            return
+        }
+        myManagedPlayers = (try? await FanManagedPlayerService().listMyManagedPlayers()) ?? []
+    }
+
+    /// Keep root Teams tab invitation badge aligned with invitee pending list (not manager-sent counts).
     @MainActor
     private func syncMyTeamsInvitationBadge() {
-        chatViewModel.applyPendingFanTeamInvitationCount(store.invitations.count)
+        guard isSignedInForTeams else {
+            chatViewModel.applyPendingFanTeamInvitations([])
+            return
+        }
+        chatViewModel.applyPendingFanTeamInvitations(store.invitations)
+    }
+
+    @MainActor
+    private func applySignedOutTeamsState() {
+        store.resetAccountScopedState()
+        selectedTeam = nil
+        errorText = nil
+        searchText = ""
+        homeSegment = .myTeams
+        relationshipFilter = .all
+        myManagedPlayers = []
+        showingCreate = false
+        showingMyPlayers = false
+        highlightedInvitationId = nil
+        invitationPendingPlayerChoice = nil
+        chatViewModel.applyPendingFanTeamInvitations([])
+    }
+
+    @MainActor
+    private func handleTeamsAuthSessionChanged(source: String) async {
+        guard TeamsHomeAuthPresentation.shouldFetchAuthenticatedTeamData(
+            isSignedIn: isSignedInForTeams
+        ) else {
+            applySignedOutTeamsState()
+            return
+        }
+        store.prepareForAuthenticatedRefresh()
+        await store.refresh(source: source, surfaceError: false)
+        syncMyTeamsInvitationBadge()
+        await applyPendingInvitationHighlightIfNeeded()
+        await applyPendingOpenFanTeamRosterIfNeeded()
+        await refreshMyManagedPlayers()
     }
 
     /// Deep-link highlight: fail soft when the invitation was cancelled/accepted elsewhere.
     @MainActor
     private func applyPendingInvitationHighlightIfNeeded() async {
+        guard isSignedInForTeams else { return }
         guard let targetId = chatViewModel.pendingHighlightFanTeamInvitationId else { return }
 
         if store.invitations.isEmpty {
@@ -290,6 +542,7 @@ struct MyTeamsChatSectionView: View {
         }
 
         highlightedInvitationId = targetId
+        homeSegment = .invites
         // Clear the emphasis after a short beat so the list settles.
         try? await Task.sleep(nanoseconds: 2_500_000_000)
         if highlightedInvitationId == targetId {
@@ -297,143 +550,612 @@ struct MyTeamsChatSectionView: View {
         }
     }
 
-    @ViewBuilder
-    private func myTeamsFeedRow(_ item: ChatMyTeamsListItem) -> some View {
-        switch item {
-        case .team(let team):
-            Button {
-                selectedTeam = team
-            } label: {
-                MyTeamCardView(
-                    team: team,
-                    languageCode: languageCode,
-                    displayRefreshToken: teamMarkRefreshTokens[team.id]
-                )
-            }
-            .buttonStyle(FGPremiumPressButtonStyle())
-        case .nativeAd(let slot):
-            CompactNativeAdCard(
-                placement: ChatMyTeamsAdPlacement.placementID,
-                hostTabRaw: "chat",
-                slotIndex: slot.slotIndex,
-                layoutWidth: max(280, myTeamsAdLayoutWidth),
-                onAdLoaded: {
+    /// member_left_team push: open Team Detail → Roster (fail soft if Team gone).
+    @MainActor
+    private func applyPendingOpenFanTeamRosterIfNeeded() async {
+        guard isSignedInForTeams else { return }
+        guard let teamId = chatViewModel.pendingOpenFanTeamRosterTeamId else { return }
+        if store.homeItems.isEmpty {
+            await store.refresh(source: "deepLink.memberLeftRoster")
+        }
+        _ = chatViewModel.consumePendingOpenFanTeamRosterTeamId()
+        guard let team = store.homeItems.first(where: { $0.id == teamId })?.team
+            ?? store.teams.first(where: { $0.id == teamId }) else {
 #if DEBUG
-                    logMyTeamsAdLifecycle(slot: slot, phase: "adLoaded")
+            print("[FanTeamMemberLeaveDebug] roster_deep_link_miss team_id=\(teamId.uuidString.lowercased())")
 #endif
-                },
-                onAdFailed: { error in
+            return
+        }
+        mapViewModel.clearPickupGameRosterCaches()
+        selectedTeamInitialTab = .roster
+        selectedTeam = team
+    }
+
+    /// Action Center join approval → Team Detail Schedule → game + pending requests.
+    @MainActor
+    private func fulfillPendingTeamScheduleJoinApprovalIfNeeded() async {
+        guard isSignedInForTeams else { return }
+        guard let pending = mapViewModel.pendingTeamScheduleJoinApproval else { return }
+        if store.homeItems.isEmpty {
+            await store.refresh(source: "deepLink.joinApprovalSchedule")
+        }
+        guard let team = store.homeItems.first(where: { $0.id == pending.teamId })?.team
+            ?? store.teams.first(where: { $0.id == pending.teamId }) else {
+            // Team not in list — fall back to organizer requests sheet only.
+            mapViewModel.pendingOrganizerJoinRequestsGameToken =
+                PickupDetailNavigationToken.standalone(pending.pickupGameId)
+            mapViewModel.clearPendingTeamScheduleJoinApproval()
+            return
+        }
+        homeSegment = .myTeams
+        selectedTeamInitialTab = .schedule
+        if selectedTeam?.id != team.id {
+            selectedTeam = team
+        }
+        // FanTeamDetailSheet consumes pendingTeamScheduleJoinApproval for game + requests.
+    }
+
+    /// Team Schedule create/update APNs → Team Detail Schedule → event detail.
+    @MainActor
+    private func fulfillPendingTeamScheduleEventDeepLinkIfNeeded() async {
+        guard isSignedInForTeams else { return }
+        guard let pending = mapViewModel.pendingTeamScheduleEventDeepLink else { return }
+        if store.homeItems.isEmpty {
+            await store.refresh(source: "deepLink.teamScheduleEvent")
+        }
+        guard let team = store.homeItems.first(where: { $0.id == pending.teamId })?.team
+            ?? store.teams.first(where: { $0.id == pending.teamId }) else {
 #if DEBUG
-                    logMyTeamsAdLifecycle(
-                        slot: slot,
-                        phase: "adFailed error=\(error.localizedDescription)"
-                    )
-#endif
-                }
+            print(
+                "[TeamScheduleNotification] deepLinkResolved miss team_id=\(pending.teamId.uuidString.lowercased()) " +
+                "fallback=sharedPickupDetail"
             )
-            .frame(maxWidth: .infinity)
-            .frame(height: CompactNativeAdLayout.preferredHeight)
-        }
-    }
-
-    private func updateMyTeamsAdLayoutWidth(_ width: CGFloat) {
-        guard width > 0, abs(myTeamsAdLayoutWidth - width) > 0.5 else { return }
-        myTeamsAdLayoutWidth = width
-    }
-
-    private func logMyTeamsAdPlacementIfNeeded() {
-#if DEBUG
-        guard AdDiagnostics.enabled else { return }
-        guard ChatMyTeamsAdPlacement.shouldLogDiagnostics(for: filteredTeams) else { return }
-        let teamCount = filteredTeams.count
-        let positions = ChatMyTeamsAdPlacement.insertionPositions(for: teamCount)
-        let rendered = positions.map(String.init).joined(separator: ",")
-        print("[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) teamCount=\(teamCount)")
-        print("[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) insertionIndexes=[\(rendered)]")
-        print("[ChatMyTeamsAdDebug] teamCount=\(teamCount)")
-        print("[ChatMyTeamsAdDebug] insertionIndexes=[\(rendered)]")
-        print("[ChatMyTeamsAdDebug] adsInsertedCount=\(positions.count)")
-        print("[ChatMyTeamsAdDebug] policyInsert=\(FanGeoAdPolicy.shouldInsertAdsInFeeds())")
-        if let reason = ChatMyTeamsAdPlacement.skippedReason(teamCount: teamCount) {
-            print("[ChatMyTeamsAdDebug] skippedReason=\(reason)")
-        }
 #endif
+            mapViewModel.presentSharedPickupGameDetail(
+                gameId: pending.pickupGameId,
+                presentationMode: .teamEvent,
+                seededTeamContext: PickupGameTeamCreationContext(
+                    teamId: pending.teamId,
+                    teamName: "",
+                    teamSport: ""
+                )
+            )
+            mapViewModel.clearPendingTeamScheduleEventDeepLink()
+            return
+        }
+        homeSegment = .myTeams
+        selectedTeamInitialTab = .schedule
+        if selectedTeam?.id != team.id {
+            selectedTeam = team
+        }
+        // FanTeamDetailSheet consumes pendingTeamScheduleEventDeepLink for game detail.
     }
 
+    @ViewBuilder
+    private var myTeamsSegmentContent: some View {
+        relationshipFilterChips
+            .padding(.bottom, 2)
+
+        if store.homeItems.isEmpty {
+            if let retryMessage = store.sectionRetryMessage {
+                myTeamsSectionRetry(retryMessage)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 28)
+            } else {
+                emptyState
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 28)
+            }
+        } else {
+            Text(L10n.t("fan_teams_your_teams", languageCode: languageCode))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .padding(.horizontal, 2)
+                .accessibilityAddTraits(.isHeader)
+
+            if filteredHomeItems.isEmpty {
+                filterEmptyState
+                    .padding(.vertical, 20)
+                    .frame(maxWidth: .infinity)
+            } else {
+                let listItems = myTeamsFeedListItems
 #if DEBUG
-    private func logMyTeamsAdLifecycle(slot: ChatMyTeamsNativeAdSlot, phase: String) {
-        guard AdDiagnostics.enabled else { return }
-        print(
-            "[ChatMyTeamsAdDebug] \(phase) slot=\(slot.slotIndex) afterTeam=\(slot.insertedAfterTeamPosition)"
+                let _ = {
+                    let listTeams = filteredHomeItems.map(\.team)
+                    guard ChatMyTeamsAdPlacement.shouldLogDiagnostics(for: listTeams) else { return }
+                    let positions = ChatMyTeamsAdPlacement.insertionPositions(for: listTeams.count)
+                    print(
+                        "[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) " +
+                        "filter=\(relationshipFilter.rawValue) teamCount=\(listTeams.count)"
+                    )
+                    print("[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) insertedAfter=\(positions.map(String.init).joined(separator: ","))")
+                    if let reason = ChatMyTeamsAdPlacement.skippedReason(teamCount: listTeams.count) {
+                        print("[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) skippedReason=\(reason)")
+                    }
+                    if FanGeoAdPolicy.adsSuppressed {
+                        print("[NativeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) adsSuppressed=true")
+                    }
+                }()
+#endif
+                ForEach(listItems) { item in
+                    switch item {
+                    case .team(let team):
+                        let relationship = filteredHomeItems.first(where: { $0.id == team.id })?.relationship
+                            ?? FanTeamHomeCatalog.relationship(forAccountRole: team.myRole)
+                        MyTeamCardView(
+                            team: team,
+                            relationship: relationship,
+                            languageCode: languageCode,
+                            displayRefreshToken: teamMarkRefreshTokens[team.id],
+                            chromeAccent: teamsChromeAccent,
+                            onOpenDetail: {
+                                TeamDetailCrashTrace.log(
+                                    "teamCardTapped",
+                                    details: "teamID=\(team.id.uuidString.lowercased()) teamName=\(team.name)"
+                                )
+                                // One presentation per Team id — ignore rapid re-taps while opening.
+                                if selectedTeam?.id == team.id { return }
+                                TeamDetailCrashTrace.teamOpen(teamID: team.id, teamName: team.name)
+                                selectedTeamInitialTab = .overview
+                                selectedTeam = team
+                            }
+                        )
+                    case .nativeAd(let slot):
+                        TeamsHomeNativeAdCard(slot: slot)
+                    }
+                }
+                // Keep filter switches from animating ad/team row remounts into janky jumps.
+                .animation(nil, value: relationshipFilter)
+                .animation(nil, value: searchText)
+            }
+        }
+    }
+
+    private var relationshipFilterChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(FanTeamHomeFilter.allCases) { filter in
+                    relationshipFilterChip(filter)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func relationshipFilterChip(_ filter: FanTeamHomeFilter) -> some View {
+        let selected = relationshipFilter == filter
+        let count = homeFilterCounts.count(for: filter)
+        let title = L10n.t(filter.localizationKey, languageCode: languageCode)
+        return Button {
+            relationshipFilter = filter
+        } label: {
+            HStack(spacing: 5) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                Text("\(count)")
+                    .font(.caption2.weight(.bold))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            .foregroundStyle(
+                selected
+                    ? teamsChromeAccent
+                    : FGColor.secondaryText(colorScheme)
+            )
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background {
+                Capsule(style: .continuous)
+                    .fill(
+                        selected
+                            ? teamsChromeAccent.opacity(colorScheme == .dark ? 0.28 : 0.14)
+                            : FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.72 : 1)
+                    )
+            }
+            .overlay {
+                Capsule(style: .continuous)
+                    .strokeBorder(
+                        selected
+                            ? teamsChromeAccent.opacity(0.55)
+                            : FGColor.divider(colorScheme).opacity(0.45),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            filterChipAccessibilityLabel(title: title, count: count, selected: selected)
+        )
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private func filterChipAccessibilityLabel(
+        title: String,
+        count: Int,
+        selected: Bool
+    ) -> String {
+        let key = selected
+            ? "fan_teams_filter_a11y_selected"
+            : "fan_teams_filter_a11y"
+        return String(
+            format: L10n.t(key, languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            title,
+            count
         )
     }
-#endif
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(L10n.t("fan_teams_title", languageCode: languageCode))
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                Spacer()
+    @ViewBuilder
+    private var filterEmptyState: some View {
+        let hasSearch = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if hasSearch {
+            Text(L10n.t("fan_teams_empty_body", languageCode: languageCode))
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            switch relationshipFilter {
+            case .all:
+                emptyState
+            case .managing:
+                filterBucketEmptyState(
+                    messageKey: FanTeamHomeFilter.managing.emptyTitleKey,
+                    showsCreate: true
+                )
+            case .joined:
+                filterBucketEmptyState(
+                    messageKey: FanTeamHomeFilter.joined.emptyTitleKey,
+                    showsCreate: false
+                )
+            }
+        }
+    }
+
+    private func filterBucketEmptyState(messageKey: String, showsCreate: Bool) -> some View {
+        VStack(spacing: 12) {
+            Text(L10n.t(messageKey, languageCode: languageCode))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+
+            if showsCreate {
                 Button {
                     showingCreate = true
                 } label: {
                     Label(L10n.t("fan_teams_create", languageCode: languageCode), systemImage: "plus")
                         .font(.subheadline.weight(.bold))
-                        .foregroundStyle(Color.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(FGColor.accentGreen, in: Capsule())
+                        .foregroundStyle(teamsChromeAccent)
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 12)
+                        .overlay {
+                            Capsule(style: .continuous)
+                                .strokeBorder(teamsChromeAccent.opacity(0.85), lineWidth: 1.5)
+                        }
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(L10n.t("fan_teams_create", languageCode: languageCode))
             }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .combine)
+    }
 
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                TextField(L10n.t("fan_teams_search_placeholder", languageCode: languageCode), text: $searchText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.7 : 0.95))
+    @ViewBuilder
+    private var invitesSegmentContent: some View {
+        if store.invitations.isEmpty {
+            ContentUnavailableView(
+                L10n.t("fan_teams_invitations_section", languageCode: languageCode),
+                systemImage: "envelope.open"
             )
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(FGColor.divider(colorScheme).opacity(0.5), lineWidth: 1)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 36)
+        } else {
+            Text(L10n.t("fan_teams_invitations_section", languageCode: languageCode))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .padding(.horizontal, 2)
+                .accessibilityAddTraits(.isHeader)
+
+            ForEach(store.invitations) { invitation in
+                FanTeamInvitationCardView(
+                    invitation: invitation,
+                    languageCode: languageCode,
+                    isBusy: store.busyInvitationIds.contains(invitation.id),
+                    isHighlighted: highlightedInvitationId == invitation.id,
+                    onAccept: {
+                        invitationPendingPlayerChoice = invitation
+                    },
+                    onDecline: {
+                        Task {
+                            do {
+                                try await store.declineInvitation(invitation)
+                                syncMyTeamsInvitationBadge()
+                            } catch {
+                                if let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
+                                    errorText = message
+                                }
+                            }
+                        }
+                    }
+                )
+                .id(invitation.id)
+            }
+        }
+    }
+
+    private var homeSegmentControl: some View {
+        GameOnSegmentedControl(
+            tabs: [
+                GameOnSegmentedTab(
+                    id: TeamsHomeSegment.myTeams,
+                    title: L10n.t("My Teams", languageCode: languageCode),
+                    systemImage: "person.3.fill",
+                    tint: teamsChromeAccent,
+                    accessibilityLabel: L10n.t("My Teams", languageCode: languageCode)
+                ),
+                GameOnSegmentedTab(
+                    id: TeamsHomeSegment.invites,
+                    title: L10n.t("Invites", languageCode: languageCode),
+                    systemImage: "envelope.fill",
+                    badge: inviteBadgeText,
+                    tint: teamsChromeAccent,
+                    accessibilityLabel: L10n.t("Invites", languageCode: languageCode)
+                )
+            ],
+            selection: $homeSegment,
+            accent: teamsChromeAccent,
+            animatesSelectionChanges: true
+        )
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 6) {
+                FanGeoPagePurposeHeader(
+                    title: L10n.t("teams", languageCode: languageCode),
+                    subtitle: ""
+                )
+                // Keep "Teams" intrinsic so action buttons receive the leftover width
+                // and ViewThatFits can collapse on very narrow layouts (e.g. SE).
+                .fixedSize(horizontal: true, vertical: false)
+
+                Spacer(minLength: 4)
+
+                if isSignedInForTeams {
+                    // Prefer labeled actions; collapse only when the leftover width cannot fit.
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 6) {
+                            teamsHeaderMyPlayersButton(showsTitle: true)
+                            teamsHeaderCreateTeamButton(showsTitle: true)
+                        }
+                        HStack(spacing: 6) {
+                            teamsHeaderMyPlayersButton(showsTitle: false)
+                            teamsHeaderCreateTeamButton(showsTitle: true)
+                        }
+                        HStack(spacing: 6) {
+                            teamsHeaderMyPlayersButton(showsTitle: false)
+                            teamsHeaderCreateTeamButton(showsTitle: false)
+                        }
+                    }
+                }
+
+                FanGeoActionCenterHeaderButton()
+            }
+
+            if isSignedInForTeams {
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    TextField(L10n.t("fan_teams_search_placeholder", languageCode: languageCode), text: $searchText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(FGColor.cardBackground(colorScheme).opacity(colorScheme == .dark ? 0.78 : 1))
+                        .shadow(
+                            color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.06),
+                            radius: 8,
+                            x: 0,
+                            y: 3
+                        )
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(FGColor.divider(colorScheme).opacity(0.45), lineWidth: 1)
+                }
             }
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
-        .padding(.bottom, 4)
+        .padding(.bottom, 6)
+    }
+
+    private var signedOutLanding: some View {
+        SignedOutFeatureView(
+            icon: "person.3.fill",
+            title: L10n.t("teams_signed_out_title", languageCode: languageCode),
+            description: L10n.t("teams_signed_out_body", languageCode: languageCode),
+            accent: teamsChromeAccent,
+            onSignIn: {
+                mapViewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
+            },
+            onCreateAccount: {
+                mapViewModel.discoverPresentFanUserAuthSheet(openRegisterMode: true)
+            }
+        )
+    }
+
+    private func teamsHeaderMyPlayersButton(showsTitle: Bool) -> some View {
+        Button {
+            showingMyPlayers = true
+        } label: {
+            HStack(spacing: showsTitle ? 6 : 0) {
+                Image(systemName: "person.3.fill")
+                    .font(.system(size: 13, weight: .bold))
+                if showsTitle {
+                    Text(L10n.t("managed_players_title", languageCode: languageCode))
+                        .font(.caption.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+            }
+            .foregroundStyle(teamsChromeAccent)
+            .padding(.horizontal, showsTitle ? 10 : 0)
+            .frame(minWidth: 44, minHeight: 44)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(teamsChromeAccent.opacity(colorScheme == .dark ? 0.22 : 0.12))
+            )
+            .overlay {
+                Capsule(style: .continuous)
+                    .strokeBorder(teamsChromeAccent.opacity(0.28), lineWidth: 1)
+            }
+            .contentShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.t("managed_players_title", languageCode: languageCode))
+    }
+
+    private func teamsHeaderCreateTeamButton(showsTitle: Bool) -> some View {
+        Button {
+            showingCreate = true
+        } label: {
+            HStack(spacing: showsTitle ? 5 : 0) {
+                Image(systemName: "plus")
+                    .font(.system(size: 13, weight: .bold))
+                if showsTitle {
+                    Text(L10n.t("fan_teams_create", languageCode: languageCode))
+                        .font(.caption.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                }
+            }
+            .foregroundStyle(Color.white)
+            .padding(.horizontal, showsTitle ? 10 : 0)
+            .frame(minWidth: 44, minHeight: 44)
+            .background(teamsChromeAccent, in: Capsule(style: .continuous))
+            .contentShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.t("fan_teams_create", languageCode: languageCode))
+    }
+
+    private func myTeamsSectionRetry(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(teamsChromeAccent.opacity(colorScheme == .dark ? 0.22 : 0.12))
+                    .frame(width: 72, height: 72)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(teamsChromeAccent)
+            }
+            .accessibilityHidden(true)
+
+            Text(L10n.t("fan_teams_error_title", languageCode: languageCode))
+                .font(.title3.weight(.bold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .multilineTextAlignment(.center)
+
+            Text(message)
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+
+            Button {
+                Task {
+                    await store.refresh(source: "section.retry", surfaceError: false)
+                    syncMyTeamsInvitationBadge()
+                }
+            } label: {
+                Text(L10n.t("Try Again", languageCode: languageCode))
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(teamsChromeAccent)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .overlay {
+                        Capsule(style: .continuous)
+                            .strokeBorder(teamsChromeAccent.opacity(0.85), lineWidth: 1.5)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(L10n.t("Try Again", languageCode: languageCode))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+        .accessibilityElement(children: .combine)
     }
 
     private var emptyState: some View {
-        ContentUnavailableView {
-            Label(L10n.t("fan_teams_empty_title", languageCode: languageCode), systemImage: "person.3.fill")
-        } description: {
-            Text(L10n.t("fan_teams_empty_body", languageCode: languageCode))
-        } actions: {
-            Button(L10n.t("fan_teams_create", languageCode: languageCode)) {
-                showingCreate = true
+        VStack(spacing: 16) {
+            ZStack {
+                Circle()
+                    .fill(teamsChromeAccent.opacity(colorScheme == .dark ? 0.22 : 0.12))
+                    .frame(width: 72, height: 72)
+                Image(systemName: "person.3.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(teamsChromeAccent)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(FGColor.accentGreen)
+            .accessibilityHidden(true)
+
+            Text(L10n.t("fan_teams_empty_title", languageCode: languageCode))
+                .font(.title3.weight(.bold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .multilineTextAlignment(.center)
+
+            Text(L10n.t("fan_teams_empty_body", languageCode: languageCode))
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 12)
+
+            Button {
+                showingCreate = true
+            } label: {
+                Label(L10n.t("fan_teams_create", languageCode: languageCode), systemImage: "plus")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(teamsChromeAccent)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .overlay {
+                        Capsule(style: .continuous)
+                            .strokeBorder(teamsChromeAccent.opacity(0.85), lineWidth: 1.5)
+                    }
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 4)
+            .accessibilityLabel(L10n.t("fan_teams_create", languageCode: languageCode))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 20)
+        .accessibilityElement(children: .combine)
     }
 }
 
+private enum TeamsHomeSegment: Hashable {
+    case myTeams
+    case invites
+}
+
 /// Classifies My Teams load/mutation failures for UI presentation.
-/// Cancellation is control flow — never user-facing.
+/// Cancellation and missing auth are control flow — never user-facing.
 enum FanTeamsLoadErrorPresentation {
     static func isCancellation(_ error: Error) -> Bool {
         if error is CancellationError { return true }
+        if let layered = error as? FanTeamLayeredError {
+            return isCancellation(layered.underlying)
+        }
+        if let urlError = error as? URLError, urlError.code == .cancelled { return true }
         let nsError = error as NSError
         if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return true }
         let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -444,30 +1166,245 @@ enum FanTeamsLoadErrorPresentation {
             || message.contains("task was canceled")
     }
 
-    /// `nil` when the error must not be shown (cancellation).
+    /// No session / JWT is not a Teams refresh failure.
+    static func isMissingAuthSession(_ error: Error) -> Bool {
+        if let layered = error as? FanTeamLayeredError {
+            return isMissingAuthSession(layered.underlying)
+        }
+        let text = combinedErrorText(error)
+        if text.contains("not authenticated") || text.contains("unauthenticated") {
+            return true
+        }
+        if text.contains("session") && (
+            text.contains("missing")
+                || text.contains("not found")
+                || text.contains("not exist")
+                || text.contains("no current")
+                || text.contains("expired")
+        ) {
+            return true
+        }
+        if text.contains("jwt") && (text.contains("expired") || text.contains("missing")) {
+            return true
+        }
+        return false
+    }
+
+    private static func combinedErrorText(_ error: Error) -> String {
+        var parts: [String] = [error.localizedDescription]
+        if let pe = error as? PostgrestError {
+            parts.append(pe.message)
+            if let detail = pe.detail { parts.append(detail) }
+            if let hint = pe.hint { parts.append(hint) }
+            if let code = pe.code { parts.append(code) }
+        }
+        return parts.joined(separator: " ").lowercased()
+    }
+
+    /// Specific managed-seat / invite messages when the backend surfaces a known code.
+    static func managedPlayerSeatMessage(for error: Error, languageCode: String? = nil) -> String? {
+        let text = combinedErrorText(error)
+        if text.contains("managed_player_team_seats_disabled")
+            || text.contains("managed_player_seats_disabled") {
+            return L10n.t("managed_players_seats_disabled", languageCode: languageCode)
+        }
+        if text.contains("managed_player_already_on_team") {
+            return L10n.t("managed_players_already_on_team", languageCode: languageCode)
+        }
+        if text.contains("managed_player_invite_selection_empty") {
+            return L10n.t("managed_players_invite_selection_empty", languageCode: languageCode)
+        }
+        return nil
+    }
+
+    /// `nil` when the error must not be shown (cancellation / signed-out).
     static func userFacingMessage(for error: Error, languageCode: String? = nil) -> String? {
+        userFacingMessage(for: error, layer: (error as? FanTeamLayeredError)?.layer, languageCode: languageCode)
+    }
+
+    /// Layer-aware copy: do not say "refresh" when the membership mutation itself failed.
+    static func userFacingMessage(
+        for error: Error,
+        layer: FanTeamOperationLayer?,
+        languageCode: String? = nil
+    ) -> String? {
         if isCancellation(error) { return nil }
-        return L10n.t("fan_teams_refresh_failed", languageCode: languageCode)
+        if isMissingAuthSession(error) { return nil }
+        if let specific = managedPlayerSeatMessage(for: error, languageCode: languageCode) {
+            return specific
+        }
+        let resolved = layer ?? (error as? FanTeamLayeredError)?.layer
+        switch resolved {
+        case .membershipUpdate:
+            return L10n.t("fan_teams_membership_update_failed", languageCode: languageCode)
+        case .teamDetailMembers, .teamDetailGames:
+            return L10n.t("fan_teams_detail_reload_failed", languageCode: languageCode)
+        case .managedPlayerRefresh:
+            return nil
+        case .teamsReload, .decoding, .reconciliation, .none:
+            return L10n.t("fan_teams_refresh_failed", languageCode: languageCode)
+        }
+    }
+
+    /// DEBUG diagnostics for PostgREST / decoding failures (never shown in UI).
+    static func debugDescription(_ error: Error) -> String {
+        var parts: [String] = [String(describing: type(of: error)), error.localizedDescription]
+        if let layered = error as? FanTeamLayeredError {
+            parts.append("layer=\(layered.layer.rawValue)")
+            parts.append("httpStatus=\(layered.httpStatus.map(String.init) ?? "nil")")
+            parts.append("mutationCommitted=\(layered.mutationCommitted.map { $0 ? "YES" : "NO" } ?? "unknown")")
+            if let body = layered.responseBody, !body.isEmpty {
+                parts.append("body=\(body)")
+            }
+            parts.append("underlying=\(debugDescription(layered.underlying))")
+            return parts.joined(separator: " | ")
+        }
+        if let pe = error as? PostgrestError {
+            parts.append("message=\(pe.message)")
+            if let code = pe.code { parts.append("code=\(code)") }
+            if let detail = pe.detail { parts.append("detail=\(detail)") }
+            if let hint = pe.hint { parts.append("hint=\(hint)") }
+        }
+        if let http = error as? HTTPError {
+            parts.append("httpStatus=\(http.response.statusCode)")
+            if let body = String(data: http.data, encoding: .utf8), !body.isEmpty {
+                parts.append("httpBody=\(body)")
+            }
+        }
+        if let decoding = error as? DecodingError {
+            parts.append(String(describing: decoding))
+        }
+        let ns = error as NSError
+        if ns.domain != NSCocoaErrorDomain || ns.code != 0 {
+            parts.append("ns=\(ns.domain)#\(ns.code)")
+        }
+        return parts.joined(separator: " | ")
+    }
+}
+
+/// Teams home chrome vs signed-out landing (pure; no network).
+enum TeamsHomeAuthPresentation {
+    static func shouldFetchAuthenticatedTeamData(isSignedIn: Bool) -> Bool {
+        isSignedIn
+    }
+
+    static func showsSignedOutLanding(isSignedIn: Bool) -> Bool {
+        !isSignedIn
+    }
+
+    static func showsAuthenticatedChrome(isSignedIn: Bool) -> Bool {
+        isSignedIn
+    }
+
+    static func showsAuthenticatedEmptyState(isSignedIn: Bool, homeItemCount: Int) -> Bool {
+        isSignedIn && homeItemCount == 0
     }
 }
 
 @MainActor
 final class MyTeamsStore: ObservableObject {
     @Published var teams: [FanTeamSummary] = []
+    /// Deduplicated My Teams home catalog (account seats + guardian-only access).
+    @Published private(set) var homeItems: [FanTeamHomeItem] = []
     @Published var invitations: [FanTeamInvitation] = []
     @Published var isLoading = false
     @Published var errorText: String?
+    /// Inline Teams-home retry copy when automatic refresh failed and there is no cache.
+    @Published var sectionRetryMessage: String?
     @Published var busyInvitationIds: Set<UUID> = []
 
     private let service = FanTeamsService()
+    private let managedPlayerService = FanManagedPlayerService()
     /// Owns loading-spinner / result application across overlapping refreshes.
     private var refreshGeneration = 0
+    /// In-flight refresh task; concurrent callers await the same work.
+    private var refreshInFlight: Task<Void, Never>?
+    /// Identity of ``refreshInFlight`` so a finished/cancelled task cannot clear a newer one.
+    private var refreshInFlightToken: UUID?
+    /// When true, another refresh was requested while one was in flight — run once more.
+    private var refreshNeededAgain = false
+    /// False after logout until the next authenticated session is prepared.
+    private var allowsAuthenticatedFetch = false
 
-    func refresh(source: String = "unspecified") async {
+    /// Compact “Via …” labels keyed by Team id (from My Players memberships).
+    private var managedViaNamesByTeamId: [UUID: [String]] = [:]
+    /// Teams visible only through managed-player access (no account seat).
+    private var guardianOnlyTeamsById: [UUID: FanTeamSummary] = [:]
+
+    var homeFilterCounts: FanTeamHomeFilterCounts {
+        FanTeamHomeCatalog.counts(for: homeItems)
+    }
+
+    func refresh(source: String = "unspecified", surfaceError: Bool = true) async {
+        guard allowsAuthenticatedFetch else {
+#if DEBUG
+            print("[FanTeamsLoad] operation=refresh skippedUnauthenticated source=\(source)")
+#endif
+            return
+        }
+        if let existing = refreshInFlight {
+            refreshNeededAgain = true
+#if DEBUG
+            print("[FanTeamsLoad] operation=refresh coalesced source=\(source)")
+#endif
+            await existing.value
+            return
+        }
+
+        refreshNeededAgain = false
+        let token = UUID()
+        refreshInFlightToken = token
+        let task = Task { @MainActor in
+            repeat {
+                self.refreshNeededAgain = false
+                await self.performRefresh(source: source, surfaceError: surfaceError)
+            } while self.refreshNeededAgain
+            if self.refreshInFlightToken == token {
+                self.refreshInFlight = nil
+                self.refreshInFlightToken = nil
+            }
+        }
+        refreshInFlight = task
+        await task.value
+    }
+
+    /// Drops account-scoped Teams state and invalidates in-flight refresh generations.
+    func resetAccountScopedState() {
+        refreshGeneration += 1
+        refreshNeededAgain = false
+        allowsAuthenticatedFetch = false
+        refreshInFlightToken = nil
+        refreshInFlight?.cancel()
+        refreshInFlight = nil
+        teams = []
+        homeItems = []
+        invitations = []
+        isLoading = false
+        errorText = nil
+        sectionRetryMessage = nil
+        busyInvitationIds = []
+        managedViaNamesByTeamId = [:]
+        guardianOnlyTeamsById = [:]
+#if DEBUG
+        print("[FanTeamsLoad] operation=resetAccountScopedState generation=\(refreshGeneration)")
+#endif
+    }
+
+    /// Re-enables authenticated fetches after login / account switch (shows spinner if empty).
+    func prepareForAuthenticatedRefresh() {
+        allowsAuthenticatedFetch = true
+        errorText = nil
+        if homeItems.isEmpty && invitations.isEmpty && teams.isEmpty {
+            isLoading = true
+        }
+    }
+
+    @MainActor
+    private func performRefresh(source: String, surfaceError: Bool = true) async {
         refreshGeneration += 1
         let generation = refreshGeneration
         // Full-screen spinner only when we have nothing to show yet.
-        let showBlockingSpinner = teams.isEmpty && invitations.isEmpty
+        let showBlockingSpinner = teams.isEmpty && homeItems.isEmpty && invitations.isEmpty
         if showBlockingSpinner {
             isLoading = true
         }
@@ -490,12 +1427,24 @@ final class MyTeamsStore: ObservableObject {
                 return
             }
             let previous = teams
-            teams = nextTeams
-            invitations = nextInvitations
+            if nextTeams != teams {
+                teams = nextTeams
+            }
+            if nextInvitations != invitations {
+                invitations = nextInvitations
+            }
             errorText = nil
-            FanTeamIdentityRealtimeCoordinator.shared.publishDiffs(previous: previous, next: nextTeams)
+            sectionRetryMessage = nil
+            recomputeHomeItems()
+            if nextTeams != previous {
+                FanTeamIdentityRealtimeCoordinator.shared.publishDiffs(previous: previous, next: nextTeams)
+            }
+            await refreshManagedAccessOverlay(
+                accountTeamIds: Set(nextTeams.map(\.id)),
+                generation: generation
+            )
 #if DEBUG
-            print("[FanTeamsLoad] operation=refresh success source=\(source) generation=\(generation) teams=\(nextTeams.count)")
+            print("[FanTeamsLoad] operation=refresh success source=\(source) generation=\(generation) teams=\(nextTeams.count) homeItems=\(homeItems.count)")
 #endif
         } catch {
             if FanTeamsLoadErrorPresentation.isCancellation(error) {
@@ -504,17 +1453,153 @@ final class MyTeamsStore: ObservableObject {
 #endif
                 return
             }
-            guard generation == refreshGeneration else { return }
+            if FanTeamsLoadErrorPresentation.isMissingAuthSession(error) {
 #if DEBUG
-            print("[FanTeamsLoad] operation=refresh failed source=\(source) generation=\(generation) error=\(error)")
+                print("[FanTeamsLoad] operation=refresh skippedUnauthenticated source=\(source) generation=\(generation)")
 #endif
-            errorText = FanTeamsLoadErrorPresentation.userFacingMessage(for: error)
+                if generation == refreshGeneration {
+                    errorText = nil
+                }
+                return
+            }
+            guard generation == refreshGeneration else { return }
+            let hasCachedTeams = !teams.isEmpty || !homeItems.isEmpty
+#if DEBUG
+            print(
+                "[FanTeamsLoad] operation=refresh failed source=\(source) generation=\(generation) " +
+                "hasCachedTeams=\(hasCachedTeams) surfaceError=\(surfaceError) " +
+                "error=\(FanTeamsLoadErrorPresentation.debugDescription(error))"
+            )
+#endif
+            FanTeamRPCTrace.log(
+                step: "B.store.refresh.failed",
+                rpc: "list_my_fan_teams",
+                error: error,
+                extra: "source=\(source) surfaceError=\(surfaceError) hasCachedTeams=\(hasCachedTeams)"
+            )
+            if MyTeamsRefreshPresentation.shouldKeepCachedTeams(hasCachedTeams: hasCachedTeams) {
+                errorText = nil
+                sectionRetryMessage = nil
+                return
+            }
+            let message = FanTeamsLoadErrorPresentation.userFacingMessage(
+                for: error,
+                layer: .teamsReload
+            )
+            if MyTeamsRefreshPresentation.shouldShowSectionRetry(
+                hasCachedTeams: false,
+                isCancellation: false,
+                isMissingAuth: false,
+                didFail: true
+            ) {
+                sectionRetryMessage = message ?? L10n.t("fan_teams_refresh_failed")
+            }
+            // Never assign blocking store.errorText for automatic hydration.
+            errorText = nil
         }
     }
 
+    /// Loads managed-player Team access and rebuilds `homeItems` (no extra list_my_fan_teams).
+    @MainActor
+    private func refreshManagedAccessOverlay(accountTeamIds: Set<UUID>, generation: Int) async {
+        let players = (try? await managedPlayerService.listMyManagedPlayers()) ?? []
+        var viaNames: [UUID: [String]] = [:]
+        var membershipByTeamId: [UUID: FanManagedPlayerTeamMembership] = [:]
+
+        let managedService = managedPlayerService
+        await withTaskGroup(of: (String, [FanManagedPlayerTeamMembership])?.self) { group in
+            for player in players {
+                let label = FanTeamHomeCatalog.compactManagedPlayerLabel(player)
+                let playerId = player.id
+                group.addTask {
+                    let memberships = (try? await managedService.listTeamMemberships(
+                        managedPlayerId: playerId
+                    )) ?? []
+                    return (label, memberships)
+                }
+            }
+            for await payload in group {
+                guard let (label, memberships) = payload else { continue }
+                for membership in memberships {
+                    viaNames[membership.teamId, default: []].append(label)
+                    if membershipByTeamId[membership.teamId] == nil {
+                        membershipByTeamId[membership.teamId] = membership
+                    }
+                }
+            }
+        }
+
+        guard generation == refreshGeneration else { return }
+
+        for key in viaNames.keys {
+            viaNames[key] = FanTeamHomeCatalog.uniquePreservingOrder(viaNames[key] ?? [])
+        }
+
+        let missingIds = membershipByTeamId.keys.filter { !accountTeamIds.contains($0) }
+        let hydrated = await service.hydrateGuardianHomeTeams(teamIds: Array(missingIds))
+        guard generation == refreshGeneration else { return }
+
+        var guardianOnly: [UUID: FanTeamSummary] = [:]
+        for teamId in missingIds {
+            guard let membership = membershipByTeamId[teamId] else { continue }
+            let names = viaNames[teamId] ?? []
+            guardianOnly[teamId] = FanTeamHomeCatalog.guardianOnlySummary(
+                from: membership,
+                hydrated: hydrated[teamId],
+                viaNames: names
+            )
+            ManagedPlayerTeamAccessDebug.log(
+                "accessReason=managed_player",
+                detail: "teamID=\(teamId.uuidString.lowercased()) via=\(names.joined(separator: ","))"
+            )
+        }
+
+        managedViaNamesByTeamId = viaNames
+        guardianOnlyTeamsById = guardianOnly
+        ManagedPlayerTeamAccessDebug.log(
+            "myTeamsRefresh",
+            detail: "accountTeamIDs=\(accountTeamIds.count) managedPlayerTeamIDs=\(membershipByTeamId.count) mergedMissing=\(missingIds.count) managedPlayerIDs=\(players.count)"
+        )
+        recomputeHomeItems()
+    }
+
+    @MainActor
+    private func recomputeHomeItems() {
+        var viaNames = managedViaNamesByTeamId
+        for team in teams {
+            let rpcNames = FanTeamHomeCatalog.uniquePreservingOrder(team.viaManagedPlayerNames)
+            guard !rpcNames.isEmpty else { continue }
+            let merged = FanTeamHomeCatalog.uniquePreservingOrder(
+                (viaNames[team.id] ?? []) + rpcNames
+            )
+            viaNames[team.id] = merged
+        }
+        let next = FanTeamHomeCatalog.build(
+            accountTeams: teams,
+            guardianOnlyTeams: Array(guardianOnlyTeamsById.values),
+            viaNamesByTeamId: viaNames
+        )
+        if next != homeItems {
+            homeItems = next
+        }
+        ManagedPlayerTeamAccessDebug.log(
+            "dedupeResultCount",
+            detail: "teams=\(teams.count) guardianOnly=\(guardianOnlyTeamsById.count) homeItems=\(homeItems.count) direct=\(teams.filter(\.hasAccountSeat).count) managed=\(teams.filter { !$0.hasAccountSeat }.count)"
+        )
+    }
+
     func refreshInvitations(source: String = "unspecified") async {
+        guard allowsAuthenticatedFetch else {
+#if DEBUG
+            print("[FanTeamsLoad] operation=refreshInvitations skippedUnauthenticated source=\(source)")
+#endif
+            return
+        }
+        let generation = refreshGeneration
         do {
-            invitations = try await service.listMyPendingInvitations()
+            let next = try await service.listMyPendingInvitations()
+            guard generation == refreshGeneration else { return }
+            invitations = next
 #if DEBUG
             print("[FanTeamsLoad] operation=refreshInvitations success source=\(source) count=\(invitations.count)")
 #endif
@@ -522,6 +1607,12 @@ final class MyTeamsStore: ObservableObject {
             if FanTeamsLoadErrorPresentation.isCancellation(error) {
 #if DEBUG
                 print("[FanTeamsLoad] operation=refreshInvitations cancelled source=\(source)")
+#endif
+                return
+            }
+            if FanTeamsLoadErrorPresentation.isMissingAuthSession(error) {
+#if DEBUG
+                print("[FanTeamsLoad] operation=refreshInvitations skippedUnauthenticated source=\(source)")
 #endif
                 return
             }
@@ -539,6 +1630,10 @@ final class MyTeamsStore: ObservableObject {
         _ = try await service.acceptInvitation(invitationId: invitation.invitationId)
         invitations.removeAll { $0.id == invitation.id }
         teams = try await service.listMyTeams()
+        await refreshManagedAccessOverlay(
+            accountTeamIds: Set(teams.map(\.id)),
+            generation: refreshGeneration
+        )
     }
 
     func declineInvitation(_ invitation: FanTeamInvitation) async throws {
@@ -550,8 +1645,22 @@ final class MyTeamsStore: ObservableObject {
     }
 
     func applyIdentityChange(_ change: FanTeamIdentityChange) {
-        guard let idx = teams.firstIndex(where: { $0.id == change.teamId }) else { return }
-        teams[idx] = teams[idx].applying(change)
+        if let idx = teams.firstIndex(where: { $0.id == change.teamId }) {
+            teams[idx] = teams[idx].applying(change)
+        }
+        if var guardian = guardianOnlyTeamsById[change.teamId] {
+            guardian = guardian.applying(change)
+            guardianOnlyTeamsById[change.teamId] = guardian
+        }
+        recomputeHomeItems()
+    }
+
+    func applyManagedPlayerAvatarChange(_ change: FanManagedPlayerAvatarChange) {
+        teams = teams.map { $0.applyingManagedPlayerAvatarChange(change) }
+        guardianOnlyTeamsById = guardianOnlyTeamsById.mapValues {
+            $0.applyingManagedPlayerAvatarChange(change)
+        }
+        recomputeHomeItems()
     }
 }
 
@@ -641,34 +1750,263 @@ struct FanTeamInvitationCardView: View {
     }
 }
 
-struct MyTeamCardView: View {
-    let team: FanTeamSummary
-    let languageCode: String
-    var displayRefreshToken: UUID? = nil
+/// FanGeo card chrome around the shared `CompactNativeAdCard` for Teams home.
+/// Not a second native-ad implementation — same AdMob host as Chat / Going / venue comments.
+private struct TeamsHomeNativeAdCard: View {
+    let slot: ChatMyTeamsNativeAdSlot
+
     @Environment(\.colorScheme) private var colorScheme
+    @State private var layoutWidth: CGFloat = 320
+    @State private var adLoaded = false
+    @State private var adFailed = false
+
+    private var cardCornerRadius: CGFloat { 24 }
+    private var borderOpacity: Double { colorScheme == .dark ? 0.28 : 0.12 }
 
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            FanTeamMarkView(
-                sport: team.sport,
-                logoURL: team.logoURL,
-                logoThumbnailURL: team.logoThumbnailURL,
-                colorHex: team.colorHex,
-                size: 48,
-                preferDetailURL: false,
-                displayRefreshToken: displayRefreshToken
+        Group {
+            if !adFailed {
+                CompactNativeAdCard(
+                    placement: ChatMyTeamsAdPlacement.placementID,
+                    hostTabRaw: MainTabView.AppTab.teams.rawValue,
+                    slotIndex: slot.slotIndex,
+                    layoutWidth: max(CompactNativeAdLayout.minimumRequestDimension, layoutWidth),
+                    prefersLightChrome: colorScheme == .light,
+                    animatesLoadState: false,
+                    onAdLoaded: {
+                        adLoaded = true
+                        adFailed = false
+#if DEBUG
+                        if AdDiagnostics.enabled {
+                            print(
+                                "[TeamsHomeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) adLoaded=true slotIndex=\(slot.slotIndex) afterTeam=\(slot.insertedAfterTeamPosition)"
+                            )
+                        }
+#endif
+                    },
+                    onAdFailed: { error in
+                        adFailed = true
+                        adLoaded = false
+#if DEBUG
+                        if AdDiagnostics.enabled {
+                            print(
+                                "[TeamsHomeAdDebug] placement=\(ChatMyTeamsAdPlacement.placementID) adFailed=true slotIndex=\(slot.slotIndex) error=\(error.localizedDescription)"
+                            )
+                        }
+#endif
+                    }
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: adLoaded ? CompactNativeAdLayout.preferredHeight : 0)
+                .opacity(adLoaded ? 1 : 0)
+                .allowsHitTesting(adLoaded)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: displayHeight)
+        .padding(.vertical, 2)
+        .background {
+            if adLoaded {
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                    .fill(FGColor.cardBackground(colorScheme))
+            }
+        }
+        .overlay {
+            if adLoaded {
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                    .strokeBorder(
+                        Color.primary.opacity(borderOpacity),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+        .shadow(
+            color: Color.black.opacity(adLoaded ? (colorScheme == .dark ? 0.28 : 0.07) : 0),
+            radius: adLoaded ? 12 : 0,
+            x: 0,
+            y: adLoaded ? 5 : 0
+        )
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { updateLayoutWidth(geometry.size.width) }
+                    .onChange(of: geometry.size.width) { _, newWidth in
+                        updateLayoutWidth(newWidth)
+                    }
+            }
+        }
+        // Ordinal identity is stable across All/Managing/Joined so loaded ads reuse.
+        .id(slot.id)
+        .onChange(of: slot.insertedAfterTeamPosition) { _, _ in
+            // Same ordinal reused under a different feed composition — keep loaded ads;
+            // only clear a sticky failure so the next filter can request again if needed.
+            if adFailed {
+                adFailed = false
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Sponsored advertisement")
+        .accessibilityHidden(!adLoaded)
+    }
+
+    private var displayHeight: CGFloat {
+        if adFailed { return 0 }
+        return adLoaded ? CompactNativeAdLayout.preferredHeight : 0
+    }
+
+    private func updateLayoutWidth(_ width: CGFloat) {
+        guard width > 0, abs(layoutWidth - width) > 0.5 else { return }
+        layoutWidth = width
+    }
+}
+
+struct MyTeamCardView: View {
+    let team: FanTeamSummary
+    var relationship: FanTeamHomeRelationship
+    let languageCode: String
+    var displayRefreshToken: UUID? = nil
+    var chromeAccent: Color = Color(red: 0.52, green: 0.38, blue: 0.95)
+    var onOpenDetail: (() -> Void)? = nil
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(
+        team: FanTeamSummary,
+        relationship: FanTeamHomeRelationship? = nil,
+        languageCode: String,
+        displayRefreshToken: UUID? = nil,
+        chromeAccent: Color = Color(red: 0.52, green: 0.38, blue: 0.95),
+        onOpenDetail: (() -> Void)? = nil
+    ) {
+        self.team = team
+        self.relationship = relationship
+            ?? FanTeamHomeCatalog.relationship(forAccountRole: team.myRole)
+        self.languageCode = languageCode
+        self.displayRefreshToken = displayRefreshToken
+        self.chromeAccent = chromeAccent
+        self.onOpenDetail = onOpenDetail
+    }
+
+    private var teamAccent: Color {
+        if let hex = team.colorHex, let color = Color(fanTeamHex: hex) { return color }
+        return chromeAccent
+    }
+
+    private var visibleMemberPreviews: [FanTeamMemberAvatarPreview] {
+        FanTeamHomeMemberAvatarStack.visiblePreviews(
+            from: team.memberAvatarPreviews,
+            memberCount: team.memberCount
+        )
+    }
+
+    private var avatarOverflowCount: Int {
+        let visibleCount = visibleMemberPreviews.isEmpty
+            ? min(
+                FanTeamHomeMemberAvatarStack.maxVisibleAvatars,
+                max(0, team.memberCount)
             )
+            : visibleMemberPreviews.count
+        return FanTeamHomeMemberAvatarStack.overflowCount(
+            memberCount: team.memberCount,
+            visiblePreviewCount: visibleCount
+        )
+    }
+
+    var body: some View {
+        Button {
+            onOpenDetail?()
+        } label: {
+            VStack(alignment: .leading, spacing: 0) {
+                topIdentityRow
+                    .padding(.horizontal, 14)
+                    .padding(.top, 14)
+                    .padding(.bottom, 10)
+
+                Divider()
+                    .opacity(colorScheme == .dark ? 0.35 : 0.45)
+                    .padding(.horizontal, 14)
+
+                memberPresenceRow
+                    .padding(.horizontal, 14)
+                    .padding(.top, 10)
+                    .padding(.bottom, 12)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(cardBackgroundGradient)
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(
+                    teamAccent.opacity(colorScheme == .dark ? 0.28 : 0.16),
+                    lineWidth: 1
+                )
+        }
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.32 : 0.08),
+            radius: 14,
+            x: 0,
+            y: 6
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(cardAccessibilityLabel)
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var cardBackgroundGradient: LinearGradient {
+        let top = teamAccent.opacity(colorScheme == .dark ? 0.18 : 0.10)
+        let bottom = FGColor.cardBackground(colorScheme)
+            .opacity(colorScheme == .dark ? 0.92 : 1)
+        return LinearGradient(colors: [top, bottom], startPoint: .top, endPoint: .bottom)
+    }
+
+    private var topIdentityRow: some View {
+        HStack(alignment: .center, spacing: 12) {
+            ZStack(alignment: .bottomTrailing) {
+                FanTeamMarkView(
+                    sport: team.sport,
+                    logoURL: team.logoURL,
+                    logoThumbnailURL: team.logoThumbnailURL,
+                    colorHex: team.colorHex,
+                    size: 52,
+                    preferDetailURL: false,
+                    displayRefreshToken: displayRefreshToken
+                )
+                if FanTeamHomeRelationshipPresentation.showsCrownAccessory(relationship) {
+                    Image(systemName: "crown.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(Color.white)
+                        .padding(5)
+                        .background(chromeAccent, in: Circle())
+                        .overlay {
+                            Circle()
+                                .strokeBorder(Color.white, lineWidth: 1.5)
+                        }
+                        .offset(x: 2, y: 2)
+                        .accessibilityHidden(true)
+                }
+            }
+
             VStack(alignment: .leading, spacing: 4) {
                 Text(team.name)
                     .font(.headline.weight(.bold))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(1)
+                    .lineLimit(2)
                     .minimumScaleFactor(0.85)
+                    .multilineTextAlignment(.leading)
+
                 Text(metaLine)
-                    .font(.caption.weight(.medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
+
+                metadataBadgesRow
+
                 if let pendingLine {
                     Label {
                         Text(pendingLine)
@@ -683,34 +2021,199 @@ struct MyTeamCardView: View {
                     }
                     .labelStyle(.titleAndIcon)
                 }
-                if let next = nextGameLine {
-                    Text(next)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(FGColor.accentGreen)
-                        .lineLimit(2)
-                        .minimumScaleFactor(0.85)
-                }
             }
-            Spacer(minLength: 0)
+
+            Spacer(minLength: 4)
+
             Image(systemName: "chevron.right")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme).opacity(0.7))
                 .accessibilityHidden(true)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 13)
-        .fanTeamIdentityCardChrome(colorHex: team.colorHex, colorScheme: colorScheme)
-        .softCardShadow()
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// Avatar stack + member count only — no action controls.
+    private var memberPresenceRow: some View {
+        HStack(spacing: 10) {
+            memberAvatarStack
+                .accessibilityHidden(true)
+
+            Text(membersCountLine)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var memberAvatarStack: some View {
+        let size = FanTeamHomeMemberAvatarStack.avatarSize
+        let visible = visibleMemberPreviews
+        let overflow = avatarOverflowCount
+        // Before 20260966 (or empty preview payload), keep a count-matched silhouette
+        // fallback so layout doesn't collapse — never invent fake people photos.
+        let fallbackCount = visible.isEmpty
+            ? min(FanTeamHomeMemberAvatarStack.maxVisibleAvatars, max(0, team.memberCount))
+            : 0
+
+        return HStack(spacing: FanTeamHomeMemberAvatarStack.overlap) {
+            if !visible.isEmpty {
+                ForEach(visible) { preview in
+                    realMemberAvatar(preview, size: size)
+                }
+            } else {
+                ForEach(0..<fallbackCount, id: \.self) { index in
+                    fallbackMemberAvatar(index: index, size: size)
+                }
+            }
+            if overflow > 0 {
+                Text("+\(overflow)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(chromeAccent)
+                    .frame(width: size, height: size)
+                    .background(
+                        chromeAccent.opacity(colorScheme == .dark ? 0.22 : 0.12),
+                        in: Circle()
+                    )
+                    .overlay {
+                        Circle()
+                            .strokeBorder(
+                                FGColor.cardBackground(colorScheme),
+                                lineWidth: 1.5
+                            )
+                    }
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func realMemberAvatar(_ preview: FanTeamMemberAvatarPreview, size: CGFloat) -> some View {
+        ManagedPlayerAvatarView(
+            managedPlayerId: preview.managedPlayerId,
+            avatarURL: preview.avatarURL,
+            avatarThumbnailURL: preview.avatarThumbnailURL,
+            displayName: preview.displayName,
+            size: size
+        )
+        .overlay {
+            Circle()
+                .strokeBorder(
+                    FGColor.cardBackground(colorScheme),
+                    lineWidth: 1.5
+                )
+        }
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.06),
+            radius: 1.5,
+            x: 0,
+            y: 1
+        )
+        .accessibilityHidden(true)
+    }
+
+    private func fallbackMemberAvatar(index: Int, size: CGFloat) -> some View {
+        ZStack {
+            Circle()
+                .fill(teamAccent.opacity(0.16 + Double(index) * 0.08))
+            Image(systemName: "person.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(teamAccent.opacity(0.85))
+        }
+        .frame(width: size, height: size)
+        .overlay {
+            Circle()
+                .strokeBorder(
+                    FGColor.cardBackground(colorScheme),
+                    lineWidth: 1.5
+                )
+        }
+        .accessibilityHidden(true)
     }
 
     private var metaLine: String {
-        FanTeamMetaLine.compose(
-            competitionLevel: team.competitionLevel,
-            sport: team.sport,
-            memberCount: team.memberCount,
+        let sport = AppSportCatalog.displayLabel(forSportToken: team.sport)
+        let members = String(
+            format: L10n.t("fan_teams_members_count_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            Int64(team.memberCount)
+        )
+        return "\(sport) • \(members)"
+    }
+
+    private var membersCountLine: String {
+        String(
+            format: L10n.t("fan_teams_members_count_format", languageCode: languageCode),
+            locale: Locale(identifier: languageCode),
+            Int64(team.memberCount)
+        )
+    }
+
+    private var metadataBadgesRow: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 6) {
+                if FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team) {
+                    privacyBadge
+                }
+                relationshipBadge
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                if FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team) {
+                    privacyBadge
+                }
+                relationshipBadge
+            }
+        }
+    }
+
+    private var privacyBadge: some View {
+        Text(L10n.t("fan_teams_private_team", languageCode: languageCode))
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(chromeAccent)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                chromeAccent.opacity(colorScheme == .dark ? 0.22 : 0.12),
+                in: Capsule(style: .continuous)
+            )
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
+    }
+
+    private var relationshipBadge: some View {
+        let title = FanTeamHomeRelationshipPresentation.title(
+            relationship,
             languageCode: languageCode
+        )
+        let isManaging = relationship.isManaging
+        return HStack(spacing: 4) {
+            if let symbol = FanTeamHomeRelationshipPresentation.systemImage(relationship) {
+                Image(systemName: symbol)
+                    .font(.system(size: 9, weight: .bold))
+            }
+            Text(title)
+                .font(.caption2.weight(isManaging ? .bold : .semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .foregroundStyle(
+            isManaging
+                ? chromeAccent
+                : FGColor.secondaryText(colorScheme)
+        )
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(
+            (isManaging ? chromeAccent : FGColor.secondaryText(colorScheme))
+                .opacity(colorScheme == .dark ? 0.22 : 0.10),
+            in: Capsule(style: .continuous)
+        )
+        .accessibilityLabel(
+            FanTeamHomeRelationshipPresentation.accessibilityLabel(
+                relationship,
+                languageCode: languageCode
+            )
         )
     }
 
@@ -722,20 +2225,25 @@ struct MyTeamCardView: View {
         )
     }
 
-    private var nextGameLine: String? {
-        guard let date = team.nextGameStartsAt else { return nil }
-        let when = FanTeamDateFormatting.gameWhen(date, languageCode: languageCode)
-        return String(
-            format: L10n.t("fan_teams_next_game_format", languageCode: languageCode),
-            locale: Locale(identifier: languageCode),
-            when
-        )
-    }
-
-    private var accessibilityLabel: String {
+    private var cardAccessibilityLabel: String {
         var parts = [team.name, metaLine]
+        if FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team) {
+            parts.append(L10n.t("fan_teams_private_team", languageCode: languageCode))
+        }
+        parts.append(
+            FanTeamHomeRelationshipPresentation.accessibilityLabel(
+                relationship,
+                languageCode: languageCode
+            )
+        )
         if let pendingLine { parts.append(pendingLine) }
-        if let nextGameLine { parts.append(nextGameLine) }
+        parts.append(
+            FanTeamHomeMemberAvatarStack.accessibilityLabel(
+                memberCount: team.memberCount,
+                visibleNames: visibleMemberPreviews.map(\.displayName),
+                languageCode: languageCode
+            )
+        )
         return parts.joined(separator: ". ")
     }
 }
@@ -1008,6 +2516,10 @@ struct CreateFanTeamSheet: View {
                 colorHex: normalizedColor,
                 competitionLevel: competitionLevel
             )
+            await mapViewModel.awardFanXP(
+                source: FanXPSource.teamCreated,
+                sourceId: id
+            )
 
             var logoWarning: String?
             // 2–4) Upload final local image into fan-team-logos/{team_id}/… then identity RPC.
@@ -1085,7 +2597,8 @@ struct CreateFanTeamSheet: View {
                 logoThumbnailURL: uploaded.thumbnailURL,
                 previousLogoURL: nil,
                 previousLogoThumbnailURL: nil,
-                displayRefreshToken: refreshToken
+                displayRefreshToken: refreshToken,
+                artworkReplaced: true
             )
             FanTeamIdentityChangeCenter.postIdentityChange(change)
         }
@@ -1126,9 +2639,13 @@ struct FanTeamDetailSheet: View {
     let summary: FanTeamSummary
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var chatViewModel: ChatViewModel
+    var initialTab: FanTeamDetailTab = .overview
     var onOpenChat: (FanTeamChatContext) -> Void
     var onTeamsChanged: () -> Void
     var onTeamDeleted: () -> Void = {}
+    /// Home catalog refresh that must not surface "Couldn't refresh your Teams"
+    /// after a membership mutation that already committed.
+    var onQuietTeamsRefresh: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
@@ -1136,12 +2653,61 @@ struct FanTeamDetailSheet: View {
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var detail: FanTeamDetail?
-    @State private var selectedTab: FanTeamDetailTab = .overview
+    @State private var selectedTab: FanTeamDetailTab
+    /// Per-user Overview clears for Team announcements (server-backed).
+    @State private var clearedAnnouncementIds: Set<UUID> = []
+    @State private var isClearingAnnouncementId: UUID?
+
+    init(
+        summary: FanTeamSummary,
+        mapViewModel: MapViewModel,
+        chatViewModel: ChatViewModel,
+        initialTab: FanTeamDetailTab = .overview,
+        onOpenChat: @escaping (FanTeamChatContext) -> Void,
+        onTeamsChanged: @escaping () -> Void,
+        onTeamDeleted: @escaping () -> Void = {},
+        onQuietTeamsRefresh: @escaping () -> Void = {}
+    ) {
+        self.summary = summary
+        self.mapViewModel = mapViewModel
+        self.chatViewModel = chatViewModel
+        self.initialTab = initialTab
+        self.onOpenChat = onOpenChat
+        self.onTeamsChanged = onTeamsChanged
+        self.onTeamDeleted = onTeamDeleted
+        self.onQuietTeamsRefresh = onQuietTeamsRefresh
+        _selectedTab = State(initialValue: initialTab)
+        TeamDetailCrashTrace.log(
+            "detailSheetInit",
+            details: "teamID=\(summary.id.uuidString.lowercased()) teamName=\(summary.name) tab=\(initialTab.rawValue)"
+        )
+    }
     @State private var isLoading = true
     @State private var errorText: String?
+    /// Active seats on THIS Team held by players the viewer guards. Empty for
+    /// every user without managed players, which hides the Overview card.
+    @State private var managedPlayerSeats: [FanTeamManagedPlayerSeat] = []
+    /// Authoritative in-session Player Info subject (`membership_id`); hydrated from durable store.
+    @State private var selectedPlayerInfoMembershipId: UUID?
+    @State private var showingPlayerInfoChangeSheet = false
+    @State private var isCommittingPlayerInfoSelection = false
+    /// True after at least one seats refresh attempt finished for this Team detail session.
+    @State private var managedPlayerSeatsCatalogComplete = false
+    @StateObject private var playerInfoSelectionGuard = FanTeamPlayerInfoSelectionGuard()
+    @State private var showingMyPlayers = false
     @State private var pickupCreateFormMode: PickupGameFormMode?
     @State private var pickupDetailNav: PickupDetailNavigationToken?
+    /// Set before dismissing Event detail so `sheet(onDismiss:)` can select Chat without asyncAfter.
+    @State private var pendingSelectChatAfterEventDetailDismiss = false
+    @State private var pendingSelectChatEventId: UUID?
+    @State private var organizerJoinRequestsGame: PickupGameRow?
     @State private var showingAddMembers = false
+    @State private var showingAddManagedPlayers = false
+    @State private var showingManagePlayerMembership = false
+    /// Global My Players count (any Team). Used for Overview manage visibility when none are on this Team.
+    @State private var viewerManagedPlayerCount = 0
+    /// Full managed-player catalog for Overview “Players from Your Account” (includes off-team).
+    @State private var viewerManagedPlayers: [FanManagedPlayer] = []
     @State private var showingEditTeam = false
     @State private var showingReportTeam = false
     @State private var showingNotifications = false
@@ -1157,10 +2723,14 @@ struct FanTeamDetailSheet: View {
     @State private var showResendInviteSuccessAlert = false
     @State private var resendCooldownUntilByInvitationId: [UUID: Date] = [:]
     @State private var memberPendingRemoval: FanTeamMember?
-    @State private var memberPendingPlayerNumberEdit: FanTeamMember?
+    @State private var memberPendingPlayerInformation: FanTeamMember?
+    @State private var memberPendingRoleEdit: FanTeamMember?
     @State private var isMessagingMember = false
     @State private var isRemovingMember = false
     @State private var isSavingPlayerNumber = false
+    @State private var isSavingPreferredPosition = false
+    @State private var isSavingTeamRole = false
+    @State private var isSavingPermissions = false
     /// Local-only Team → Games presentation filters (does not refetch `list_fan_team_games`).
     @State private var gamesFilter = FanTeamGamesFilterState.default
     @State private var showGamesCustomDateSheet = false
@@ -1197,15 +2767,31 @@ struct FanTeamDetailSheet: View {
     }
 
     var body: some View {
+        let _ = TeamDetailCrashTrace.logOnceBody(teamID: summary.id, tab: selectedTab.rawValue, hasDetail: detail != nil)
+        let _ = {
+#if DEBUG
+            TeamDetailRenderDiagnostic.logMode()
+#endif
+        }()
         NavigationStack {
-            teamDetailChromeAndLifecycle
+            teamDetailBodyRoot
                 .sheet(item: $pickupCreateFormMode) { mode in
                     NavigationStack {
                         SettingsPickupGameFormView(
                             viewModel: mapViewModel,
                             mode: mode,
                             creationContext: .team(PickupGameTeamCreationContext(from: team)),
-                            onCreated: { _ in }
+                            onCreated: { created in
+#if DEBUG
+                                if created.gameFormat == .announcement {
+                                    print(
+                                        "[TeamAnnouncement] overviewRefresh " +
+                                        "announcementID=\(created.id.uuidString.lowercased()) " +
+                                        "teamID=\(team.id.uuidString.lowercased())"
+                                    )
+                                }
+#endif
+                            }
                         ) {
                             pickupCreateFormMode = nil
                             onTeamsChanged()
@@ -1214,15 +2800,130 @@ struct FanTeamDetailSheet: View {
                     }
                 }
                 .sheet(item: $pickupDetailNav, onDismiss: {
+                    applyPendingTeamChatTabAfterEventDetailDismissIfNeeded()
                     Task { await reload() }
                 }) { token in
-                    DiscoverPickupGameDetailSheet(viewModel: mapViewModel, gameId: token.id)
+                    DiscoverPickupGameDetailSheet(
+                        viewModel: mapViewModel,
+                        token: token,
+                        onRequestTeamDetailChatTab: { requestedTeamId, eventId in
+                            requestEmbeddedTeamChatTab(
+                                requestedTeamId: requestedTeamId,
+                                eventId: eventId
+                            )
+                        }
+                    )
                         .environmentObject(chatViewModel)
+                }
+                .sheet(item: $organizerJoinRequestsGame, onDismiss: {
+                    Task { await reload() }
+                }) { game in
+                    PickupOrganizerRequestsSheet(viewModel: mapViewModel, game: game)
+                        .environmentObject(mapViewModel)
                 }
                 .sheet(isPresented: $showingAddMembers) {
                     AddFanTeamMembersSheet(teamId: team.id, chatViewModel: chatViewModel) {
                         onTeamsChanged()
                         Task { await reload() }
+                    }
+                }
+                .sheet(isPresented: $showingAddManagedPlayers) {
+                    NavigationStack {
+                        AddManagedPlayersToTeamSheet(
+                            teamId: team.id,
+                            teamName: team.name,
+                            languageCode: languageCode,
+                            alreadyOnTeamManagedPlayerIds: Set(
+                                (detail?.members ?? []).compactMap(\.managedPlayerId)
+                                    + managedPlayerSeats.map(\.managedPlayerId)
+                            ),
+                            onAdded: { addedIds in
+                                onTeamsChanged()
+                                Task {
+                                    await reload()
+                                    await refreshManagedPlayerSeats()
+#if DEBUG
+                                    print(
+                                        "[ManagedPlayerTeamDebug] owner_direct_add_refresh " +
+                                        "team_id=\(team.id.uuidString.lowercased()) " +
+                                        "added_count=\(addedIds.count) " +
+                                        "list_my_managed_players_on_team_count=\(managedPlayerSeats.count) " +
+                                        "eligibleSubjects=\(overviewPlayerInfoSubjects.count)"
+                                    )
+#endif
+                                }
+                            }
+                        )
+                    }
+                    .onAppear {
+                        logManagedPlayerTeamAttachmentDebug(source: "addManagedPlayersSheet.appear")
+                    }
+                }
+                .sheet(isPresented: $showingManagePlayerMembership) {
+                    FanTeamPlayerMembershipManageSheet(
+                        teamId: team.id,
+                        teamName: team.name,
+                        languageCode: languageCode,
+                        accent: teamAccent,
+                        myselfDisplayName: viewerAccountSeatMember?.displayName
+                            ?? mapViewModel.currentUserDisplayName,
+                        myselfUserId: mapViewModel.currentUserAuthId
+                            ?? viewerAccountSeatMember?.userId,
+                        myselfAvatarURL: viewerAccountSeatMember?.avatarURL
+                            ?? mapViewModel.currentUserAvatarURL.nilIfEmpty,
+                        myselfAvatarThumbnailURL: viewerAccountSeatMember?.avatarThumbnailURL
+                            ?? mapViewModel.currentUserAvatarThumbnailURL.nilIfEmpty,
+                        myselfIsPlayer: viewerAccountSeatMember?.isPlayer ?? false,
+                        onMembershipChanged: { appliedMyselfIsPlayer in
+                            if appliedMyselfIsPlayer == true {
+                                Task {
+                                    await mapViewModel.awardFanXP(
+                                        source: FanXPSource.teamJoinPlayer,
+                                        sourceId: team.id
+                                    )
+                                }
+                            }
+                            refreshAfterPlayerMembershipChange(
+                                appliedMyselfIsPlayer: appliedMyselfIsPlayer
+                            )
+                        },
+                        onAddManagedPlayer: {
+                            showingManagePlayerMembership = false
+                            showingMyPlayers = true
+                        }
+                    )
+                }
+                .sheet(isPresented: $showingMyPlayers) {
+                    NavigationStack {
+                        MyPlayersView(
+                            languageCode: languageCode,
+                            mapViewModel: mapViewModel,
+                            chatViewModel: chatViewModel,
+                            knownTeams: [team],
+                            currentTeamId: team.id,
+                            onOpenTeamChat: { context in
+                                showingMyPlayers = false
+                                onOpenChat(context)
+                            },
+                            onTeamsChanged: {
+                                onTeamsChanged()
+                                Task { await reload() }
+                            },
+                            onRevealCurrentTeam: {
+                                showingMyPlayers = false
+                            }
+                        )
+                    }
+                    .onDisappear { Task { await refreshManagedPlayerSeats() } }
+                }
+                .sheet(isPresented: $showingPlayerInfoChangeSheet) {
+                    FanTeamPlayerInfoChangeSheet(
+                        subjects: overviewPlayerInfoSubjects,
+                        selectedMembershipId: selectedPlayerInfoMembershipId,
+                        languageCode: languageCode,
+                        isBusy: isCommittingPlayerInfoSelection
+                    ) { membershipId in
+                        commitPlayerInfoSelection(membershipId)
                     }
                 }
                 .sheet(isPresented: $showingEditTeam) {
@@ -1250,11 +2951,7 @@ struct FanTeamDetailSheet: View {
                     }
                 }
                 .confirmationDialog(
-                    String(
-                        format: L10n.t("fan_teams_leave_confirm_title_format", languageCode: languageCode),
-                        locale: Locale(identifier: languageCode),
-                        team.name
-                    ),
+                    leaveConfirmTitle,
                     isPresented: $showLeaveConfirm,
                     titleVisibility: .visible
                 ) {
@@ -1266,11 +2963,7 @@ struct FanTeamDetailSheet: View {
                     Text(L10n.t("fan_teams_leave_confirm_message", languageCode: languageCode))
                 }
                 .confirmationDialog(
-                    String(
-                        format: L10n.t("fan_teams_delete_confirm_title_format", languageCode: languageCode),
-                        locale: Locale(identifier: languageCode),
-                        team.name
-                    ),
+                    deleteConfirmTitle,
                     isPresented: $showDeleteConfirm,
                     titleVisibility: .visible
                 ) {
@@ -1324,14 +3017,7 @@ struct FanTeamDetailSheet: View {
                     Button(L10n.t("OK", languageCode: languageCode), role: .cancel) {}
                 }
                 .alert(
-                    memberPendingRemoval.map { member in
-                        String(
-                            format: L10n.t("fan_teams_remove_member_confirm_title_format", languageCode: languageCode),
-                            locale: Locale(identifier: languageCode),
-                            member.displayName,
-                            team.name
-                        )
-                    } ?? L10n.t("fan_teams_remove_member", languageCode: languageCode),
+                    removeMemberConfirmTitle,
                     isPresented: Binding(
                         get: { memberPendingRemoval != nil },
                         set: { if !$0 { memberPendingRemoval = nil } }
@@ -1351,28 +3037,123 @@ struct FanTeamDetailSheet: View {
         }
     }
 
+    /// Confirmation / alert titles are evaluated during body construction even when closed.
+    private var leaveConfirmTitle: String {
+        let _ = TeamDetailRenderBisect.mark("confirmationDialogLeaveTitle")
+        return TeamDetailLocalizedFormat.format(
+            "fan_teams_leave_confirm_title_format",
+            languageCode: languageCode,
+            stringArgs: [team.name]
+        )
+    }
+
+    private var deleteConfirmTitle: String {
+        let _ = TeamDetailRenderBisect.mark("confirmationDialogDeleteTitle")
+        return TeamDetailLocalizedFormat.format(
+            "fan_teams_delete_confirm_title_format",
+            languageCode: languageCode,
+            stringArgs: [team.name]
+        )
+    }
+
+    private var removeMemberConfirmTitle: String {
+        let _ = TeamDetailRenderBisect.mark("alertRemoveMemberTitle")
+        guard let member = memberPendingRemoval else {
+            return L10n.t("fan_teams_remove_member", languageCode: languageCode)
+        }
+        return TeamDetailLocalizedFormat.format(
+            "fan_teams_remove_member_confirm_title_format",
+            languageCode: languageCode,
+            stringArgs: [member.displayName, team.name]
+        )
+    }
+
+    @ViewBuilder
+    private var teamDetailBodyRoot: some View {
+        switch TeamDetailRenderDiagnostic.mode {
+        case .placeholder:
+            let _ = TeamDetailRenderBisect.mark("teamDetailChromeAndLifecycle", details: "mode=placeholder")
+            Text("Team Detail Diagnostic")
+                .font(.title3.weight(.semibold))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(colorScheme == .dark ? Color.black : Color(.systemGroupedBackground))
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { teamDetailLeadingToolbar }
+                .onAppear {
+                    TeamDetailCrashTrace.log(
+                        "detailSheetAppear",
+                        details: "teamID=\(summary.id.uuidString.lowercased()) tab=\(selectedTab.rawValue) mode=placeholder"
+                    )
+                }
+        case .full, .headerOnly, .headerAndTabs, .overviewInfo, .announcementOnly, .fullOverview, .overviewWithoutNextEvent, .overviewWithoutAnnouncement, .noToolbar, .noRoleBadge, .noMark:
+            teamDetailChromeAndLifecycle
+        }
+    }
+
     private var teamDetailChromeAndLifecycle: some View {
-        teamDetailPrimaryColumn
+        let _ = TeamDetailRenderBisect.mark(
+            "teamDetailChromeAndLifecycle",
+            details: "mode=\(TeamDetailRenderDiagnostic.mode.rawValue)"
+        )
+        return teamDetailPrimaryColumn
             .background(colorScheme == .dark ? Color.black : Color(.systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 teamDetailLeadingToolbar
-                teamDetailTrailingToolbar
+                if TeamDetailRenderDiagnostic.mode != .noToolbar {
+                    teamDetailTrailingToolbar
+                }
             }
             .onPreferenceChange(ChatComposerFocusPreferenceKey.self, perform: handleEmbeddedComposerFocusPreference)
             .onChange(of: selectedTab) { oldTab, newTab in
                 handleSelectedTabChange(oldTab, newTab)
             }
             .onAppear {
+                TeamDetailCrashTrace.log(
+                    "detailSheetAppear",
+                    details: "teamID=\(summary.id.uuidString.lowercased()) tab=\(selectedTab.rawValue)"
+                )
+                if selectedTab == .chat, !summary.canAccessTeamChat {
+                    selectedTab = .overview
+                }
                 TeamChatKeyboardDebug.log(
                     "teamDetail.appear",
-                    detail: "tab=\(selectedTab.rawValue)"
+                    detail: "tab=\(selectedTab.rawValue) canAccessTeamChat=\(summary.canAccessTeamChat) hasAccountSeat=\(summary.hasAccountSeat)"
                 )
+                hydratePlayerInfoSelectionFromStore(source: "teamDetail.appear")
+                Task {
+                    await consumePendingTeamScheduleJoinApprovalIfNeeded()
+                    await consumePendingTeamScheduleEventDeepLinkIfNeeded()
+                }
+            }
+            .onChange(of: mapViewModel.pendingTeamScheduleJoinApproval) { _, pending in
+                guard pending?.teamId == team.id else { return }
+                Task { await consumePendingTeamScheduleJoinApprovalIfNeeded() }
+            }
+            .onChange(of: mapViewModel.pendingTeamScheduleEventDeepLink) { _, pending in
+                guard pending?.teamId == team.id else { return }
+                Task { await consumePendingTeamScheduleEventDeepLinkIfNeeded() }
             }
             .onDisappear {
+                if pendingSelectChatAfterEventDetailDismiss {
+                    TeamEventChatNavigationDebug.log(
+                        "navigationCancelled",
+                        detail: "reason=teamDetailDisappear teamID=\(team.id.uuidString.lowercased())"
+                    )
+                }
+                pendingSelectChatAfterEventDetailDismiss = false
+                pendingSelectChatEventId = nil
                 TeamChatKeyboardDebug.log("teamDetail.disappear")
             }
-            .task { await reload() }
+            .task {
+                hydratePlayerInfoSelectionFromStore(source: "teamDetail.task")
+                // Cache-friendly: avoid redundant full detail re-fetch when already loaded.
+                if detail == nil {
+                    await reload()
+                } else if !managedPlayerSeatsCatalogComplete {
+                    await refreshManagedPlayerSeats()
+                }
+            }
             .onReceive(NotificationCenter.default.publisher(for: FanTeamIdentityChangeCenter.identityDidChangeNotification)) { note in
                 guard let change = FanTeamIdentityChangeCenter.identityChange(from: note),
                       change.teamId == team.id else { return }
@@ -1386,6 +3167,27 @@ struct FanTeamDetailSheet: View {
                 guard let change = FanProfileChangeCenter.avatarChange(from: note) else { return }
                 applyRosterAvatarChange(change)
             }
+            .onReceive(NotificationCenter.default.publisher(for: FanManagedPlayerChangeCenter.avatarDidChangeNotification)) { note in
+                guard let change = FanManagedPlayerChangeCenter.avatarChange(from: note) else { return }
+                applyManagedPlayerAvatarChange(change)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: FanManagedPlayerChangeCenter.teamMembershipDidChangeNotification)) { note in
+                guard let change = FanManagedPlayerChangeCenter.teamMembershipChange(from: note),
+                      change.teamId == team.id else { return }
+                Task {
+                    await reload()
+                    await refreshManagedPlayerSeats()
+#if DEBUG
+                    print(
+                        "[ManagedPlayerTeamDebug] team_detail_membership_refresh " +
+                        "team_id=\(team.id.uuidString.lowercased()) " +
+                        "managed_player_id=\(change.managedPlayerId.uuidString.lowercased()) " +
+                        "list_my_managed_players_on_team_count=\(managedPlayerSeats.count) " +
+                        "eligibleSubjects=\(overviewPlayerInfoSubjects.count)"
+                    )
+#endif
+                }
+            }
     }
 
     /// Primary column.
@@ -1397,10 +3199,11 @@ struct FanTeamDetailSheet: View {
     /// Team chrome is applied as a **top** safe-area inset only.
     @ViewBuilder
     private var teamDetailPrimaryColumn: some View {
+        let _ = TeamDetailRenderBisect.mark("teamDetailPrimaryColumn", details: "tab=\(selectedTab.rawValue)")
         switch selectedTab {
         case .chat:
             teamChatKeyboardHostColumn
-        case .overview, .games, .roster:
+        case .overview, .schedule, .roster:
             teamNonChatColumn
         }
     }
@@ -1441,23 +3244,134 @@ struct FanTeamDetailSheet: View {
         .background(colorScheme == .dark ? Color.black : Color(.systemGroupedBackground))
     }
 
+    @ViewBuilder
     private var teamNonChatColumn: some View {
-        VStack(spacing: 0) {
-            teamHeader
-            tabPicker
-            Group {
-                switch selectedTab {
-                case .overview:
-                    overviewTab
-                case .games:
-                    gamesTab
-                case .roster:
-                    rosterTab
-                case .chat:
-                    EmptyView()
+        let _ = TeamDetailRenderBisect.mark(
+            "teamNonChatColumn",
+            details: "begin tab=\(selectedTab.rawValue) mode=\(TeamDetailRenderDiagnostic.mode.rawValue)"
+        )
+        // Sheet-level chrome diagnostics (UserDefaults / forcedMode only — never default).
+        // Product path always routes by selectedTab; Overview diagnostics live in overviewTab.
+        switch TeamDetailRenderDiagnostic.mode {
+        case .headerOnly:
+            VStack(spacing: 0) {
+                teamHeader
+                Spacer(minLength: 0)
+            }
+        case .headerAndTabs:
+            VStack(spacing: 0) {
+                teamHeader
+                tabPicker
+                Text("Team Detail Tabs Diagnostic")
+                    .font(.footnote)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        default:
+            VStack(spacing: 0) {
+                teamHeader
+                tabPicker
+                Group {
+                    switch selectedTab {
+                    case .overview:
+                        overviewTab
+                    case .schedule:
+                        gamesTab
+                    case .roster:
+                        rosterTab
+                    case .chat:
+                        EmptyView()
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .sheet(isPresented: Binding(
+                get: { memberPendingPlayerInformation != nil },
+                set: { presented in
+                    if !presented {
+                        memberPendingPlayerInformation = nil
+                        Task { await refreshManagedPlayerSeats() }
+#if DEBUG
+                        print("[PlayerInfoPresentation] playerInfoDismissed host=teamNonChatColumn")
+#endif
+                    }
+                }
+            )) {
+                if memberPendingPlayerInformation != nil {
+                    FanTeamPlayerInformationSheet(
+                        member: Binding(
+                            get: {
+                                guard let pending = memberPendingPlayerInformation else {
+                                    // Sheet is dismissing; return a harmless placeholder.
+                                    return FanTeamMember(
+                                        userId: nil,
+                                        role: .member,
+                                        joinedAt: nil,
+                                        displayName: "",
+                                        username: nil,
+                                        avatarURL: nil,
+                                        avatarThumbnailURL: nil,
+                                        lastSeenAtRaw: nil
+                                    )
+                                }
+                                return refreshedRosterMember(pending)
+                            },
+                            set: { updated in
+                                memberPendingPlayerInformation = updated
+                                replaceCanonicalRosterMember(updated)
+                            }
+                        ),
+                        team: team,
+                        teamAccent: teamAccent,
+                        languageCode: languageCode,
+                        currentUserId: mapViewModel.currentUserAuthId,
+                        isSavingPlayerNumber: isSavingPlayerNumber,
+                        isSavingPreferredPosition: isSavingPreferredPosition,
+                        isSavingTeamRole: isSavingTeamRole,
+                        isSavingPermissions: isSavingPermissions,
+                        onSavePlayerNumber: { number in
+                            guard let pending = memberPendingPlayerInformation else { return }
+                            await saveMemberPlayerNumber(refreshedRosterMember(pending), number: number)
+                        },
+                        onClearPlayerNumber: {
+                            guard let pending = memberPendingPlayerInformation else { return }
+                            await clearMemberPlayerNumber(refreshedRosterMember(pending))
+                        },
+                        onSavePreferredPosition: { code in
+                            guard let pending = memberPendingPlayerInformation else { return }
+                            await saveMemberPreferredPosition(refreshedRosterMember(pending), code: code)
+                        },
+                        onSaveTeamRole: {
+                            guard team.canAssignRoles else { return nil }
+                            guard let pending = memberPendingPlayerInformation else { return nil }
+                            let resolved = refreshedRosterMember(pending)
+                            guard resolved.role != .owner else { return nil }
+                            if let me = mapViewModel.currentUserAuthId, resolved.userId == me { return nil }
+                            return { role in
+                                try await saveMemberRole(refreshedRosterMember(pending), role: role)
+                            }
+                        }(),
+                        onSavePermissions: {
+                            guard team.myRole == .owner else { return nil }
+                            guard let pending = memberPendingPlayerInformation else { return nil }
+                            let resolved = refreshedRosterMember(pending)
+                            guard FanTeamPermissions.canEditPermissions(
+                                viewerRole: team.myRole,
+                                targetRole: resolved.role,
+                                targetIsManagedPlayer: resolved.isManagedPlayer,
+                                viewerUserId: mapViewModel.currentUserAuthId,
+                                targetUserId: resolved.userId
+                            ) else { return nil }
+                            return { permissions in
+                                try await saveMemberPermissions(
+                                    refreshedRosterMember(pending),
+                                    permissions: permissions
+                                )
+                            }
+                        }()
+                    )
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -1472,8 +3386,11 @@ struct FanTeamDetailSheet: View {
                     .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
-            // Do not label this "Done" — iOS may mirror nav items into the keyboard bar.
             .accessibilityLabel(L10n.t("Close", languageCode: languageCode))
+            .background {
+                let _ = TeamDetailRenderBisect.mark("toolbarLeadingConstruction")
+                Color.clear
+            }
         }
     }
 
@@ -1481,9 +3398,6 @@ struct FanTeamDetailSheet: View {
     private var teamDetailTrailingToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarTrailing) {
             Menu {
-                Button(L10n.t("fan_teams_open_chat", languageCode: languageCode)) {
-                    onOpenChat(chatContext)
-                }
                 Button {
                     showingNotifications = true
                 } label: {
@@ -1497,12 +3411,14 @@ struct FanTeamDetailSheet: View {
                         showingEditTeam = true
                     }
                 }
-                if team.canManage {
+                if team.canInviteMembers {
                     Button(L10n.t("fan_teams_invite_members", languageCode: languageCode)) {
                         showingAddMembers = true
                     }
-                    Button(L10n.t("fan_teams_schedule_game", languageCode: languageCode)) {
-                        openScheduleGame()
+                }
+                if team.canManageManagedPlayersStaff {
+                    Button(L10n.t("managed_players_add_to_team", languageCode: languageCode)) {
+                        showingAddManagedPlayers = true
                     }
                 }
                 Divider()
@@ -1529,6 +3445,158 @@ struct FanTeamDetailSheet: View {
             }
             .accessibilityLabel(L10n.t("More", languageCode: languageCode))
             .disabled(isLeaving || isDeleting)
+            .background {
+                let _ = TeamDetailRenderBisect.mark("toolbarTrailingConstruction")
+                Color.clear
+            }
+        }
+    }
+
+    private var teamHeader: some View {
+        let _ = TeamDetailRenderBisect.mark("teamHeader", details: "begin")
+        let showAnnounce = team.canPublishAnnouncements
+        let showCreateEvent = team.canOrganizeActivities
+        // Single shallow HStack: mark + identity (title/meta/badges) + optional Quick Actions.
+        // No ViewThatFits, no duplicated action trees, no reserved blank column when absent.
+        return HStack(alignment: .top, spacing: 12) {
+            teamHeaderMark
+            VStack(alignment: .leading, spacing: 5) {
+                FanTeamDetailHeaderTitleBlock(
+                    teamName: team.name,
+                    metaLine: headerMetaLine
+                )
+                teamHeaderBadgesRow
+            }
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+
+            if showAnnounce || showCreateEvent {
+                FanTeamDetailHeaderActionsView(
+                    languageCode: languageCode,
+                    showAnnounce: showAnnounce,
+                    showCreateEvent: showCreateEvent,
+                    onAnnounce: { openMakeAnnouncement() },
+                    onCreateEvent: { openScheduleGame() }
+                )
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .fanTeamIdentityCardChrome(
+            colorHex: team.colorHex,
+            colorScheme: colorScheme,
+            baseOpacityDark: 0.72,
+            baseOpacityLight: 0.96
+        )
+        .softCardShadow()
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var teamHeaderMark: some View {
+        let _ = TeamDetailRenderBisect.mark("teamHeaderMark")
+        if TeamDetailRenderDiagnostic.mode == .noMark {
+            FanTeamDetailHeaderStaticMarkView(accent: teamAccent, size: 56)
+        } else {
+            FanTeamDetailHeaderMarkView(
+                sport: team.sport,
+                logoURL: team.logoURL,
+                logoThumbnailURL: team.logoThumbnailURL,
+                colorHex: team.colorHex,
+                size: 56,
+                displayRefreshToken: markRefreshToken
+            )
+        }
+    }
+
+    /// Privacy + role badges under metadata (Quick Actions are a separate trailing leaf).
+    ///
+    /// Uses shallow leaf views. Avoid nested `ViewThatFits` + press `ButtonStyle`
+    /// (iOS AttributeGraph risk during sheet presentation with `detail == nil`).
+    @ViewBuilder
+    private var teamHeaderBadgesRow: some View {
+        FanTeamDetailHeaderBadgesView(
+            showsPrivateBadge: FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team),
+            privateBadgeTitle: L10n.t("fan_teams_private_team", languageCode: languageCode),
+            role: team.myRole,
+            languageCode: languageCode,
+            accent: teamAccent,
+            showsRoleBadge: TeamDetailRenderDiagnostic.mode != .noRoleBadge
+        )
+    }
+
+    private var headerMetaLine: String {
+        FanTeamDetailHeaderPresentation.metaLine(
+            competitionLevel: team.competitionLevel,
+            sport: team.sport,
+            memberCount: FanTeamDetailHeaderPresentation.safeMemberCount(team.memberCount),
+            pendingInvitationCount: max(team.pendingInvitationCount, pendingInvitations.count),
+            canManage: team.canManage,
+            languageCode: languageCode
+        )
+    }
+
+    private var visibleDetailTabs: [FanTeamDetailTab] {
+        FanTeamDetailTabComposition.visibleTabs(canAccessTeamChat: summary.canAccessTeamChat)
+    }
+
+    private var tabPicker: some View {
+        let _ = TeamDetailRenderBisect.mark("tabPicker", details: "begin")
+        return HStack(spacing: 0) {
+            ForEach(visibleDetailTabs) { tab in
+                let isSelected = selectedTab == tab
+                Button {
+                    if reduceMotion {
+                        selectedTab = tab
+                    } else {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                            selectedTab = tab
+                        }
+                    }
+                } label: {
+                    VStack(spacing: 5) {
+                        HStack(spacing: 4) {
+                            Image(systemName: tab.systemImage)
+                                .font(.system(size: 12, weight: .semibold))
+                                .layoutPriority(1)
+                            Text(L10n.t(tab.titleKey, languageCode: languageCode))
+                                .font(.caption.weight(isSelected ? .bold : .semibold))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
+                        }
+                        .foregroundStyle(isSelected ? teamAccent : FGColor.secondaryText(colorScheme))
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 2)
+                        .padding(.top, 8)
+                        .padding(.bottom, 6)
+
+                        Capsule()
+                            .fill(isSelected ? teamAccent : Color.clear)
+                            .frame(height: 2)
+                            .padding(.horizontal, 6)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(L10n.t(tab.titleKey, languageCode: languageCode))
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 2)
+        .background(
+            Color(.secondarySystemGroupedBackground).opacity(colorScheme == .dark ? 0.35 : 0.7)
+        )
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(FGColor.divider(colorScheme).opacity(0.55))
+                .frame(height: 0.5)
+        }
+        .background(alignment: .center) {
+            let _ = TeamDetailRenderBisect.mark("tabPicker", details: "completed")
+            Color.clear
         }
     }
 
@@ -1561,188 +3629,645 @@ struct FanTeamDetailSheet: View {
             "teamDetail.tab",
             detail: "tab=\(tab.rawValue) composerFocused=\(isEmbeddedChatComposerFocused)"
         )
+        Task { await loadDetailForTabIfNeeded(tab) }
     }
 
-    private var teamHeader: some View {
-        HStack(alignment: .center, spacing: 12) {
-            FanTeamMarkView(
-                sport: team.sport,
-                logoURL: team.logoURL,
-                logoThumbnailURL: team.logoThumbnailURL,
-                colorHex: team.colorHex,
-                size: 56,
-                preferDetailURL: true,
-                displayRefreshToken: markRefreshToken
-            )
-            VStack(alignment: .leading, spacing: 5) {
-                Text(team.name)
-                    .font(.title3.weight(.bold))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.85)
-                Text(headerMetaLine)
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-                HStack(spacing: 6) {
-                    if FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team) {
-                        Text(L10n.t("fan_teams_private_team", languageCode: languageCode))
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(teamAccent)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(
-                                teamAccent.opacity(colorScheme == .dark ? 0.22 : 0.14),
-                                in: Capsule()
-                            )
-                            .accessibilityAddTraits(.isStaticText)
-                    }
-                    if let roleBadgeText {
-                        Text(roleBadgeText)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(
-                                FGColor.secondaryText(colorScheme).opacity(colorScheme == .dark ? 0.18 : 0.10),
-                                in: Capsule()
-                            )
-                            .accessibilityAddTraits(.isStaticText)
-                    }
-                }
+    /// Conservative lazy load: Chat needs no members/games fetch; other tabs ensure detail once.
+    private func loadDetailForTabIfNeeded(_ tab: FanTeamDetailTab) async {
+        switch tab {
+        case .chat:
+            return
+        case .overview, .roster, .schedule:
+            if detail == nil {
+                await reload()
             }
-            Spacer(minLength: 8)
-            if team.canManage {
-                Button {
-                    showingAddMembers = true
-                } label: {
-                    Label(L10n.t("fan_teams_invite", languageCode: languageCode), systemImage: "person.badge.plus")
-                        .font(.caption.weight(.bold))
-                        .labelStyle(.titleAndIcon)
-                        .foregroundStyle(Color.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(FGColor.accentGreen, in: Capsule())
-                }
-                .buttonStyle(FGPremiumPressButtonStyle())
-                .accessibilityLabel(L10n.t("fan_teams_invite", languageCode: languageCode))
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .fanTeamIdentityCardChrome(
-            colorHex: team.colorHex,
-            colorScheme: colorScheme,
-            baseOpacityDark: 0.72,
-            baseOpacityLight: 0.96
-        )
-        .softCardShadow()
-        .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 10)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var roleBadgeText: String? {
-        switch team.myRole {
-        case .owner, .manager, .captain:
-            return L10n.t(team.myRole.localizedKey, languageCode: languageCode)
-        case .member:
-            return nil
-        }
-    }
-
-    private var headerMetaLine: String {
-        let base = FanTeamMetaLine.compose(
-            competitionLevel: team.competitionLevel,
-            sport: team.sport,
-            memberCount: team.memberCount,
-            languageCode: languageCode
-        )
-        let pendingCount = max(team.pendingInvitationCount, pendingInvitations.count)
-        if team.canManage, pendingCount > 0 {
-            let pending = String(
-                format: L10n.t("fan_teams_pending_count_compact_format", languageCode: languageCode),
-                locale: Locale(identifier: languageCode),
-                pendingCount
-            )
-            return "\(base) · \(pending)"
-        }
-        return base
-    }
-
-    private var tabPicker: some View {
-        HStack(spacing: 0) {
-            ForEach(FanTeamDetailTab.allCases) { tab in
-                let isSelected = selectedTab == tab
-                Button {
-                    if reduceMotion {
-                        selectedTab = tab
-                    } else {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            selectedTab = tab
-                        }
-                    }
-                } label: {
-                    VStack(spacing: 5) {
-                        HStack(spacing: 4) {
-                            Image(systemName: tab.systemImage)
-                                .font(.system(size: 12, weight: .semibold))
-                            Text(L10n.t(tab.titleKey, languageCode: languageCode))
-                                .font(.caption.weight(isSelected ? .bold : .semibold))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.72)
-                        }
-                        .foregroundStyle(isSelected ? teamAccent : FGColor.secondaryText(colorScheme))
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 8)
-                        .padding(.bottom, 6)
-
-                        Capsule()
-                            .fill(isSelected ? teamAccent : Color.clear)
-                            .frame(height: 2)
-                            .padding(.horizontal, 6)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(L10n.t(tab.titleKey, languageCode: languageCode))
-                .accessibilityAddTraits(isSelected ? .isSelected : [])
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.bottom, 2)
-        .background(
-            Color(.secondarySystemGroupedBackground).opacity(colorScheme == .dark ? 0.35 : 0.7)
-        )
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(FGColor.divider(colorScheme).opacity(0.55))
-                .frame(height: 0.5)
         }
     }
 
     @ViewBuilder
     private var overviewTab: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                teamInfoCard
+        let mode = TeamDetailRenderDiagnostic.mode
+        let _ = TeamDetailRenderBisect.mark(
+            "overviewTab",
+            details: "begin detailNil=\(detail == nil) mode=\(mode.rawValue)"
+        )
+        let _ = TeamOverviewCrashBisect.mark(
+            "overviewGetterRequested",
+            details: "detailNil=\(detail == nil) mode=\(mode.rawValue)"
+        )
 
-                // Shared `detail.members` from `loadDetail` — no extra leadership fetch.
-                if detail != nil {
-                    teamLeadershipCard
+        // Overview-only diagnostic gates (never affect Schedule / Chat / Roster).
+        if TeamDetailRenderDiagnostic.overviewInfoOnly {
+            ScrollView {
+                teamInfoCard
+                    .padding(.vertical, 14)
+            }
+        } else if TeamDetailRenderDiagnostic.announcementOnly {
+            announcementOnlyOverviewContent
+        } else if let detail {
+            // Crash-safe: loaded dashboard only after detail exists.
+            loadedOverviewContent(detail)
+        } else {
+            FanTeamOverviewLoadingView()
+                .task {
+                    await refreshManagedPlayerSeats()
+                    logManagedPlayerTeamAttachmentDebug(source: "overview.loading.task")
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var announcementOnlyOverviewContent: some View {
+        if let detail {
+            let presentations = FanTeamOverviewAnnouncementPresentation.makeAll(
+                from: detail,
+                clearedIds: clearedAnnouncementIds,
+                viewerUserId: mapViewModel.currentUserAuthId,
+                languageCode: languageCode
+            )
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if presentations.isEmpty {
+                        Text(L10n.t("fan_teams_no_upcoming_events", languageCode: languageCode))
+                            .font(.subheadline)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 24)
+                    } else {
+                        FanTeamOverviewAnnouncementCarouselView(
+                            announcements: presentations,
+                            accent: teamAccent,
+                            languageCode: languageCode,
+                            onOpen: { openAnnouncementFromOverview($0) },
+                            onClear: { clearOverviewAnnouncement($0) }
+                        )
+                    }
+                }
+                .padding(.vertical, 14)
+            }
+            .refreshable { await reload() }
+        } else {
+            FanTeamOverviewLoadingView()
+        }
+    }
+
+    private func loadedOverviewContent(_ detail: FanTeamDetail) -> some View {
+        let includesNextEvent = !TeamDetailRenderDiagnostic.omitsOverviewNextEvent
+        let includesAnnouncement = !TeamDetailRenderDiagnostic.omitsOverviewAnnouncement
+        let nextEvent = includesNextEvent ? overviewNextEventPresentation(from: detail) : nil
+        let announcements = includesAnnouncement
+            ? FanTeamOverviewAnnouncementPresentation.makeAll(
+                from: detail,
+                clearedIds: clearedAnnouncementIds,
+                viewerUserId: mapViewModel.currentUserAuthId,
+                languageCode: languageCode
+            )
+            : []
+
+        return FanTeamLoadedOverviewView(
+            nextEvent: nextEvent,
+            includesNextEvent: includesNextEvent,
+            canOrganize: team.canOrganizeActivities,
+            announcements: announcements,
+            includesAnnouncement: includesAnnouncement,
+            languageCode: languageCode,
+            accent: teamAccent,
+            onOpenEvent: { openPickupGameDetail($0) },
+            onScheduleEvent: { openScheduleGame() },
+            onOpenAnnouncement: { openAnnouncementFromOverview($0) },
+            onClearAnnouncement: { clearOverviewAnnouncement($0) },
+            teamInfo: { teamInfoCard },
+            extra: {
+                recentResultsCard(from: detail)
+                teamLeadershipCard
+                myPlayerInfoCard
+                myManagedPlayersCard
+            }
+        )
+        .refreshable { await reload() }
+        .task {
+            await refreshManagedPlayerSeats()
+            logManagedPlayerTeamAttachmentDebug(source: "overview.loaded.task")
+        }
+    }
+
+    private func openAnnouncementFromOverview(_ announcementId: UUID) {
+        Task {
+            try? await FanTeamAnnouncementUserStateService.markRead(announcementId: announcementId)
+        }
+        openPickupGameDetail(announcementId)
+    }
+
+    private func clearOverviewAnnouncement(_ announcementId: UUID) {
+        guard isClearingAnnouncementId == nil else { return }
+        // Always allow Clear for the final remaining card (count == 1).
+        isClearingAnnouncementId = announcementId
+        var nextCleared = clearedAnnouncementIds
+        nextCleared.insert(announcementId)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            clearedAnnouncementIds = nextCleared
+        }
+        Task {
+            do {
+                try await FanTeamAnnouncementUserStateService.clearAnnouncement(announcementId: announcementId)
+            } catch {
+                await MainActor.run {
+                    // RPC failed — restore so the final announcement reappears.
+                    var restored = clearedAnnouncementIds
+                    restored.remove(announcementId)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        clearedAnnouncementIds = restored
+                    }
+                    errorText = error.localizedDescription
                 }
             }
-            .padding(.vertical, 14)
+            await MainActor.run {
+                if isClearingAnnouncementId == announcementId {
+                    isClearingAnnouncementId = nil
+                }
+            }
         }
-        .refreshable {
-            await reload()
+    }
+
+    private func refreshClearedAnnouncementIds() async {
+        do {
+            clearedAnnouncementIds = try await FanTeamAnnouncementUserStateService.listClearedAnnouncementIds(
+                teamId: team.id
+            )
+        } catch {
+            // Pre-migration / soft fail: keep existing local set; do not wipe clears mid-session.
+#if DEBUG
+            print("[TeamAnnouncementOverview] clearedIdsLoadFailed \(error.localizedDescription)")
+#endif
         }
+    }
+
+    /// Builds Next Event presentation outside the child view. Returns `nil` for empty state.
+    private func overviewNextEventPresentation(from detail: FanTeamDetail) -> FanTeamOverviewNextEventPresentation? {
+        guard let event = FanTeamOverviewNextEvent.upcomingEvent(from: detail.games) else {
+            return nil
+        }
+        return FanTeamOverviewNextEventPresentation.make(
+            event: event,
+            teamShowsPrivateBadge: FanTeamPrivacyPresentation.showsPrivateTeamBadge(for: team),
+            pickupIsVisible: mapViewModel.resolvedPickupGameRow(for: event.id)?.is_visible,
+            languageCode: languageCode
+        )
+    }
+
+    /// Only rendered when the viewer guards a player with an active seat on THIS
+    /// Team. Suppressed when those seats already appear under "Players from Your Account".
+    @ViewBuilder
+    private var myManagedPlayersCard: some View {
+        // All on-team managed seats are listed in `myPlayerInfoCard` — avoid duplicate Overview rows.
+        EmptyView()
+    }
+
+    /// Membership add/remove lives in Manage sheet (organizers only).
+    @MainActor
+    private func refreshAfterPlayerMembershipChange(appliedMyselfIsPlayer: Bool? = nil) {
+        if let appliedMyselfIsPlayer {
+            applyLocalMyselfIsPlayer(appliedMyselfIsPlayer)
+        }
+        FanTeamRPCTrace.log(
+            step: "F.reconcile.start",
+            rpc: "onMembershipChanged",
+            extra: "appliedMyselfIsPlayer=\(appliedMyselfIsPlayer.map(String.init) ?? "nil") team=\(team.id.uuidString.lowercased())"
+        )
+        onQuietTeamsRefresh()
+        Task {
+            await reload(surfaceError: false)
+            await refreshManagedPlayerSeats()
+        }
+    }
+
+    /// Keep the account row visible after Myself OFF; only flip `is_player`.
+    @MainActor
+    private func applyLocalMyselfIsPlayer(_ isPlayer: Bool) {
+        guard var loaded = detail else { return }
+        let uid = mapViewModel.currentUserAuthId
+        guard let uid, let idx = loaded.members.firstIndex(where: { $0.userId == uid }) else {
+            FanTeamRPCTrace.log(
+                step: "F.reconcile.noSeat",
+                rpc: "local_detail",
+                extra: "could not patch is_player locally"
+            )
+            return
+        }
+        let previous = loaded.members[idx]
+        loaded.members[idx] = previous.replacingIsPlayer(isPlayer)
+        let playerCount = FanTeamRosterPlayerPresentation.playerCount(from: loaded.members)
+        loaded.summary = loaded.summary.applyingMyRole(
+            previous.role,
+            memberCount: playerCount,
+            myPermissions: previous.effectivePermissions
+        )
+        detail = loaded
+        FanTeamRPCTrace.log(
+            step: "F.reconcile.patched",
+            rpc: "local_detail",
+            extra: "user_id=\(uid.uuidString.lowercased()) is_player=\(isPlayer) role=\(previous.role.rawValue) playerCount=\(playerCount) rowRemains=YES"
+        )
+    }
+
+    /// Silent on empty: users without managed seats on this Team must not see an error.
+    /// Decode/RPC failures are logged in DEBUG so Player Info Change never fails closed quietly.
+    @MainActor
+    private func refreshManagedPlayerSeats() async {
+        let teamId = team.id
+        let generation = playerInfoSelectionGuard.beginSeatsRefresh()
+        let selectionEpochAtStart = playerInfoSelectionGuard.selectionEpoch
+        logTeamPlayerInfo(
+            "refresh start",
+            teamId: teamId,
+            extra: "generation=\(generation) selectionEpoch=\(selectionEpochAtStart)"
+        )
+        let allPlayers = (try? await FanManagedPlayerService().listMyManagedPlayers()) ?? []
+        viewerManagedPlayers = allPlayers
+        viewerManagedPlayerCount = allPlayers.count
+        do {
+            let seats = try await FanManagedPlayerService().listMyManagedPlayersOnTeam(teamId: teamId)
+            guard playerInfoSelectionGuard.shouldApplySeatsRefresh(generation: generation) else {
+                logTeamPlayerInfo(
+                    "stale refresh ignored",
+                    teamId: teamId,
+                    extra: "generation=\(generation) current=\(playerInfoSelectionGuard.seatsRefreshGeneration)"
+                )
+                return
+            }
+            if playerInfoSelectionGuard.isSelectionStaleRelative(to: selectionEpochAtStart) {
+                // Newer user selection won while this fetch was in flight — still apply seats,
+                // but reconcile with the latest preferred (never clobber with a pre-selection snapshot).
+                logTeamPlayerInfo(
+                    "refresh completed after newer selection",
+                    teamId: teamId,
+                    extra: "generation=\(generation) selectionEpochNow=\(playerInfoSelectionGuard.selectionEpoch)"
+                )
+            }
+            managedPlayerSeats = seats
+            managedPlayerSeatsCatalogComplete = true
+            reconcilePlayerInfoSelection(catalogComplete: true, source: "refreshManagedPlayerSeats.ok")
+            logManagedPlayerTeamAttachmentDebug(source: "refreshManagedPlayerSeats.ok")
+#if DEBUG
+            print(
+                "[ManagedPlayerTeamDebug] list_my_managed_players_on_team_count=\(seats.count) " +
+                "team_id=\(teamId.uuidString.lowercased()) " +
+                "eligibleSubjects=\(overviewPlayerInfoSubjects.count)"
+            )
+            for seat in seats {
+                print(
+                    "[ManagedPlayerTeamDebug] seat " +
+                    "managed_player_id=\(seat.managedPlayerId.uuidString.lowercased()) " +
+                    "membership_id=\(seat.id.uuidString.lowercased()) " +
+                    "left_at=nil"
+                )
+            }
+#endif
+            logTeamPlayerInfo(
+                "refresh completion",
+                teamId: teamId,
+                extra: "seats=\(seats.count) generation=\(generation)"
+            )
+        } catch {
+            FanTeamRPCTrace.log(
+                step: "D.managed_player_list.failed",
+                rpc: "list_my_managed_players_on_team",
+                error: error,
+                extra: "team=\(teamId.uuidString.lowercased())"
+            )
+#if DEBUG
+            print(
+                "[PlayerInfoSelectorDebug] list_my_managed_players_on_team FAILED " +
+                "team_id=\(teamId.uuidString.lowercased()) error=\(error.localizedDescription)"
+            )
+            print(
+                "[ManagedPlayerTeamDebug] list_my_managed_players_on_team_error=" +
+                "\(error.localizedDescription)"
+            )
+#endif
+            guard playerInfoSelectionGuard.shouldApplySeatsRefresh(generation: generation) else {
+                logTeamPlayerInfo(
+                    "stale refresh ignored",
+                    teamId: teamId,
+                    extra: "generation=\(generation) errorPath=true"
+                )
+                return
+            }
+            // Keep prior seats on transient failure; only clear when we never loaded.
+            if managedPlayerSeats.isEmpty {
+                managedPlayerSeats = []
+            }
+            managedPlayerSeatsCatalogComplete = true
+            reconcilePlayerInfoSelection(catalogComplete: true, source: "refreshManagedPlayerSeats.error")
+            logManagedPlayerTeamAttachmentDebug(source: "refreshManagedPlayerSeats.error")
+            logTeamPlayerInfo(
+                "refresh completion",
+                teamId: teamId,
+                extra: "failed error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// User confirmed a Player Info subject in the Change sheet.
+    @MainActor
+    private func commitPlayerInfoSelection(_ membershipId: UUID) {
+        guard !isCommittingPlayerInfoSelection else { return }
+        guard let userId = mapViewModel.currentUserAuthId else {
+            errorText = L10n.t("fan_teams_refresh_failed", languageCode: languageCode)
+            return
+        }
+        let teamId = team.id
+        let previous = selectedPlayerInfoMembershipId
+            ?? FanTeamPlayerInfoSelectionStore.load(userId: userId, teamId: teamId)
+
+        isCommittingPlayerInfoSelection = true
+        defer { isCommittingPlayerInfoSelection = false }
+
+        logTeamPlayerInfo(
+            "save start",
+            teamId: teamId,
+            userId: userId,
+            previousPlayerId: previous,
+            requestedPlayerId: membershipId
+        )
+
+        let epoch = playerInfoSelectionGuard.noteUserSelectionCommitted()
+        // Do not dismiss until durable write verifies — avoids “looked saved then reverted”.
+        let saved = FanTeamPlayerInfoSelectionStore.save(
+            userId: userId,
+            teamId: teamId,
+            membershipId: membershipId
+        )
+        let verified = FanTeamPlayerInfoSelectionStore.load(userId: userId, teamId: teamId)
+
+        guard saved, verified == membershipId else {
+            logTeamPlayerInfo(
+                "backend failure",
+                teamId: teamId,
+                userId: userId,
+                previousPlayerId: previous,
+                requestedPlayerId: membershipId,
+                extra: "verify=\(verified?.uuidString.lowercased() ?? "nil") epoch=\(epoch)"
+            )
+            selectedPlayerInfoMembershipId = previous
+            if let previous {
+                _ = FanTeamPlayerInfoSelectionStore.save(
+                    userId: userId,
+                    teamId: teamId,
+                    membershipId: previous
+                )
+            } else {
+                FanTeamPlayerInfoSelectionStore.clear(userId: userId, teamId: teamId)
+            }
+            errorText = L10n.t("fan_teams_refresh_failed", languageCode: languageCode)
+            return
+        }
+
+        selectedPlayerInfoMembershipId = membershipId
+        showingPlayerInfoChangeSheet = false
+
+        logTeamPlayerInfo(
+            "backend success",
+            teamId: teamId,
+            userId: userId,
+            previousPlayerId: previous,
+            requestedPlayerId: membershipId,
+            extra: "affected_membership_id=\(membershipId.uuidString.lowercased()) epoch=\(epoch)"
+        )
+        reconcilePlayerInfoSelection(catalogComplete: managedPlayerSeatsCatalogComplete, source: "commit.success")
+        logTeamPlayerInfo(
+            "local-store reconciliation",
+            teamId: teamId,
+            userId: userId,
+            previousPlayerId: previous,
+            requestedPlayerId: selectedPlayerInfoMembershipId,
+            extra: "final=\(selectedPlayerInfoMembershipId?.uuidString.lowercased() ?? "nil")"
+        )
+    }
+
+    /// Hydrate selection from durable store when Team detail opens / identity is known.
+    @MainActor
+    private func hydratePlayerInfoSelectionFromStore(source: String) {
+        guard let userId = mapViewModel.currentUserAuthId else { return }
+        let teamId = team.id
+        let stored = FanTeamPlayerInfoSelectionStore.load(userId: userId, teamId: teamId)
+        if let stored {
+            selectedPlayerInfoMembershipId = stored
+        }
+        logTeamPlayerInfo(
+            "hydrate",
+            teamId: teamId,
+            userId: userId,
+            requestedPlayerId: stored,
+            extra: "source=\(source)"
+        )
+        reconcilePlayerInfoSelection(
+            catalogComplete: managedPlayerSeatsCatalogComplete,
+            source: "hydrate.\(source)"
+        )
+    }
+
+#if DEBUG
+    private func logTeamPlayerInfo(
+        _ event: String,
+        teamId: UUID,
+        userId: UUID? = nil,
+        previousPlayerId: UUID? = nil,
+        requestedPlayerId: UUID? = nil,
+        extra: String = ""
+    ) {
+        let auth = (userId ?? mapViewModel.currentUserAuthId)?.uuidString.lowercased() ?? "nil"
+        print(
+            "[TeamPlayerInfo] \(event) " +
+            "teamID=\(teamId.uuidString.lowercased()) " +
+            "authUserID=\(auth) " +
+            "previousPlayerID=\(previousPlayerId?.uuidString.lowercased() ?? "nil") " +
+            "requestedPlayerID=\(requestedPlayerId?.uuidString.lowercased() ?? "nil") " +
+            "selectedPlayerID=\(selectedPlayerInfoMembershipId?.uuidString.lowercased() ?? "nil") " +
+            "\(extra)"
+        )
+    }
+#else
+    private func logTeamPlayerInfo(
+        _ event: String,
+        teamId: UUID,
+        userId: UUID? = nil,
+        previousPlayerId: UUID? = nil,
+        requestedPlayerId: UUID? = nil,
+        extra: String = ""
+    ) {}
+#endif
+
+#if DEBUG
+    private func logManagedPlayerTeamAttachmentDebug(source: String) {
+        print("[ManagedPlayerTeamDebug] source=\(source)")
+        print("[ManagedPlayerTeamDebug] team_id=\(team.id.uuidString.lowercased())")
+        print("[ManagedPlayerTeamDebug] viewer_role=\(team.myRole.rawValue)")
+        print("[ManagedPlayerTeamDebug] canManage=\(team.canManage)")
+        print(
+            "[ManagedPlayerTeamDebug] managed_player_team_seats_enabled=" +
+            "unknown_client_cannot_read_flag"
+        )
+        print("[ManagedPlayerTeamDebug] managed_players_count=\(viewerManagedPlayerCount)")
+        print("[ManagedPlayerTeamDebug] already_on_team_count=\(managedPlayerSeats.count)")
+        print(
+            "[ManagedPlayerTeamDebug] add_my_players_ui_visible=\(team.canManage) " +
+            "(menu+header; members never)"
+        )
+        print(
+            "[ManagedPlayerTeamDebug] note=If add fails with managed_player_team_seats_disabled, " +
+            "apply supabase/migrations/20260969_0001_enable_managed_player_team_seats.sql"
+        )
+    }
+#else
+    private func logManagedPlayerTeamAttachmentDebug(source: String) {}
+#endif
+
+    #if DEBUG
+    private func logPlayerInfoSelectorDebug(source: String) {
+        let members = detail?.members ?? []
+        let subjects = FanTeamMyPlayerInfoPresentation.eligibleSubjects(
+            members: members,
+            currentUserId: mapViewModel.currentUserAuthId,
+            managedSeats: managedPlayerSeats
+        )
+        print("[PlayerInfoSelectorDebug] source=\(source)")
+        print("[PlayerInfoSelectorDebug] team_id=\(team.id.uuidString.lowercased())")
+        print(
+            "[PlayerInfoSelectorDebug] current_user_id=" +
+            (mapViewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil")
+        )
+        print("[PlayerInfoSelectorDebug] detail.members count=\(members.count)")
+        print("[PlayerInfoSelectorDebug] managedPlayerSeats count=\(managedPlayerSeats.count)")
+        print("[PlayerInfoSelectorDebug] eligibleSubjects count=\(subjects.count)")
+        print(
+            "[PlayerInfoSelectorDebug] showsChange=" +
+            "\(FanTeamMyPlayerInfoPresentation.showsChangeControl(subjects: subjects)) " +
+            "titleKey=\(FanTeamMyPlayerInfoPresentation.titleKey(subjects: subjects))"
+        )
+        for seat in managedPlayerSeats {
+            print(
+                "[PlayerInfoSelectorDebug] seat membership_id=\(seat.id.uuidString.lowercased()) " +
+                "managed_player_id=\(seat.managedPlayerId.uuidString.lowercased()) " +
+                "display_name=\(seat.displayName) " +
+                "player_number=\(seat.playerNumber.map(String.init) ?? "nil")"
+            )
+        }
+        for subject in subjects {
+            let kind = subject.isViewerAccountSeat ? "account" : "managed"
+            print(
+                "[PlayerInfoSelectorDebug] eligible membership_id=\(subject.membershipId.uuidString.lowercased()) " +
+                "kind=\(kind) " +
+                "display_name=\(subject.member.displayName) " +
+                "managed_player_id=\(subject.member.managedPlayerId?.uuidString.lowercased() ?? "nil") " +
+                "is_active=true"
+            )
+        }
+        logTeamPlayerInfo(
+            "selector debug",
+            teamId: team.id,
+            requestedPlayerId: selectedPlayerInfoMembershipId,
+            extra: "source=\(source)"
+        )
+    }
+    #else
+    private func logPlayerInfoSelectorDebug(source: String) {}
+    #endif
+
+    /// Reconcile Player Info selection against refreshed Team seats (no polling).
+    private func reconcilePlayerInfoSelection(
+        catalogComplete: Bool? = nil,
+        source: String = "reconcile"
+    ) {
+        let complete = catalogComplete ?? managedPlayerSeatsCatalogComplete
+        let userId = mapViewModel.currentUserAuthId
+        let teamId = team.id
+        let stored = userId.flatMap {
+            FanTeamPlayerInfoSelectionStore.load(userId: $0, teamId: teamId)
+        }
+        let preferred = selectedPlayerInfoMembershipId ?? stored
+        let subjects = overviewPlayerInfoSubjects
+        let resolved = FanTeamPlayerInfoSelectionReconciliation.resolve(
+            preferred: preferred,
+            subjects: subjects,
+            catalogComplete: complete
+        )
+        selectedPlayerInfoMembershipId = resolved
+
+        if let userId,
+           FanTeamPlayerInfoSelectionReconciliation.shouldRewriteDurableStore(
+               previousPreferred: preferred,
+               resolved: resolved,
+               subjects: subjects,
+               catalogComplete: complete
+           ),
+           let resolved {
+            let ok = FanTeamPlayerInfoSelectionStore.save(
+                userId: userId,
+                teamId: teamId,
+                membershipId: resolved
+            )
+            logTeamPlayerInfo(
+                ok ? "durable rewrite" : "durable rewrite failed",
+                teamId: teamId,
+                userId: userId,
+                previousPlayerId: preferred,
+                requestedPlayerId: resolved,
+                extra: "source=\(source)"
+            )
+        }
+
+        logTeamPlayerInfo(
+            "reconcile",
+            teamId: teamId,
+            userId: userId,
+            previousPlayerId: preferred,
+            requestedPlayerId: resolved,
+            extra: "source=\(source) catalogComplete=\(complete) subjects=\(subjects.count)"
+        )
+        logPlayerInfoSelectorDebug(source: source)
     }
 
     private var overviewLeadershipMembers: [FanTeamMember] {
         FanTeamLeadership.leaders(from: detail?.members ?? [])
+    }
+
+    /// Team-scoped Player Info subjects the viewer may represent on this Team.
+    private var overviewPlayerInfoSubjects: [FanTeamPlayerInfoSubject] {
+        FanTeamMyPlayerInfoPresentation.eligibleSubjects(
+            members: detail?.members ?? [],
+            currentUserId: mapViewModel.currentUserAuthId,
+            managedSeats: managedPlayerSeats
+        )
+    }
+
+    /// Viewer's account seat on this Team (player or access-only). Nil when guardian-only.
+    private var viewerAccountSeatMember: FanTeamMember? {
+        guard let uid = mapViewModel.currentUserAuthId else { return nil }
+        return (detail?.members ?? []).first { $0.userId == uid }
+    }
+
+    private var accountPlayerOverviewRows: [FanTeamAccountPlayerOverviewRow] {
+        FanTeamAccountPlayerOverviewPresentation.rows(
+            hasAccountSeat: team.hasAccountSeat,
+            myselfDisplayName: viewerAccountSeatMember?.displayName
+                ?? mapViewModel.currentUserDisplayName,
+            myselfIsPlayer: viewerAccountSeatMember?.isPlayer ?? false,
+            myselfMembershipId: viewerAccountSeatMember?.membershipId,
+            managedPlayers: viewerManagedPlayers,
+            managedSeats: managedPlayerSeats
+        )
+    }
+
+    /// Selected Player Info seat from durable + in-session authoritative selection.
+    private var overviewSelectedPlayerInfoSubject: FanTeamPlayerInfoSubject? {
+        let subjects = overviewPlayerInfoSubjects
+        let membershipId = FanTeamPlayerInfoSelectionReconciliation.resolve(
+            preferred: selectedPlayerInfoMembershipId,
+            subjects: subjects,
+            catalogComplete: managedPlayerSeatsCatalogComplete
+        )
+        return FanTeamMyPlayerInfoPresentation.subject(membershipId: membershipId, in: subjects)
     }
 
     @ViewBuilder
@@ -1789,7 +4314,7 @@ struct FanTeamDetailSheet: View {
         } label: {
             HStack(spacing: 12) {
                 ZStack(alignment: .bottomTrailing) {
-                    SocialAvatarRenderer.socialAvatarView(for: member.preview, size: 42)
+                    TeamMemberAvatarView(member: member, size: 42)
                         .frame(width: 42, height: 42)
                         .background(Circle().fill(FGColor.cardBackground(colorScheme)))
                         .clipShape(Circle())
@@ -1798,34 +4323,34 @@ struct FanTeamDetailSheet: View {
                                 .strokeBorder(FGColor.divider(colorScheme), lineWidth: 1)
                         }
 
-                    if member.role == .owner {
-                        Image(systemName: "crown.fill")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(3.5)
-                            .background(Circle().fill(teamAccent))
-                            .overlay {
-                                Circle()
-                                    .strokeBorder(
-                                        FGColor.cardBackground(colorScheme),
-                                        lineWidth: 1.5
-                                    )
-                            }
-                            .offset(x: 2, y: 2)
-                    }
+                    Image(systemName: member.role.badgeSystemImage)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(3.5)
+                        .background(Circle().fill(member.role.badgeTint.color(for: colorScheme)))
+                        .overlay {
+                            Circle()
+                                .strokeBorder(
+                                    FGColor.cardBackground(colorScheme),
+                                    lineWidth: 1.5
+                                )
+                        }
+                        .offset(x: 2, y: 2)
                 }
                 .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(member.displayName)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(1)
                         .truncationMode(.tail)
-                    Text(L10n.t(member.role.localizedKey, languageCode: languageCode))
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(teamAccent)
-                        .lineLimit(1)
+                    FanTeamRoleBadgeView(
+                        role: member.role,
+                        languageCode: languageCode,
+                        showsTitle: true,
+                        compact: true
+                    )
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "chevron.right")
@@ -1850,8 +4375,264 @@ struct FanTeamDetailSheet: View {
         .accessibilityHint(L10n.t("Opens profile preview", languageCode: languageCode))
     }
 
+    @ViewBuilder
+    private var myPlayerInfoCard: some View {
+        let rows = accountPlayerOverviewRows
+        let canManageMembership = FanTeamPlayerMembershipManagePresentation.showsManageControl(
+            hasActiveAccountMembership: team.hasAccountSeat
+        )
+        let showSection = FanTeamPlayerMembershipManagePresentation.shouldShowAccountPlayersSection(
+            hasActiveAccountMembership: canManageMembership,
+            globalManagedPlayerCount: viewerManagedPlayerCount,
+            onTeamPlayerSubjectCount: overviewPlayerInfoSubjects.count
+        )
+        if showSection, !rows.isEmpty || canManageMembership {
+            let accountSeatId = viewerAccountSeatMember?.membershipId
+            let managedOnTeam = rows.filter {
+                if case .managed = $0.kind { return $0.isOnTeam }
+                return false
+            }.count
+            let _ = logTeamOverviewPlayers(
+                "displayed",
+                accountSeat: accountSeatId,
+                managedSeats: managedOnTeam,
+                displayed: rows.compactMap(\.membershipId)
+            )
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "person.2.fill")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(teamAccent)
+                        .accessibilityHidden(true)
+                    Text(
+                        L10n.t(
+                            FanTeamMyPlayerInfoPresentation.overviewSectionTitleKey,
+                            languageCode: languageCode
+                        )
+                    )
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    Spacer(minLength: 0)
+                    if canManageMembership {
+                        Button {
+                            showingManagePlayerMembership = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(L10n.t("team_player_membership_manage", languageCode: languageCode))
+                                    .font(.subheadline.weight(.semibold))
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.bold))
+                                    .accessibilityHidden(true)
+                            }
+                            .foregroundStyle(teamAccent)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            L10n.t("team_player_membership_manage_a11y", languageCode: languageCode)
+                        )
+                    }
+                }
+
+                Text(
+                    L10n.t(
+                        FanTeamMyPlayerInfoPresentation.overviewSectionHelperKey,
+                        languageCode: languageCode
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+
+                if rows.isEmpty {
+                    Text(L10n.t("team_player_membership_overview_none_on_team", languageCode: languageCode))
+                        .font(.subheadline)
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+                        if index > 0 {
+                            Divider()
+                                .overlay(FGColor.divider(colorScheme).opacity(0.55))
+                        }
+                        overviewAccountPlayerRow(row)
+                    }
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(FGColor.cardBackground(colorScheme))
+            }
+            .softCardShadow()
+            .padding(.horizontal, 16)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(
+                L10n.t(
+                    FanTeamMyPlayerInfoPresentation.overviewSectionTitleKey,
+                    languageCode: languageCode
+                )
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func overviewAccountPlayerRow(_ row: FanTeamAccountPlayerOverviewRow) -> some View {
+        let status = row.kind == .myself
+            ? FanTeamPlayerMembershipManagePresentation.myselfStatusCaption(
+                isPlayer: row.isOnTeam,
+                languageCode: languageCode
+            )
+            : FanTeamPlayerMembershipManagePresentation.statusCaption(
+                isOnTeam: row.isOnTeam,
+                languageCode: languageCode
+            )
+        let identity = L10n.t(row.identityCaptionKey, languageCode: languageCode)
+
+        Group {
+            if row.isOnTeam, let membershipId = row.membershipId,
+               let subject = overviewPlayerInfoSubjects.first(where: { $0.membershipId == membershipId }) {
+                Button {
+                    memberPendingPlayerInformation = subject.member
+                } label: {
+                    overviewAccountPlayerRowLabel(row: row, identity: identity, status: status)
+                }
+                .buttonStyle(FGPremiumPressButtonStyle())
+            } else if canOpenMembershipManageFromOverview {
+                Button {
+                    showingManagePlayerMembership = true
+                } label: {
+                    overviewAccountPlayerRowLabel(row: row, identity: identity, status: status)
+                }
+                .buttonStyle(FGPremiumPressButtonStyle())
+            } else {
+                overviewAccountPlayerRowLabel(row: row, identity: identity, status: status)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(row.displayName), \(identity), \(status)")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var canOpenMembershipManageFromOverview: Bool {
+        FanTeamPlayerMembershipManagePresentation.showsManageControl(
+            hasActiveAccountMembership: team.hasAccountSeat
+        )
+    }
+
+    private func overviewAccountPlayerRowLabel(
+        row: FanTeamAccountPlayerOverviewRow,
+        identity: String,
+        status: String
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Group {
+                switch row.kind {
+                case .myself:
+                    // Same circular UserAvatarView path as managed rows (not SocialAvatarRenderer,
+                    // which leaves photo fills unclipped / square in this compact list).
+                    if let member = viewerAccountSeatMember {
+                        ManagedPlayerAvatarView(
+                            managedPlayerId: member.userId,
+                            avatarURL: member.avatarURL,
+                            avatarThumbnailURL: member.avatarThumbnailURL,
+                            displayName: member.displayName,
+                            size: 48
+                        )
+                    } else {
+                        ManagedPlayerAvatarView(
+                            avatarURL: nil,
+                            avatarThumbnailURL: nil,
+                            displayName: row.displayName,
+                            size: 48
+                        )
+                    }
+                case .managed(let managedPlayerId):
+                    ManagedPlayerAvatarView(
+                        managedPlayerId: managedPlayerId,
+                        avatarURL: row.avatarURL,
+                        avatarThumbnailURL: row.avatarThumbnailURL,
+                        displayName: row.displayName,
+                        size: 48
+                    )
+                }
+            }
+            .frame(width: 48, height: 48)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(row.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.85)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(identity)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+
+                Text(status)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(
+                        row.isOnTeam ? FGColor.accentGreen : FGColor.mutedText(colorScheme)
+                    )
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .accessibilityHidden(true)
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .frame(minHeight: 44)
+    }
+
+    private func logTeamOverviewPlayers(
+        _ event: String,
+        accountSeat: UUID?,
+        managedSeats: Int?,
+        displayed: [UUID]?,
+        tapped: UUID? = nil
+    ) {
+#if DEBUG
+        var parts = [
+            "[TeamOverviewPlayers]",
+            event,
+            "teamId=\(team.id.uuidString.lowercased())"
+        ]
+        if let accountSeat {
+            parts.append("accountSeat=\(accountSeat.uuidString.lowercased())")
+        } else if event == "displayed" {
+            parts.append("accountSeat=none")
+        }
+        if let managedSeats {
+            parts.append("managedSeats=\(managedSeats)")
+        }
+        if let displayed {
+            let ids = displayed.map { $0.uuidString.lowercased() }.joined(separator: ",")
+            parts.append("displayedMembershipIds=[\(ids)]")
+        }
+        if let tapped {
+            parts.append("playerTapped=\(tapped.uuidString.lowercased())")
+            if event == "editorOpened" {
+                parts.append("editorOpened=\(tapped.uuidString.lowercased())")
+            }
+        }
+        print(parts.joined(separator: " "))
+#endif
+    }
+
     private var teamInfoCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let _ = TeamDetailRenderBisect.mark("teamInfoCard", details: "begin")
+        return VStack(alignment: .leading, spacing: 12) {
             Text(L10n.t("fan_teams_team_info", languageCode: languageCode))
                 .font(.headline.weight(.bold))
                 .foregroundStyle(FGColor.primaryText(colorScheme))
@@ -1866,12 +4647,19 @@ struct FanTeamDetailSheet: View {
             overviewInfoRow(
                 systemImage: "person.2.fill",
                 title: L10n.t("fan_teams_members_label", languageCode: languageCode),
-                value: String(
-                    format: L10n.t("fan_teams_members_count_format", languageCode: languageCode),
-                    locale: Locale(identifier: languageCode),
-                    team.memberCount
+                value: TeamDetailLocalizedFormat.format(
+                    "fan_teams_members_count_format",
+                    languageCode: languageCode,
+                    int64Args: [Int64(team.memberCount)]
                 )
             )
+            if let detail, detail.record.totalFinals > 0 || detail.games.contains(where: { $0.isScoringFinal }) {
+                overviewInfoRow(
+                    systemImage: "chart.bar.fill",
+                    title: L10n.t("fan_team_record_label", languageCode: languageCode),
+                    value: detail.record.displayLine
+                )
+            }
             if let createdAt = team.createdAt {
                 overviewInfoRow(
                     systemImage: "calendar",
@@ -1893,6 +4681,45 @@ struct FanTeamDetailSheet: View {
         }
         .softCardShadow()
         .padding(.horizontal, 16)
+        .background(alignment: .center) {
+            let _ = TeamDetailRenderBisect.mark("teamInfoCard", details: "completed")
+            Color.clear
+        }
+    }
+
+    @ViewBuilder
+    private func recentResultsCard(from detail: FanTeamDetail) -> some View {
+        let finals = FanTeamEventScoring.recentFinals(from: detail.games, limit: 5)
+        if !finals.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(L10n.t("fan_team_recent_results", languageCode: languageCode))
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                ForEach(finals) { game in
+                    Button {
+                        openPickupGameDetail(game.id)
+                    } label: {
+                        FanTeamEventResultScoreLine(
+                            teamName: team.name,
+                            opponentName: game.opponentName ?? "",
+                            teamScore: game.teamScoreValue,
+                            opponentScore: game.opponentScoreValue,
+                            languageCode: languageCode
+                        )
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(FGColor.cardBackground(colorScheme))
+            }
+            .softCardShadow()
+            .padding(.horizontal, 16)
+        }
     }
 
     private func overviewInfoRow(systemImage: String, title: String, value: String) -> some View {
@@ -1931,6 +4758,10 @@ struct FanTeamDetailSheet: View {
                 "GroupChatView.mounted",
                 detail: "conversation=\(team.groupConversationId.uuidString)"
             )
+            TeamEventChatNavigationDebug.log(
+                "chatViewAppeared",
+                detail: "teamID=\(team.id.uuidString.lowercased()) conversationID=\(team.groupConversationId.uuidString.lowercased())"
+            )
         }
         .onDisappear {
             TeamChatKeyboardDebug.log(
@@ -1955,22 +4786,11 @@ struct FanTeamDetailSheet: View {
 
         return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                if team.canManage {
-                    Button {
-                        openScheduleGame()
-                    } label: {
-                        Label(L10n.t("fan_teams_schedule_game", languageCode: languageCode), systemImage: "plus")
-                            .font(.subheadline.weight(.bold))
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 12)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(FGColor.accentGreen)
-                    .padding(.horizontal, 16)
-                }
+                // Schedule is a pure list surface — Create Event / Announce live in the Team header.
 
                 if !allGames.isEmpty {
-                    gamesFilterChrome
+                    gamesStatusSegment
+                    gamesTypeFilterChipRow
                     if let summary {
                         Text(summary)
                             .font(.caption.weight(.semibold))
@@ -1982,75 +4802,180 @@ struct FanTeamDetailSheet: View {
 
                 if allGames.isEmpty {
                     emptyCard(
-                        title: L10n.t("fan_teams_no_games_title", languageCode: languageCode),
-                        body: L10n.t("fan_teams_no_games_body", languageCode: languageCode)
+                        title: L10n.t("fan_teams_no_events_title", languageCode: languageCode),
+                        body: L10n.t("fan_teams_no_events_body", languageCode: languageCode)
                     )
                 } else if presentation.filteredCount == 0 {
                     gamesStatusOrFilteredEmptyCard
                 } else {
                     ForEach(presentation.sections) { section in
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(L10n.t(section.kind.localizedKey, languageCode: languageCode).uppercased(with: Locale(identifier: languageCode)))
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .padding(.horizontal, 16)
-                                .accessibilityAddTraits(.isHeader)
+                        VStack(alignment: .leading, spacing: 12) {
+                            gamesSectionHeader(section)
                             ForEach(section.games) { game in
-                                Button {
-                                    openPickupGameDetail(game.id)
-                                } label: {
-                                    gameListRow(game)
-                                }
-                                .buttonStyle(.plain)
-                                .padding(.horizontal, 16)
+                                gameListRow(game)
+                                    .padding(.horizontal, 16)
                             }
                         }
                     }
+                }
+
+                if !allGames.isEmpty {
+                    gamesSchedulePrivacyNote
                 }
             }
             .padding(.vertical, 14)
             .animation(.spring(response: 0.28, dampingFraction: 0.86), value: gamesFilter)
         }
         .onReceive(gamesFilterMinuteTicker) { gamesFilterClockTick = $0 }
+        .task(id: scheduleAttendanceBatchKey) {
+            let ids = allGames
+                .filter { $0.gameType != .announcement }
+                .map(\.id)
+            guard !ids.isEmpty else { return }
+            await mapViewModel.loadTeamScheduleAttendanceBatch(
+                teamId: team.id,
+                pickupGameIds: ids
+            )
+        }
         .sheet(isPresented: $showGamesCustomDateSheet) {
             gamesCustomDateSheet
         }
     }
 
-    private var gamesFilterAccent: Color {
-        if let hex = team.colorHex, let c = Color(fanTeamHex: hex) { return c }
-        return FGColor.accentGreen
+    private var scheduleAttendanceBatchKey: String {
+        let ids = (detail?.games ?? []).map { $0.id.uuidString.lowercased() }.sorted().joined(separator: ",")
+        return "\(team.id.uuidString.lowercased())|\(ids)"
     }
 
-    /// Primary Upcoming/Past segment + compact Sort / Filter (no type chips).
-    private var gamesFilterChrome: some View {
-        HStack(alignment: .center, spacing: 8) {
-            Picker(
-                "",
-                selection: Binding(
-                    get: { gamesFilter.status },
-                    set: { next in
+    private var gamesFilterAccent: Color {
+        if let hex = team.colorHex, let c = Color(fanTeamHex: hex) { return c }
+        return FGColor.accentBlueStrong
+    }
+
+    /// Upcoming / Past — full-width segment on the Schedule list.
+    private var gamesStatusSegment: some View {
+        Picker(
+            "",
+            selection: Binding(
+                get: { gamesFilter.status },
+                set: { next in
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        gamesFilter.selectStatus(next)
+                    }
+                }
+            )
+        ) {
+            ForEach(FanTeamGamesStatusFilter.allCases) { status in
+                Text(L10n.t(status.localizedKey, languageCode: languageCode))
+                    .tag(status)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .accessibilityLabel(L10n.t("fan_teams_games_status_segment_a11y", languageCode: languageCode))
+        .padding(.horizontal, 16)
+    }
+
+    /// Horizontally scrollable chips for every stored FanGeo event type (not collapsed groups).
+    private var gamesTypeFilterChipRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                gamesTypeFilterChip(
+                    title: L10n.t("fan_teams_games_type_all", languageCode: languageCode),
+                    systemImage: "square.grid.2x2.fill",
+                    isSelected: gamesFilter.gameType == nil
+                ) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        gamesFilter.gameType = nil
+                    }
+                }
+                ForEach(FanTeamGamesFilterEngine.supportedTypeFilters, id: \.self) { type in
+                    gamesTypeFilterChip(
+                        title: L10n.t(type.localizedKey, languageCode: languageCode),
+                        systemImage: type.filterSystemImage,
+                        isSelected: gamesFilter.gameType == type
+                    ) {
                         withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            gamesFilter.selectStatus(next)
+                            gamesFilter.gameType = gamesFilter.gameType == type ? nil : type
                         }
                     }
-                )
-            ) {
-                ForEach(FanTeamGamesStatusFilter.allCases) { status in
-                    Text(L10n.t(status.localizedKey, languageCode: languageCode))
-                        .tag(status)
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .accessibilityLabel(L10n.t("fan_teams_games_status_segment_a11y", languageCode: languageCode))
-            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 2)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(L10n.t("fan_teams_games_type_section", languageCode: languageCode))
+    }
 
+    private func gamesTypeFilterChip(
+        title: String,
+        systemImage: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .bold))
+                    .accessibilityHidden(true)
+                Text(title)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(isSelected ? Color.white : FGColor.primaryText(colorScheme))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background {
+                Capsule(style: .continuous)
+                    .fill(isSelected ? gamesFilterAccent : FGColor.cardBackground(colorScheme))
+            }
+            .overlay {
+                Capsule(style: .continuous)
+                    .strokeBorder(
+                        isSelected ? gamesFilterAccent : FGColor.divider(colorScheme),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private func gamesSectionHeader(_ section: FanTeamGamesSection) -> some View {
+        HStack(spacing: 8) {
+            Text(L10n.t(section.kind.localizedKey, languageCode: languageCode).uppercased(with: Locale(identifier: languageCode)))
+                .font(.caption.weight(.bold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: 0)
             gamesSortMenu
             gamesSecondaryFilterMenu
         }
         .padding(.horizontal, 16)
-        .accessibilityElement(children: .contain)
+    }
+
+    private var gamesSchedulePrivacyNote: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "info.circle.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(gamesFilterAccent)
+                .accessibilityHidden(true)
+            Text(L10n.t("fan_teams_schedule_rsvp_privacy_note", languageCode: languageCode))
+                .font(.caption.weight(.medium))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(gamesFilterAccent.opacity(colorScheme == .dark ? 0.18 : 0.10))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .accessibilityElement(children: .combine)
     }
 
     private var gamesSortMenu: some View {
@@ -2088,33 +5013,6 @@ struct FanTeamDetailSheet: View {
 
     private var gamesSecondaryFilterMenu: some View {
         Menu {
-            Section(L10n.t("fan_teams_games_type_section", languageCode: languageCode)) {
-                Button {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                        gamesFilter.gameType = nil
-                    }
-                } label: {
-                    if gamesFilter.gameType == nil {
-                        Label(L10n.t("fan_teams_games_type_all", languageCode: languageCode), systemImage: "checkmark")
-                    } else {
-                        Text(L10n.t("fan_teams_games_type_all", languageCode: languageCode))
-                    }
-                }
-                ForEach(FanTeamGamesFilterEngine.supportedTypeFilters, id: \.self) { type in
-                    Button {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            gamesFilter.gameType = gamesFilter.gameType == type ? nil : type
-                        }
-                    } label: {
-                        if gamesFilter.gameType == type {
-                            Label(L10n.t(type.localizedKey, languageCode: languageCode), systemImage: "checkmark")
-                        } else {
-                            Text(L10n.t(type.localizedKey, languageCode: languageCode))
-                        }
-                    }
-                }
-            }
-
             Section(L10n.t("fan_teams_games_date_section", languageCode: languageCode)) {
                 ForEach(FanTeamGamesDatePreset.allCases) { preset in
                     Button {
@@ -2187,7 +5085,7 @@ struct FanTeamDetailSheet: View {
             }
         } label: {
             HStack(spacing: 4) {
-                Image(systemName: gamesFilter.hasActiveSecondaryFilters
+                Image(systemName: gamesFilter.hasActiveMenuFilters
                       ? "line.3.horizontal.decrease.circle.fill"
                       : "line.3.horizontal.decrease.circle")
                     .font(.system(size: 18, weight: .semibold))
@@ -2260,13 +5158,13 @@ struct FanTeamDetailSheet: View {
             gamesFilteredEmptyCard
         } else if gamesFilter.status == .upcoming {
             emptyCard(
-                title: L10n.t("fan_teams_games_no_upcoming_title", languageCode: languageCode),
-                body: L10n.t("fan_teams_games_no_upcoming_body", languageCode: languageCode)
+                title: L10n.t("fan_teams_events_no_upcoming_title", languageCode: languageCode),
+                body: L10n.t("fan_teams_events_no_upcoming_body", languageCode: languageCode)
             )
         } else {
             emptyCard(
-                title: L10n.t("fan_teams_games_no_past_title", languageCode: languageCode),
-                body: L10n.t("fan_teams_games_no_past_body", languageCode: languageCode)
+                title: L10n.t("fan_teams_events_no_past_title", languageCode: languageCode),
+                body: L10n.t("fan_teams_events_no_past_body", languageCode: languageCode)
             )
         }
     }
@@ -2301,6 +5199,30 @@ struct FanTeamDetailSheet: View {
 
     private var rosterTab: some View {
         List {
+            if team.canManage {
+                Section {
+                    Button {
+                        showingAddMembers = true
+                    } label: {
+                        Label(
+                            L10n.t("fan_teams_invite", languageCode: languageCode),
+                            systemImage: "person.badge.plus"
+                        )
+                    }
+                    .accessibilityLabel(L10n.t("fan_teams_invite", languageCode: languageCode))
+
+                    Button {
+                        showingAddManagedPlayers = true
+                    } label: {
+                        Label(
+                            L10n.t("managed_players_add_to_team", languageCode: languageCode),
+                            systemImage: "figure.and.child.holdinghands"
+                        )
+                    }
+                    .accessibilityLabel(L10n.t("managed_players_add_to_team", languageCode: languageCode))
+                }
+            }
+
             if team.canManage, !pendingInvitations.isEmpty {
                 Section {
                     ForEach(pendingInvitations) { invitation in
@@ -2365,7 +5287,11 @@ struct FanTeamDetailSheet: View {
             }
 
             Section {
-                ForEach(detail?.members ?? []) { member in
+                ForEach(
+                    FanTeamRosterOrdering.sorted(
+                        FanTeamRosterPlayerPresentation.playerSeats(from: detail?.members ?? [])
+                    )
+                ) { member in
                     rosterMemberRow(member)
                 }
             } header: {
@@ -2373,23 +5299,47 @@ struct FanTeamDetailSheet: View {
             }
         }
         .listStyle(.insetGrouped)
-        .sheet(item: $memberPendingPlayerNumberEdit) { member in
-            FanTeamPlayerNumberEditorSheet(
-                memberName: member.displayName,
-                initialNumber: member.playerNumber,
-                teamAccent: teamAccent,
+        // Roster menu can still open Team Role directly (not nested under Player Information).
+        .sheet(item: $memberPendingRoleEdit, onDismiss: {
+            memberPendingRoleEdit = nil
+        }) { member in
+            FanTeamMemberRolePickerSheet(
+                member: refreshedRosterMember(member),
                 languageCode: languageCode,
-                isSaving: isSavingPlayerNumber,
-                onSave: { number in
-                    Task { await saveMemberPlayerNumber(member, number: number) }
-                },
-                onClear: {
-                    Task { await clearMemberPlayerNumber(member) }
-                },
-                onCancel: {
-                    memberPendingPlayerNumberEdit = nil
+                isSaving: isSavingTeamRole,
+                onSelect: { role in
+                    do {
+                        try await saveMemberRole(refreshedRosterMember(member), role: role)
+                        memberPendingRoleEdit = nil
+                    } catch {
+                        // Error already surfaced via errorText inside saveMemberRole.
+                    }
                 }
             )
+        }
+    }
+
+    /// Roster seat identity, never `userId`: managed seats all have a nil `userId`,
+    /// so matching on it would resolve every child to the first one.
+    private func refreshedRosterMember(_ member: FanTeamMember) -> FanTeamMember {
+        detail?.members.first(where: { $0.membershipId == member.membershipId }) ?? member
+    }
+
+    /// Canonical local roster mutation — Player Information Binding, Roster, and Team Leadership
+    /// all read from `detail.members`.
+    @MainActor
+    private func replaceCanonicalRosterMember(_ updated: FanTeamMember) {
+        if var detail {
+            detail.members = detail.members.map { row in
+                row.membershipId == updated.membershipId ? updated : row
+            }
+            self.detail = detail
+        }
+        if memberPendingPlayerInformation?.membershipId == updated.membershipId {
+            memberPendingPlayerInformation = updated
+        }
+        if memberPendingRoleEdit?.membershipId == updated.membershipId {
+            memberPendingRoleEdit = updated
         }
     }
 
@@ -2400,8 +5350,11 @@ struct FanTeamDetailSheet: View {
         return HStack(alignment: .center, spacing: 14) {
             HStack(alignment: .center, spacing: 14) {
                 VStack(spacing: 5) {
-                    if let number = member.playerNumber {
-                        Text(FanTeamPlayerNumber.displayLabel(number))
+                    if let metadata = FanTeamMemberPositionPresentation.compactMetadata(
+                        playerNumber: member.playerNumber,
+                        preferredPositionCode: member.preferredPositionCode
+                    ) {
+                        Text(metadata)
                             .font(.caption.weight(.bold))
                             .foregroundStyle(teamAccent)
                             .padding(.horizontal, 7)
@@ -2411,10 +5364,12 @@ struct FanTeamDetailSheet: View {
                                 in: Capsule(style: .continuous)
                             )
                             .lineLimit(1)
-                            .minimumScaleFactor(0.85)
+                            .minimumScaleFactor(0.75)
                     }
 
-                    ProfileAvatarView(preview: member.preview, size: avatarSize)
+                    TeamMemberAvatarView(member: member, size: avatarSize)
+                        .frame(width: avatarSize, height: avatarSize)
+                        .clipShape(Circle())
                 }
                 .frame(width: leadingWidth, alignment: .center)
 
@@ -2423,7 +5378,7 @@ struct FanTeamDetailSheet: View {
 
                     Text(rosterRoleGenderLine(member))
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(FGColor.accentGreen)
+                        .foregroundStyle(member.role.badgeTint.color(for: colorScheme))
                         .lineLimit(1)
 
                     if let joinedLine = FanTeamRosterJoinedCaption.line(
@@ -2464,101 +5419,63 @@ struct FanTeamDetailSheet: View {
                     } label: {
                         Label(
                             L10n.t("Message", languageCode: languageCode),
-                            systemImage: "message"
+                            systemImage: "bubble.left"
                         )
                     }
                     .disabled(isMessagingMember)
                 }
 
-                if team.canManage {
-                    Divider()
-                    Button {
-                        memberPendingPlayerNumberEdit = member
-                    } label: {
-                        Label(
-                            L10n.t(
-                                member.playerNumber == nil
-                                    ? "fan_teams_set_player_number"
-                                    : "fan_teams_change_player_number",
-                                languageCode: languageCode
-                            ),
-                            systemImage: "number"
-                        )
-                    }
-                    .disabled(isSavingPlayerNumber)
-                    if member.playerNumber != nil {
-                        Button(role: .destructive) {
-                            Task { await clearMemberPlayerNumber(member) }
-                        } label: {
-                            Label(
-                                L10n.t(
-                                    "fan_teams_remove_player_number",
-                                    languageCode: languageCode
-                                ),
-                                systemImage: "minus.circle"
-                            )
-                        }
-                        .disabled(isSavingPlayerNumber)
-                    }
-                }
+                Divider()
 
-                if team.canManage,
+                Button {
+                    memberPendingPlayerInformation = member
+                } label: {
+                    Label(
+                        L10n.t("fan_teams_player_information", languageCode: languageCode),
+                        systemImage: "person.text.rectangle"
+                    )
+                }
+                .accessibilityLabel(
+                    L10n.t("fan_teams_player_information", languageCode: languageCode)
+                )
+
+                if team.canAssignRoles,
                    member.role != .owner,
                    !FanTeamRosterMemberActions.isSelf(
                        member: member,
                        currentUserId: mapViewModel.currentUserAuthId
                    ) {
-                    if team.myRole == .owner {
-                        Divider()
-                        ForEach([FanTeamMemberRole.manager, .captain, .member], id: \.self) { role in
-                            Button {
-                                guard member.role != role else { return }
-                                Task {
-                                    do {
-                                        try await service.setMemberRole(
-                                            teamId: team.id,
-                                            userId: member.userId,
-                                            role: role
-                                        )
-                                        await reload()
-                                    } catch {
-                                        if !FanTeamsLoadErrorPresentation.isCancellation(error) {
-                                            errorText = L10n.t(
-                                                "fan_teams_set_role_failed",
-                                                languageCode: languageCode
-                                            )
-                                        }
-                                    }
-                                }
-                            } label: {
-                                if member.role == role {
-                                    Label(
-                                        L10n.t(role.localizedKey, languageCode: languageCode),
-                                        systemImage: "checkmark"
-                                    )
-                                } else {
-                                    Text(L10n.t(role.localizedKey, languageCode: languageCode))
-                                }
-                            }
-                        }
+                    Button {
+                        memberPendingRoleEdit = member
+                    } label: {
+                        Label(
+                            L10n.t("fan_teams_team_role", languageCode: languageCode),
+                            systemImage: "person.badge.shield.checkmark"
+                        )
                     }
+                    .accessibilityLabel(
+                        L10n.t("fan_teams_team_role", languageCode: languageCode)
+                    )
+                }
 
-                    if FanTeamRosterMemberActions.canRemove(
-                        member: member,
-                        viewerCanManage: team.canManage,
-                        currentUserId: mapViewModel.currentUserAuthId
-                    ) {
-                        Divider()
-                        Button(role: .destructive) {
-                            memberPendingRemoval = member
-                        } label: {
-                            Label(
-                                L10n.t("fan_teams_remove_member", languageCode: languageCode),
-                                systemImage: "person.fill.xmark"
-                            )
-                        }
-                        .disabled(isRemovingMember)
+                if FanTeamRosterMemberActions.canRemove(
+                    member: member,
+                    viewerCanManage: team.canManage,
+                    currentUserId: mapViewModel.currentUserAuthId
+                ) {
+                    Divider()
+                    Button(role: .destructive) {
+                        memberPendingRemoval = member
+                    } label: {
+                        Label(
+                            L10n.t("fan_teams_remove_member", languageCode: languageCode),
+                            systemImage: "person.badge.minus"
+                        )
                     }
+                    .disabled(isRemovingMember)
+                    .accessibilityLabel(
+                        L10n.t("fan_teams_remove_member", languageCode: languageCode)
+                    )
                 }
             } label: {
                 Image(systemName: "ellipsis")
@@ -2630,6 +5547,14 @@ struct FanTeamDetailSheet: View {
                 )
             )
         }
+        if let position = FanTeamSportPositions.position(
+            code: member.preferredPositionCode,
+            sportToken: team.sport
+        ) {
+            parts.append(position.accessibilityLabel(languageCode: languageCode))
+        } else if let code = member.preferredPositionCode {
+            parts.append(code)
+        }
         parts.append(L10n.t(member.role.localizedKey, languageCode: languageCode))
         if let gender = member.rosterGender {
             parts.append(L10n.t(gender.localizedKey, languageCode: languageCode))
@@ -2650,18 +5575,23 @@ struct FanTeamDetailSheet: View {
         isSavingPlayerNumber = true
         defer { isSavingPlayerNumber = false }
         do {
+            // Seat-scoped RPC: one path for account seats and managed players.
             try await service.setMemberPlayerNumber(
                 teamId: team.id,
-                userId: member.userId,
+                membershipId: member.membershipId,
                 playerNumber: number
             )
             if var detail {
                 detail.members = detail.members.map { row in
-                    row.userId == member.userId ? row.replacingPlayerNumber(number) : row
+                    row.membershipId == member.membershipId
+                        ? row.replacingPlayerNumber(number)
+                        : row
                 }
                 self.detail = detail
             }
-            memberPendingPlayerNumberEdit = nil
+            if memberPendingPlayerInformation?.membershipId == member.membershipId {
+                memberPendingPlayerInformation = refreshedRosterMember(member)
+            }
         } catch {
             if !FanTeamsLoadErrorPresentation.isCancellation(error) {
                 errorText = L10n.t("fan_teams_set_player_number_failed", languageCode: languageCode)
@@ -2674,18 +5604,182 @@ struct FanTeamDetailSheet: View {
         await saveMemberPlayerNumber(member, number: nil)
     }
 
+    @MainActor
+    private func saveMemberPreferredPosition(_ member: FanTeamMember, code: String?) async {
+        guard !isSavingPreferredPosition else { return }
+        isSavingPreferredPosition = true
+        defer { isSavingPreferredPosition = false }
+        do {
+            try await service.setMemberPreferredPosition(
+                teamId: team.id,
+                membershipId: member.membershipId,
+                positionCode: code
+            )
+            if var detail {
+                detail.members = detail.members.map { row in
+                    row.membershipId == member.membershipId
+                        ? row.replacingPreferredPositionCode(code)
+                        : row
+                }
+                self.detail = detail
+            }
+            if memberPendingPlayerInformation?.membershipId == member.membershipId {
+                memberPendingPlayerInformation = refreshedRosterMember(member)
+            }
+        } catch {
+            if !FanTeamsLoadErrorPresentation.isCancellation(error) {
+                errorText = L10n.t("fan_teams_set_player_position_failed", languageCode: languageCode)
+            }
+        }
+    }
+
+    @MainActor
+    private func saveMemberPermissions(
+        _ member: FanTeamMember,
+        permissions: FanTeamPermissionSet
+    ) async throws {
+        guard !isSavingPermissions else { return }
+        isSavingPermissions = true
+        defer { isSavingPermissions = false }
+
+        let previous = refreshedRosterMember(member)
+        let updated = previous.replacingPermissions(useCustom: true, granted: permissions)
+        replaceCanonicalRosterMember(updated)
+        if memberPendingPlayerInformation?.membershipId == member.membershipId {
+            memberPendingPlayerInformation = updated
+        }
+
+        do {
+            let saved = try await service.setMemberPermissions(
+                teamId: team.id,
+                membershipId: member.membershipId,
+                permissions: permissions
+            )
+            let reconciled = previous.replacingPermissions(useCustom: true, granted: saved)
+            replaceCanonicalRosterMember(reconciled)
+            if memberPendingPlayerInformation?.membershipId == member.membershipId {
+                memberPendingPlayerInformation = reconciled
+            }
+        } catch {
+            replaceCanonicalRosterMember(previous)
+            if memberPendingPlayerInformation?.membershipId == member.membershipId {
+                memberPendingPlayerInformation = previous
+            }
+            throw error
+        }
+    }
+
+    @MainActor
+    private func saveMemberRole(_ member: FanTeamMember, role: FanTeamMemberRole) async throws {
+        guard member.role != role else { return }
+        guard role.isAssignableViaRolePicker else {
+            throw FanTeamsServiceError.invalidMemberRole
+        }
+        guard !isSavingTeamRole else { return }
+        isSavingTeamRole = true
+        defer { isSavingTeamRole = false }
+
+        let previous = refreshedRosterMember(member)
+        let updated = previous.replacingRole(role)
+        FanTeamRPCTrace.log(
+            step: "role.save.start",
+            rpc: "set_fan_team_membership_role",
+            extra: "membership=\(previous.membershipId.uuidString.lowercased()) " +
+                "managed_player_id=\(previous.managedPlayerId?.uuidString.lowercased() ?? "nil") " +
+                "user_id=\(previous.userId?.uuidString.lowercased() ?? "nil") " +
+                "roleBefore=\(previous.role.rawValue) roleAfter=\(role.rawValue)"
+        )
+        // Deterministic local update — do not wait for reload/realtime to refresh UI.
+        replaceCanonicalRosterMember(updated)
+
+        do {
+            try await service.setMemberRole(
+                teamId: team.id,
+                membershipId: previous.membershipId,
+                role: role
+            )
+            memberPendingRoleEdit = nil
+            // Soft reconcile in background; local state already shows the new role.
+            Task { await softReloadRosterAfterRoleChange() }
+        } catch {
+            FanTeamRPCTrace.log(
+                step: "role.save.failed",
+                rpc: "set_fan_team_membership_role",
+                error: error,
+                extra: "membership=\(previous.membershipId.uuidString.lowercased()) " +
+                    "revertedRole=\(previous.role.rawValue)"
+            )
+            replaceCanonicalRosterMember(previous)
+            if !FanTeamsLoadErrorPresentation.isCancellation(error) {
+                errorText = L10n.t("fan_teams_set_role_failed", languageCode: languageCode)
+            }
+            throw error
+        }
+    }
+
+    @MainActor
+    private func softReloadRosterAfterRoleChange() async {
+        do {
+            let members = try await service.listMembers(teamId: team.id)
+            if var detail {
+                detail.members = members
+                detail.summary = detail.summary.applyingMemberCount(members.count)
+                if let me = mapViewModel.currentUserAuthId,
+                   let selfSeat = members.first(where: { $0.userId == me }) {
+                    detail.summary = detail.summary.applyingMyRole(
+                        selfSeat.role,
+                        memberCount: members.count
+                    )
+                }
+                self.detail = detail
+            }
+            if let pending = memberPendingPlayerInformation {
+                memberPendingPlayerInformation = refreshedRosterMember(pending)
+            }
+        } catch {
+#if DEBUG
+            print("[TeamRole] softReloadFailed \(error.localizedDescription)")
+#endif
+        }
+    }
+
+    private func preferredPositionMenuAccessibilityLabel(for member: FanTeamMember) -> String {
+        let actionKey = member.preferredPositionCode == nil
+            ? "fan_teams_set_player_position"
+            : "fan_teams_change_player_position"
+        var parts = [L10n.t(actionKey, languageCode: languageCode)]
+        if let position = FanTeamSportPositions.position(
+            code: member.preferredPositionCode,
+            sportToken: team.sport
+        ) {
+            parts.append(
+                String(
+                    format: L10n.t(
+                        "fan_teams_player_position_current_a11y_format",
+                        languageCode: languageCode
+                    ),
+                    locale: Locale(identifier: languageCode),
+                    position.accessibilityLabel(languageCode: languageCode)
+                )
+            )
+        }
+        return parts.joined(separator: ", ")
+    }
+
     private var rosterActiveMembersHeader: String {
+        let playerCount = FanTeamRosterPlayerPresentation.playerCount(from: detail?.members ?? [])
+        let displayCount = detail == nil ? team.memberCount : playerCount
         let members = String(
             format: L10n.t("fan_teams_members_count_format", languageCode: languageCode),
             locale: Locale(identifier: languageCode),
-            team.memberCount
+            Int64(displayCount)
         )
         let pendingCount = max(team.pendingInvitationCount, pendingInvitations.count)
         if team.canManage, pendingCount > 0 {
             let pending = String(
                 format: L10n.t("fan_teams_pending_count_compact_format", languageCode: languageCode),
                 locale: Locale(identifier: languageCode),
-                pendingCount
+                Int64(pendingCount)
             )
             return "\(members) · \(pending)"
         }
@@ -2693,23 +5787,158 @@ struct FanTeamDetailSheet: View {
     }
 
     private func openScheduleGame() {
-        guard team.canManage else { return }
+        guard team.canOrganizeActivities else { return }
         pickupCreateFormMode = .add
     }
 
+    private func openMakeAnnouncement() {
+        guard team.canPublishAnnouncements else { return }
+        pickupCreateFormMode = .addTeamAnnouncement
+    }
+
     private func openPickupGameDetail(_ pickupGameId: UUID) {
-        pickupDetailNav = PickupDetailNavigationToken(id: pickupGameId)
+        // Drop any stale Chat intent when opening a different event.
+        pendingSelectChatAfterEventDetailDismiss = false
+        pendingSelectChatEventId = nil
+        // Team Schedule / Overview already know this is a Team Event — lock mode before first frame.
+        let token = PickupDetailNavigationToken.teamEvent(gameId: pickupGameId, teamSummary: team)
+        mapViewModel.seedPickupDiscoverTeamIdentityIfNeeded(
+            gameId: pickupGameId,
+            from: PickupGameTeamCreationContext(from: team)
+        )
+        pickupDetailNav = token
+    }
+
+    /// Event detail Chat → same Team's Chat tab. Returns whether the intent was accepted.
+    @MainActor
+    private func requestEmbeddedTeamChatTab(requestedTeamId: UUID, eventId: UUID) -> Bool {
+        TeamEventChatNavigationDebug.log(
+            "teamTabRequested=chat",
+            detail: "teamID=\(requestedTeamId.uuidString.lowercased()) eventID=\(eventId.uuidString.lowercased()) hostTeamID=\(team.id.uuidString.lowercased())"
+        )
+        guard requestedTeamId == team.id else {
+            TeamEventChatNavigationDebug.log(
+                "routeMismatch",
+                detail: "requested=\(requestedTeamId.uuidString.lowercased()) host=\(team.id.uuidString.lowercased())"
+            )
+            return false
+        }
+        guard summary.canAccessTeamChat else {
+            TeamEventChatNavigationDebug.log(
+                "navigationCancelled",
+                detail: "reason=noTeamAccountAccess teamID=\(team.id.uuidString.lowercased())"
+            )
+            return false
+        }
+        pendingSelectChatAfterEventDetailDismiss = true
+        pendingSelectChatEventId = eventId
+        return true
+    }
+
+    @MainActor
+    private func applyPendingTeamChatTabAfterEventDetailDismissIfNeeded() {
+        guard pendingSelectChatAfterEventDetailDismiss else { return }
+        let eventId = pendingSelectChatEventId
+        pendingSelectChatAfterEventDetailDismiss = false
+        pendingSelectChatEventId = nil
+
+        guard summary.canAccessTeamChat else {
+            TeamEventChatNavigationDebug.log(
+                "navigationCancelled",
+                detail: "reason=noTeamAccountAccessOnDismiss teamID=\(team.id.uuidString.lowercased())"
+            )
+            return
+        }
+
+        if reduceMotion {
+            selectedTab = .chat
+        } else {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                selectedTab = .chat
+            }
+        }
+        TeamEventChatNavigationDebug.log(
+            "teamTabApplied=chat",
+            detail: "teamID=\(team.id.uuidString.lowercased()) eventID=\(eventId?.uuidString.lowercased() ?? "nil")"
+        )
+    }
+
+    /// Action Center Review → Schedule tab + game detail + pending join requests for this Team event.
+    @MainActor
+    private func consumePendingTeamScheduleJoinApprovalIfNeeded() async {
+        guard let pending = mapViewModel.pendingTeamScheduleJoinApproval,
+              pending.teamId == team.id else { return }
+        selectedTab = .schedule
+        let gameId = pending.pickupGameId
+        mapViewModel.seedPickupDiscoverTeamIdentityIfNeeded(
+            gameId: gameId,
+            from: PickupGameTeamCreationContext(from: team)
+        )
+        pickupDetailNav = .teamEvent(gameId: gameId, teamSummary: team)
+        let game = await mapViewModel.loadPickupGameRowForDetailIfNeeded(id: gameId)
+            ?? mapViewModel.resolvedPickupGameRow(for: gameId)
+        if let game {
+            organizerJoinRequestsGame = game
+        } else {
+            // Detail may still load; keep requests presentation pending via token fallback.
+            mapViewModel.pendingOrganizerJoinRequestsGameToken =
+                PickupDetailNavigationToken.standalone(gameId)
+        }
+        mapViewModel.clearPendingTeamScheduleJoinApproval()
+    }
+
+    /// Schedule APNs → Schedule tab + game detail only (no organizer requests).
+    @MainActor
+    private func consumePendingTeamScheduleEventDeepLinkIfNeeded() async {
+        guard let pending = mapViewModel.pendingTeamScheduleEventDeepLink,
+              pending.teamId == team.id else { return }
+        selectedTab = .schedule
+        let gameId = pending.pickupGameId
+        mapViewModel.seedPickupDiscoverTeamIdentityIfNeeded(
+            gameId: gameId,
+            from: PickupGameTeamCreationContext(from: team)
+        )
+        pickupDetailNav = .teamEvent(gameId: gameId, teamSummary: team)
+        _ = await mapViewModel.loadPickupGameRowForDetailIfNeeded(id: gameId)
+        await mapViewModel.loadTeamScheduleAttendance(pickupGameId: gameId, force: true)
+        mapViewModel.clearPendingTeamScheduleEventDeepLink()
+#if DEBUG
+        print(
+            "[TeamScheduleNotification] deepLinkResolved teamScheduleEvent " +
+            "team_id=\(team.id.uuidString.lowercased()) event_id=\(gameId.uuidString.lowercased())"
+        )
+#endif
     }
 
     private func gameListRow(_ game: FanTeamGame) -> some View {
-        FanTeamGameRichCard(
+        let policy = FanTeamEventPresentation.policy(for: game.gameType)
+        let matchup = FanTeamScheduleMatchup.matchupLine(
+            homeTeamName: team.name,
+            opponentName: game.opponentName,
+            languageCode: languageCode
+        ) ?? {
+            guard policy.requiresOpponent, game.opponentTeamId != nil else { return nil }
+            let vs = L10n.t("fan_team_schedule_vs", languageCode: languageCode)
+            let opp = L10n.t("fan_teams_opponent_team", languageCode: languageCode)
+            return "\(team.name) \(vs) \(opp)"
+        }()
+        let usesMatchupPrimary = policy.requiresOpponent && matchup != nil
+        return FanTeamGameRichCard(
             game: game,
             teamName: team.name,
             teamSport: team.sport,
             teamColorHex: team.colorHex,
             languageCode: languageCode,
             mapViewModel: mapViewModel,
-            headline: opponentHeadline(for: game)
+            headline: matchup ?? game.displayTitle,
+            emphasizeTitle: usesMatchupPrimary,
+            rsvpSubject: game.gameType == .announcement
+                ? nil
+                : FanTeamRSVPSubject.currentViewer(
+                from: detail?.members ?? [],
+                currentUserId: mapViewModel.currentUserAuthId
+            ),
+            onOpenDetail: { openPickupGameDetail(game.id) }
         )
     }
 
@@ -2727,36 +5956,55 @@ struct FanTeamDetailSheet: View {
         .padding(.horizontal, 16)
     }
 
-    private func opponentHeadline(for game: FanTeamGame) -> String {
-        let home = team.name
-        if game.gameType == .practice {
-            return "\(home) · \(L10n.t("fan_team_game_type_practice", languageCode: languageCode))"
-        }
-        if let opp = game.opponentName?.trimmingCharacters(in: .whitespacesAndNewlines), !opp.isEmpty {
-            return "\(home) vs \(opp)"
-        }
-        if game.opponentTeamId != nil {
-            return "\(home) vs \(L10n.t("fan_teams_opponent_team", languageCode: languageCode))"
-        }
-        return home
-    }
-
-    private func reload() async {
+    private func reload(surfaceError: Bool = true) async {
         isLoading = true
         defer { isLoading = false }
         do {
-            let loaded = try await service.loadDetail(for: team)
+            var loaded = try await service.loadDetail(for: team)
+            let playerCount = FanTeamRosterPlayerPresentation.playerCount(from: loaded.members)
+            // Server-authoritative role + effective permissions + player-seat count.
+            if let me = mapViewModel.currentUserAuthId,
+               let selfSeat = loaded.members.first(where: { $0.userId == me }) {
+                let effective = selfSeat.effectivePermissions
+                loaded.summary = loaded.summary.applyingMyRole(
+                    selfSeat.role,
+                    memberCount: playerCount,
+                    myPermissions: effective
+                )
+            } else {
+                loaded.summary = loaded.summary.applyingMemberCount(playerCount)
+            }
             detail = loaded
+            let announcementCount = loaded.games.filter { $0.gameType == .announcement }.count
+            TeamDetailCrashTrace.detailLoadSuccess(
+                teamID: loaded.summary.id,
+                gameCount: loaded.games.count,
+                announcementCount: announcementCount
+            )
+            await refreshClearedAnnouncementIds()
             if loaded.summary.canManage {
                 pendingInvitations = (try? await service.listPendingInvitations(teamId: loaded.summary.id)) ?? []
             } else {
                 pendingInvitations = []
             }
             errorText = nil
+            hydratePlayerInfoSelectionFromStore(source: "reload.beforeSeats")
+            await refreshManagedPlayerSeats()
         } catch {
-            if let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
+            TeamDetailCrashTrace.detailLoadFailure(teamID: team.id, error: error)
+            FanTeamRPCTrace.log(
+                step: "C.reload.failed",
+                rpc: "loadDetail",
+                error: error,
+                extra: "surfaceError=\(surfaceError) team=\(team.id.uuidString.lowercased())"
+            )
+            if surfaceError, let message = FanTeamsLoadErrorPresentation.userFacingMessage(for: error) {
                 errorText = message
             }
+            reconcilePlayerInfoSelection(
+                catalogComplete: managedPlayerSeatsCatalogComplete,
+                source: "reload.error"
+            )
         }
     }
 
@@ -2818,15 +6066,17 @@ struct FanTeamDetailSheet: View {
     /// Shared Overview leadership + Roster profile open (self → own preview; others → public profile).
     @MainActor
     private func openTeamMemberProfile(_ member: FanTeamMember, context: String) {
+        // Managed players have no public profile to open.
+        guard let memberUserId = member.userId else { return }
         if FanTeamLeadership.usesOwnPublicProfilePreview(
-            memberUserId: member.userId,
+            memberUserId: memberUserId,
             currentUserId: mapViewModel.currentUserAuthId
         ) {
             mapViewModel.presentOwnPublicProfilePreview()
             return
         }
         mapViewModel.presentPublicProfile(
-            userId: member.userId,
+            userId: memberUserId,
             context: context
         )
     }
@@ -2848,6 +6098,49 @@ struct FanTeamDetailSheet: View {
         self.detail = detail
     }
 
+    private func applyManagedPlayerAvatarChange(_ change: FanManagedPlayerAvatarChange) {
+        managedPlayerSeats = managedPlayerSeats.map { seat in
+            guard seat.managedPlayerId == change.managedPlayerId else { return seat }
+            return seat.applyingAvatar(
+                avatarURL: change.avatarURL,
+                avatarThumbnailURL: change.avatarThumbnailURL
+            )
+        }
+        if var detail {
+            detail.members = detail.members.map {
+                $0.applyingManagedPlayerAvatar(
+                    managedPlayerId: change.managedPlayerId,
+                    avatarURL: change.avatarURL,
+                    avatarThumbnailURL: change.avatarThumbnailURL
+                )
+            }
+            detail.summary = detail.summary.applyingManagedPlayerAvatarChange(change)
+            self.detail = detail
+        }
+        if let pending = memberPendingPlayerInformation,
+           pending.managedPlayerId == change.managedPlayerId {
+            memberPendingPlayerInformation = pending.applyingManagedPlayerAvatar(
+                managedPlayerId: change.managedPlayerId,
+                avatarURL: change.avatarURL,
+                avatarThumbnailURL: change.avatarThumbnailURL
+            )
+        }
+        reconcilePlayerInfoSelection(
+            catalogComplete: managedPlayerSeatsCatalogComplete,
+            source: "managedPlayerAvatarChange"
+        )
+#if DEBUG
+        ManagedPlayerAvatarDebug.log(
+            "team_detail_local_replaced",
+            managedPlayerId: change.managedPlayerId,
+            newAvatarURL: change.avatarURL,
+            newThumbnailURL: change.avatarThumbnailURL,
+            localArrayReplaced: true,
+            refreshTriggered: false
+        )
+#endif
+    }
+
     @MainActor
     private func openPendingInviteeProfile(_ invitation: FanTeamPendingInvitation) {
         if invitation.inviteeUserId == mapViewModel.currentUserAuthId {
@@ -2862,13 +6155,14 @@ struct FanTeamDetailSheet: View {
 
     @MainActor
     private func messageRosterMember(_ member: FanTeamMember) async {
+        guard let memberUserId = member.userId else { return }
         guard FanTeamRosterMemberActions.canMessage(
             member: member,
             currentUserId: mapViewModel.currentUserAuthId
         ) else { return }
         guard !isMessagingMember else { return }
 
-        if chatViewModel.isEitherDirectionBlocked(with: member.userId) {
+        if chatViewModel.isEitherDirectionBlocked(with: memberUserId) {
             errorText = L10n.t("fan_teams_message_blocked", languageCode: languageCode)
             return
         }
@@ -2877,7 +6171,7 @@ struct FanTeamDetailSheet: View {
         defer { isMessagingMember = false }
         do {
             let conversationId = try await chatViewModel.startDirectConversationWithFriend(
-                friendUserId: member.userId
+                friendUserId: memberUserId
             )
             await chatViewModel.refreshInboxSummaries()
             await chatViewModel.ensureSignedInSocialRealtimeIfNeeded()
@@ -2902,7 +6196,13 @@ struct FanTeamDetailSheet: View {
         isRemovingMember = true
         defer { isRemovingMember = false }
         do {
-            try await service.removeMember(teamId: team.id, userId: member.userId)
+            if member.isManagedPlayer {
+                try await service.removeMembership(membershipId: member.membershipId)
+            } else if let memberUserId = member.userId {
+                try await service.removeMember(teamId: team.id, userId: memberUserId)
+            } else {
+                return
+            }
             onTeamsChanged()
             await reload()
         } catch {
@@ -3106,14 +6406,28 @@ enum FanTeamPendingInvitationCopy {
     }
 }
 
+/// Team Detail tab strip. Chat is included whenever the account can access the Team.
+enum FanTeamDetailTabComposition {
+    static func visibleTabs(canAccessTeamChat: Bool) -> [FanTeamDetailTab] {
+        FanTeamDetailTab.allCases.filter { tab in
+            if tab == .chat { return canAccessTeamChat }
+            return true
+        }
+    }
+
+    static func showsChatTab(for summary: FanTeamSummary) -> Bool {
+        summary.canAccessTeamChat
+    }
+}
+
 enum FanTeamDetailTab: String, CaseIterable, Identifiable {
-    case overview, chat, games, roster
+    case overview, chat, schedule, roster
     var id: String { rawValue }
     var titleKey: String {
         switch self {
         case .overview: return "fan_teams_tab_overview"
         case .chat: return "fan_teams_tab_chat"
-        case .games: return "fan_teams_tab_games"
+        case .schedule: return "fan_teams_tab_schedule"
         case .roster: return "fan_teams_tab_roster"
         }
     }
@@ -3122,14 +6436,14 @@ enum FanTeamDetailTab: String, CaseIterable, Identifiable {
         switch self {
         case .overview: return "info.circle.fill"
         case .chat: return "bubble.left.and.bubble.right"
-        case .games: return "sportscourt"
+        case .schedule: return "calendar"
         case .roster: return "person.2"
         }
     }
 }
 
 /// Compact owner/manager editor for Team-specific jersey numbers (0–99 / clear).
-private struct FanTeamPlayerNumberEditorSheet: View {
+struct FanTeamPlayerNumberEditorSheet: View {
     let memberName: String
     let initialNumber: Int?
     let teamAccent: Color
@@ -3182,9 +6496,12 @@ private struct FanTeamPlayerNumberEditorSheet: View {
                         Button(role: .destructive) {
                             onClear()
                         } label: {
-                            Text(L10n.t("fan_teams_remove_player_number", languageCode: languageCode))
+                            Text(L10n.t("fan_teams_remove_number", languageCode: languageCode))
                         }
                         .disabled(isSaving)
+                        .accessibilityLabel(
+                            L10n.t("fan_teams_remove_number", languageCode: languageCode)
+                        )
                     }
                 }
             }
@@ -3238,6 +6555,10 @@ private struct FanTeamPlayerNumberEditorSheet: View {
 
 // MARK: - Add members
 
+/// Invite accepted friends onto a Fan Team.
+/// Future: add a Friends/Groups segmented control and reuse
+/// ``FriendGroupsBrowseAndSelectView`` / ``FriendGroupSelectionStore``
+/// (see ``FriendGroupInviteIntegrationPoints``). Do not treat Friend Groups as Team membership.
 struct AddFanTeamMembersSheet: View {
     let teamId: UUID
     @ObservedObject var chatViewModel: ChatViewModel
@@ -3367,6 +6688,34 @@ enum FanTeamDateFormatting {
         return f
     }()
 
+    private static let monthOnly: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("MMM")
+        return f
+    }()
+
+    private static let dayOnly: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("d")
+        return f
+    }()
+
+    private static let weekdayOnly: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("EEE")
+        return f
+    }()
+
+    private static let timeOnly: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .autoupdatingCurrent
+        f.setLocalizedDateFormatFromTemplate("jmm")
+        return f
+    }()
+
     static func gameWhen(_ date: Date, languageCode: String) -> String {
         dayTime.locale = Locale(identifier: languageCode)
         return dayTime.string(from: date)
@@ -3375,6 +6724,26 @@ enum FanTeamDateFormatting {
     static func shortDay(_ date: Date, languageCode: String) -> String {
         short.locale = Locale(identifier: languageCode)
         return short.string(from: date)
+    }
+
+    static func scheduleMonth(_ date: Date, languageCode: String) -> String {
+        monthOnly.locale = Locale(identifier: languageCode)
+        return monthOnly.string(from: date).uppercased(with: Locale(identifier: languageCode))
+    }
+
+    static func scheduleDayNumber(_ date: Date, languageCode: String) -> String {
+        dayOnly.locale = Locale(identifier: languageCode)
+        return dayOnly.string(from: date)
+    }
+
+    static func scheduleWeekday(_ date: Date, languageCode: String) -> String {
+        weekdayOnly.locale = Locale(identifier: languageCode)
+        return weekdayOnly.string(from: date).uppercased(with: Locale(identifier: languageCode))
+    }
+
+    static func scheduleTime(_ date: Date, languageCode: String) -> String {
+        timeOnly.locale = Locale(identifier: languageCode)
+        return timeOnly.string(from: date)
     }
 }
 
@@ -3385,7 +6754,7 @@ private extension String {
     }
 }
 
-/// Richer Team Games card — still one pickup_games row + existing roster social proof.
+/// Team Schedule Option C card — date rail left, event details + RSVP right.
 private struct FanTeamGameRichCard: View {
     let game: FanTeamGame
     let teamName: String
@@ -3396,17 +6765,33 @@ private struct FanTeamGameRichCard: View {
     let headline: String
     var emphasizeTitle: Bool = false
     var showsCardChrome: Bool = true
+    /// When non-nil and eligible, show Schedule quick RSVP for this subject.
+    var rsvpSubject: FanTeamRSVPSubject? = nil
+    var onOpenDetail: (() -> Void)? = nil
 
     @Environment(\.colorScheme) private var colorScheme
+    @ScaledMetric(relativeTo: .body) private var dateBadgeWidth: CGFloat = 56
+    @ScaledMetric(relativeTo: .body) private var dateTypeIconSize: CGFloat = 26
 
     private var sportToken: String {
         let s = game.sport.trimmingCharacters(in: .whitespacesAndNewlines)
         return s.isEmpty ? teamSport : s
     }
 
+    /// Team accent for RSVP / directions chrome.
     private var accent: Color {
         if let teamColorHex, let c = Color(fanTeamHex: teamColorHex) { return c }
         return SportFilterCatalog.resolve(sportToken).accent
+    }
+
+    /// Event-type accent for labels, sport ring, and date-badge icon circle.
+    private var dateBlockColor: Color {
+        game.gameType.scheduleDateBlockColor
+    }
+
+    private var dateBlockGradient: LinearGradient {
+        let stops = game.gameType.scheduleDateBlockGradientColors
+        return LinearGradient(colors: [stops.top, stops.bottom], startPoint: .top, endPoint: .bottom)
     }
 
     private var roster: PickupGameRosterPayload? {
@@ -3424,73 +6809,107 @@ private struct FanTeamGameRichCard: View {
         )
     }
 
+    private var showsQuickRSVP: Bool {
+        guard rsvpSubject != nil else { return false }
+        guard FanTeamScheduleQuickRSVPEligibility.showsQuickRSVPControls(game: game) else {
+            return false
+        }
+        return true
+    }
+
+    private var isExcludedFromEvent: Bool {
+        guard let rsvpSubject else { return false }
+        return FanTeamScheduleQuickRSVPEligibility.isExcludedFromEvent(
+            subjectUserId: rsvpSubject.userId,
+            gameId: game.id,
+            roster: roster
+        )
+    }
+
+    private var isPrivateEvent: Bool {
+        mapViewModel.resolvedPickupGameRow(for: game.id)?.is_visible == false
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
-                SportArtworkIconView(sport: sportToken, diameter: 42)
-                    .overlay {
-                        Circle()
-                            .strokeBorder(accent.opacity(0.55), lineWidth: 1.5)
+        HStack(alignment: .top, spacing: 0) {
+            dateBlock
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 8) {
+                    Button {
+                        onOpenDetail?()
+                    } label: {
+                        eventDetails
                     }
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Image(systemName: game.gameType.filterSystemImage)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(accent)
-                        Text(L10n.t(game.gameType.localizedKey, languageCode: languageCode))
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(accent)
-                        if mapViewModel.resolvedPickupGameRow(for: game.id)?.is_visible == false {
-                            Image(systemName: "lock.fill")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(FGColor.secondaryText(colorScheme))
-                                .accessibilityLabel(
-                                    L10n.t("pickup_form_visibility_private", languageCode: languageCode)
-                                )
+                    .buttonStyle(.plain)
+                    .disabled(onOpenDetail == nil)
+
+                    VStack(spacing: 8) {
+                        SportArtworkIconView(sport: sportToken, diameter: 44)
+                            .overlay {
+                                Circle()
+                                    .strokeBorder(dateBlockColor.opacity(0.45), lineWidth: 1.5)
+                            }
+                            .accessibilityHidden(true)
+                        if game.hasUsableDirectionsCoordinate {
+                            FanTeamScheduleDirectionsButton(
+                                game: game,
+                                languageCode: languageCode,
+                                accent: accent
+                            )
                         }
                     }
-                    Text(emphasizeTitle ? headline : game.displayTitle)
-                        .font(emphasizeTitle ? .title3.weight(.bold) : .subheadline.weight(.semibold))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .lineLimit(2)
-                    if !emphasizeTitle, headline != game.displayTitle {
-                        Text(headline)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .lineLimit(1)
-                    }
-                    if let level = game.competitionLevel
-                        ?? mapViewModel.resolvedPickupGameRow(for: game.id)?.competitionLevel {
-                        Text(level.displayTitle(languageCode: languageCode))
+                    .padding(.trailing, 10)
+                    .padding(.top, 10)
+                }
+
+                if let roster, !roster.stackMembers.isEmpty {
+                    HStack(spacing: 8) {
+                        PickupPlayingAvatarStack(members: roster.stackMembers, diameter: 20)
+                        Text(socialProofLine)
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(FGColor.secondaryText(colorScheme))
                             .lineLimit(1)
+                        Spacer(minLength: 0)
                     }
-                    Text(FanTeamDateFormatting.gameWhen(game.startsAt, languageCode: languageCode))
-                        .font(.caption)
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    if !game.locationLine.isEmpty {
-                        Text(game.locationLine)
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(FGColor.secondaryText(colorScheme))
-                            .lineLimit(2)
-                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
                 }
-                Spacer(minLength: 0)
-            }
 
-            if let roster, !roster.stackMembers.isEmpty {
-                HStack(spacing: 10) {
-                    PickupPlayingAvatarStack(members: roster.stackMembers, diameter: 22)
-                    Text(socialProofLine)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
+                if showsQuickRSVP, let rsvpSubject {
+                    Divider()
+                        .opacity(colorScheme == .dark ? 0.35 : 0.55)
+                        .padding(.horizontal, 12)
+                    FanTeamScheduleQuickRSVPView(
+                        gameId: game.id,
+                        subject: rsvpSubject,
+                        accent: accent,
+                        languageCode: languageCode,
+                        isExcluded: isExcludedFromEvent,
+                        mapViewModel: mapViewModel
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .id(game.id)
+                } else if FanTeamScheduleQuickRSVPEligibility.isCancelled(game) {
+                    Divider()
+                        .opacity(colorScheme == .dark ? 0.35 : 0.55)
+                        .padding(.horizontal, 12)
+                    HStack(spacing: 6) {
+                        Image(systemName: "xmark.octagon.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.dangerRed)
+                            .accessibilityHidden(true)
+                        Text(L10n.t("fan_team_schedule_event_cancelled", languageCode: languageCode))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.dangerRed)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(showsCardChrome ? 14 : 0)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
             if showsCardChrome {
@@ -3498,15 +6917,223 @@ private struct FanTeamGameRichCard: View {
                     .fill(FGColor.cardBackground(colorScheme))
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay {
             if showsCardChrome {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .strokeBorder(accent.opacity(0.28), lineWidth: 1)
+                    .strokeBorder(dateBlockColor.opacity(0.28), lineWidth: 1)
             }
         }
+        .shadow(
+            color: Color.black.opacity(colorScheme == .dark ? 0.28 : 0.06),
+            radius: showsCardChrome ? 8 : 0,
+            x: 0,
+            y: showsCardChrome ? 3 : 0
+        )
         .task(id: game.id) {
-            await mapViewModel.loadPickupGameRoster(pickupGameId: game.id)
+            guard game.gameType != .announcement else { return }
+            // Prefer batched Schedule prefetch; fall back only for cache misses.
+            await mapViewModel.loadTeamScheduleAttendanceIfMissing(pickupGameId: game.id)
         }
+    }
+
+    /// Premium floating date badge (mockup): weekday / day / month + overlapping type icon.
+    private var dateBlock: some View {
+        VStack(spacing: -(dateTypeIconSize * 0.42)) {
+            dateBadgeFace
+            dateTypeIconBadge
+        }
+        .padding(.leading, 10)
+        .padding(.trailing, 4)
+        .padding(.vertical, 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            FanTeamDateFormatting.gameWhen(game.startsAt, languageCode: languageCode)
+        )
+    }
+
+    private var dateBadgeFace: some View {
+        VStack(spacing: 3) {
+            Text(FanTeamDateFormatting.scheduleWeekday(game.startsAt, languageCode: languageCode))
+                .font(.system(.caption2, design: .rounded).weight(.semibold))
+                .tracking(0.5)
+                .minimumScaleFactor(0.75)
+                .lineLimit(1)
+            Text(FanTeamDateFormatting.scheduleDayNumber(game.startsAt, languageCode: languageCode))
+                .font(.system(.title2, design: .rounded).weight(.bold))
+                .monospacedDigit()
+                .minimumScaleFactor(0.7)
+                .lineLimit(1)
+            Text(FanTeamDateFormatting.scheduleMonth(game.startsAt, languageCode: languageCode))
+                .font(.system(.caption2, design: .rounded).weight(.semibold))
+                .tracking(0.5)
+                .minimumScaleFactor(0.75)
+                .lineLimit(1)
+        }
+        .foregroundStyle(Color.white)
+        .multilineTextAlignment(.center)
+        .frame(width: dateBadgeWidth)
+        .padding(.top, 11)
+        .padding(.bottom, 13)
+        .background {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(dateBlockGradient)
+                .overlay {
+                    // Soft top highlight for a premium Apple-style finish.
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(colorScheme == .dark ? 0.22 : 0.30),
+                                    Color.white.opacity(0.0)
+                                ],
+                                startPoint: .top,
+                                endPoint: UnitPoint(x: 0.5, y: 0.55)
+                            )
+                        )
+                        .allowsHitTesting(false)
+                }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.38),
+                                    Color.white.opacity(0.06)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 0.75
+                        )
+                        .allowsHitTesting(false)
+                }
+                .shadow(
+                    color: Color.black.opacity(colorScheme == .dark ? 0.32 : 0.12),
+                    radius: 5,
+                    x: 0,
+                    y: 3
+                )
+        }
+    }
+
+    private var dateTypeIconBadge: some View {
+        ZStack {
+            Circle()
+                .fill(dateBlockColor)
+                .shadow(
+                    color: Color.black.opacity(colorScheme == .dark ? 0.35 : 0.16),
+                    radius: 2.5,
+                    x: 0,
+                    y: 1.5
+                )
+            Circle()
+                .strokeBorder(Color.white, lineWidth: 2)
+            Image(systemName: game.gameType.filterSystemImage)
+                .font(.system(size: max(9, dateTypeIconSize * 0.40), weight: .bold))
+                .foregroundStyle(Color.white)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(width: dateTypeIconSize, height: dateTypeIconSize)
+        .accessibilityHidden(true)
+    }
+
+    private var eventDetails: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: game.gameType.filterSystemImage)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(dateBlockColor)
+                    .accessibilityHidden(true)
+                Text(L10n.t(game.gameType.localizedKey, languageCode: languageCode).uppercased(with: Locale(identifier: languageCode)))
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(dateBlockColor)
+                    .lineLimit(1)
+                if game.isScoringLive {
+                    Text(L10n.t("fan_team_score_live", languageCode: languageCode))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Color.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(FGColor.dangerRed))
+                } else if game.isScoringFinal {
+                    Text(L10n.t("fan_team_score_final", languageCode: languageCode))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(dateBlockColor)
+                }
+                if isPrivateEvent {
+                    Image(systemName: "lock.fill")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        .accessibilityLabel(
+                            L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+                        )
+                }
+                Spacer(minLength: 0)
+            }
+
+            Text(emphasizeTitle ? headline : game.displayTitle)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+
+            if !emphasizeTitle, headline != game.displayTitle {
+                Text(headline)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+            }
+
+            if game.isScoringFinal || game.isScoringLive, game.isScoreCapable,
+               FanTeamEventScoring.hasOpponent(opponentName: game.opponentName, opponentTeamId: game.opponentTeamId) {
+                FanTeamEventResultScoreLine(
+                    teamName: teamName,
+                    opponentName: game.opponentName ?? "",
+                    teamScore: game.teamScoreValue,
+                    opponentScore: game.opponentScoreValue,
+                    languageCode: languageCode,
+                    showsFinalBadge: game.isScoringFinal
+                )
+            }
+
+            if FanTeamEventPresentation.policy(for: game.gameType).showsCompetitionLevel,
+               let level = game.competitionLevel
+                ?? mapViewModel.resolvedPickupGameRow(for: game.id)?.competitionLevel {
+                Text(level.displayTitle(languageCode: languageCode))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .lineLimit(1)
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: "clock")
+                    .font(.caption2.weight(.semibold))
+                    .accessibilityHidden(true)
+                Text(FanTeamDateFormatting.scheduleTime(game.startsAt, languageCode: languageCode))
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(FGColor.secondaryText(colorScheme))
+
+            if !game.locationLine.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "mappin.and.ellipse")
+                        .font(.caption2.weight(.semibold))
+                        .accessibilityHidden(true)
+                    Text(game.locationLine)
+                        .font(.caption2.weight(.medium))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                }
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            }
+        }
+        .padding(.leading, 12)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
+        .contentShape(Rectangle())
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var socialProofLine: String {
@@ -3517,7 +7144,6 @@ private struct FanTeamGameRichCard: View {
         if pendingCount > 0 {
             parts.append("\(pendingCount) \(L10n.t("Maybe", languageCode: languageCode))")
         }
-        // Do not treat full roster as Playing — only RSVP-backed Going / Maybe.
         if parts.isEmpty {
             return L10n.t("pickup_detail_team_awaiting_response", languageCode: languageCode)
         }
@@ -3525,13 +7151,14 @@ private struct FanTeamGameRichCard: View {
     }
 }
 
+
 private extension Color {
     var fanTeamHexString: String {
         #if canImport(UIKit)
         let ui = UIColor(self)
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         ui.getRed(&r, green: &g, blue: &b, alpha: &a)
-        return String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+        return String(format: "#%02X%02X%02X", UInt(r * 255), UInt(g * 255), UInt(b * 255))
         #else
         return "#22C25A"
         #endif

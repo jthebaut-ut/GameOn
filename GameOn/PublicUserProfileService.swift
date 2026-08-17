@@ -125,6 +125,12 @@ struct PublicUserProfileData {
     let sharedTeamNames: [String]
     /// Privacy-gated `last_seen_at` for Last active UI (nil when hidden / unavailable).
     let lastSeenAtRaw: String?
+    /// FanGeo Fan Team memberships visible to this viewer (not Favorite Teams).
+    let fanTeamMemberships: [ProfileFanTeamMembership]
+    /// Owner's global My Teams visibility (for self-preview caption). Defaults to product default.
+    let myTeamsProfileVisibility: FanTeamProfileVisibility
+    /// Privacy-gated public gender. Nil when unset or prefer-not-to-say.
+    let genderRaw: String?
 
     var publicHandleDisplayLine: String {
         FanGeoHandleRules.handleDisplayLine(
@@ -169,12 +175,60 @@ struct PublicUserProfileData {
             socialHighlightLabels: socialHighlightLabels,
             personalityTags: personalityTags,
             sharedTeamNames: sharedTeamNames,
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: fanTeamMemberships,
+            myTeamsProfileVisibility: myTeamsProfileVisibility,
+            genderRaw: genderRaw
+        )
+    }
+
+    func replacingFanTeamMemberships(
+        _ memberships: [ProfileFanTeamMembership],
+        visibility: FanTeamProfileVisibility
+    ) -> PublicUserProfileData {
+        PublicUserProfileData(
+            userId: userId,
+            displayName: displayName,
+            publicHandleLine: publicHandleLine,
+            profileCreatedAt: profileCreatedAt,
+            bio: bio,
+            avatarURL: avatarURL,
+            avatarThumbnailURL: avatarThumbnailURL,
+            totalXP: totalXP,
+            reputation: reputation,
+            organizerStats: organizerStats,
+            favoriteTeams: favoriteTeams,
+            primaryFavoriteTeamID: primaryFavoriteTeamID,
+            nationalTeam: nationalTeam,
+            profileBackgroundKey: profileBackgroundKey,
+            isBusinessAccount: isBusinessAccount,
+            hasResolvedIdentity: hasResolvedIdentity,
+            isPubliclyVisible: isPubliclyVisible,
+            isDiscoverableByFans: isDiscoverableByFans,
+            memberSinceLabel: memberSinceLabel,
+            openToItems: openToItems,
+            mutualFansCount: mutualFansCount,
+            mutualFanAvatars: mutualFanAvatars,
+            sharedTeamsCount: sharedTeamsCount,
+            venueCount: venueCount,
+            venueCards: venueCards,
+            homeCrowd: homeCrowd,
+            homeCityDisplayLine: homeCityDisplayLine,
+            pickupHostedCount: pickupHostedCount,
+            pickupJoinedCount: pickupJoinedCount,
+            lastPickupGameCreatedAt: lastPickupGameCreatedAt,
+            socialHighlightLabels: socialHighlightLabels,
+            personalityTags: personalityTags,
+            sharedTeamNames: sharedTeamNames,
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: memberships,
+            myTeamsProfileVisibility: visibility,
+            genderRaw: genderRaw
         )
     }
 
     /// Self-preview only: fill gaps from already-loaded owner state without changing public visibility rules.
-    /// Prefer the owner's live My Team selection so national-fan sport subtitles stay consistent.
+    /// Prefer the owner's live Favorite Team selection so national-fan sport subtitles stay consistent.
     func seededForSelfPreview(
         homeCrowd ownerHomeCrowd: HomeCrowdVenueSummary?,
         openToPreferences ownerPreferences: FanIdentityPreferences,
@@ -242,7 +296,10 @@ struct PublicUserProfileData {
             socialHighlightLabels: socialHighlightLabels,
             personalityTags: personalityTags,
             sharedTeamNames: sharedTeamNames,
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: fanTeamMemberships,
+            myTeamsProfileVisibility: myTeamsProfileVisibility,
+            genderRaw: genderRaw
         )
     }
 }
@@ -270,7 +327,7 @@ struct PublicProfileMutualFanAvatar: Equatable, Identifiable {
 
 enum PublicUserProfileService {
     private static let profileSelect =
-        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,created_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,home_city,home_region,home_country,show_home_city,profile_background_key"
+        "id,email,display_name,username,bio,avatar_url,avatar_thumbnail_url,is_deleted,admin_status,live_visibility_enabled,live_visibility_mode,selected_live_visibility_friend_ids,discoverable_by_fans,created_at,national_team_country_code,national_team_country_name,national_team_flag,national_team_supporter_label,national_team_updated_at,home_city,home_region,home_country,show_home_city,profile_background_key,gender"
 
     /// Always returns a displayable profile; optional sections use safe fallbacks.
     /// - Parameter isSelfPreview: When `true` and `userId` matches the authenticated session user,
@@ -411,6 +468,7 @@ enum PublicUserProfileService {
         // matches what other fans see via those RPCs.
         let homeCrowd = await fetchSelfHomeCrowdForPublicProjection(userId: userId)
         let lastSeenAtRaw = row?.last_seen_at
+        let myTeams = await FanTeamsService().listProfileFanTeamMemberships(targetUserId: userId)
 
         let built = buildProfileData(
             userId: userId,
@@ -444,7 +502,9 @@ enum PublicUserProfileService {
             pickupJoinedCount: 0,
             lastPickupGameCreatedAt: organizerSummary.lastPickupGameCreatedAt,
             sharedTeamNames: [],
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: myTeams.memberships,
+            myTeamsProfileVisibility: myTeams.visibility
         )
 
 #if DEBUG
@@ -569,6 +629,8 @@ enum PublicUserProfileService {
         let last_pickup_game_created_at: String?
         /// Present after 20260885; curated background catalog key.
         let profile_background_key: String?
+        /// Optional; nil on backends that do not yet return gender on the identity RPC.
+        let gender: String?
 
         struct MutualFanRow: Decodable {
             let user_id: UUID?
@@ -620,6 +682,7 @@ enum PublicUserProfileService {
             pickup_organizer_rating_count = try? c.decode(Int.self, forKey: .pickup_organizer_rating_count)
             last_pickup_game_created_at = try? c.decode(String.self, forKey: .last_pickup_game_created_at)
             profile_background_key = try? c.decode(String.self, forKey: .profile_background_key)
+            gender = try? c.decode(String.self, forKey: .gender)
             if c.contains(.home_crowd_venue) {
                 if (try? c.decodeNil(forKey: .home_crowd_venue)) == true {
                     home_crowd_venue = nil
@@ -690,6 +753,7 @@ enum PublicUserProfileService {
             case pickup_organizer_rating_count
             case last_pickup_game_created_at
             case profile_background_key
+            case gender
         }
     }
 
@@ -917,7 +981,8 @@ enum PublicUserProfileService {
             home_region: rpc.show_home_city == true ? rpc.home_region : nil,
             home_country: rpc.show_home_city == true ? rpc.home_country : nil,
             show_home_city: rpc.show_home_city,
-            profile_background_key: rpc.profile_background_key
+            profile_background_key: rpc.profile_background_key,
+            gender: rpc.gender ?? cachedProfile?.gender
         )
 
         let organizerStats: PickupCreatorPublicRatingStats
@@ -978,6 +1043,8 @@ enum PublicUserProfileService {
         if homeCrowd == nil {
             homeCrowd = await fetchSupplementalPublicHomeCrowd(userId: userId)
         }
+
+        let myTeams = await FanTeamsService().listProfileFanTeamMemberships(targetUserId: userId)
 
         let built = buildProfileData(
             userId: userId,
@@ -1045,7 +1112,9 @@ enum PublicUserProfileService {
             pickupJoinedCount: pickupJoined,
             lastPickupGameCreatedAt: lastPickupCreated,
             sharedTeamNames: sharedTeamNames,
-            lastSeenAtRaw: await fetchVisibleActivityLastSeen(userId: userId)
+            lastSeenAtRaw: await fetchVisibleActivityLastSeen(userId: userId),
+            fanTeamMemberships: myTeams.memberships,
+            myTeamsProfileVisibility: myTeams.visibility
         )
 
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
@@ -1102,7 +1171,10 @@ enum PublicUserProfileService {
             socialHighlightLabels: [],
             personalityTags: [],
             sharedTeamNames: [],
-            lastSeenAtRaw: nil
+            lastSeenAtRaw: nil,
+            fanTeamMemberships: [],
+            myTeamsProfileVisibility: .productDefault,
+            genderRaw: nil
         )
     }
 
@@ -1187,6 +1259,7 @@ enum PublicUserProfileService {
 
         let legacyHomeCrowd = await fetchPublicHomeCrowdForLegacyProfile(userId: userId)
         let lastSeenAtRaw = await fetchVisibleActivityLastSeen(userId: userId)
+        let myTeams = await FanTeamsService().listProfileFanTeamMemberships(targetUserId: userId)
 
         let built = buildProfileData(
             userId: userId,
@@ -1219,7 +1292,9 @@ enum PublicUserProfileService {
             pickupHostedCount: pickupHosted,
             pickupJoinedCount: pickupJoined,
             sharedTeamNames: [],
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: myTeams.memberships,
+            myTeamsProfileVisibility: myTeams.visibility
         )
 
         logRenderedHomeCrowd(built.homeCrowd?.venueId)
@@ -1396,7 +1471,9 @@ enum PublicUserProfileService {
         pickupJoinedCount: Int,
         lastPickupGameCreatedAt: Date? = nil,
         sharedTeamNames: [String],
-        lastSeenAtRaw: String? = nil
+        lastSeenAtRaw: String? = nil,
+        fanTeamMemberships: [ProfileFanTeamMembership] = [],
+        myTeamsProfileVisibility: FanTeamProfileVisibility = .productDefault
     ) -> PublicUserProfileData {
         let emailNorm = OwnerBusinessEmail.normalized(row?.email ?? "")
         let display = (row?.display_name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1491,7 +1568,10 @@ enum PublicUserProfileService {
             ),
             personalityTags: [],
             sharedTeamNames: sharedTeamNames,
-            lastSeenAtRaw: lastSeenAtRaw
+            lastSeenAtRaw: lastSeenAtRaw,
+            fanTeamMemberships: fanTeamMemberships,
+            myTeamsProfileVisibility: myTeamsProfileVisibility,
+            genderRaw: FanProfileGender.rosterDisplayValue(from: row?.gender)?.rawValue
         )
     }
 

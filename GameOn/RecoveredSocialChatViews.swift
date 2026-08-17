@@ -263,6 +263,25 @@ struct FriendsTabView: View {
     @State private var conversationOpenGate = ChatConversationOpenGate()
     @State private var openSupportChat = false
     @State private var unfriendConfirmationItem: ChatViewModel.FriendDisplay?
+    /// Friends directory: All Friends vs private Friend Groups.
+    @State private var friendDirectoryMode: FriendDirectoryMode = .allFriends
+    @StateObject private var friendGroupsStore = FriendGroupsStore()
+    @State private var friendGroupDetailRoute: FriendGroup?
+    @State private var friendGroupDetailMembers: [FriendGroupSelectableFriend] = []
+    @State private var friendGroupDetailBusy = false
+    @State private var showingCreateFriendGroupSheet = false
+    @State private var showingRenameFriendGroupSheet = false
+    @State private var showingAddFriendsToGroupSheet = false
+    /// Rename target from detail or list overflow (not always the open detail route).
+    @State private var friendGroupPendingRename: FriendGroup?
+    /// Member faces for group list cards, resolved from already-loaded friends (no N+1).
+    @State private var friendGroupMemberPreviewCache: [UUID: [UserPreview]] = [:]
+    @State private var friendGroupPendingDelete: FriendGroup?
+    @State private var addToGroupsFriendItem: ChatViewModel.FriendDisplay?
+    @State private var addToGroupsSelectedIds: Set<UUID> = []
+    @State private var showingCreateFriendGroupFromAddSheet = false
+    @State private var friendGroupActionError: String?
+    @StateObject private var addFriendsToGroupSelection = FriendGroupSelectionStore()
     /// Presentation-only inbox type filter (does not fetch or alter chat architecture).
     @State private var chatInboxTypeFilter: ChatInboxTypeFilter = .all
     @StateObject private var globalSearch = ChatGlobalSearchController()
@@ -292,7 +311,6 @@ struct FriendsTabView: View {
         case chats
         case friends
         case requests
-        case myTeams
         var id: String { rawValue }
 
         var titleKey: String {
@@ -300,7 +318,6 @@ struct FriendsTabView: View {
             case .chats: return "chat_section_chats"
             case .friends: return "chat_section_friends"
             case .requests: return "chat_section_requests"
-            case .myTeams: return "chat_section_my_teams"
             }
         }
     }
@@ -472,11 +489,147 @@ struct FriendsTabView: View {
                     unfriendConfirmationItem = nil
                     Task {
                         await viewModel.unfriend(item)
+                        await friendGroupsStore.refresh()
+                        if let detailId = friendGroupDetailRoute?.id {
+                            await reloadFriendGroupDetail(groupId: detailId)
+                        }
                     }
                 }
             } message: {
                 Text("They will be removed from your friends list. You can send a new request later.")
             }
+            .alert(
+                friendGroupDeleteConfirmationTitle,
+                isPresented: friendGroupDeleteAlertBinding
+            ) {
+                Button(L10n.t("Cancel", languageCode: appLanguageRaw), role: .cancel) {
+                    friendGroupPendingDelete = nil
+                }
+                Button(L10n.t("friend_groups_delete", languageCode: appLanguageRaw), role: .destructive) {
+                    guard let group = friendGroupPendingDelete else { return }
+                    friendGroupPendingDelete = nil
+                    Task { await deleteFriendGroup(group) }
+                }
+            } message: {
+                Text(L10n.t("friend_groups_delete_message", languageCode: appLanguageRaw))
+            }
+            .alert(
+                L10n.t("friend_groups_error_title", languageCode: appLanguageRaw),
+                isPresented: friendGroupActionErrorBinding
+            ) {
+                Button(L10n.t("OK", languageCode: appLanguageRaw), role: .cancel) {
+                    friendGroupActionError = nil
+                }
+            } message: {
+                Text(friendGroupActionError ?? "")
+            }
+            .sheet(isPresented: $showingCreateFriendGroupSheet) {
+                FriendGroupNameEditorSheet(
+                    mode: .create,
+                    languageCode: appLanguageRaw,
+                    onSubmit: { name in
+                        let created = try await friendGroupsStore.create(name: name)
+                        friendDirectoryMode = .groups
+                        await openFriendGroupDetail(created)
+                    }
+                )
+            }
+            .sheet(isPresented: $showingCreateFriendGroupFromAddSheet) {
+                FriendGroupNameEditorSheet(
+                    mode: .create,
+                    languageCode: appLanguageRaw,
+                    onSubmit: { name in
+                        _ = try await friendGroupsStore.create(name: name)
+                    }
+                )
+            }
+            .sheet(isPresented: $showingRenameFriendGroupSheet, onDismiss: {
+                friendGroupPendingRename = nil
+            }) {
+                if let group = friendGroupPendingRename ?? friendGroupDetailRoute {
+                    FriendGroupNameEditorSheet(
+                        mode: .rename(group),
+                        languageCode: appLanguageRaw,
+                        onSubmit: { name in
+                            let updated = try await friendGroupsStore.rename(groupId: group.id, name: name)
+                            if friendGroupDetailRoute?.id == updated.id {
+                                friendGroupDetailRoute = updated
+                            }
+                            friendGroupPendingRename = nil
+                        }
+                    )
+                }
+            }
+            .sheet(isPresented: $showingAddFriendsToGroupSheet) {
+                if let group = friendGroupDetailRoute {
+                    let candidates = FriendGroupMemberResolver.acceptedSelectableFriends(
+                        from: viewModel.friends,
+                        chipKind: { viewModel.chipKind(forOtherUserId: $0) },
+                        isBlocked: { viewModel.isEitherDirectionBlocked(with: $0) }
+                    )
+                    FriendGroupFriendPicker(
+                        title: L10n.t("friend_groups_add_friends", languageCode: appLanguageRaw),
+                        candidates: candidates,
+                        selection: addFriendsToGroupSelection,
+                        languageCode: appLanguageRaw,
+                        confirmTitleFormatKey: "friend_groups_add_count_format",
+                        isSubmitting: friendGroupDetailBusy,
+                        errorText: nil,
+                        onConfirm: {
+                            Task {
+                                await saveFriendGroupMembers(
+                                    groupId: group.id,
+                                    selectedIds: addFriendsToGroupSelection.selectedIds
+                                )
+                            }
+                        },
+                        onCancel: { showingAddFriendsToGroupSheet = false }
+                    )
+                }
+            }
+            .sheet(item: $addToGroupsFriendItem) { item in
+                FriendAddToGroupsSheet(
+                    friend: FriendGroupSelectableFriend(friend: item),
+                    groups: friendGroupsStore.groups,
+                    initiallySelectedGroupIds: addToGroupsSelectedIds,
+                    languageCode: appLanguageRaw,
+                    onSave: { selected in
+                        try await friendGroupsStore.setMembership(
+                            friendUserId: item.preview.id,
+                            groupIds: Array(selected)
+                        )
+                    },
+                    onCreateGroup: {
+                        showingCreateFriendGroupFromAddSheet = true
+                    }
+                )
+            }
+    }
+
+    private var friendGroupDeleteConfirmationTitle: String {
+        guard let name = friendGroupPendingDelete?.name.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            return L10n.t("friend_groups_delete", languageCode: appLanguageRaw)
+        }
+        return String(
+            format: L10n.t("friend_groups_delete_title_format", languageCode: appLanguageRaw),
+            locale: Locale(identifier: appLanguageRaw),
+            name
+        )
+    }
+
+    private var friendGroupDeleteAlertBinding: Binding<Bool> {
+        Binding(
+            get: { friendGroupPendingDelete != nil },
+            set: { if !$0 { friendGroupPendingDelete = nil } }
+        )
+    }
+
+    private var friendGroupActionErrorBinding: Binding<Bool> {
+        Binding(
+            get: { friendGroupActionError != nil },
+            set: { if !$0 { friendGroupActionError = nil } }
+        )
     }
 
     private var unfriendConfirmationTitle: String {
@@ -533,6 +686,33 @@ struct FriendsTabView: View {
                 .navigationDestination(isPresented: $showingRecentlyDeleted) {
                     ChatRecentlyDeletedView(chatViewModel: viewModel)
                         .environmentObject(mapViewModel)
+                }
+                .navigationDestination(item: $friendGroupDetailRoute) { group in
+                    FriendGroupDetailView(
+                        group: group,
+                        members: friendGroupDetailMembers,
+                        languageCode: appLanguageRaw,
+                        isBusy: friendGroupDetailBusy,
+                        onRefresh: { await reloadFriendGroupDetail(groupId: group.id) },
+                        onAddFriends: {
+                            addFriendsToGroupSelection.replaceSelection(Set(friendGroupDetailMembers.map(\.id)))
+                            showingAddFriendsToGroupSheet = true
+                        },
+                        onRename: {
+                            friendGroupPendingRename = group
+                            showingRenameFriendGroupSheet = true
+                        },
+                        onDelete: { friendGroupPendingDelete = group },
+                        onRemoveMember: { member in
+                            Task { await removeFriendFromCurrentGroup(member) }
+                        },
+                        onOpenProfile: { member in
+                            mapViewModel.presentPublicProfile(
+                                userId: member.id,
+                                context: "friend_group_detail"
+                            )
+                        }
+                    )
                 }
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar(.hidden, for: .navigationBar)
@@ -873,7 +1053,21 @@ struct FriendsTabView: View {
     @ViewBuilder
     private var chatRootContent: some View {
         if shouldShowChatSignInRequired {
-            chatSignInRequiredView
+            VStack(spacing: 0) {
+                chatSignedOutHeader
+                SignedOutFeatureView(
+                    icon: "bubble.left.and.bubble.right.fill",
+                    title: L10n.t("chat_signed_out_title", languageCode: appLanguageRaw),
+                    description: L10n.t("chat_signed_out_body", languageCode: appLanguageRaw),
+                    accent: FGColor.accentBlue,
+                    onSignIn: {
+                        mapViewModel.discoverPresentFanUserAuthSheet(openRegisterMode: false)
+                    },
+                    onCreateAccount: {
+                        mapViewModel.discoverPresentFanUserAuthSheet(openRegisterMode: true)
+                    }
+                )
+            }
         } else if viewModel.isLoading && viewModel.friends.isEmpty && viewModel.incomingRequests.isEmpty {
             ProgressView("Loading…")
         } else {
@@ -889,12 +1083,18 @@ struct FriendsTabView: View {
         }
     }
 
-    private var chatSignInRequiredView: some View {
-        ContentUnavailableView(
-            "Sign in to chat",
-            systemImage: "person.crop.circle.badge.questionmark",
-            description: Text("Use your account tab to sign in, then open Chat again.")
-        )
+    private var chatSignedOutHeader: some View {
+        HStack(alignment: .center, spacing: 10) {
+            FanGeoPagePurposeHeader(
+                title: L10n.t("Chat", languageCode: appLanguageRaw),
+                subtitle: ""
+            )
+            .layoutPriority(1)
+            Spacer(minLength: 0)
+            FanGeoActionCenterHeaderButton()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
     }
 
     private func logChatAuthGate(reason: String) {
@@ -911,13 +1111,14 @@ struct FriendsTabView: View {
     }
 
     private var chatHeader: some View {
-        HStack(alignment: .center, spacing: 12) {
+        HStack(alignment: .center, spacing: 10) {
             // Subtitle removed from normal inbox (was two-line privacy copy).
             // Privacy education remains available via Support / account help surfaces.
             FanGeoPagePurposeHeader(
                 title: L10n.t("Chat", languageCode: appLanguageRaw),
                 subtitle: ""
             )
+            .layoutPriority(1)
 
             Spacer(minLength: 0)
 
@@ -929,6 +1130,8 @@ struct FriendsTabView: View {
                 }
 
                 chatOptionsMenu
+
+                FanGeoActionCenterHeaderButton()
             }
         }
         .padding(.horizontal, 16)
@@ -1020,7 +1223,7 @@ struct FriendsTabView: View {
         }
         .padding(4)
         // Extra top padding only when a red segment badge can overflow the capsule.
-        .padding(.top, (pendingIncomingRequestCount > 0 || pendingMyTeamsInvitationCount > 0) ? 4 : 0)
+        .padding(.top, pendingIncomingRequestCount > 0 ? 4 : 0)
         .background {
             Capsule(style: .continuous)
                 .fill(Color(.secondarySystemGroupedBackground).opacity(colorScheme == .dark ? 0.36 : 0.72))
@@ -1034,17 +1237,11 @@ struct FriendsTabView: View {
         .onAppear {
 #if DEBUG
             print("[ChatRequestsBadge] incomingPending=\(pendingIncomingRequestCount) sent=\(viewModel.outgoingRequests.count)")
-            print("[ChatMyTeamsBadge] pendingForMe=\(pendingMyTeamsInvitationCount)")
 #endif
         }
         .onChange(of: pendingIncomingRequestCount) { _, count in
 #if DEBUG
             print("[ChatRequestsBadge] incomingPending=\(count)")
-#endif
-        }
-        .onChange(of: pendingMyTeamsInvitationCount) { _, count in
-#if DEBUG
-            print("[ChatMyTeamsBadge] pendingForMe=\(count)")
 #endif
         }
     }
@@ -1054,12 +1251,9 @@ struct FriendsTabView: View {
         let hasUnreadDMs = viewModel.unreadDirectMessageCount > 0
         // Red tab badge = actionable incoming friend requests only (never outgoing / group invites).
         let requestsTabBadgeCount = pendingIncomingRequestCount
-        // My Teams badge = Team invitations waiting for ME (never manager-sent pending counts).
-        let myTeamsTabBadgeCount = pendingMyTeamsInvitationCount
         let segmentBadgeCount: Int = {
             switch section {
             case .requests: return requestsTabBadgeCount
-            case .myTeams: return myTeamsTabBadgeCount
             default: return 0
             }
         }()
@@ -1077,7 +1271,6 @@ struct FriendsTabView: View {
                 )
                 .animation(.spring(response: 0.28, dampingFraction: 0.82), value: hasUnreadDMs)
                 .animation(.spring(response: 0.28, dampingFraction: 0.82), value: requestsTabBadgeCount)
-                .animation(.spring(response: 0.28, dampingFraction: 0.82), value: myTeamsTabBadgeCount)
                 .zIndex(segmentBadgeCount > 0 ? 1 : 0)
 
                 Text(L10n.t(section.titleKey, languageCode: appLanguageRaw))
@@ -1105,8 +1298,7 @@ struct FriendsTabView: View {
             chatSectionAccessibilityLabel(
                 section,
                 hasUnreadDMs: section == .chats && hasUnreadDMs,
-                pendingRequests: section == .requests ? requestsTabBadgeCount : 0,
-                pendingMyTeamsInvitations: section == .myTeams ? myTeamsTabBadgeCount : 0
+                pendingRequests: section == .requests ? requestsTabBadgeCount : 0
             )
         )
         .accessibilityValue(isSelected ? "Selected" : "Not selected")
@@ -1115,8 +1307,7 @@ struct FriendsTabView: View {
     private func chatSectionAccessibilityLabel(
         _ section: ChatSection,
         hasUnreadDMs: Bool,
-        pendingRequests: Int,
-        pendingMyTeamsInvitations: Int
+        pendingRequests: Int
     ) -> String {
         let title = L10n.t(section.titleKey, languageCode: appLanguageRaw)
         switch section {
@@ -1126,11 +1317,7 @@ struct FriendsTabView: View {
             guard pendingRequests > 0 else { return title }
             let noun = pendingRequests == 1 ? "incoming request" : "incoming requests"
             return "\(title), \(pendingRequests) \(noun)"
-        case .myTeams:
-            guard pendingMyTeamsInvitations > 0 else { return title }
-            let noun = pendingMyTeamsInvitations == 1 ? "Team invitation" : "Team invitations"
-            return "\(title), \(pendingMyTeamsInvitations) \(noun)"
-        default:
+        case .friends:
             return title
         }
     }
@@ -1166,11 +1353,6 @@ struct FriendsTabView: View {
         viewModel.pendingBadgeCount
     }
 
-    /// Invitee-only Team invitation badge (`ChatViewModel.pendingFanTeamInvitationCount`).
-    private var pendingMyTeamsInvitationCount: Int {
-        viewModel.pendingFanTeamInvitationCount
-    }
-
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
     }
@@ -1183,8 +1365,6 @@ struct FriendsTabView: View {
             return "person.2.fill"
         case .requests:
             return "person.badge.plus"
-        case .myTeams:
-            return "shield.checkered"
         }
     }
 
@@ -1198,19 +1378,6 @@ struct FriendsTabView: View {
                 friendsDirectoryList
             case .requests:
                 requestsList
-            case .myTeams:
-                MyTeamsChatSectionView(
-                    mapViewModel: mapViewModel,
-                    chatViewModel: viewModel,
-                    onOpenTeamChat: { context in
-                        selectedSection = .chats
-                        openGroupChatRoute(
-                            conversationId: context.conversationId,
-                            reason: "myTeamsOpenChat",
-                            fanTeamContext: context
-                        )
-                    }
-                )
             }
         } else {
             chatsList
@@ -1236,8 +1403,8 @@ struct FriendsTabView: View {
             consumePendingFriendRequestsSectionOpen()
             return
         }
+        // Team invitations / management deep links are handled by the root Teams tab.
         if viewModel.pendingOpenMyTeamsInvitations {
-            consumePendingMyTeamsInvitationsOpen()
             return
         }
         if let groupId = viewModel.pendingGroupOpenConversationId {
@@ -1274,20 +1441,21 @@ struct FriendsTabView: View {
             viewModel.acknowledgeChatMessageDirectPushDeepLinkOpened(conversationId: cid)
             return
         }
-        guard let conversationId = preview.dmConversationId else {
-            viewModel.pendingDmOpenPreview = nil
 #if DEBUG
-            PushDeepLinkLog.failed(reason: "missing_conversation_id")
-#endif
-            return
+        if let conversationId = preview.dmConversationId {
+            PushDeepLinkLog.opening(conversation: conversationId, kind: "direct")
+        } else {
+            print("[ChatNav] pendingDmOpen peer=\(preview.id.uuidString.lowercased()) conversationId=nil")
         }
-#if DEBUG
-        PushDeepLinkLog.opening(conversation: conversationId, kind: "direct")
 #endif
         // Clear UI pending to prevent re-entry; keep APNs pending until route publishes.
+        // Profile / roster Message must still navigate even if the seed omitted conversation id —
+        // DirectChatView reuses fetchExisting + startDirectConversation.
         viewModel.pendingDmOpenPreview = nil
         openDirectChatRoute(from: preview, reason: "pendingDmOpen", force: true) {
-            viewModel.acknowledgeChatMessageDirectPushDeepLinkOpened(conversationId: conversationId)
+            if let conversationId = preview.dmConversationId {
+                viewModel.acknowledgeChatMessageDirectPushDeepLinkOpened(conversationId: conversationId)
+            }
         }
     }
 
@@ -1317,28 +1485,10 @@ struct FriendsTabView: View {
         }
     }
 
-    /// APNs Fan Team invitation tap → Chat → My Teams (fail soft if invitation already gone).
+    /// APNs Fan Team invitation / management taps are routed to the root Teams tab
+    /// (``MainTabView`` + ``TeamsTabRootView``). Chat no longer hosts My Teams.
     private func consumePendingMyTeamsInvitationsOpen() {
-        guard viewModel.pendingOpenMyTeamsInvitations else { return }
-        dmNavigationRoute = nil
-        groupNavigationRoute = nil
-        if showsChatSocialSections {
-#if DEBUG
-            PushDeepLinkLog.selectingMyTeamsSection()
-#endif
-            selectedSection = .myTeams
-        } else {
-#if DEBUG
-            PushDeepLinkLog.selectingChatsSection()
-#endif
-            selectedSection = .chats
-        }
-#if DEBUG
-        print("[FanTeamInvitationPushRoute] FriendsTab selectedSection=\(selectedSection.rawValue)")
-#endif
-        viewModel.acknowledgeFanTeamInvitationPushDeepLinkOpened()
-        // Highlight id remains on ChatViewModel until MyTeamsChatSectionView consumes it.
-        // Cancelled/accepted-elsewhere invites simply won't appear after refresh (no crash).
+        // Intentionally no-op: keep symbol for any residual call sites during migration.
     }
 
     private func refreshFansLiveNowAfterFirstPaint(reason: String) {
@@ -1679,16 +1829,7 @@ struct FriendsTabView: View {
                 mapViewModel.presentPublicProfile(userId: userId, context: "fans_live_now")
             },
             onOpenChat: { preview in
-                let shouldDismissSearch =
-                    isGlobalSearchModeActive || isGlobalSearchFocused || !globalSearch.query.isEmpty
-                let route = DirectChatNavRoute(preview: preview)
-                scheduleConversationRoutePublication(reason: "fansLiveNow") {
-                    if shouldDismissSearch {
-                        dismissGlobalSearchForNavigation()
-                    }
-                    groupNavigationRoute = nil
-                    dmNavigationRoute = route
-                }
+                openDirectChatRoute(from: preview, reason: "fansLiveNow")
             }
         )
     }
@@ -1731,8 +1872,7 @@ struct FriendsTabView: View {
             } header: {
                 VStack(alignment: .leading, spacing: 6) {
                     chatListHeader(
-                        title: L10n.t("chat_inbox_section_conversations", languageCode: appLanguageRaw),
-                        count: allConversations.count
+                        title: L10n.t("chat_inbox_section_conversations", languageCode: appLanguageRaw)
                     )
                     chatInboxTypeFilterBar(counts: filterCounts, compact: false)
                 }
@@ -2244,24 +2384,14 @@ struct FriendsTabView: View {
         .accessibilityLabel(filter.emptyTitle(languageCode: languageCode))
     }
 
-    private func chatListHeader(title: String, count: Int = 0) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(title)
-                .font(.subheadline.weight(.bold))
-                .textCase(nil)
-                .foregroundStyle(FGColor.primaryText(colorScheme))
-            Spacer(minLength: 0)
-            if count > 0 {
-                Text("\(count)")
-                    .font(.subheadline.weight(.semibold))
-                    .textCase(nil)
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .monospacedDigit()
-            }
-        }
-        .padding(.horizontal, 0)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(count > 0 ? "\(title), \(count)" : title)
+    private func chatListHeader(title: String) -> some View {
+        Text(title)
+            .font(.subheadline.weight(.bold))
+            .textCase(nil)
+            .foregroundStyle(FGColor.primaryText(colorScheme))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 0)
+            .accessibilityLabel(title)
     }
 
     private var supportInboxCardButton: some View {
@@ -2484,8 +2614,36 @@ struct FriendsTabView: View {
     }
 
     private var friendsDirectoryList: some View {
-        Group {
-            if friendsDirectoryItems.isEmpty {
+        VStack(spacing: 0) {
+            FriendDirectoryModePicker(
+                mode: $friendDirectoryMode,
+                languageCode: appLanguageRaw,
+                colorScheme: colorScheme
+            )
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .padding(.bottom, 10)
+
+            if friendDirectoryMode == .groups {
+                FriendGroupsListView(
+                    groups: friendGroupsStore.groups,
+                    languageCode: appLanguageRaw,
+                    isLoading: friendGroupsStore.isLoading,
+                    memberPreviewsByGroupId: friendGroupMemberPreviewCache,
+                    onRefresh: { await friendGroupsStore.refresh() },
+                    onSelect: { group in
+                        Task { await openFriendGroupDetail(group) }
+                    },
+                    onCreate: { showingCreateFriendGroupSheet = true },
+                    onRename: { group in
+                        friendGroupPendingRename = group
+                        showingRenameFriendGroupSheet = true
+                    },
+                    onDelete: { group in
+                        friendGroupPendingDelete = group
+                    }
+                )
+            } else if friendsDirectoryItems.isEmpty {
                 ContentUnavailableView(
                     "No friends yet",
                     systemImage: "person.2",
@@ -2529,10 +2687,16 @@ struct FriendsTabView: View {
                 .refreshable {
                     await viewModel.refreshFriendRequestListsOnly()
                     await viewModel.refreshInboxSummaries()
+                    await friendGroupsStore.refresh()
                 }
                 .onAppear {
                     logFriendsDirectoryLoadedCount()
                 }
+            }
+        }
+        .task(id: friendDirectoryMode) {
+            if friendDirectoryMode == .groups {
+                await friendGroupsStore.refresh()
             }
         }
     }
@@ -2893,11 +3057,100 @@ struct FriendsTabView: View {
         FriendDirectoryCard(
             item: item,
             colorScheme: colorScheme,
+            languageCode: appLanguageRaw,
             onProfile: { openFriendProfile(from: $0) },
             onMessage: { openMessage(from: $0) },
+            onAddToFriendGroup: { friend in
+                Task { await presentAddToFriendGroups(for: friend) }
+            },
             onUnfriend: { unfriendConfirmationItem = $0 }
         )
         .equatable()
+    }
+
+    @MainActor
+    private func presentAddToFriendGroups(for item: ChatViewModel.FriendDisplay) async {
+        do {
+            if friendGroupsStore.groups.isEmpty {
+                await friendGroupsStore.refresh()
+            }
+            let containing = try await friendGroupsStore.groupsContaining(friendUserId: item.preview.id)
+            addToGroupsSelectedIds = Set(containing.map(\.id))
+            addToGroupsFriendItem = item
+        } catch {
+            friendGroupActionError = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func openFriendGroupDetail(_ group: FriendGroup) async {
+        friendGroupDetailRoute = group
+        await reloadFriendGroupDetail(groupId: group.id)
+    }
+
+    @MainActor
+    private func reloadFriendGroupDetail(groupId: UUID) async {
+        friendGroupDetailBusy = true
+        defer { friendGroupDetailBusy = false }
+        do {
+            let ids = try await friendGroupsStore.memberIds(groupId: groupId)
+            let resolved = FriendGroupMemberResolver.selectableFriends(
+                memberIds: ids,
+                fromAcceptedFriends: viewModel.friends,
+                chipKind: { viewModel.chipKind(forOtherUserId: $0) }
+            )
+            friendGroupDetailMembers = resolved
+            friendGroupMemberPreviewCache[groupId] = resolved.map(\.preview)
+            if let refreshed = friendGroupsStore.groups.first(where: { $0.id == groupId }) {
+                friendGroupDetailRoute = refreshed
+            } else if var current = friendGroupDetailRoute, current.id == groupId {
+                current.memberCount = resolved.count
+                friendGroupDetailRoute = current
+            }
+        } catch {
+            friendGroupActionError = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func saveFriendGroupMembers(groupId: UUID, selectedIds: Set<UUID>) async {
+        friendGroupDetailBusy = true
+        defer { friendGroupDetailBusy = false }
+        do {
+            try await friendGroupsStore.setMembers(groupId: groupId, friendUserIds: Array(selectedIds))
+            showingAddFriendsToGroupSheet = false
+            await reloadFriendGroupDetail(groupId: groupId)
+        } catch {
+            friendGroupActionError = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func removeFriendFromCurrentGroup(_ member: FriendGroupSelectableFriend) async {
+        guard let groupId = friendGroupDetailRoute?.id else { return }
+        let remaining = friendGroupDetailMembers
+            .map(\.id)
+            .filter { $0 != member.id }
+        do {
+            try await friendGroupsStore.setMembers(groupId: groupId, friendUserIds: remaining)
+            await reloadFriendGroupDetail(groupId: groupId)
+        } catch {
+            friendGroupActionError = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func deleteFriendGroup(_ group: FriendGroup) async {
+        do {
+            try await friendGroupsStore.delete(groupId: group.id)
+            friendGroupMemberPreviewCache[group.id] = nil
+            if friendGroupDetailRoute?.id == group.id {
+                friendGroupDetailRoute = nil
+                friendGroupDetailMembers = []
+            }
+        } catch {
+            friendGroupActionError = error.localizedDescription
+        }
     }
 
     private var friendDirectoryCardBackground: AnyShapeStyle {
@@ -3781,12 +4034,16 @@ private struct GroupInboxMemberAvatarCluster: View {
 private struct FriendDirectoryCard: View, Equatable {
     let item: ChatViewModel.FriendDisplay
     let colorScheme: ColorScheme
+    let languageCode: String
     let onProfile: (ChatViewModel.FriendDisplay) -> Void
     let onMessage: (ChatViewModel.FriendDisplay) -> Void
+    let onAddToFriendGroup: (ChatViewModel.FriendDisplay) -> Void
     let onUnfriend: (ChatViewModel.FriendDisplay) -> Void
 
     static func == (lhs: FriendDirectoryCard, rhs: FriendDirectoryCard) -> Bool {
-        lhs.item == rhs.item && lhs.colorScheme == rhs.colorScheme
+        lhs.item == rhs.item
+            && lhs.colorScheme == rhs.colorScheme
+            && lhs.languageCode == rhs.languageCode
     }
 
     var body: some View {
@@ -3858,6 +4115,15 @@ private struct FriendDirectoryCard: View, Equatable {
                 onProfile(item)
             } label: {
                 Label("View Profile", systemImage: "person.crop.circle")
+            }
+
+            Button {
+                onAddToFriendGroup(item)
+            } label: {
+                Label(
+                    L10n.t("friend_groups_add_to_group_title", languageCode: languageCode),
+                    systemImage: "person.3"
+                )
             }
 
             Divider()
@@ -4127,10 +4393,6 @@ private struct FriendsTabLifecycleModifier: ViewModifier {
                 onPendingDmOpen()
             }
             .onChange(of: viewModel.pendingOpenFriendRequestsSection) { _, open in
-                guard open else { return }
-                onPendingDmOpen()
-            }
-            .onChange(of: viewModel.pendingOpenMyTeamsInvitations) { _, open in
                 guard open else { return }
                 onPendingDmOpen()
             }
@@ -4563,9 +4825,24 @@ private enum ChatFansLiveNowMetrics {
     static let nameNearbySpacing: CGFloat = 1
     static let hStackSpacing: CGFloat = 10
     static let sectionHeaderSpacing: CGFloat = 4
+    /// Small profile affordance over the avatar (does not change strip height).
+    static let profileButtonSize: CGFloat = 18
     /// Header + strip target ≈ 100–112pt.
     static let stripContentHeight: CGFloat =
         avatarSize + profileLabelSpacing + nameLineHeight + nameNearbySpacing + nearbyLineHeight
+}
+
+/// Card interaction contract for Fans Live Now (Chat → Chats).
+enum ChatFansLiveNowCardAction: Equatable, Sendable {
+    case openDirectChat
+    case openProfile
+}
+
+enum ChatFansLiveNowCardInteraction {
+    /// Avatar, name, status, and the rest of the card.
+    static let primaryTap: ChatFansLiveNowCardAction = .openDirectChat
+    /// Info button and context-menu “View Profile”.
+    static let accessoryTap: ChatFansLiveNowCardAction = .openProfile
 }
 
 struct ChatFansLiveNowEntry: Identifiable, Hashable {
@@ -4796,74 +5073,110 @@ private struct ChatFansLiveNowStripView: View {
 
 private struct ChatFansLiveNowCell: View {
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     let entry: ChatFansLiveNowEntry
     let onOpenProfile: (UUID) -> Void
     let onOpenChat: (UserPreview) -> Void
 
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
     private var itemWidth: CGFloat { ChatFansLiveNowMetrics.itemWidth }
     private var avatarSize: CGFloat { ChatFansLiveNowMetrics.avatarSize }
 
     var body: some View {
-        Button {
-            onOpenProfile(entry.id)
-        } label: {
-            VStack(spacing: ChatFansLiveNowMetrics.profileLabelSpacing) {
-                ZStack(alignment: .bottomTrailing) {
-                    SocialAvatarRenderer.socialAvatarView(for: entry.preview, size: avatarSize)
-                        .frame(width: avatarSize, height: avatarSize)
-                        .clipShape(Circle())
-
-                    PresenceOnlineBadge(size: ChatFansLiveNowMetrics.onlineDotSize)
-                        .offset(x: 1, y: 1)
-                }
-                .frame(width: avatarSize, height: avatarSize)
-
-                VStack(spacing: ChatFansLiveNowMetrics.nameNearbySpacing) {
-                    Text(entry.preview.displayName)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(FGColor.primaryText(colorScheme))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(ChatFansLiveNowMetrics.nameMaxLines)
-                        .truncationMode(.tail)
-                        .frame(width: itemWidth, height: ChatFansLiveNowMetrics.nameLineHeight, alignment: .top)
-
-                    // One compact status line from snapshot `isNearby` (no distance/privacy work in body).
-                    Text(entry.statusLine)
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(
-                            entry.isNearby
-                                ? FGColor.accentGreen
-                                : FGColor.secondaryText(colorScheme)
-                        )
-                        .multilineTextAlignment(.center)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
-                        .truncationMode(.tail)
-                        .frame(width: itemWidth, height: ChatFansLiveNowMetrics.nearbyLineHeight, alignment: .top)
-                        .accessibilityHidden(true)
-                }
-            }
-            .frame(width: itemWidth, alignment: .top)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button {
-                onOpenProfile(entry.id)
-            } label: {
-                Label("View Profile", systemImage: "person.crop.circle")
-            }
+        ZStack(alignment: .topTrailing) {
             Button {
                 onOpenChat(entry.preview)
             } label: {
-                Label("Message", systemImage: "bubble.left.and.bubble.right.fill")
+                VStack(spacing: ChatFansLiveNowMetrics.profileLabelSpacing) {
+                    ZStack(alignment: .bottomTrailing) {
+                        SocialAvatarRenderer.socialAvatarView(for: entry.preview, size: avatarSize)
+                            .frame(width: avatarSize, height: avatarSize)
+                            .clipShape(Circle())
+
+                        PresenceOnlineBadge(size: ChatFansLiveNowMetrics.onlineDotSize)
+                            .offset(x: 1, y: 1)
+                    }
+                    .frame(width: avatarSize, height: avatarSize)
+
+                    VStack(spacing: ChatFansLiveNowMetrics.nameNearbySpacing) {
+                        Text(entry.preview.displayName)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .multilineTextAlignment(.center)
+                            .lineLimit(ChatFansLiveNowMetrics.nameMaxLines)
+                            .truncationMode(.tail)
+                            .frame(width: itemWidth, height: ChatFansLiveNowMetrics.nameLineHeight, alignment: .top)
+
+                        // One compact status line from snapshot `isNearby` (no distance/privacy work in body).
+                        Text(entry.statusLine)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(
+                                entry.isNearby
+                                    ? FGColor.accentGreen
+                                    : FGColor.secondaryText(colorScheme)
+                            )
+                            .multilineTextAlignment(.center)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                            .truncationMode(.tail)
+                            .frame(width: itemWidth, height: ChatFansLiveNowMetrics.nearbyLineHeight, alignment: .top)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .frame(width: itemWidth, alignment: .top)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(entry.preview.displayName), \(entry.accessibilitySubtitle)")
+            .accessibilityHint(
+                L10n.t("chat_fans_live_now_open_chat_a11y_hint", languageCode: languageCode)
+            )
+
+            Button {
+                onOpenProfile(entry.id)
+            } label: {
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(
+                        FGColor.secondaryText(colorScheme),
+                        FGColor.cardBackground(colorScheme)
+                    )
+                    .frame(
+                        width: ChatFansLiveNowMetrics.profileButtonSize,
+                        height: ChatFansLiveNowMetrics.profileButtonSize
+                    )
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .offset(x: -4, y: 0)
+            .accessibilityLabel(
+                L10n.t("chat_fans_live_now_view_profile_a11y", languageCode: languageCode)
+            )
+        }
+        .frame(width: itemWidth, alignment: .top)
+        .contextMenu {
+            Button {
+                onOpenChat(entry.preview)
+            } label: {
+                Label(
+                    L10n.t("Message", languageCode: languageCode),
+                    systemImage: "bubble.left.and.bubble.right.fill"
+                )
+            }
+            Button {
+                onOpenProfile(entry.id)
+            } label: {
+                Label(
+                    L10n.t("View Profile", languageCode: languageCode),
+                    systemImage: "person.crop.circle"
+                )
             }
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(entry.preview.displayName), \(entry.accessibilitySubtitle)")
-        .accessibilityHint("Double tap to open profile")
-        .accessibilityAddTraits(.isButton)
     }
 }
 

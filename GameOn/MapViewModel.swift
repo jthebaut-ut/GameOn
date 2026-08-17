@@ -169,6 +169,7 @@ final class MapViewModel: ObservableObject {
             guard oldValue != currentUserAuthId else { return }
             clearSavedProGamesForSessionBoundary()
             guard let userID = currentUserAuthId else {
+                clearActionCenterDismissalsFromMemory()
                 return
             }
             reloadSavedProGamesFromStorage(for: userID)
@@ -177,6 +178,7 @@ final class MapViewModel: ObservableObject {
                 await PushNotificationRegistrationService.shared.refreshPushTokenRegistration(reason: "currentUserAuthIdChanged")
                 await loadProGameNotificationPreferencesFromBackend(reason: "currentUserAuthIdChanged")
             }
+            hydrateActionCenterDismissalsForCurrentUser()
         }
     }
     @Published var activeAccountBan: FanGeoAccountBan?
@@ -864,6 +866,12 @@ final class MapViewModel: ObservableObject {
     /// Bottom-tab Calendar selected (updated by ``MainTabView``); gates calendar-only preload/enrichment while tab is preserved off-screen.
     var isCalendarTabSelected = false
     var isLiveTabSelected = false
+    /// True while the Going root tab (`AppTab.following`) is selected.
+    var isFollowingTabSelected = false
+    /// Schedule hub surface (Live / Watch / Play / Pro). Mirrored from ScheduleHubView SceneStorage.
+    @Published var scheduleHubSurface: ScheduleHubSurface = .watch
+    /// One-shot deep-link / Action Center request consumed by ScheduleHubView.
+    @Published var pendingScheduleHubSurface: ScheduleHubSurface?
     /// Bottom-tab Discover selected (updated by ``MainTabView``); used only for Phase 3 off-tab perf instrumentation.
     var isDiscoverTabSelectedForEnrichment = true
     var scheduleTabInteractionProtected = false
@@ -916,6 +924,8 @@ final class MapViewModel: ObservableObject {
     @Published var currentUserHomeRegion: String = ""
     @Published var currentUserHomeCountry: String = ""
     @Published var currentUserShowHomeCity: Bool = false
+    /// Global visibility for FanGeo Fan Team memberships on the owner's profile.
+    @Published var currentUserMyTeamsProfileVisibility: FanTeamProfileVisibility = .productDefault
     /// `user_profiles.gender` raw token (`male` / `female` / …). Empty = unset.
     @Published var currentUserGenderRaw: String = ""
     /// Curated profile background catalog key (default FanGeo).
@@ -1038,6 +1048,8 @@ final class MapViewModel: ObservableObject {
     @Published var pendingProGameNotificationDeepLink: ProGameNotificationDeepLinkRequest?
     /// Deep link from a pickup end-of-game rating local notification → Going → Play → Playing.
     @Published var pendingPickupCreatorRatingNotificationDeepLink: PickupCreatorRatingNotificationDeepLinkRequest?
+    /// Opens the existing organizer rating prompt (Action Center / Going pending row) — not a second flow.
+    @Published var pendingPickupCreatorRatingPromptToken: PickupDetailNavigationToken?
     /// Briefly highlights the Playing card targeted by a pickup rating notification deep link.
     @Published var pendingPickupPlayingHighlightGameID: UUID?
     /// Opens canonical pickup detail from an in-app chat share card (any tab).
@@ -1045,6 +1057,8 @@ final class MapViewModel: ObservableObject {
     /// Chat → open shared professional game detail (`LiveMatchDetailSheet`).
     @Published var pendingSharedProGameDetailMatch: LiveMatch?
     @Published var pendingSupportReplyNotificationDeepLink: SupportReplyNotificationDeepLinkRequest?
+    /// Security-session APNs tap: open Inbox if signed in, otherwise stay on signed-out landing.
+    @Published var pendingOpenActionCenterForSecurityEvent = false
     /// Remote poke APNs tap → open sender Fan Profile after auth/bootstrap.
     @Published var pendingPokeNotificationDeepLink: PokeNotificationDeepLinkRequest?
     /// Gate so cold-start taps wait for splash/bootstrap before presenting a profile.
@@ -1074,6 +1088,10 @@ final class MapViewModel: ObservableObject {
     @Published var sponsoredPromotedVenueBarsByID: [UUID: BarVenue] = [:]
     @Published var sponsoredPromotedVenueLocationByID: [UUID: DiscoverSponsoredVenueLocationFields] = [:]
     var sponsoredPromotedVenuePrefetchTask: Task<Void, Never>?
+    /// When set, ``MainTabView`` presents ``SignedOutLandingView`` as an explicit auth cover.
+    @Published var presentSignedOutAuthLanding: Bool = false
+    /// Distinguishes Profile-tab presentation from other auth gates (close vs post-login routing).
+    @Published var signedOutAuthLandingSource: SignedOutAuthLandingSource = .none
     /// When set, ``SettingsScreen`` presents ``SettingsUserAuthSheet`` (same fan sheet as Account tab). Cleared when handled.
     @Published var presentFanUserAuthSheetFromDiscover: Bool = false
     /// Initial mode for ``SettingsUserAuthSheet`` when opened from Discover guest prompts.
@@ -1167,6 +1185,10 @@ final class MapViewModel: ObservableObject {
     @Published var pickupPlacesForDiscoverMap: [PickupPlaceRow] = []
     @Published var selectedPickupPlaceForMap: PickupPlaceRow?
     @Published var isLoadingPickupPlacesForMap: Bool = false
+    /// Discoverable Fan Teams overlayed on Play → Places (not a third Places|Games|Teams mode).
+    @Published var discoverableFanTeamsForMap: [DiscoverableFanTeamMapRow] = []
+    @Published var selectedDiscoverableFanTeamForMap: DiscoverableFanTeamMapRow?
+    @Published var isLoadingDiscoverableFanTeamsForMap: Bool = false
     @Published var myPickupGamesForSettings: [PickupGameRow] = []
     /// Organizer soft-deleted games (`status = removed`), shown under History in Settings.
     @Published var myRemovedPickupGamesForSettings: [PickupGameRow] = []
@@ -1187,6 +1209,9 @@ final class MapViewModel: ObservableObject {
     @Published var pickupMyLatestJoinRequestByGameId: [UUID: PickupGameRequestRow] = [:]
     /// Privacy-safe public roster from `get_pickup_game_roster` (organizer + approved; pending only for organizer).
     @Published var pickupGameRosterByGameId: [UUID: PickupGameRosterPayload] = [:]
+    /// Viewer account RSVP for Team-linked games, keyed by `pickup_games.id` (event-scoped).
+    /// Loaded via `get_fan_team_game_rsvp` — never derive personal Schedule RSVP from organizer role.
+    @Published var fanTeamSelfRSVPByGameId: [UUID: FanTeamCachedSelfRSVP] = [:]
     /// Discover accent for Team-linked pickups the viewer can see (hex). Derived from `pickupDiscoverTeamIdentityByGameId`.
     @Published var pickupDiscoverTeamAccentHexByGameId: [UUID: String] = [:]
     /// Discover Team identity (name/logo/color) for Team-linked pickups the viewer can already see.
@@ -1210,16 +1235,30 @@ final class MapViewModel: ObservableObject {
     @Published var pickupJoinRequesterProfileByUserId: [UUID: UserProfileRow] = [:]
     /// Bumped when a join-requester profile loads so ``UserAvatarView`` refreshes thumbnails.
     @Published var pickupJoinRequesterAvatarTokenByUserId: [UUID: UUID] = [:]
-    /// Discover map segmented control: venue clusters vs pickup pins only.
-    @Published var discoverMapContentMode: DiscoverMapContentMode = .venues
+    /// UserDefaults keys for Discover Watch/Play + Places/Games (device-local; cleared on logout).
+    private static let discoverMapContentModeDefaultsKey = "discoverMapContentMode"
+    private static let discoverPickupSubModeDefaultsKey = "discoverPickupSubMode"
+    /// When true, mode didSets skip writing UserDefaults (logout reset to product defaults).
+    private var suppressDiscoverModePreferencePersistence = false
+
+    /// Discover map segmented control: Watch (venues) vs Play (pickup).
+    /// Restores last user selection; falls back to Play when unset.
+    @Published var discoverMapContentMode: DiscoverMapContentMode = MapViewModel.loadPersistedDiscoverMapContentMode() {
+        didSet {
+            guard oldValue != discoverMapContentMode else { return }
+            persistDiscoverMapContentModeIfNeeded()
+        }
+    }
     /// Pickup-only sub-toggle: physical places to play vs user-created games.
-    /// Defaults to Places (broad browse), matching Watch’s All Spots default.
-    @Published var discoverPickupSubMode: DiscoverPickupSubMode = .places {
+    /// Restores last user selection; falls back to Places when unset.
+    @Published var discoverPickupSubMode: DiscoverPickupSubMode = MapViewModel.loadPersistedDiscoverPickupSubMode() {
         didSet {
             guard oldValue != discoverPickupSubMode else { return }
+            persistDiscoverPickupSubModeIfNeeded()
             selectedBar = nil
             selectedPickupGameForMap = nil
             selectedPickupPlaceForMap = nil
+            selectedDiscoverableFanTeamForMap = nil
             discoverClusteredBarsCacheKey = nil
             discoverClusteredBarsCache = nil
             scheduleDiscoverMapRenderSnapshotRebuild(reason: "discoverPickupSubMode")
@@ -1231,6 +1270,9 @@ final class MapViewModel: ObservableObject {
     var lastPickupPlacesFetchKey: String?
     var pickupPlacesRegionalCache: [String: (rows: [PickupPlaceRow], fetchedAt: Date)] = [:]
     var pickupPlacesDiscoverRequestID: UUID?
+    var lastDiscoverFanTeamsFetchKey: String?
+    var discoverFanTeamsRegionalCache: [String: (rows: [DiscoverableFanTeamMapRow], fetchedAt: Date)] = [:]
+    var discoverFanTeamsRequestID: UUID?
     var pickupGamesDiscoverCache: [String: (rows: [PickupGameRow], fetchedAt: Date)] = [:]
     var pickupGamesDiscoverRequestID: UUID?
 
@@ -1250,6 +1292,9 @@ final class MapViewModel: ObservableObject {
     @Published var followingTabUserVenueEventInterestIDs: Set<UUID> = []
     /// Following → Games to Play: pickup join requests for the current user (see ``loadMyPickupGameJoinRequestsForFollowing()``).
     @Published var myPickupGameJoinRequestCards: [PickupGameJoinRequestCardDisplay] = []
+    /// Going → Play Team events the viewer (or a managed player they guard) is Going to,
+    /// loaded via existing `list_my_fan_teams` + `list_fan_team_games` + attendance.
+    @Published var goingPlayTeamParticipations: [GoingPlayTeamParticipation] = []
     /// Incoming friend invites for pickup/practice/scrimmage games.
     @Published var incomingPickupGameInvites: [PickupGameInviteDisplay] = []
     /// Latest join request row per pickup game for the signed-in fan (includes declined/rejected; excludes nothing except empty fetch). Following / pickup detail surfaces.
@@ -1323,6 +1368,36 @@ final class MapViewModel: ObservableObject {
     @Published var hasUnreadPickupActivity: Bool = false
     /// Count of pickup games with unread activity (segment badge + tab hint).
     @Published var pickupActivityCount: Int = 0
+    /// Action Center deep-link: Going → Play → Invites.
+    @Published var pendingOpenGoingPickupInvites: Bool = false
+    /// Action Center deep-link: Going → Play → Hosting (legacy; prefer organizer-requests / Team Schedule routes).
+    @Published var pendingOpenGoingHostingApprovals: Bool = false
+    /// Exact hosted game for Action Center join-approval deep links (Going hosting scroll highlight).
+    @Published var pendingHostingApprovalPickupGameId: UUID? = nil
+    /// Team Schedule + pending join requests for Action Center join-approval cards.
+    @Published var pendingTeamScheduleJoinApproval: PendingTeamScheduleJoinApprovalDeepLink? = nil
+    /// Team Schedule event detail from Team schedule create/update APNs (no join-requests sheet).
+    @Published var pendingTeamScheduleEventDeepLink: PendingTeamScheduleEventDeepLink? = nil
+    /// Non-team hosted game: present organizer join-requests sheet directly.
+    @Published var pendingOrganizerJoinRequestsGameToken: PickupDetailNavigationToken? = nil
+    /// Exact game for Action Center schedule-activity deep links.
+    @Published var pendingScheduleActivityPickupGameId: UUID? = nil
+    /// Batch-loaded pending join-request summaries for Action Center cards.
+    @Published var pendingPickupJoinApprovalSummaries: [FanGeoActionJoinApprovalInput] = []
+    /// Per-user Action Center dismissals (filter-before-render). Local cache + server ledger.
+    @Published var actionCenterDismissedKeys: Set<String> = []
+    /// Pending-request inbox snoozes for this process only (`action_key` → hidden at).
+    @Published var actionCenterPendingSnoozedAt: [String: Date] = [:]
+    /// Durable Clear All hides for specific pending Action Needed ids.
+    @Published var actionCenterClearAllHiddenKeys: Set<String> = []
+    /// Last seen detailed pending Action Needed ids for stale aggregate suppression.
+    var actionCenterLastKnownPendingKeys: Set<String> = []
+    /// Bumps when the local Notifications inbox changes (read/clear/upsert/push ingest).
+    @Published var actionCenterNotificationInboxEpoch: UInt64 = 0
+    /// Cached Action Center projection. Live-map publishes must not rebuild Inbox.
+    var actionCenterSnapshotCacheKey: FanGeoActionCenterSnapshotCacheKey?
+    var actionCenterSnapshotCache: FanGeoActionCenterProjection.Snapshot?
+    var lastInboxLiveCandidateFingerprint: String = ""
     /// Account-tab badge when incoming pokes are newer than last acknowledgment.
     @Published var hasUnseenPokes: Bool = false
     @Published var unseenPokesCount: Int = 0
@@ -1364,6 +1439,8 @@ final class MapViewModel: ObservableObject {
     var fanIdentityPreferencesLoadTask: Task<Void, Never>?
     var lastFanIdentityPreferencesLoadAt: Date?
     var lastFanIdentityPreferencesLoadUserId: UUID?
+    var lastMyTeamsProfileVisibilityLoadAt: Date?
+    var lastMyTeamsProfileVisibilityLoadUserId: UUID?
     /// Discover / map card organizer aggregates (`pickup_organizer_profile_summary`), keyed by organizer.
     @Published var pickupOrganizerSummaryByUserId: [UUID: PickupOrganizerSummary] = [:]
     /// Last successful fetch time for ``pickupOrganizerSummaryByUserId`` freshness gating.
@@ -1477,7 +1554,10 @@ final class MapViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.syncDiscoverMyActiveFanTeamIdsFromCoordinator()
+                guard let self else { return }
+                self.syncDiscoverMyActiveFanTeamIdsFromCoordinator()
+                // Former members must disappear from Schedule/Who's Going without restart.
+                self.clearPickupGameRosterCaches()
             }
         }
         syncDiscoverMyActiveFanTeamIdsFromCoordinator()
@@ -1493,6 +1573,61 @@ final class MapViewModel: ObservableObject {
         if let fanTeamMembershipSnapshotsObserver {
             NotificationCenter.default.removeObserver(fanTeamMembershipSnapshotsObserver)
         }
+    }
+
+    // MARK: - Discover map mode preference (Watch/Play + Places/Games)
+
+    private static func loadPersistedDiscoverMapContentMode() -> DiscoverMapContentMode {
+        if let raw = UserDefaults.standard.string(forKey: discoverMapContentModeDefaultsKey),
+           let mode = DiscoverMapContentMode(rawValue: raw) {
+            return mode
+        }
+        return DiscoverMapContentMode.productDefault
+    }
+
+    private static func loadPersistedDiscoverPickupSubMode() -> DiscoverPickupSubMode {
+        if let raw = UserDefaults.standard.string(forKey: discoverPickupSubModeDefaultsKey),
+           let mode = DiscoverPickupSubMode(rawValue: raw) {
+            return mode
+        }
+        return DiscoverPickupSubMode.productDefault
+    }
+
+    private func persistDiscoverMapContentModeIfNeeded() {
+        guard !suppressDiscoverModePreferencePersistence else { return }
+        UserDefaults.standard.set(discoverMapContentMode.rawValue, forKey: Self.discoverMapContentModeDefaultsKey)
+    }
+
+    private func persistDiscoverPickupSubModeIfNeeded() {
+        guard !suppressDiscoverModePreferencePersistence else { return }
+        UserDefaults.standard.set(discoverPickupSubMode.rawValue, forKey: Self.discoverPickupSubModeDefaultsKey)
+    }
+
+    /// Clears Discover pin/detail selection so a fresh process shows the map, not a leftover sheet.
+    func resetDiscoverPresentationForFreshLaunch() {
+        selectedBar = nil
+        selectedPickupGameForMap = nil
+        selectedPickupPlaceForMap = nil
+        selectedDiscoverableFanTeamForMap = nil
+        discoverFocusVenueId = nil
+        discoverFocusedProGame = nil
+        discoverSearchVenueIDFilter = nil
+        searchText = ""
+        debouncedDiscoverSearchText = ""
+#if DEBUG
+        print("[FreshLaunch] discoverPresentation=map clearedDetailSelection=true")
+#endif
+    }
+
+    /// Clears saved Discover mode prefs and restores product defaults (Play + Places).
+    /// Called on logout so the next session does not inherit the previous account's mode.
+    func resetDiscoverMapModePreferencesForLogout() {
+        suppressDiscoverModePreferencePersistence = true
+        UserDefaults.standard.removeObject(forKey: Self.discoverMapContentModeDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: Self.discoverPickupSubModeDefaultsKey)
+        discoverMapContentMode = DiscoverMapContentMode.productDefault
+        discoverPickupSubMode = DiscoverPickupSubMode.productDefault
+        suppressDiscoverModePreferencePersistence = false
     }
 
     /// Publishes a freshly built Discover map snapshot, skipping the publication

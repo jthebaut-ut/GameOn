@@ -2,6 +2,8 @@ import SwiftUI
 
 struct PickupGamePollCreateSheet: View {
     let languageCode: String
+    /// Pickup-only auto-close toggle. Hidden for Team Chat (no game-start close).
+    var showsAutoCloseAtGameStart: Bool = true
     let onCancel: () -> Void
     let onCreate: (_ question: String, _ options: [String], _ allowMultiple: Bool, _ isAnonymous: Bool, _ autoCloseAtGameStart: Bool) async -> String?
 
@@ -128,12 +130,14 @@ struct PickupGamePollCreateSheet: View {
                     .tint(FGColor.accentGreen)
                     .frame(minHeight: 44)
 
-                    Toggle(isOn: $autoCloseAtGameStart) {
-                        Text(L10n.t("pickup_poll_auto_close", languageCode: languageCode))
-                            .font(.body)
+                    if showsAutoCloseAtGameStart {
+                        Toggle(isOn: $autoCloseAtGameStart) {
+                            Text(L10n.t("pickup_poll_auto_close", languageCode: languageCode))
+                                .font(.body)
+                        }
+                        .tint(FGColor.accentGreen)
+                        .frame(minHeight: 44)
                     }
-                    .tint(FGColor.accentGreen)
-                    .frame(minHeight: 44)
                 } header: {
                     Text(L10n.t("pickup_poll_settings_label", languageCode: languageCode))
                 }

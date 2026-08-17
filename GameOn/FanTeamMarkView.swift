@@ -1,19 +1,22 @@
 import SwiftUI
 import UIKit
 
-/// Compact Team mark: real logo when available, otherwise a sport SF Symbol badge (never initials).
+/// Compact Team mark: uploaded logo, otherwise the official FanGeo sport mark.
+/// Never resolves TheSportsDB / professional crests — FanGeo user-created Teams are a separate identity family.
 struct FanTeamMarkView: View {
     let sport: String
     let logoURL: String?
     let logoThumbnailURL: String?
     let colorHex: String?
+    var sportSubtype: String? = nil
     var size: CGFloat = 48
+    var wordmark: String? = nil
     /// Prefer full logo URL for larger detail/header marks; list rows prefer thumbnail-first.
+    /// Team Detail header intentionally uses `false` on first paint to avoid heavy full-logo
+    /// AttributeGraph churn during sheet presentation (`hasDetail=false` shell).
     var preferDetailURL: Bool = false
     var localPreviewImage: UIImage? = nil
     var displayRefreshToken: UUID? = nil
-
-    @Environment(\.colorScheme) private var colorScheme
 
     private var resolvedURL: URL? {
         if localPreviewImage != nil { return nil }
@@ -32,18 +35,26 @@ struct FanTeamMarkView: View {
         if let displayRefreshToken {
             raw = ImageDisplayURL.displayVersionedURLString(raw, refreshToken: displayRefreshToken)
         }
-        return URL(string: raw)
+        return FanTeamMarkIdentity.safeURL(from: raw)
     }
 
     private var accent: Color {
         if let colorHex, let color = Color(fanTeamHex: colorHex) {
             return color
         }
-        return SportFilterCatalog.resolve(sport).accent
+        return FanGeoSportMarkCatalog.accent(sport: sport, subtype: sportSubtype)
     }
 
-    private var systemImage: String {
-        SportFilterCatalog.resolve(sport).systemImage
+    private var identityToken: String {
+        FanTeamMarkIdentity.token(
+            sport: sport,
+            logoURL: logoURL,
+            logoThumbnailURL: logoThumbnailURL,
+            colorHex: colorHex,
+            preferDetailURL: preferDetailURL,
+            displayRefreshToken: displayRefreshToken,
+            sportSubtype: sportSubtype
+        )
     }
 
     var body: some View {
@@ -52,54 +63,42 @@ struct FanTeamMarkView: View {
                 Image(uiImage: localPreviewImage)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+                    .overlay {
+                        Circle()
+                            .strokeBorder(accent.opacity(0.86), lineWidth: max(1.5, size * 0.04))
+                    }
             } else if let resolvedURL {
-                DiscoverCachedRemoteImage(url: resolvedURL, contentMode: .fill) {
+                DiscoverCachedRemoteImage(
+                    url: resolvedURL,
+                    contentMode: .fill,
+                    bucket: DiscoverMapImageCache.Bucket.forPointSize(size, preferDetail: preferDetailURL)
+                ) {
                     sportBadge
+                }
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+                .overlay {
+                    Circle()
+                        .strokeBorder(accent.opacity(0.86), lineWidth: max(1.5, size * 0.04))
                 }
             } else {
                 sportBadge
             }
         }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-        .overlay {
-            Circle()
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [
-                            accent.opacity(colorScheme == .dark ? 0.55 : 0.35),
-                            accent.opacity(0.12)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: max(1.5, size * 0.04)
-                )
-        }
         .accessibilityHidden(true)
-        .id(displayRefreshToken?.uuidString ?? resolvedURL?.absoluteString ?? "sport-\(sport)-\(colorHex ?? "")")
+        // Short stable identity — never embed raw logo URL strings (AttributeGraph thrash).
+        .id(identityToken)
     }
 
     private var sportBadge: some View {
-        ZStack {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            accent.opacity(colorScheme == .dark ? 0.42 : 0.28),
-                            accent.opacity(colorScheme == .dark ? 0.18 : 0.12)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-            Circle()
-                .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.35))
-            Image(systemName: systemImage)
-                .font(.system(size: size * 0.42, weight: .semibold))
-                .foregroundStyle(accent)
-                .symbolRenderingMode(.hierarchical)
-        }
+        FanGeoSportMark(
+            sport: sport,
+            subtype: sportSubtype,
+            size: size,
+            wordmark: wordmark
+        )
     }
 }
 
@@ -137,6 +136,79 @@ nonisolated enum ChatInboxFanTeamRowIdentity {
 
     static func showsTeamChatBadge(isFanTeamChat: Bool) -> Bool {
         isFanTeamChat
+    }
+}
+
+/// Action Center leading identity: cached Team mark (logo → sport badge).
+/// Falls back to the existing kind glyph when Team identity is not in cache
+/// (offline, left Team, or deleted Team). Does not load images itself.
+struct ActionCenterTeamIdentityMark: View, Equatable {
+    let teamId: UUID
+    var size: CGFloat = 44
+    var fallbackSystemImage: String
+    var accent: Color
+    var languageCode: String = L10n.defaultLanguageCode
+    /// Snapshot sport from the inbox payload when the Team is no longer in cache
+    /// (removed member / left Team). Never a raw logo URL.
+    var fallbackSport: String? = nil
+
+    static func == (lhs: ActionCenterTeamIdentityMark, rhs: ActionCenterTeamIdentityMark) -> Bool {
+        lhs.teamId == rhs.teamId
+            && lhs.size == rhs.size
+            && lhs.fallbackSystemImage == rhs.fallbackSystemImage
+            && lhs.languageCode == rhs.languageCode
+            && lhs.fallbackSport == rhs.fallbackSport
+    }
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var localRefreshToken: UUID?
+
+    private var snapshot: FanTeamIdentityRealtimeCoordinator.MarkSnapshot? {
+        FanTeamIdentityRealtimeCoordinator.shared.markSnapshot(
+            teamId: teamId,
+            conversationId: nil
+        )
+    }
+
+    var body: some View {
+        let _ = FanGeoInboxOpenPerf.teamIdentityMarkBody()
+        if let mark = snapshot {
+            FanTeamMarkView(
+                sport: mark.sport,
+                logoURL: mark.logoURL,
+                logoThumbnailURL: mark.logoThumbnailURL,
+                colorHex: mark.colorHex,
+                size: size,
+                preferDetailURL: false,
+                displayRefreshToken: localRefreshToken ?? mark.displayRefreshToken
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(L10n.t("fan_teams_logo_a11y", languageCode: languageCode))
+            .onReceive(NotificationCenter.default.publisher(for: FanTeamIdentityChangeCenter.identityDidChangeNotification)) { note in
+                guard let change = FanTeamIdentityChangeCenter.identityChange(from: note),
+                      change.teamId == teamId else { return }
+                localRefreshToken = change.displayRefreshToken
+            }
+        } else if let sport = fallbackSport?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !sport.isEmpty {
+            FanTeamMarkView(
+                sport: sport,
+                logoURL: nil,
+                logoThumbnailURL: nil,
+                colorHex: nil,
+                size: size,
+                preferDetailURL: false
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(L10n.t("fan_teams_logo_a11y", languageCode: languageCode))
+        } else {
+            Image(systemName: fallbackSystemImage)
+                .font(.system(size: size * 0.36, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: size, height: size)
+                .background(Circle().fill(accent.opacity(colorScheme == .dark ? 0.24 : 0.12)))
+                .accessibilityHidden(true)
+        }
     }
 }
 

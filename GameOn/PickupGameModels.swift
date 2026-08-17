@@ -174,23 +174,37 @@ enum GameType: String, Codable, CaseIterable, Hashable {
     case tournament_game
     case tryout
     case clinic
+    /// Team-linked non-game activity (coach / parent / film / briefing). Not used for standalone Pickup.
+    case team_meeting
+    /// Flexible Team-linked fallback event type. Canonical token only — no freeform DB types.
+    case other
+    /// Official Team notice (Owner/Manager). Not a game/practice; title + description body.
+    case announcement
 
-    /// Classic Pickup create/edit (excludes legacy Team-only `.match`).
+    /// Classic Pickup create/edit (excludes Team-only and legacy `.match`).
+    /// Sport-aware picker subsets live in ``PickupEventTypeCatalog.availableTypes(for:)``.
     static var pickupOrganizerCases: [GameType] {
-        [.pickup, .practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic]
+        PickupEventTypeCatalog.allPickupOrganizerCases
     }
 
-    /// My Teams → Schedule Game (same column). Includes legacy `.match` for edit compatibility.
+    /// My Teams → Schedule Event (same column). Includes legacy `.match` for edit compatibility.
     static var fanTeamOrganizerCases: [GameType] {
-        [.practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match]
+        [
+            .practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match,
+            .team_meeting, .other, .announcement
+        ]
     }
 
     /// Formats allowed by `link_pickup_game_to_fan_team` (plain pickup excluded).
     static var fanTeamLinkableCases: [GameType] {
-        [.practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match]
+        [
+            .practice, .scrimmage, .league_game, .tournament_game, .tryout, .clinic, .match,
+            .team_meeting, .other, .announcement
+        ]
     }
 
-    static var defaultForTeamCreate: GameType { .league_game }
+    /// Default Game Format when opening Team Schedule create (not edit / not Pickup).
+    static var defaultForTeamCreate: GameType { .practice }
     static var defaultForNormalCreate: GameType { .pickup }
 
     var displayTitle: String {
@@ -215,6 +229,12 @@ enum GameType: String, Codable, CaseIterable, Hashable {
             return L10n.t("pickup_game_format_tryout", languageCode: languageCode)
         case .clinic:
             return L10n.t("pickup_game_format_clinic", languageCode: languageCode)
+        case .team_meeting:
+            return L10n.t("pickup_game_format_team_meeting", languageCode: languageCode)
+        case .other:
+            return L10n.t("pickup_game_format_other", languageCode: languageCode)
+        case .announcement:
+            return L10n.t("pickup_game_format_announcement", languageCode: languageCode)
         }
     }
 
@@ -231,6 +251,9 @@ enum GameType: String, Codable, CaseIterable, Hashable {
         case .tournament_game: return "medal.fill"
         case .tryout: return "person.badge.plus"
         case .clinic: return "graduationcap.fill"
+        case .team_meeting: return "person.3.sequence.fill"
+        case .other: return "ellipsis.circle.fill"
+        case .announcement: return "megaphone.fill"
         }
     }
 
@@ -253,6 +276,12 @@ enum GameType: String, Codable, CaseIterable, Hashable {
             return L10n.t("pickup_form_intro_title_clinic", languageCode: languageCode)
         case .match:
             return L10n.t("pickup_form_intro_title_match", languageCode: languageCode)
+        case .team_meeting:
+            return L10n.t("pickup_form_intro_title_team_meeting", languageCode: languageCode)
+        case .other:
+            return L10n.t("pickup_form_intro_title_other", languageCode: languageCode)
+        case .announcement:
+            return L10n.t("pickup_form_intro_title_announcement", languageCode: languageCode)
         }
     }
 
@@ -264,7 +293,8 @@ enum GameType: String, Codable, CaseIterable, Hashable {
         case .clinic:
             // Prefer short "Clinic" over picker label "Clinic / Camp".
             return L10n.t("pickup_form_summary_format_clinic", languageCode: languageCode)
-        case .practice, .scrimmage, .league_game, .tournament_game, .tryout, .match:
+        case .practice, .scrimmage, .league_game, .tournament_game, .tryout, .match,
+                .team_meeting, .other, .announcement:
             return displayTitle(languageCode: languageCode)
         }
     }
@@ -279,6 +309,9 @@ enum GameType: String, Codable, CaseIterable, Hashable {
         case .tournament_game: return "🏅"
         case .tryout: return "📋"
         case .clinic: return "🎓"
+        case .team_meeting: return "💬"
+        case .other: return "📌"
+        case .announcement: return "📣"
         }
     }
 
@@ -302,9 +335,191 @@ enum GameType: String, Codable, CaseIterable, Hashable {
             return .clinic
         case "game", "fixture":
             return .league_game
+        case "meeting", "teammeeting", "team_meetings", "coach_meeting", "parent_meeting":
+            return .team_meeting
+        case "misc", "misc_event", "general", "custom":
+            return .other
         default:
             return nil
         }
+    }
+}
+
+/// Central presentation policy for Team-linked (and shared) event formats.
+/// Keeps gameplay vs meeting/other field visibility out of scattered SwiftUI `if` chains.
+enum FanTeamEventPresentation {
+    static func policy(for format: GameType, sport: String = "") -> FanTeamEventFormatPolicy {
+        FanTeamEventFormatPolicy(format: format, sport: sport)
+    }
+
+    static func policy(for format: FanTeamGameType, sport: String = "") -> FanTeamEventFormatPolicy {
+        FanTeamEventFormatPolicy(
+            format: GameType(rawValue: format.rawValue) ?? .other,
+            sport: sport
+        )
+    }
+}
+
+struct FanTeamEventFormatPolicy: Equatable, Sendable {
+    let format: GameType
+    /// Sport token from the form / Team. Empty string keeps legacy format-only behavior
+    /// for call sites that have not yet passed sport (defaults to team-ball-like H2H rules
+    /// only when format alone historically required an opponent — prefer passing sport).
+    var sport: String = ""
+
+    /// Sport + format capability (opponent / head-to-head scoring).
+    var capabilities: FanTeamEventCapabilities {
+        FanTeamEventCapabilityResolver.capabilities(format: format, sport: sport)
+    }
+
+    var resultCapability: FanTeamEventResultCapability {
+        capabilities.result.effectiveForCurrentProduct
+    }
+
+    /// Sport/activity formats that use gameplay-oriented fields.
+    var isGameplayEvent: Bool {
+        switch format {
+        case .practice, .scrimmage, .league_game, .tournament_game, .match, .tryout, .clinic, .pickup:
+            return true
+        case .team_meeting, .other, .announcement:
+            return false
+        }
+    }
+
+    /// Team-linked Meeting/Other/Announcement never recruit outside players. Gameplay Team formats may.
+    var allowsTeamOutsideRecruitment: Bool {
+        switch format {
+        case .team_meeting, .other, .announcement:
+            return false
+        case .practice, .scrimmage, .league_game, .tournament_game, .match, .tryout, .clinic, .pickup:
+            return true
+        }
+    }
+
+    var supportsOutsideRecruitment: Bool { allowsTeamOutsideRecruitment }
+
+    var showsCompetitionLevel: Bool { isGameplayEvent }
+
+    var showsHowYouPlay: Bool { isGameplayEvent }
+
+    var supportsCapacity: Bool { isGameplayEvent }
+
+    var showsSpotsLeft: Bool { isGameplayEvent }
+
+    /// Competitive formats that require a free-text opponent — **sport-aware**.
+    /// Running Race / Climbing Competition / etc. do not require a single Team opponent.
+    var requiresOpponent: Bool {
+        capabilities.requiresOpponent
+    }
+
+    /// Show the Matchup / Opponent row (Team Schedule create + edit).
+    var showsOpponentField: Bool { requiresOpponent }
+
+    /// Live / final head-to-head scoring UI may appear only when capability says so.
+    var supportsHeadToHeadScore: Bool {
+        resultCapability == .headToHeadScore
+    }
+
+    var usesGenericDetailLabels: Bool {
+        if FanTeamEventTypeCatalog.usesGenericEventChrome(format: format, sport: sport) {
+            return true
+        }
+        switch format {
+        case .team_meeting, .other, .announcement:
+            return true
+        default:
+            return false
+        }
+    }
+
+    var prefersCustomTitle: Bool {
+        format == .other || format == .team_meeting || format == .announcement
+    }
+
+    /// Announcement requires a non-empty description/body (message).
+    var requiresDescriptionBody: Bool {
+        format == .announcement
+    }
+
+    /// Hide RSVP / attendance for announcements.
+    var showsAttendanceRSVP: Bool {
+        isGameplayEvent || format == .team_meeting || format == .other
+    }
+
+    /// Announcements are message-first; venue/directions are optional and omitted when empty.
+    var showsLocationFields: Bool {
+        format != .announcement
+    }
+
+    /// Announcements are notices — no lineup / attendance roster UI.
+    var showsLineup: Bool {
+        format != .announcement
+    }
+
+    var systemImage: String { format.systemImage }
+
+    func localizedTitle(languageCode: String?) -> String {
+        if sport.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return format.displayTitle(languageCode: languageCode)
+        }
+        return FanTeamEventTypeCatalog.displayTitle(
+            for: format,
+            sport: sport,
+            languageCode: languageCode
+        )
+    }
+
+    func detailSectionTitleKey() -> String {
+        usesGenericDetailLabels
+            ? "pickup_detail_event_details"
+            : "pickup_detail_game_details"
+    }
+
+    func calendarNounKey() -> String {
+        usesGenericDetailLabels
+            ? "pickup_calendar_noun_event"
+            : "pickup_calendar_noun_pickup"
+    }
+}
+
+extension FanTeamEventPresentation {
+    /// Navigation title for `DiscoverPickupGameDetailSheet`.
+    /// Announcement → “Team Announcement”; Team-linked → “Event Details”; standalone → “Pickup game”.
+    static func detailNavigationTitleKey(
+        isTeamLinked: Bool,
+        format: GameType? = nil
+    ) -> String {
+        if format == .announcement {
+            return FanTeamAnnouncementDetailPresentation.navTitleKey
+        }
+        return isTeamLinked ? "team_event_detail_nav_title" : "share_pickup_card_badge"
+    }
+}
+
+/// Team Schedule matchup helpers: home team is always the FanGeo team; opponent is free text.
+enum FanTeamScheduleMatchup {
+    static func trimmedOpponent(_ raw: String?) -> String? {
+        let trimmed = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Only formats whose **sport-aware** capability requires an opponent serialize opponent data.
+    /// Pass `sport` whenever available so Running Race / Climbing Competition do not persist opponents.
+    static func persistableOpponent(format: GameType, opponentName: String?, sport: String = "") -> String? {
+        guard FanTeamEventPresentation.policy(for: format, sport: sport).requiresOpponent else { return nil }
+        return trimmedOpponent(opponentName)
+    }
+
+    static func matchupLine(
+        homeTeamName: String,
+        opponentName: String?,
+        languageCode: String?
+    ) -> String? {
+        guard let opponent = trimmedOpponent(opponentName) else { return nil }
+        let home = homeTeamName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !home.isEmpty else { return nil }
+        let vs = L10n.t("fan_team_schedule_vs", languageCode: languageCode)
+        return "\(home) \(vs) \(opponent)"
     }
 }
 
@@ -386,6 +601,18 @@ struct PickupGameTeamCreationContext: Equatable, Hashable, Sendable {
     let logoURL: String?
     let logoThumbnailURL: String?
     let colorHex: String?
+    /// Durable Team Chat conversation (`fan_teams.group_conversation_id`).
+    let groupConversationId: UUID?
+    /// Owner/Manager (or granted) may create Announcement format.
+    let canPublishAnnouncements: Bool
+    /// Broad staff gate (invite / roster / identity / etc.). Prefer finer flags when available.
+    let canManageTeam: Bool
+    /// Edit existing Team-linked events (`edit_events`).
+    let canEditTeamEvents: Bool
+    /// Owner, Manager title, or granted `edit_events` may score Live/Final games.
+    let canScoreTeamEvents: Bool
+    /// Owner/Manager/Head Coach (or granted `create_events`) may manage Team saved locations.
+    let canManageTeamLocations: Bool
 
     init(
         teamId: UUID,
@@ -395,7 +622,13 @@ struct PickupGameTeamCreationContext: Equatable, Hashable, Sendable {
         competitionLevel: PickupCompetitionLevel? = nil,
         logoURL: String? = nil,
         logoThumbnailURL: String? = nil,
-        colorHex: String? = nil
+        colorHex: String? = nil,
+        groupConversationId: UUID? = nil,
+        canPublishAnnouncements: Bool = false,
+        canManageTeam: Bool = false,
+        canEditTeamEvents: Bool = false,
+        canScoreTeamEvents: Bool = false,
+        canManageTeamLocations: Bool = false
     ) {
         self.teamId = teamId
         self.teamName = teamName
@@ -405,6 +638,12 @@ struct PickupGameTeamCreationContext: Equatable, Hashable, Sendable {
         self.logoURL = logoURL
         self.logoThumbnailURL = logoThumbnailURL
         self.colorHex = colorHex
+        self.groupConversationId = groupConversationId
+        self.canPublishAnnouncements = canPublishAnnouncements
+        self.canManageTeam = canManageTeam
+        self.canEditTeamEvents = canEditTeamEvents
+        self.canScoreTeamEvents = canScoreTeamEvents
+        self.canManageTeamLocations = canManageTeamLocations
     }
 
     init(from summary: FanTeamSummary) {
@@ -416,7 +655,13 @@ struct PickupGameTeamCreationContext: Equatable, Hashable, Sendable {
             competitionLevel: summary.competitionLevel,
             logoURL: summary.logoURL,
             logoThumbnailURL: summary.logoThumbnailURL,
-            colorHex: summary.colorHex
+            colorHex: summary.colorHex,
+            groupConversationId: summary.groupConversationId,
+            canPublishAnnouncements: summary.canPublishAnnouncements,
+            canManageTeam: summary.canManage,
+            canEditTeamEvents: summary.canEditTeamEvents,
+            canScoreTeamEvents: summary.canScoreTeamEvents,
+            canManageTeamLocations: summary.canOrganizeActivities
         )
     }
 
@@ -527,34 +772,53 @@ struct PickupGameCreationContext: Equatable, Sendable {
 
 /// Product rules for Public/Private on create/edit (`pickup_games.is_visible`).
 ///
+/// Canonical field: `pickup_games.is_visible`
+/// - `true`  = Public (Discover-eligible under existing RLS / Discover filters)
+/// - `false` = Private (authorized viewers only; Team membership ≠ Public)
+///
 /// - Normal Pickup create defaults Public (`true`).
-/// - Team → Schedule Game create defaults Private (`false`).
-/// - Team-linked + “Need additional players” OFF → always Private (Team RSVP only; not outside-discoverable).
-/// - Team-linked + recruiting ON → organizer Public/Private selection wins.
-/// - Standalone Pickup → organizer selection wins.
+/// - Team → Schedule Game create defaults Private (`false`) — privacy-safe default only.
+/// - Organizer Public/Private selection always wins on save (Team or standalone).
+/// - Outside recruiting (`needsAdditionalPlayers`) is independent and must NOT override visibility.
+/// - Event Type / Sport changes must NOT override visibility.
 /// - Edit seeds from the existing row only (never from Team create context).
-/// - Team link is independent of visibility (Public Team-linked games stay linked when recruiting).
+/// - Standalone pickup games are always public. There is no private pickup game.
+/// - Team events keep organizer Public/Private selection.
+/// - Team link is independent of visibility (Public Team-linked games stay linked).
 enum PickupGameEditPrivacyPolicy {
-    /// Initial value for a **new** game only. Edit must use `row.is_visible`.
+    /// Canonical `is_visible` value persisted for standalone pickup games.
+    static let standalonePickupIsVisible = true
+
+    /// Public/Private is a Team Event control only.
+    static func showsVisibilityControl(isTeamLinked: Bool) -> Bool {
+        isTeamLinked
+    }
+
+    /// Initial value for a **new** game only. Edit must use `row.is_visible` for Team events.
+    /// Standalone pickup create is always Public.
     static func defaultIsPublicForNewGame(isTeamSourcedCreate: Bool) -> Bool {
-        !isTeamSourcedCreate
+        isTeamSourcedCreate ? false : standalonePickupIsVisible
     }
 
-    /// Persist the organizer's form selection for standalone / Team-recruiting games.
-    static func resolvedIsVisible(formIsPublic: Bool) -> Bool {
-        formIsPublic
+    /// Persist the organizer's form selection for Team events.
+    /// Standalone pickup always persists the canonical public value.
+    static func resolvedIsVisible(formIsPublic: Bool, isStandalonePickup: Bool = false) -> Bool {
+        if isStandalonePickup { return standalonePickupIsVisible }
+        return formIsPublic
     }
 
-    /// Team roster-only games (recruiting OFF) must not remain publicly discoverable.
+    /// Compatibility overload — recruiting must not override visibility.
+    /// Standalone pickup stays public; Team events persist the organizer selection.
     static func resolvedIsVisible(
         formIsPublic: Bool,
         isTeamLinked: Bool,
         needsAdditionalPlayers: Bool
     ) -> Bool {
-        if isTeamLinked, !needsAdditionalPlayers {
-            return false
-        }
-        return formIsPublic
+        _ = needsAdditionalPlayers
+        return resolvedIsVisible(
+            formIsPublic: formIsPublic,
+            isStandalonePickup: !isTeamLinked
+        )
     }
 }
 
@@ -566,6 +830,8 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
     let creator_email: String?
     let title: String
     let sport: String
+    /// Optional reusable activity subtype (`mountain_biking`, `group_ride`, …). Nil on legacy rows.
+    let sport_subtype: String?
     let description: String?
     let game_format: String
     /// Optional sport level axis (`youth`…`professional`). Nil = not specified.
@@ -598,6 +864,15 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
     let updated_at: String?
     /// `organizer_only` (default) | `approved_players`. Nil/unknown → organizer only.
     let poll_create_permission: String?
+    /// Optional free-text opponent for Team competitive events (`pickup_games.opponent_name`).
+    let opponent_name: String?
+    /// Optional player arrival instant (`pickup_games.arrival_time`). Nil = not specified.
+    let arrival_time: String?
+    /// Team scoring columns (nil until 20261003 is applied / row is Live or Final).
+    let team_score: Int?
+    let opponent_score: Int?
+    let scoring_status: String?
+    let scoring_finalized_at: String?
 
     var pollCreatePermission: PickupPollCreatePermission {
         PickupPollCreatePermission.resolved(poll_create_permission)
@@ -609,6 +884,7 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
         creator_email: String?,
         title: String,
         sport: String,
+        sport_subtype: String? = nil,
         description: String?,
         game_format: String,
         competition_level: String? = nil,
@@ -635,13 +911,20 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
         remove_after_at: String?,
         created_at: String?,
         updated_at: String?,
-        poll_create_permission: String? = nil
+        poll_create_permission: String? = nil,
+        opponent_name: String? = nil,
+        arrival_time: String? = nil,
+        team_score: Int? = nil,
+        opponent_score: Int? = nil,
+        scoring_status: String? = nil,
+        scoring_finalized_at: String? = nil
     ) {
         self.id = id
         self.creator_user_id = creator_user_id
         self.creator_email = creator_email
         self.title = title
         self.sport = sport
+        self.sport_subtype = sport_subtype
         self.description = description
         self.game_format = game_format
         self.competition_level = competition_level
@@ -669,6 +952,12 @@ struct PickupGameRow: Codable, Identifiable, Equatable, Hashable {
         self.created_at = created_at
         self.updated_at = updated_at
         self.poll_create_permission = poll_create_permission
+        self.opponent_name = opponent_name
+        self.arrival_time = arrival_time
+        self.team_score = team_score
+        self.opponent_score = opponent_score
+        self.scoring_status = scoring_status
+        self.scoring_finalized_at = scoring_finalized_at
     }
 }
 
@@ -734,6 +1023,7 @@ extension PickupGameRow {
             creator_email: creator_email,
             title: title,
             sport: sport,
+            sport_subtype: sport_subtype,
             description: description,
             game_format: game_format,
             competition_level: competition_level,
@@ -760,7 +1050,62 @@ extension PickupGameRow {
             remove_after_at: remove_after_at,
             created_at: created_at,
             updated_at: updated_at,
-            poll_create_permission: poll_create_permission
+            poll_create_permission: poll_create_permission,
+            opponent_name: opponent_name,
+            arrival_time: arrival_time,
+            team_score: team_score,
+            opponent_score: opponent_score,
+            scoring_status: scoring_status,
+            scoring_finalized_at: scoring_finalized_at
+        )
+    }
+
+    func replacingScoring(
+        teamScore: Int,
+        opponentScore: Int,
+        scoringStatus: String,
+        scoringFinalizedAt: String?
+    ) -> PickupGameRow {
+        PickupGameRow(
+            id: id,
+            creator_user_id: creator_user_id,
+            creator_email: creator_email,
+            title: title,
+            sport: sport,
+            sport_subtype: sport_subtype,
+            description: description,
+            game_format: game_format,
+            competition_level: competition_level,
+            skill_level: skill_level,
+            game_start_at: game_start_at,
+            end_time: end_time,
+            address: address,
+            city: city,
+            state: state,
+            latitude: latitude,
+            longitude: longitude,
+            is_visible: is_visible,
+            players_needed: players_needed,
+            play_environment: play_environment,
+            participant_preference: participant_preference,
+            age_min: age_min,
+            age_max: age_max,
+            is_free: is_free,
+            entry_fee_amount: entry_fee_amount,
+            max_players: max_players,
+            status: status,
+            approved_join_count: approved_join_count,
+            cleanup_delay_hours: cleanup_delay_hours,
+            remove_after_at: remove_after_at,
+            created_at: created_at,
+            updated_at: updated_at,
+            poll_create_permission: poll_create_permission,
+            opponent_name: opponent_name,
+            arrival_time: arrival_time,
+            team_score: teamScore,
+            opponent_score: opponentScore,
+            scoring_status: scoringStatus,
+            scoring_finalized_at: scoringFinalizedAt
         )
     }
 
@@ -908,6 +1253,15 @@ extension PickupGameRow {
         guard let viewerUserId, creator_user_id == viewerUserId else { return false }
         return status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "active"
     }
+
+    func sportIdentityLabel(languageCode: String? = nil, compact: Bool = false) -> String {
+        SportSubtypeCatalog.identityLine(
+            sport: sport,
+            subtype: sport_subtype,
+            languageCode: languageCode,
+            compactSport: compact
+        )
+    }
 }
 
 struct PickupGameInsert: Encodable {
@@ -915,6 +1269,7 @@ struct PickupGameInsert: Encodable {
     let creator_email: String?
     let title: String
     let sport: String
+    let sport_subtype: String?
     let description: String?
     let game_format: String
     let competition_level: String?
@@ -939,6 +1294,9 @@ struct PickupGameInsert: Encodable {
     /// Always `game_start_at` + 12h; sent on every write so `remove_after_at` never lags behind an edited start time.
     let remove_after_at: String
     let poll_create_permission: String
+    let opponent_name: String?
+    /// Optional; omitted from JSON when nil (column stays DEFAULT NULL on insert).
+    let arrival_time: String?
 
     /// Write payload with canonical 12h pickup retention. Preserves caller `is_visible`
     /// (classic create passes true; Team Schedule Game passes false).
@@ -949,6 +1307,7 @@ struct PickupGameInsert: Encodable {
             creator_email: creator_email,
             title: title,
             sport: sport,
+            sport_subtype: sport_subtype,
             description: description,
             game_format: game_format,
             competition_level: competition_level,
@@ -971,14 +1330,39 @@ struct PickupGameInsert: Encodable {
             max_players: max_players,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
             remove_after_at: remove,
-            poll_create_permission: poll_create_permission
+            poll_create_permission: poll_create_permission,
+            opponent_name: opponent_name,
+            arrival_time: arrival_time
         )
+    }
+}
+
+/// PostgREST UPDATE-friendly optional timestamptz: encodes JSON `null` when absent so edits clear the column.
+struct PickupNullableTimestamptz: Encodable, Equatable, Sendable {
+    let iso: String?
+
+    init(_ iso: String?) {
+        self.iso = iso
+    }
+
+    init(date: Date?) {
+        self.iso = date.map { PickupGameModels.encodeSupabaseTimestamptz($0) }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let iso {
+            try container.encode(iso)
+        } else {
+            try container.encodeNil()
+        }
     }
 }
 
 struct PickupGameFullUpdate: Encodable {
     let title: String
     let sport: String
+    let sport_subtype: String?
     let description: String?
     let game_format: String
     let competition_level: String?
@@ -1003,6 +1387,8 @@ struct PickupGameFullUpdate: Encodable {
     /// Always `game_start_at` + 12h; sent on full edit so expiration tracks the edited start instant.
     let remove_after_at: String
     let poll_create_permission: String
+    let opponent_name: String?
+    let arrival_time: PickupNullableTimestamptz
 
     /// Write payload with canonical 12h pickup retention. Preserves caller `is_visible`
     /// so Team-private games are not republished on edit.
@@ -1011,6 +1397,7 @@ struct PickupGameFullUpdate: Encodable {
         return PickupGameFullUpdate(
             title: title,
             sport: sport,
+            sport_subtype: sport_subtype,
             description: description,
             game_format: game_format,
             competition_level: competition_level,
@@ -1033,7 +1420,9 @@ struct PickupGameFullUpdate: Encodable {
             max_players: max_players,
             cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
             remove_after_at: remove,
-            poll_create_permission: poll_create_permission
+            poll_create_permission: poll_create_permission,
+            opponent_name: opponent_name,
+            arrival_time: arrival_time
         )
     }
 }

@@ -19,7 +19,7 @@ struct FanGeoIdentitySetupView: View {
     @State private var displayNameDraft = ""
     @State private var handleDraft = ""
     @State private var bioDraft = ""
-    @State private var favoriteTeamIDs: Set<String> = []
+    @State private var favoriteTeamIDs: [String] = []
     @State private var showFavoriteTeamsPicker = false
     @State private var selectedAvatarItem: PhotosPickerItem?
     @State private var isSaving = false
@@ -109,7 +109,7 @@ struct FanGeoIdentitySetupView: View {
                 refreshDisplayNameValidation(markTouched: false)
             }
             .sheet(isPresented: $showFavoriteTeamsPicker) {
-                FavoriteTeamsPickerSheet(selectedIDs: $favoriteTeamIDs)
+                AnyView(FavoriteTeamsPickerSheet(selectedIDs: $favoriteTeamIDs))
             }
         }
     }
@@ -213,9 +213,7 @@ struct FanGeoIdentitySetupView: View {
     }
 
     private var selectedFavoriteTeams: [FavoriteTeam] {
-        favoriteTeamIDs
-            .compactMap { FavoriteTeamCatalog.team(id: $0) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        FavoriteTeamsStore.resolvedTeams(fromIDs: favoriteTeamIDs)
     }
 
     private var handleSection: some View {
@@ -400,10 +398,10 @@ struct FanGeoIdentitySetupView: View {
         }
 
         if mode == .complete, !favoriteTeamIDs.isEmpty {
-            let sortedIDs = favoriteTeamIDs.sorted()
-            FavoriteTeamsStore.writeToAppStorage(sortedIDs)
-            FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(sortedIDs.first)
-            _ = await viewModel.syncFavoriteTeamsToSupabase(teamIDs: sortedIDs, primaryTeamID: sortedIDs.first)
+            let orderedIDs = FavoriteTeamsStore.uniquedIDs(favoriteTeamIDs)
+            FavoriteTeamsStore.writeToAppStorage(orderedIDs)
+            FavoriteTeamsStore.writePrimaryTeamIDToAppStorage(orderedIDs.first)
+            _ = await viewModel.syncFavoriteTeamsToSupabase(teamIDs: orderedIDs, primaryTeamID: orderedIDs.first)
         }
 
         print("[SignupProfileDebug] profileSaveSuccess")

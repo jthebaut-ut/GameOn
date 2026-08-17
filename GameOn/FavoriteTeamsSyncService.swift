@@ -58,11 +58,13 @@ enum FavoriteTeamsSyncService {
                 .execute()
                 .value
 
-            let ids = rows
-                .map(\.team_id)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .filter { FavoriteTeamCatalog.team(id: $0) != nil }
+            let ids = FavoriteTeamsStore.uniquedIDs(
+                rows
+                    .map(\.team_id)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .filter { FavoriteTeamCatalog.team(id: $0) != nil }
+            )
             let primary = rows
                 .first { $0.is_primary == true && ids.contains($0.team_id) }?
                 .team_id
@@ -96,14 +98,8 @@ enum FavoriteTeamsSyncService {
 
     /// Replaces favorite teams while marking one row as the primary Trophy Team.
     static func replaceTeamSelection(userId: UUID, teamIDs: [String], primaryTeamID: String?) async -> Bool {
-        let valid = Array(
-            Set(
-                teamIDs
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
-                    .filter { FavoriteTeamCatalog.team(id: $0) != nil }
-            )
-        ).sorted()
+        let valid = FavoriteTeamsStore.uniquedIDs(teamIDs)
+            .filter { FavoriteTeamCatalog.team(id: $0) != nil }
         let primary = FavoriteTeamsStore.normalizedPrimaryTeamID(primaryTeamID, within: valid)
 
 #if DEBUG
@@ -156,11 +152,13 @@ enum FavoriteTeamsSyncService {
                 .order("created_at", ascending: true)
                 .execute()
                 .value
-            let ids = rows
-                .map(\.team_id)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .filter { FavoriteTeamCatalog.team(id: $0) != nil }
+            let ids = FavoriteTeamsStore.uniquedIDs(
+                rows
+                    .map(\.team_id)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .filter { FavoriteTeamCatalog.team(id: $0) != nil }
+            )
 #if DEBUG
             print("[FavoriteTeamsHydration] rows returned authUserId=\(userId.uuidString.lowercased()) raw=\(rows.count) valid=\(ids.count) source=legacy")
 #endif

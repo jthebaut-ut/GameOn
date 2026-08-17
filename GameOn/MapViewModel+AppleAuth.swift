@@ -522,6 +522,7 @@ extension MapViewModel {
 
         await persistAccountModeForActiveAuthSession(.businessOwner)
         clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+        await registerFanActiveSessionOnLogin()
         await refreshOwnedBusinessesAndVenuesAfterOwnerLogin()
         _ = await ensureBusinessOwnerSessionFlagsIfPossible(context: "after_apple_business_login")
 

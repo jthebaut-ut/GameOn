@@ -160,10 +160,17 @@ private struct SmoothCachedAvatarImage: View {
         .frame(width: size, height: size)
         .task(id: url.absoluteString) {
             let requestedURL = url
+
+            if let peeked = DiscoverMapImageCache.shared.peekCachedImage(for: requestedURL, bucket: .avatar) {
+                if uiImage !== peeked {
+                    uiImage = peeked
+                }
+                imageOpacity = 1
+                return
+            }
+
             let token = loadToken &+ 1
             loadToken = token
-            imageOpacity = 0
-            uiImage = nil
 
             if let cached = await DiscoverMapImageCache.shared.cachedImage(for: requestedURL, bucket: .avatar) {
                 guard isCurrentLoad(token: token, requestedURL: requestedURL) else { return }
@@ -197,9 +204,7 @@ private struct SmoothCachedAvatarImage: View {
             ProfileAvatarDebug.avatarRenderSource("server")
             ProfileAvatarDebug.avatarImageLoadFinished(url: requestedURL, succeeded: true, detail: "network_or_disk_decode_ok")
 #endif
-            withAnimation(.easeOut(duration: 0.22)) {
-                imageOpacity = 1
-            }
+            imageOpacity = 1
         }
     }
 

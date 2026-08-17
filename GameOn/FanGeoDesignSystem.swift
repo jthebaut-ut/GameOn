@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UIKit
 
@@ -86,11 +87,14 @@ enum FGColor {
     static let dangerRed = Color(red: 0.91, green: 0.25, blue: 0.28)
     static let businessGreen = Color(red: 0.18, green: 0.66, blue: 0.37)
 
-    /// Consumer Watch / Play / Pro Games intent accents (Discover, Schedule, Going).
+    /// Consumer Watch / Play / Pro Games / Teams intent accents (Discover, Schedule, Going, My Teams).
     /// Play uses system orange to match existing FanGeo pickup chrome.
+    /// Teams uses FanGeo purple for Team Schedule and My Teams chrome (not Pickup orange).
     static let intentWatch = accentGreen
     static let intentPlay = Color.orange
     static let intentProGames = accentBlue
+    /// Semantic Teams accent — Schedule Game, Team identity chrome, My Teams purple.
+    static let intentTeams = Color(red: 0.52, green: 0.38, blue: 0.95)
 
     static let gradientStart = Color(red: 0.78, green: 0.90, blue: 0.99)
     static let gradientMiddle = Color(red: 0.43, green: 0.68, blue: 0.93)
@@ -845,16 +849,43 @@ enum PokesUnseenEmphasis {
     }
 }
 
+/// True while the Account Profile `ScrollView` is actively scrolling / decelerating.
+/// Derived from ``ProfileScrollInteractionRelay`` for call sites that only need a Bool read.
+/// Prefer the relay's publisher inside long-lived Profile leaves so Settings does not rebuild.
+extension EnvironmentValues {
+    var profileScrollInteractionActive: Bool {
+        profileScrollInteractionRelay.isActive
+    }
+}
+
 /// Breathing warm glow, light sweep, and border for the profile Pokes highlights card.
+///
+/// Performance: pauses while Profile is scrolling / Reduce Motion; caps at ~10fps;
+/// avoids live blur + GeometryReader (same visual language, cheaper compositing).
 struct PokesUnseenHighlightsEmphasisModifier: ViewModifier {
     let isActive: Bool
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.profileScrollInteractionRelay) private var scrollRelay
+    @State private var isScrolling = false
     @State private var wasActive = false
 
+    /// Mid-cycle static emphasis used while paused (scroll / reduce motion).
+    private static let pausedPulse: Double = 0.55
+    private static let pausedSweep: Double = 0.42
+
+    private var shouldAnimate: Bool {
+        isActive && !reduceMotion && !isScrolling
+    }
+
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
-            let pulse = isActive ? PokesUnseenEmphasis.pulse(at: timeline.date) : 0
-            let sweep = isActive ? PokesUnseenEmphasis.sweep(at: timeline.date) : 0
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: !shouldAnimate)) { timeline in
+            let pulse = shouldAnimate
+                ? PokesUnseenEmphasis.pulse(at: timeline.date)
+                : (isActive ? Self.pausedPulse : 0)
+            let sweep = shouldAnimate
+                ? PokesUnseenEmphasis.sweep(at: timeline.date)
+                : (isActive ? Self.pausedSweep : 0)
             content
                 .shadow(
                     color: PokesUnseenEmphasis.warmAccentColor(
@@ -867,46 +898,45 @@ struct PokesUnseenHighlightsEmphasisModifier: ViewModifier {
                 )
                 .background {
                     if isActive {
+                        // Soft radial glow without `.blur` — blur forced an offscreen pass every tick.
                         RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .fill(
                                 RadialGradient(
                                     colors: [
                                         PokesUnseenEmphasis.warmAccentColor(
-                                            opacity: colorScheme == .dark ? 0.16 + 0.14 * pulse : 0.11 + 0.12 * pulse
+                                            opacity: colorScheme == .dark ? 0.18 + 0.12 * pulse : 0.13 + 0.10 * pulse
                                         ),
-                                        FGColor.accentBlue.opacity(colorScheme == .dark ? 0.08 + 0.06 * pulse : 0.06 + 0.05 * pulse),
+                                        FGColor.accentBlue.opacity(colorScheme == .dark ? 0.07 + 0.05 * pulse : 0.05 + 0.04 * pulse),
                                         Color.clear
                                     ],
                                     center: .center,
-                                    startRadius: 6,
-                                    endRadius: 130
+                                    startRadius: 4,
+                                    endRadius: 150
                                 )
                             )
-                            .padding(-8)
-                            .blur(radius: 10)
+                            .padding(-10)
                             .allowsHitTesting(false)
                     }
                 }
                 .overlay {
                     if isActive {
-                        GeometryReader { proxy in
-                            let sweepX = -0.35 + 1.7 * sweep
-                            LinearGradient(
-                                colors: [
-                                    Color.clear,
-                                    Color.white.opacity(colorScheme == .dark ? 0.06 : 0.14),
-                                    PokesUnseenEmphasis.warmAccentColor(opacity: colorScheme == .dark ? 0.10 : 0.08),
-                                    Color.white.opacity(colorScheme == .dark ? 0.04 : 0.10),
-                                    Color.clear
-                                ],
-                                startPoint: UnitPoint(x: sweepX - 0.22, y: 0),
-                                endPoint: UnitPoint(x: sweepX + 0.22, y: 1)
+                        let sweepX = -0.35 + 1.7 * sweep
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color.clear,
+                                        Color.white.opacity(colorScheme == .dark ? 0.06 : 0.14),
+                                        PokesUnseenEmphasis.warmAccentColor(opacity: colorScheme == .dark ? 0.10 : 0.08),
+                                        Color.white.opacity(colorScheme == .dark ? 0.04 : 0.10),
+                                        Color.clear
+                                    ],
+                                    startPoint: UnitPoint(x: sweepX - 0.22, y: 0),
+                                    endPoint: UnitPoint(x: sweepX + 0.22, y: 1)
+                                )
                             )
-                            .frame(width: proxy.size.width, height: proxy.size.height)
                             .blendMode(.overlay)
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                        .allowsHitTesting(false)
+                            .allowsHitTesting(false)
                     }
                 }
                 .overlay {
@@ -929,9 +959,11 @@ struct PokesUnseenHighlightsEmphasisModifier: ViewModifier {
                 }
         }
         .onAppear {
+            isScrolling = scrollRelay.isActive
             wasActive = isActive
             DebugLogGate.debug("[PokesCardAnimation] active=\(isActive)")
         }
+        .onReceive(scrollRelay.publisher) { isScrolling = $0 }
         .onChange(of: isActive) { _, active in
             DebugLogGate.debug("[PokesCardAnimation] active=\(active)")
             if wasActive, !active {
@@ -946,10 +978,19 @@ struct PokesUnseenHighlightsEmphasisModifier: ViewModifier {
 struct PokesUnseenTitleRowEmphasisModifier: ViewModifier {
     let isActive: Bool
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.profileScrollInteractionRelay) private var scrollRelay
+    @State private var isScrolling = false
+
+    private var shouldAnimate: Bool {
+        isActive && !reduceMotion && !isScrolling
+    }
 
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
-            let pulse = isActive ? PokesUnseenEmphasis.pulse(at: timeline.date) : 0
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: !shouldAnimate)) { timeline in
+            let pulse = shouldAnimate
+                ? PokesUnseenEmphasis.pulse(at: timeline.date)
+                : (isActive ? 0.55 : 0)
             content
                 .shadow(
                     color: PokesUnseenEmphasis.warmAccentColor(opacity: isActive ? 0.10 + 0.14 * pulse : 0),
@@ -957,6 +998,8 @@ struct PokesUnseenTitleRowEmphasisModifier: ViewModifier {
                 )
                 .opacity(isActive ? 0.92 + 0.08 * pulse : 1)
         }
+        .onAppear { isScrolling = scrollRelay.isActive }
+        .onReceive(scrollRelay.publisher) { isScrolling = $0 }
     }
 }
 
@@ -964,10 +1007,19 @@ struct PokesUnseenTitleRowEmphasisModifier: ViewModifier {
 struct PokesUnseenWaveIconEmphasisModifier: ViewModifier {
     let isActive: Bool
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.profileScrollInteractionRelay) private var scrollRelay
+    @State private var isScrolling = false
+
+    private var shouldAnimate: Bool {
+        isActive && !reduceMotion && !isScrolling
+    }
 
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
-            let pulse = isActive ? PokesUnseenEmphasis.pulse(at: timeline.date) : 0
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: !shouldAnimate)) { timeline in
+            let pulse = shouldAnimate
+                ? PokesUnseenEmphasis.pulse(at: timeline.date)
+                : (isActive ? 0.55 : 0)
             content
                 .foregroundStyle(
                     isActive
@@ -997,16 +1049,27 @@ struct PokesUnseenWaveIconEmphasisModifier: ViewModifier {
                     }
                 }
         }
+        .onAppear { isScrolling = scrollRelay.isActive }
+        .onReceive(scrollRelay.publisher) { isScrolling = $0 }
     }
 }
 
 /// Gentle emphasis on the "New" pill while unseen pokes are present.
 struct PokesUnseenNewPillEmphasisModifier: ViewModifier {
     let isActive: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.profileScrollInteractionRelay) private var scrollRelay
+    @State private var isScrolling = false
+
+    private var shouldAnimate: Bool {
+        isActive && !reduceMotion && !isScrolling
+    }
 
     func body(content: Content) -> some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isActive)) { timeline in
-            let pulse = isActive ? PokesUnseenEmphasis.pulse(at: timeline.date) : 0
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: !shouldAnimate)) { timeline in
+            let pulse = shouldAnimate
+                ? PokesUnseenEmphasis.pulse(at: timeline.date)
+                : (isActive ? 0.55 : 0)
             content
                 .opacity(isActive ? 0.88 + 0.12 * pulse : 1)
                 .shadow(
@@ -1015,6 +1078,8 @@ struct PokesUnseenNewPillEmphasisModifier: ViewModifier {
                     y: 0.5
                 )
         }
+        .onAppear { isScrolling = scrollRelay.isActive }
+        .onReceive(scrollRelay.publisher) { isScrolling = $0 }
     }
 }
 

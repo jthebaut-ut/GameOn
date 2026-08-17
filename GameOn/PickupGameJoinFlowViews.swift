@@ -87,15 +87,75 @@ struct PickupGameStartedLineCaption: View {
     }
 }
 
-/// Stable token for presenting pickup detail from Discover (`Identifiable` for `.sheet(item:)`).
+/// Stable presentation classification for pickup / Team Event detail.
+/// Must be known at presentation time whenever the caller already knows Team linkage.
+enum PickupDetailPresentationMode: String, Equatable, Hashable, Sendable {
+    case standalonePickup
+    case teamEvent
+}
+
+/// Stable token for presenting pickup / Team Event detail (`.sheet(item:)`).
+///
+/// `presentationMode` and optional Team seed are set by the caller when known
+/// (Team Schedule, Team Overview, Team push deep links) so the first frame never
+/// morphs from standalone Pickup → Team Event after async hydration.
 struct PickupDetailNavigationToken: Identifiable, Equatable, Hashable {
     let id: UUID
+    var presentationMode: PickupDetailPresentationMode
+    /// Seeded Team identity for first-frame Team Event chrome (optional enrichment OK later).
+    var seededTeamContext: PickupGameTeamCreationContext?
+
+    init(
+        id: UUID,
+        presentationMode: PickupDetailPresentationMode = .standalonePickup,
+        seededTeamContext: PickupGameTeamCreationContext? = nil
+    ) {
+        self.id = id
+        self.presentationMode = presentationMode
+        self.seededTeamContext = seededTeamContext
+    }
+
+    static func standalone(_ gameId: UUID) -> PickupDetailNavigationToken {
+        PickupDetailNavigationToken(id: gameId, presentationMode: .standalonePickup)
+    }
+
+    static func teamEvent(
+        gameId: UUID,
+        team: PickupGameTeamCreationContext
+    ) -> PickupDetailNavigationToken {
+        PickupDetailNavigationToken(
+            id: gameId,
+            presentationMode: .teamEvent,
+            seededTeamContext: team
+        )
+    }
+
+    static func teamEvent(
+        gameId: UUID,
+        teamSummary: FanTeamSummary
+    ) -> PickupDetailNavigationToken {
+        .teamEvent(gameId: gameId, team: PickupGameTeamCreationContext(from: teamSummary))
+    }
+}
+
+/// Action Center → Teams → Schedule game + pending join requests.
+struct PendingTeamScheduleJoinApprovalDeepLink: Equatable, Hashable {
+    let teamId: UUID
+    let pickupGameId: UUID
 }
 
 /// Discover → Pickup mode: full detail + join request entry (Phase 2).
 struct DiscoverPickupGameDetailSheet: View {
     @ObservedObject var viewModel: MapViewModel
     let gameId: UUID
+    /// Locked at presentation time whenever the caller already knows Team linkage.
+    let initialPresentationMode: PickupDetailPresentationMode
+    /// Optional first-frame Team chrome (Team Schedule / Overview / Team deep links).
+    let initialTeamContext: PickupGameTeamCreationContext?
+    /// When presented from Team Detail → Schedule, request the embedded Team Chat tab
+    /// for `teamId` instead of routing through the global Chat tab.
+    /// Returns `true` when the parent accepted the intent (sheet should dismiss).
+    var onRequestTeamDetailChatTab: ((UUID /* teamId */, UUID /* eventId */) -> Bool)? = nil
 
     @EnvironmentObject private var chatViewModel: ChatViewModel
     @Environment(\.colorScheme) private var colorScheme
@@ -121,15 +181,88 @@ struct DiscoverPickupGameDetailSheet: View {
     @State private var didAttemptSharedPickupLoad = false
     @State private var showInAppShareSheet = false
     @State private var editFormMode: PickupGameFormMode?
+    @State private var editCreationContext: PickupGameCreationContext = .standard
     @State private var isPreparingEdit = false
     @State private var showCancelGameConfirm = false
     @State private var isCancellingGame = false
-    @State private var isTeamLinkedGame = false
+    /// Presentation lock — seeded from caller / sync cache; never flip Team → Pickup mid-session.
+    @State private var isTeamLinkedGame: Bool
     @State private var linkedTeamContext: PickupGameTeamCreationContext?
+    @State private var presentationModeLockedAsTeamEvent: Bool
     @State private var myTeamRSVP: FanTeamGameRSVPStatus?
     @State private var canUseTeamRSVP = false
     @State private var isSettingTeamRSVP = false
+    @State private var showTeamRSVPChangeMenu = false
     @State private var showDirectionsChooser = false
+    /// Announcement sender role from Team roster (presentation only; optional).
+    @State private var announcementSenderRole: FanTeamMemberRole?
+    @State private var announcementSenderMemberName: String?
+    @State private var scoringTeamScore: Int?
+    @State private var scoringOpponentScore: Int?
+    @State private var scoringStatusRaw: String?
+    @State private var scoringFinalizedAtRaw: String?
+    @State private var scoringBusy = false
+    @State private var scoringError: String?
+    @State private var showCorrectResultSheet = false
+    @State private var correctDraftTeam = 0
+    @State private var correctDraftOpponent = 0
+
+    init(
+        viewModel: MapViewModel,
+        gameId: UUID,
+        initialPresentationMode: PickupDetailPresentationMode = .standalonePickup,
+        initialTeamContext: PickupGameTeamCreationContext? = nil,
+        onRequestTeamDetailChatTab: ((UUID, UUID) -> Bool)? = nil
+    ) {
+        self.viewModel = viewModel
+        self.gameId = gameId
+        self.onRequestTeamDetailChatTab = onRequestTeamDetailChatTab
+
+        let syncIdentity = viewModel.pickupDiscoverTeamIdentityByGameId[gameId]
+        let resolvedMode: PickupDetailPresentationMode = {
+            if initialPresentationMode == .teamEvent { return .teamEvent }
+            if initialTeamContext != nil { return .teamEvent }
+            if syncIdentity != nil { return .teamEvent }
+            return .standalonePickup
+        }()
+        let resolvedTeam: PickupGameTeamCreationContext? = {
+            if let initialTeamContext { return initialTeamContext }
+            if let syncIdentity {
+                return PickupGameTeamCreationContext(
+                    teamId: syncIdentity.teamId,
+                    teamName: syncIdentity.teamName,
+                    teamSport: syncIdentity.teamSport.isEmpty ? "" : syncIdentity.teamSport,
+                    logoURL: syncIdentity.logoURL,
+                    logoThumbnailURL: syncIdentity.logoThumbnailURL,
+                    colorHex: syncIdentity.colorHex
+                )
+            }
+            return nil
+        }()
+
+        self.initialPresentationMode = resolvedMode
+        self.initialTeamContext = resolvedTeam
+        self._isTeamLinkedGame = State(initialValue: resolvedMode == .teamEvent)
+        self._linkedTeamContext = State(initialValue: resolvedTeam)
+        self._presentationModeLockedAsTeamEvent = State(initialValue: resolvedMode == .teamEvent)
+        if let resolvedTeam {
+            self._editCreationContext = State(initialValue: .team(resolvedTeam))
+        }
+    }
+
+    init(
+        viewModel: MapViewModel,
+        token: PickupDetailNavigationToken,
+        onRequestTeamDetailChatTab: ((UUID, UUID) -> Bool)? = nil
+    ) {
+        self.init(
+            viewModel: viewModel,
+            gameId: token.id,
+            initialPresentationMode: token.presentationMode,
+            initialTeamContext: token.seededTeamContext,
+            onRequestTeamDetailChatTab: onRequestTeamDetailChatTab
+        )
+    }
 
     private var languageCode: String {
         L10n.normalizedLanguageCode(appLanguageRaw)
@@ -159,10 +292,36 @@ struct DiscoverPickupGameDetailSheet: View {
         return g.creator_user_id == uid
     }
 
+    /// Team-linked: `edit_events` (Owner/Manager defaults or Owner-granted).
+    /// Standalone Pickup: creator / organizer unchanged.
+    private var canEditEvent: Bool {
+        guard game != nil, !viewModel.isGuestDiscoverMode else { return false }
+        if isTeamLinkedGame {
+            return linkedTeamContext?.canEditTeamEvents == true
+        }
+        return isCreator
+    }
+
+    private var showsPrimaryEditButton: Bool {
+        canEditEvent
+    }
+
     private var showsOrganizerOverflowMenu: Bool {
         guard let g = game, !viewModel.isGuestDiscoverMode else { return false }
-        if isCreator { return true }
-        return g.isEligibleForInAppShare()
+        if isCreator, g.isPickupGameInvitable() { return true }
+        if g.isEligibleForInAppShare() { return true }
+        if canCancelPickupGame { return true }
+        return false
+    }
+
+    private var editToolbarTitle: String {
+        guard let g = game else {
+            return L10n.t("Edit", languageCode: languageCode)
+        }
+        if g.hasPickupGameStarted() {
+            return L10n.t("Manage", languageCode: languageCode)
+        }
+        return L10n.t("Edit", languageCode: languageCode)
     }
 
     /// Soft-cancel is organizer-only and only while the game is still active.
@@ -216,36 +375,40 @@ struct DiscoverPickupGameDetailSheet: View {
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                 }
             }
-            .navigationTitle(L10n.t("share_pickup_card_badge", languageCode: languageCode))
+            .navigationTitle(
+                L10n.t(
+                    FanTeamEventPresentation.detailNavigationTitleKey(
+                        isTeamLinked: isTeamLinkedGame,
+                        format: game?.gameFormat
+                    ),
+                    languageCode: languageCode
+                )
+            )
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(L10n.t("Done", languageCode: languageCode)) { dismiss() }
                 }
-                ToolbarItem(placement: .primaryAction) {
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if let g = game, showsPrimaryEditButton {
+                        Button {
+                            Task { await openEditGame(for: g) }
+                        } label: {
+                            Label(editToolbarTitle, systemImage: "pencil")
+                        }
+                        .disabled(isPreparingEdit || isCancellingGame)
+                        .accessibilityLabel(editToolbarTitle)
+                    }
                     if let g = game, showsOrganizerOverflowMenu {
                         Menu {
-                            if isCreator {
+                            if isCreator, !isTeamLinkedGame, g.isPickupGameInvitable() {
                                 Button {
-                                    Task { await openEditGame(for: g) }
+                                    showInviteComposer = true
                                 } label: {
                                     Label(
-                                        g.hasPickupGameStarted()
-                                            ? L10n.t("Manage", languageCode: languageCode)
-                                            : L10n.t("pickup_form_nav_edit", languageCode: languageCode),
-                                        systemImage: "pencil"
+                                        L10n.t("Invite friends", languageCode: languageCode),
+                                        systemImage: "person.badge.plus"
                                     )
-                                }
-                                .disabled(isPreparingEdit || isCancellingGame)
-                                if g.isPickupGameInvitable() {
-                                    Button {
-                                        showInviteComposer = true
-                                    } label: {
-                                        Label(
-                                            L10n.t("Invite friends", languageCode: languageCode),
-                                            systemImage: "person.badge.plus"
-                                        )
-                                    }
                                 }
                             }
                             if g.isEligibleForInAppShare() {
@@ -285,6 +448,9 @@ struct DiscoverPickupGameDetailSheet: View {
                     }
                 }
             }
+            .sheet(isPresented: $showCorrectResultSheet) {
+                teamEventCorrectResultSheet
+            }
             .sheet(isPresented: $showInviteComposer) {
                 if let g = game {
                     PickupGameInviteFriendsSheet(viewModel: viewModel, game: g)
@@ -294,9 +460,11 @@ struct DiscoverPickupGameDetailSheet: View {
                 NavigationStack {
                     SettingsPickupGameFormView(
                         viewModel: viewModel,
-                        mode: mode
+                        mode: mode,
+                        creationContext: editCreationContext
                     ) {
                         editFormMode = nil
+                        editCreationContext = .standard
                         Task {
                             // Form save already merges the updated row; force refresh keeps Description in sync.
                             await viewModel.refreshPickupGamesForDiscoverMap(force: true)
@@ -339,8 +507,19 @@ struct DiscoverPickupGameDetailSheet: View {
                     .environmentObject(viewModel)
             }
             .sheet(isPresented: $showTeamAttendanceRoster) {
-                PickupTeamAttendanceRosterSheet(viewModel: viewModel, pickupGameId: gameId)
-                    .environmentObject(viewModel)
+                PickupTeamAttendanceRosterSheet(
+                    viewModel: viewModel,
+                    pickupGameId: gameId,
+                    staffContext: linkedTeamContext.map { team in
+                        FanTeamAttendanceStaffContext(
+                            teamId: team.teamId,
+                            teamName: team.teamName,
+                            canManageEventRoster: viewModel.pickupGameRosterByGameId[gameId]?
+                                .canManageEventRoster == true
+                        )
+                    }
+                )
+                .environmentObject(viewModel)
             }
             .task(id: gameId) {
                 if viewModel.resolvedPickupGameRow(for: gameId) == nil, !didAttemptSharedPickupLoad {
@@ -434,15 +613,26 @@ struct DiscoverPickupGameDetailSheet: View {
 
     @MainActor
     private func openEditGame(for g: PickupGameRow) async {
-        guard isCreator, !isPreparingEdit else { return }
+        guard canEditEvent, !isPreparingEdit else { return }
         isPreparingEdit = true
         defer { isPreparingEdit = false }
         // Prefer the freshest cached row (Discover / settings / following / selected).
         let row = viewModel.resolvedPickupGameRow(for: g.id) ?? g
+        // Team Event editor must receive Team creation context so future events use the
+        // Team Schedule form (not the creator-only post-start Manage Game lock by mistake).
+        if isTeamLinkedGame, let team = linkedTeamContext {
+            editCreationContext = .team(team)
+        } else {
+            editCreationContext = .standard
+        }
         editFormMode = .edit(row)
 #if DEBUG
         print(
             "[PickupDetailEdit] open id=\(row.id.uuidString.lowercased()) " +
+            "teamLinked=\(isTeamLinkedGame) " +
+            "canManageTeam=\(linkedTeamContext?.canManageTeam == true) " +
+            "canEditTeamEvents=\(linkedTeamContext?.canEditTeamEvents == true) " +
+            "canOrganize=\(linkedTeamContext?.canManageTeamLocations == true) " +
             "isVisible=\(row.is_visible) started=\(row.hasPickupGameStarted())"
         )
 #endif
@@ -479,7 +669,7 @@ struct DiscoverPickupGameDetailSheet: View {
                         .font(FGTypography.sectionTitle)
                         .foregroundStyle(pickupDetailMainInk)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("\(AppSportCatalog.displayLabel(forSportToken: g.sport)) · \(g.playEnvironmentEnum.shortLabel)")
+                    Text("\(g.sportIdentityLabel(languageCode: languageCode)) · \(g.playEnvironmentEnum.shortLabel)")
                         .font(FGTypography.metadata.weight(.medium))
                         .foregroundStyle(pickupDetailSubInk)
                 }
@@ -514,9 +704,451 @@ struct DiscoverPickupGameDetailSheet: View {
             city: g.city,
             state: g.state
         )
+        if g.gameFormat == .announcement {
+            teamAnnouncementDetailContent(for: g)
+        } else if isTeamLinkedGame {
+            teamEventPlayerDetailContent(for: g, location: location)
+        } else {
+            standalonePickupDetailContent(for: g, location: location)
+        }
+    }
+
+    /// Announcement-focused detail — not an Event / game layout.
+    @ViewBuilder
+    private func teamAnnouncementDetailContent(for g: PickupGameRow) -> some View {
         let creatorLabel = viewModel.pickupCreatorDisplayLabel(for: g.creator_user_id)
-        let sportMeta = AppSportCatalog.displayLabel(forSportToken: g.sport)
+        let teamAccent = linkedTeamContext.flatMap { Color(fanTeamHex: $0.colorHex ?? "") }
+            ?? FGColor.intentPlay
+        let senderName = FanTeamAnnouncementDetailPresentation.senderDisplayName(
+            creatorLabel: creatorLabel,
+            memberDisplayName: announcementSenderMemberName,
+            languageCode: languageCode
+        )
+        let fromLine = FanTeamAnnouncementDetailPresentation.fromLine(
+            senderName: senderName,
+            role: announcementSenderRole,
+            languageCode: languageCode
+        )
+        let sentAt = FanTeamAnnouncementDetailPresentation.sentAtText(
+            for: g,
+            languageCode: languageCode
+        )
+        let audience = FanTeamAnnouncementDetailPresentation.audienceText(
+            memberCount: linkedTeamContext.map(\.activeMemberCount),
+            isTeamLinked: isTeamLinkedGame || linkedTeamContext != nil,
+            languageCode: languageCode
+        )
+
+        ScrollView {
+            VStack(alignment: .leading, spacing: FGSpacing.lg) {
+                if isPickupGameCancelled {
+                    pickupInfoBanner(
+                        text: L10n.t("pickup_detail_cancelled_banner", languageCode: languageCode)
+                    )
+                }
+
+                FanTeamAnnouncementDetailHeaderCard(
+                    team: linkedTeamContext,
+                    fallbackSport: g.sport,
+                    fromLine: fromLine,
+                    sentAtText: sentAt,
+                    audienceText: audience,
+                    languageCode: languageCode,
+                    accent: teamAccent
+                )
+
+                FanTeamAnnouncementMessageCard(
+                    subjectTitle: FanTeamAnnouncementDetailPresentation.subjectTitle(for: g),
+                    message: FanTeamAnnouncementDetailPresentation.messageBody(for: g),
+                    languageCode: languageCode,
+                    accent: teamAccent
+                )
+
+                if let joinError, !joinError.isEmpty {
+                    Text(joinError)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.dangerRed)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(FGSpacing.lg)
+        }
+        .scrollContentBackground(.hidden)
+        .fanGeoScreenBackground()
+    }
+
+    /// Parent/player-first Team Event layout (WHAT → WHEN → WHERE → RSVP → Who's Going → Notes → Lineup → More → actions).
+    @ViewBuilder
+    private func teamEventPlayerDetailContent(
+        for g: PickupGameRow,
+        location: (primary: String?, secondary: String?)
+    ) -> some View {
+        let creatorLabel = viewModel.pickupCreatorDisplayLabel(for: g.creator_user_id)
+        let sportMeta = g.sportIdentityLabel(languageCode: languageCode)
         let showStarted = g.hasPickupGameStarted()
+        let teamAccent = linkedTeamContext.flatMap { Color(fanTeamHex: $0.colorHex ?? "") }
+            ?? FGColor.intentPlay
+        let isPast = TeamEventPlayerDetailPresentation.isPastEvent(g)
+        let rsvpSubject = teamEventRSVPSubject()
+        let isExcluded: Bool = {
+            guard let subject = rsvpSubject else { return false }
+            return FanTeamScheduleQuickRSVPEligibility.isExcludedFromEvent(
+                subjectUserId: subject.userId,
+                gameId: g.id,
+                roster: viewModel.pickupGameRosterByGameId[g.id]
+            )
+        }()
+
+        ScrollView {
+            VStack(alignment: .leading, spacing: FGSpacing.lg) {
+                if isPickupGameCancelled {
+                    pickupInfoBanner(
+                        text: L10n.t("pickup_detail_cancelled_banner", languageCode: languageCode)
+                    )
+                }
+
+                let _ = PickupDetailCrashTrace.log("organizerRender", gameId: g.id, title: g.title)
+                TeamEventWhatIdentityCard(
+                    game: g,
+                    team: linkedTeamContext,
+                    sportLabel: sportMeta,
+                    languageCode: languageCode,
+                    showStarted: showStarted,
+                    onShowOnMap: { showPickupOnDiscoverMap(g) }
+                )
+
+                if let scoreboard = teamEventScoreboardModel(for: g) {
+                    FanTeamEventScoreboardView(
+                        teamName: scoreboard.teamName,
+                        opponentName: scoreboard.opponentName,
+                        teamScore: scoreboard.teamScore,
+                        opponentScore: scoreboard.opponentScore,
+                        status: scoreboard.status,
+                        canEdit: scoreboard.canEdit,
+                        languageCode: languageCode,
+                        accent: teamAccent,
+                        isBusy: scoringBusy,
+                        errorText: scoringError,
+                        sport: g.sport,
+                        scoringTeamId: linkedTeamContext?.teamId,
+                        opponentTeamId: nil,
+                        onTeamDelta: { delta, scorerId in
+                            Task {
+                                await mutateTeamEventScore(
+                                    game: g,
+                                    teamDelta: delta,
+                                    opponentDelta: 0,
+                                    scorerMembershipId: scorerId
+                                )
+                            }
+                        },
+                        onOpponentDelta: { delta, scorerId in
+                            Task {
+                                await mutateTeamEventScore(
+                                    game: g,
+                                    teamDelta: 0,
+                                    opponentDelta: delta,
+                                    scorerMembershipId: scorerId
+                                )
+                            }
+                        },
+                        onMarkLive: { Task { await setTeamEventScoringStatus(game: g, status: .live) } },
+                        onMarkFinal: { Task { await setTeamEventScoringStatus(game: g, status: .final) } },
+                        onCorrectResult: scoreboard.canEdit ? {
+                            correctDraftTeam = scoreboard.teamScore
+                            correctDraftOpponent = scoreboard.opponentScore
+                            showCorrectResultSheet = true
+                        } : nil
+                    )
+                }
+
+                let announcementPolicy = FanTeamEventPresentation.policy(for: g.gameFormat)
+                let showsLocation = announcementPolicy.showsLocationFields
+                TeamEventWhenWhereSummaryCard(
+                    game: g,
+                    primary: showsLocation ? location.primary : nil,
+                    secondary: showsLocation ? location.secondary : nil,
+                    languageCode: languageCode,
+                    accent: teamAccent,
+                    canOpenDirections: showsLocation && Self.pickupHasUsableMapCoordinate(g),
+                    onDirections: { showDirectionsChooser = true }
+                )
+
+                if announcementPolicy.showsAttendanceRSVP,
+                   canUseTeamRSVP, !isCreator, let rsvpSubject {
+                    TeamEventYourPlayerCard(
+                        subject: rsvpSubject,
+                        rsvp: myTeamRSVP,
+                        languageCode: languageCode,
+                        accent: teamAccent,
+                        isCancelled: isPickupGameCancelled,
+                        isPast: isPast,
+                        isExcluded: isExcluded,
+                        isBusy: isSettingTeamRSVP,
+                        onSetGoing: { Task { await setTeamRSVP(.going) } },
+                        onSetCantGo: { Task { await setTeamRSVP(.cant_go) } },
+                        onChangeResponse: { showTeamRSVPChangeMenu = true }
+                    )
+                }
+
+                let _ = PickupDetailCrashTrace.log("attendanceRender", gameId: g.id, title: g.title)
+                if announcementPolicy.showsAttendanceRSVP {
+                    teamEventWhosGoingCard(for: g) {
+                        showTeamAttendanceRoster = true
+                    }
+                }
+
+                if announcementPolicy.showsLineup,
+                   !viewModel.isGuestDiscoverMode, let team = linkedTeamContext {
+                    FanTeamEventLineupDetailSection(
+                        context: FanTeamEventLineupContext(
+                            teamId: team.teamId,
+                            pickupGameId: g.id,
+                            teamName: team.teamName,
+                            teamLogoURL: team.logoURL,
+                            teamLogoThumbnailURL: team.logoThumbnailURL,
+                            teamColorHex: team.colorHex,
+                            sportToken: {
+                                let eventSport = g.sport.trimmingCharacters(in: .whitespacesAndNewlines)
+                                return eventSport.isEmpty ? team.teamSport : eventSport
+                            }(),
+                            eventTitle: g.title,
+                            eventStartsAt: FanTeamsService.parseDate(g.game_start_at),
+                            isEventCancelled: isPickupGameCancelled
+                        ),
+                        viewModel: viewModel,
+                        presentationStyle: .playerParent
+                    )
+                }
+
+                let _ = PickupDetailCrashTrace.log("descriptionRender", gameId: g.id, title: g.title)
+                TeamEventMoreDetailsSection(languageCode: languageCode) {
+                    TeamEventNotesCard(
+                        description: g.description,
+                        languageCode: languageCode,
+                        accent: teamAccent
+                    )
+                    pickupGameDetailsCard(for: g, creatorLabel: creatorLabel)
+                    if isCreator {
+                        pickupCompactStatusFooter(
+                            text: L10n.t("pickup_detail_organizing_status", languageCode: languageCode)
+                        )
+                    }
+                    if !isCreator {
+                        pickupDetailCreatorRatingSection(for: g)
+                    }
+                }
+
+                // Team Event Detail: no bottom Invite / Chat CTAs.
+                // Invite Friends remains in the top-right … menu; Team Chat stays on Team Detail.
+
+                let _ = PickupDetailCrashTrace.log("footerRender", gameId: g.id, title: g.title)
+                // Team members RSVP via Your Player; keep outside join / sign-in footers only.
+                if !canUseTeamRSVP || isCreator {
+                    joinSection(for: g)
+                } else if shouldShowRequestToJoin(for: g) {
+                    joinSection(for: g)
+                }
+
+                if let joinError, !joinError.isEmpty {
+                    Text(joinError)
+                        .font(FGTypography.caption)
+                        .foregroundStyle(FGColor.dangerRed)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(FGSpacing.lg)
+        }
+        .scrollContentBackground(.hidden)
+        .fanGeoScreenBackground()
+        .confirmationDialog(
+            L10n.t("Directions", languageCode: languageCode),
+            isPresented: $showDirectionsChooser,
+            titleVisibility: .visible
+        ) {
+            pickupDirectionsChooserButtons(for: g, location: location)
+        }
+        .confirmationDialog(
+            FanTeamScheduleQuickRSVPCopy.prompt(
+                subjectName: rsvpSubject?.promptDisplayName
+                    ?? L10n.t("fan_team_schedule_rsvp_player_fallback", languageCode: languageCode),
+                languageCode: languageCode
+            ),
+            isPresented: $showTeamRSVPChangeMenu,
+            titleVisibility: .visible
+        ) {
+            ForEach(FanTeamGameRSVPStatus.allCases, id: \.self) { status in
+                Button(FanTeamScheduleQuickRSVPCopy.menuTitle(for: status, languageCode: languageCode)) {
+                    Task { await setTeamRSVP(status) }
+                }
+            }
+            Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
+        }
+    }
+
+    private struct TeamEventScoreboardModel {
+        let teamName: String
+        let opponentName: String
+        let teamScore: Int
+        let opponentScore: Int
+        let status: FanTeamEventScoringStatus
+        let canEdit: Bool
+    }
+
+    private func teamEventScoreboardModel(for g: PickupGameRow) -> TeamEventScoreboardModel? {
+        guard isTeamLinkedGame, let team = linkedTeamContext else { return nil }
+        guard FanTeamEventScoring.isScoreCapable(format: g.gameFormat, sport: g.sport) else { return nil }
+        guard !isPickupGameCancelled else { return nil }
+        let opponent = (g.opponent_name?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+        guard let opponent else { return nil }
+        let status = FanTeamEventScoringStatus.parse(scoringStatusRaw ?? g.scoring_status)
+        return TeamEventScoreboardModel(
+            teamName: team.teamName,
+            opponentName: opponent,
+            teamScore: scoringTeamScore ?? g.team_score ?? 0,
+            opponentScore: scoringOpponentScore ?? g.opponent_score ?? 0,
+            status: status,
+            canEdit: team.canScoreTeamEvents
+        )
+    }
+
+    @ViewBuilder
+    private var teamEventCorrectResultSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(L10n.t("fan_team_score_correct_result", languageCode: languageCode))
+                    .font(.headline)
+                HStack {
+                    Text(linkedTeamContext?.teamName ?? "")
+                    Spacer()
+                    Stepper(value: $correctDraftTeam, in: 0...999) {
+                        Text("\(correctDraftTeam)").monospacedDigit()
+                    }
+                }
+                HStack {
+                    Text(game?.opponent_name ?? "")
+                    Spacer()
+                    Stepper(value: $correctDraftOpponent, in: 0...999) {
+                        Text("\(correctDraftOpponent)").monospacedDigit()
+                    }
+                }
+                Spacer()
+            }
+            .padding()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L10n.t("Cancel", languageCode: languageCode)) { showCorrectResultSheet = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("fan_team_score_save", languageCode: languageCode)) {
+                        Task { await saveCorrectedFinalScore() }
+                    }
+                    .disabled(scoringBusy)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func applyScoringMutation(_ mutation: FanTeamsService.FanTeamEventScoreMutation, to g: PickupGameRow) {
+        scoringTeamScore = mutation.teamScore
+        scoringOpponentScore = mutation.opponentScore
+        scoringStatusRaw = mutation.scoringStatus
+        scoringFinalizedAtRaw = mutation.scoringFinalizedAt.map { FanTeamsService.encodeDate($0) }
+        scoringError = nil
+        let patched = g.replacingScoring(
+            teamScore: mutation.teamScore,
+            opponentScore: mutation.opponentScore,
+            scoringStatus: mutation.scoringStatus,
+            scoringFinalizedAt: scoringFinalizedAtRaw
+        )
+        viewModel.applyTeamEventScoringPatch(gameId: g.id, row: patched)
+    }
+
+    private func mutateTeamEventScore(
+        game g: PickupGameRow,
+        teamDelta: Int,
+        opponentDelta: Int,
+        scorerMembershipId: UUID? = nil
+    ) async {
+        guard let team = linkedTeamContext else { return }
+        let currentTeam = scoringTeamScore ?? g.team_score ?? 0
+        let currentOpp = scoringOpponentScore ?? g.opponent_score ?? 0
+        guard FanTeamEventScoring.applyingDelta(current: currentTeam, delta: teamDelta) != nil,
+              FanTeamEventScoring.applyingDelta(current: currentOpp, delta: opponentDelta) != nil else {
+            return
+        }
+        scoringBusy = true
+        scoringError = nil
+        scoringTeamScore = currentTeam + teamDelta
+        scoringOpponentScore = currentOpp + opponentDelta
+        do {
+            let mutation = try await FanTeamsService().updateEventScore(
+                eventId: g.id,
+                teamId: team.teamId,
+                teamDelta: teamDelta,
+                opponentDelta: opponentDelta,
+                idempotencyKey: UUID().uuidString.lowercased(),
+                scorerMembershipId: scorerMembershipId
+            )
+            applyScoringMutation(mutation, to: g)
+        } catch {
+            scoringTeamScore = currentTeam
+            scoringOpponentScore = currentOpp
+            scoringError = L10n.t("fan_team_score_error", languageCode: languageCode)
+        }
+        scoringBusy = false
+    }
+
+    private func setTeamEventScoringStatus(game g: PickupGameRow, status: FanTeamEventScoringStatus) async {
+        guard let team = linkedTeamContext else { return }
+        scoringBusy = true
+        scoringError = nil
+        do {
+            let mutation = try await FanTeamsService().setEventScoringStatus(
+                eventId: g.id,
+                teamId: team.teamId,
+                status: status,
+                idempotencyKey: UUID().uuidString.lowercased()
+            )
+            applyScoringMutation(mutation, to: g)
+        } catch {
+            scoringError = L10n.t("fan_team_score_error", languageCode: languageCode)
+        }
+        scoringBusy = false
+    }
+
+    private func saveCorrectedFinalScore() async {
+        guard let g = game, let team = linkedTeamContext else { return }
+        scoringBusy = true
+        scoringError = nil
+        do {
+            let mutation = try await FanTeamsService().correctEventFinalScore(
+                eventId: g.id,
+                teamId: team.teamId,
+                teamScore: correctDraftTeam,
+                opponentScore: correctDraftOpponent,
+                idempotencyKey: UUID().uuidString.lowercased()
+            )
+            applyScoringMutation(mutation, to: g)
+            showCorrectResultSheet = false
+        } catch {
+            scoringError = L10n.t("fan_team_score_error", languageCode: languageCode)
+        }
+        scoringBusy = false
+    }
+
+    /// Standalone Pickup detail — same visual language as Team Event Details, orange Pickup identity.
+    /// Order: hero → when/where → My Response → Who's Going → details → description → organizer.
+    @ViewBuilder
+    private func standalonePickupDetailContent(
+        for g: PickupGameRow,
+        location: (primary: String?, secondary: String?)
+    ) -> some View {
+        let creatorLabel = viewModel.pickupCreatorDisplayLabel(for: g.creator_user_id)
+        let sportMeta = g.sportIdentityLabel(languageCode: languageCode)
+        let showStarted = g.hasPickupGameStarted()
+        let pickupAccent = PickupGameDetailPresentation.accent
 
         ScrollViewReader { proxy in
             ScrollView {
@@ -527,39 +1159,53 @@ struct DiscoverPickupGameDetailSheet: View {
                         )
                     }
 
-                    let _ = PickupDetailCrashTrace.log("organizerRender", gameId: g.id, title: g.title)
-                    pickupHeroCard(
-                        g: g,
-                        sportMeta: sportMeta,
-                        showStarted: showStarted
+                    PickupGameDetailHeroCard(
+                        game: g,
+                        sportLabel: sportMeta,
+                        languageCode: languageCode,
+                        showStarted: showStarted,
+                        onShowOnMap: { showPickupOnDiscoverMap(g) }
                     )
 
-                    pickupWhenWhereCard(for: g, locationPrimary: location.primary, locationSecondary: location.secondary)
+                    TeamEventWhenWhereSummaryCard(
+                        game: g,
+                        primary: location.primary,
+                        secondary: location.secondary,
+                        languageCode: languageCode,
+                        accent: pickupAccent,
+                        canOpenDirections: Self.pickupHasUsableMapCoordinate(g),
+                        directionsAccent: pickupAccent,
+                        onDirections: { showDirectionsChooser = true }
+                    )
 
-                    pickupPrimarySocialActionsRow(for: g)
+                    let _ = PickupDetailCrashTrace.log("footerRender", gameId: g.id, title: g.title)
+                    pickupStandaloneMyResponseCard(for: g)
 
                     let _ = PickupDetailCrashTrace.log("attendanceRender", gameId: g.id, title: g.title)
-                    pickupWhosGoingCard(for: g) {
-                        if isTeamLinkedGame {
-                            showTeamAttendanceRoster = true
-                        } else {
-                            withAnimation(.easeInOut(duration: 0.25)) {
-                                proxy.scrollTo("pickupDetailResponses", anchor: .top)
-                            }
+                    pickupStandaloneWhosGoingCard(for: g) {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo("pickupDetailResponses", anchor: .top)
                         }
                     }
 
-                    pickupGameDetailsCard(for: g, creatorLabel: creatorLabel)
+                    pickupGameDetailsCard(
+                        for: g,
+                        creatorLabel: creatorLabel,
+                        includeOrganizer: false,
+                        usesEventChrome: true,
+                        rowAccent: pickupAccent
+                    )
 
                     let _ = PickupDetailCrashTrace.log("descriptionRender", gameId: g.id, title: g.title)
-                    pickupDescriptionCard(for: g)
+                    PickupGameDetailDescriptionCard(
+                        description: g.description,
+                        languageCode: languageCode
+                    )
 
-                    // Team-linked attendance lives in the Who's Going sheet — do not duplicate
-                    // Going/Maybe/No Response/Can't Go as an on-page Responses section.
-                    if !isTeamLinkedGame {
-                        pickupResponsesSection(for: g)
-                            .id("pickupDetailResponses")
-                    }
+                    let _ = PickupDetailCrashTrace.log("organizerRender", gameId: g.id, title: g.title)
+                    pickupStandaloneOrganizerCard(for: g, creatorLabel: creatorLabel)
+
+                    pickupPrimarySocialActionsRow(for: g)
 
                     if isCreator {
                         pickupCompactStatusFooter(
@@ -571,8 +1217,8 @@ struct DiscoverPickupGameDetailSheet: View {
                         pickupDetailCreatorRatingSection(for: g)
                     }
 
-                    let _ = PickupDetailCrashTrace.log("footerRender", gameId: g.id, title: g.title)
-                    joinSection(for: g)
+                    pickupResponsesSection(for: g)
+                        .id("pickupDetailResponses")
 
                     if let joinError, !joinError.isEmpty {
                         Text(joinError)
@@ -591,36 +1237,58 @@ struct DiscoverPickupGameDetailSheet: View {
             isPresented: $showDirectionsChooser,
             titleVisibility: .visible
         ) {
-            if Self.pickupHasUsableMapCoordinate(g),
-               let lat = g.latitude,
-               let lon = g.longitude {
-                Button(L10n.t("Apple Maps", languageCode: languageCode)) {
-                    FanGeoDirectionsActions.openAppleMapsDirections(
+            pickupDirectionsChooserButtons(for: g, location: location)
+        }
+    }
+
+    @ViewBuilder
+    private func pickupDirectionsChooserButtons(
+        for g: PickupGameRow,
+        location: (primary: String?, secondary: String?)
+    ) -> some View {
+        if Self.pickupHasUsableMapCoordinate(g),
+           let lat = g.latitude,
+           let lon = g.longitude {
+            Button(L10n.t("Apple Maps", languageCode: languageCode)) {
+                FanGeoDirectionsActions.openAppleMapsDirections(
+                    latitude: lat,
+                    longitude: lon,
+                    name: g.title
+                )
+            }
+            if FanGeoDirectionsActions.isGoogleMapsInstalled {
+                Button(L10n.t("Google Maps", languageCode: languageCode)) {
+                    FanGeoDirectionsActions.openGoogleMapsDirections(
                         latitude: lat,
                         longitude: lon,
                         name: g.title
                     )
                 }
-                if FanGeoDirectionsActions.isGoogleMapsInstalled {
-                    Button(L10n.t("Google Maps", languageCode: languageCode)) {
-                        FanGeoDirectionsActions.openGoogleMapsDirections(
-                            latitude: lat,
-                            longitude: lon,
-                            name: g.title
-                        )
-                    }
-                }
-                let addressLine = [location.primary, location.secondary]
-                    .compactMap { $0 }
-                    .joined(separator: ", ")
-                if !addressLine.isEmpty {
-                    Button(L10n.t("Copy Address", languageCode: languageCode)) {
-                        FanGeoDirectionsActions.copyAddress(addressLine)
-                    }
+            }
+            let addressLine = [location.primary, location.secondary]
+                .compactMap { $0 }
+                .joined(separator: ", ")
+            if !addressLine.isEmpty {
+                Button(L10n.t("Copy Address", languageCode: languageCode)) {
+                    FanGeoDirectionsActions.copyAddress(addressLine)
                 }
             }
-            Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
         }
+        Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {}
+    }
+
+    private func teamEventRSVPSubject() -> FanTeamRSVPSubject? {
+        guard let uid = viewModel.currentUserAuthId else { return nil }
+        // No roster payload here, so the viewer's seat id is unknown; a nil
+        // membershipId keeps this on the unchanged self-RSVP write path.
+        return FanTeamRSVPSubject(
+            membershipId: nil,
+            userId: uid,
+            displayName: viewModel.currentUserDisplayName,
+            username: nil,
+            avatarURL: nil,
+            avatarThumbnailURL: nil
+        )
     }
 
     private var pickupDisplayLocale: Locale {
@@ -684,16 +1352,30 @@ struct DiscoverPickupGameDetailSheet: View {
     private func resolveTeamLinkedParticipation() async {
         let discoverIdentity = viewModel.pickupDiscoverTeamIdentityByGameId[gameId]
         let linked: Bool
-        if discoverIdentity != nil {
+        if presentationModeLockedAsTeamEvent {
+            linked = true
+        } else if discoverIdentity != nil {
             linked = true
         } else {
             linked = await viewModel.isPickupGameLinkedToFanTeam(pickupGameId: gameId)
         }
-        isTeamLinkedGame = linked
+
+        // Never downgrade a locked Team Event presentation to standalone Pickup mid-session.
         if linked {
+            isTeamLinkedGame = true
+            if !presentationModeLockedAsTeamEvent {
+                presentationModeLockedAsTeamEvent = true
+            }
+        } else if !presentationModeLockedAsTeamEvent {
+            isTeamLinkedGame = false
+        }
+
+        announcementSenderRole = nil
+        announcementSenderMemberName = nil
+        if isTeamLinkedGame {
             if let loaded = try? await FanTeamsService().loadTeamCreationContext(forPickupGameId: gameId) {
                 linkedTeamContext = loaded
-            } else if let discoverIdentity {
+            } else if linkedTeamContext == nil, let discoverIdentity {
                 // Public-safe Discover hydrate: enough for Team identity UI; RSVP still auth-gated below.
                 linkedTeamContext = PickupGameTeamCreationContext(
                     teamId: discoverIdentity.teamId,
@@ -705,13 +1387,24 @@ struct DiscoverPickupGameDetailSheet: View {
                     logoThumbnailURL: discoverIdentity.logoThumbnailURL,
                     colorHex: discoverIdentity.colorHex
                 )
-            } else {
-                linkedTeamContext = nil
+            } else if linkedTeamContext == nil, let initialTeamContext {
+                linkedTeamContext = initialTeamContext
             }
         } else {
             linkedTeamContext = nil
         }
-        guard linked, !isCreator, !viewModel.isGuestDiscoverMode else {
+
+        if game?.gameFormat == .announcement,
+           let teamId = linkedTeamContext?.teamId,
+           let creatorId = game?.creator_user_id,
+           let members = try? await FanTeamsService().listMembers(teamId: teamId),
+           let sender = members.first(where: { $0.userId == creatorId }) {
+            announcementSenderRole = sender.role
+            let trimmed = sender.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            announcementSenderMemberName = trimmed.isEmpty ? nil : trimmed
+        }
+
+        guard isTeamLinkedGame, !isCreator, !viewModel.isGuestDiscoverMode else {
             canUseTeamRSVP = false
             myTeamRSVP = nil
             return
@@ -747,7 +1440,14 @@ struct DiscoverPickupGameDetailSheet: View {
         guard canUseTeamRSVP, !isSettingTeamRSVP else { return }
         isSettingTeamRSVP = true
         defer { isSettingTeamRSVP = false }
+        let previous = myTeamRSVP
         do {
+#if DEBUG
+            print(
+                "[TeamRSVPDebug] detail_rsvp pickup_game_id=\(gameId.uuidString.lowercased()) " +
+                "team_linked=\(isTeamLinkedGame) status=\(status.rawValue)"
+            )
+#endif
             try await FanTeamsService().setRSVP(gameId: gameId, status: status)
             myTeamRSVP = status
             await viewModel.loadMyLatestJoinRequestForPickupGame(pickupGameId: gameId)
@@ -758,12 +1458,91 @@ struct DiscoverPickupGameDetailSheet: View {
             )
             joinError = nil
         } catch {
-            canUseTeamRSVP = false
-            joinError = error.localizedDescription
+#if DEBUG
+            print(
+                "[TeamRSVPDebug] detail_rsvp_failed pickup_game_id=\(gameId.uuidString.lowercased()) " +
+                "status=\(status.rawValue) raw=\(error.localizedDescription)"
+            )
+#endif
+            myTeamRSVP = previous
+            // Keep Team RSVP UI available — auth failure here is usually a status-guard bug, not membership.
+            joinError = FanTeamRSVPErrorMapping.userFacingMessage(
+                for: error,
+                languageCode: languageCode
+            )
         }
     }
 
-    private func pickupWhosGoingCard(for g: PickupGameRow, onViewAll: @escaping () -> Void) -> some View {
+    /// Team Event Detail — richer attendance summary (avatars + Going/Maybe/Can't Go).
+    /// Standalone Pickup keeps `pickupWhosGoingCard`.
+    @ViewBuilder
+    private func teamEventWhosGoingCard(
+        for g: PickupGameRow,
+        onViewAll: @escaping () -> Void
+    ) -> some View {
+        let roster = viewModel.pickupGameRosterByGameId[g.id]
+        let counts: (going: Int, maybe: Int, noResponse: Int, cantGo: Int) = {
+            if let roster {
+                return PickupTeamAttendancePresentation.counts(from: roster)
+            }
+            return (0, 0, 0, 0)
+        }()
+        let stackMembers = roster?.stackMembers ?? fallbackOrganizerStack(for: g)
+        let showOutside = isOutsideRecruitingEnabled
+
+        TeamEventWhosGoingCard(
+            languageCode: languageCode,
+            stackMembers: stackMembers,
+            goingCount: counts.going,
+            maybeCount: counts.maybe,
+            noResponseCount: counts.noResponse,
+            cantGoCount: counts.cantGo,
+            outsideRecruitFooter: showOutside
+                ? AnyView(teamEventOutsideRecruitFooter(for: g))
+                : nil,
+            onViewAll: onViewAll
+        )
+    }
+
+    @ViewBuilder
+    private func teamEventOutsideRecruitFooter(for g: PickupGameRow) -> some View {
+        HStack(spacing: FGSpacing.md) {
+            Label {
+                Text(
+                    String(
+                        format: L10n.t(
+                            "pickup_detail_additional_players_needed_format",
+                            languageCode: languageCode
+                        ),
+                        locale: Locale(identifier: languageCode),
+                        g.playersNeededClamped
+                    )
+                )
+                .font(FGTypography.caption.weight(.semibold))
+                .foregroundStyle(pickupDetailMainInk)
+            } icon: {
+                Image(systemName: "person.badge.plus")
+                    .foregroundStyle(FGColor.intentPlay)
+            }
+            Spacer(minLength: 0)
+            Text(
+                String(
+                    format: L10n.t("pickup_detail_open_spots_format", languageCode: languageCode),
+                    locale: Locale(identifier: languageCode),
+                    g.pickupOpenSlotsRemaining
+                )
+            )
+            .font(FGTypography.caption.weight(.medium))
+            .foregroundStyle(pickupDetailSubInk)
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func pickupWhosGoingCard(
+        for g: PickupGameRow,
+        hideYourResponse: Bool = false,
+        onViewAll: @escaping () -> Void
+    ) -> some View {
         let roster = viewModel.pickupGameRosterByGameId[g.id]
         let goingCount: Int
         let maybeCount: Int
@@ -827,7 +1606,7 @@ struct DiscoverPickupGameDetailSheet: View {
                             .lineLimit(2)
                             .minimumScaleFactor(0.85)
 
-                        if let yourResponse, !isCreator {
+                        if !hideYourResponse, let yourResponse, !isCreator {
                             Text(
                                 String(
                                     format: L10n.t(
@@ -1424,6 +2203,15 @@ struct DiscoverPickupGameDetailSheet: View {
 
     @ViewBuilder
     private func pickupPrimarySocialActionsRow(for g: PickupGameRow) -> some View {
+        // Standalone Pickup only. Team-linked Event Detail omits this row so Invite/Chat
+        // are not duplicated (Invite → toolbar …; Chat → Team Detail Chat tab).
+        if TeamEventPlayerDetailPresentation.showsBottomSocialActionRow(isTeamLinked: isTeamLinkedGame) {
+            pickupStandalonePrimarySocialActionsRow(for: g)
+        }
+    }
+
+    @ViewBuilder
+    private func pickupStandalonePrimarySocialActionsRow(for g: PickupGameRow) -> some View {
         let canInvite = isCreator && g.isPickupGameInvitable()
         let canShare = g.isEligibleForInAppShare()
         let showChat = canAccessPickupGameChat
@@ -1565,63 +2353,105 @@ struct DiscoverPickupGameDetailSheet: View {
         )
     }
 
-    private func pickupGameDetailsCard(for g: PickupGameRow, creatorLabel: String?) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(L10n.t("pickup_detail_game_details", languageCode: languageCode))
+    private func pickupGameDetailsCard(
+        for g: PickupGameRow,
+        creatorLabel: String?,
+        includeOrganizer: Bool = true,
+        usesEventChrome: Bool = false,
+        rowAccent: Color = FGColor.accentBlue
+    ) -> some View {
+        let eventPolicy = FanTeamEventPresentation.policy(for: g.gameFormat)
+        let rows = VStack(alignment: .leading, spacing: 0) {
+            Text(
+                L10n.t(
+                    eventPolicy.detailSectionTitleKey(),
+                    languageCode: languageCode
+                )
+            )
                 .font(FGTypography.caption.weight(.bold))
                 .foregroundStyle(pickupDetailSubInk)
                 .textCase(.uppercase)
-                .padding(.horizontal, FGSpacing.md)
-                .padding(.top, FGSpacing.md)
+                .padding(.horizontal, usesEventChrome ? 0 : FGSpacing.md)
+                .padding(.top, usesEventChrome ? 0 : FGSpacing.md)
                 .padding(.bottom, FGSpacing.sm)
                 .accessibilityAddTraits(.isHeader)
 
-            if showsOutsideRecruitmentMetadata {
+            if eventPolicy.showsHowYouPlay, showsOutsideRecruitmentMetadata {
                 pickupGameDetailsRow(
                     systemImage: "person.2.fill",
                     title: L10n.t("pickup_form_whos_welcome", languageCode: languageCode),
-                    value: g.participantAudienceDisplayTitle
+                    value: g.participantAudienceDisplayTitle,
+                    accent: rowAccent,
+                    horizontalPadding: usesEventChrome ? 0 : FGSpacing.md
                 )
                 pickupGameDetailsDivider
             }
 
-            pickupGameDetailsRow(
-                systemImage: "sportscourt.fill",
-                title: L10n.t("pickup_detail_play_label", languageCode: languageCode),
-                value: g.playEnvironmentEnum.displayTitle(languageCode: languageCode)
-            )
+            if eventPolicy.showsHowYouPlay {
+                pickupGameDetailsRow(
+                    systemImage: "sportscourt.fill",
+                    title: L10n.t("pickup_detail_play_label", languageCode: languageCode),
+                    value: g.playEnvironmentEnum.displayTitle(languageCode: languageCode),
+                    accent: rowAccent,
+                    horizontalPadding: usesEventChrome ? 0 : FGSpacing.md
+                )
+            }
 
-            if showsOutsideRecruitmentMetadata {
+            if eventPolicy.showsHowYouPlay, showsOutsideRecruitmentMetadata {
                 pickupGameDetailsDivider
                 pickupGameDetailsRow(
                     systemImage: "chart.bar.fill",
                     title: L10n.t("pickup_form_skill_level", languageCode: languageCode),
-                    value: g.skillLevelEnum.displayTitle(languageCode: languageCode)
+                    value: g.skillLevelEnum.displayTitle(languageCode: languageCode),
+                    accent: rowAccent,
+                    horizontalPadding: usesEventChrome ? 0 : FGSpacing.md
                 )
             }
 
-            if let level = g.competitionLevel {
-                pickupGameDetailsDivider
+            if eventPolicy.showsCompetitionLevel, let level = g.competitionLevel {
+                if eventPolicy.showsHowYouPlay {
+                    pickupGameDetailsDivider
+                }
                 pickupGameDetailsRow(
                     systemImage: "trophy",
                     title: L10n.t("pickup_form_competition_level", languageCode: languageCode),
-                    value: level.displayTitle(languageCode: languageCode)
+                    value: level.displayTitle(languageCode: languageCode),
+                    accent: rowAccent,
+                    horizontalPadding: usesEventChrome ? 0 : FGSpacing.md
                 )
             }
 
-            pickupGameDetailsDivider
-            pickupGameDetailsRow(
-                systemImage: "dollarsign.circle.fill",
-                title: L10n.t("pickup_form_cost", languageCode: languageCode),
-                value: g.entryFeeDisplayLine
-            )
+            if eventPolicy.isGameplayEvent {
+                pickupGameDetailsDivider
+                pickupGameDetailsRow(
+                    systemImage: "dollarsign.circle.fill",
+                    title: L10n.t("pickup_form_cost", languageCode: languageCode),
+                    value: g.entryFeeDisplayLine,
+                    accent: rowAccent,
+                    horizontalPadding: usesEventChrome ? 0 : FGSpacing.md
+                )
+            }
 
-            pickupGameDetailsDivider
-            pickupOrganizerDetailsRow(g: g, creatorLabel: creatorLabel)
+            if includeOrganizer {
+                if eventPolicy.isGameplayEvent || eventPolicy.usesGenericDetailLabels {
+                    pickupGameDetailsDivider
+                }
+                pickupOrganizerDetailsRow(g: g, creatorLabel: creatorLabel)
+            }
         }
-        .background { pickupGlassBackground(cornerRadius: FGRadius.large) }
-        .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
-        .overlay { pickupGlassStroke(cornerRadius: FGRadius.large) }
+
+        return Group {
+            if usesEventChrome {
+                TeamEventPlayerCardChrome(padded: true) {
+                    rows
+                }
+            } else {
+                rows
+                    .background { pickupGlassBackground(cornerRadius: FGRadius.large) }
+                    .clipShape(RoundedRectangle(cornerRadius: FGRadius.large, style: .continuous))
+                    .overlay { pickupGlassStroke(cornerRadius: FGRadius.large) }
+            }
+        }
     }
 
     private var pickupGameDetailsDivider: some View {
@@ -1632,11 +2462,17 @@ struct DiscoverPickupGameDetailSheet: View {
             .accessibilityHidden(true)
     }
 
-    private func pickupGameDetailsRow(systemImage: String, title: String, value: String) -> some View {
+    private func pickupGameDetailsRow(
+        systemImage: String,
+        title: String,
+        value: String,
+        accent: Color = FGColor.accentBlue,
+        horizontalPadding: CGFloat = FGSpacing.md
+    ) -> some View {
         HStack(alignment: .center, spacing: FGSpacing.md) {
             Image(systemName: systemImage)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(FGColor.accentBlue)
+                .foregroundStyle(accent)
                 .frame(width: 28, alignment: .center)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
@@ -1650,7 +2486,7 @@ struct DiscoverPickupGameDetailSheet: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, FGSpacing.md)
+        .padding(.horizontal, horizontalPadding)
         .padding(.vertical, 12)
         .accessibilityElement(children: .combine)
     }
@@ -1816,6 +2652,8 @@ struct DiscoverPickupGameDetailSheet: View {
         let avatarFallback: UserAvatarView.FallbackStyle =
             colorScheme == .dark ? .darkCardTranslucent : .lightOnWhiteChrome
         return Button {
+            // Managed players are Team participants, not social identities.
+            guard !member.isManagedPlayer else { return }
             viewModel.presentPublicProfile(
                 userId: member.user_id,
                 context: "pickup_detail_response",
@@ -1860,6 +2698,7 @@ struct DiscoverPickupGameDetailSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(member.isManagedPlayer)
         .accessibilityLabel(
             "\(member.resolvedDisplayName), \(statusLabel)"
         )
@@ -1971,7 +2810,12 @@ struct DiscoverPickupGameDetailSheet: View {
     }
 
     private var canAccessPickupGameChat: Bool {
-        PickupGameChatAccessPolicy.canAccess(
+        if isTeamLinkedGame {
+            // Team events reuse Team Chat — available to authenticated Team participants / creator.
+            return viewModel.isAuthenticatedForSocialFeatures
+                && (isCreator || canUseTeamRSVP || linkedTeamContext?.groupConversationId != nil)
+        }
+        return PickupGameChatAccessPolicy.canAccess(
             isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
             isCreator: isCreator,
             joinRequestStatus: myRequest?.status
@@ -1979,7 +2823,8 @@ struct DiscoverPickupGameDetailSheet: View {
     }
 
     private var showsPickupChatLockedHint: Bool {
-        PickupGameChatAccessPolicy.showsLockedHint(
+        if isTeamLinkedGame { return false }
+        return PickupGameChatAccessPolicy.showsLockedHint(
             isAuthenticated: viewModel.isAuthenticatedForSocialFeatures,
             isCreator: isCreator,
             joinRequestStatus: myRequest?.status
@@ -1993,15 +2838,29 @@ struct DiscoverPickupGameDetailSheet: View {
                 Task { await openPickupGameChat(for: g) }
             } label: {
                 pickupTintedActionLabel(
-                    title: isOpeningPickupChat ? "Opening chat…" : "Chat",
+                    title: isOpeningPickupChat
+                        ? "Opening chat…"
+                        : (isTeamLinkedGame
+                           ? L10n.t("chat_inbox_badge_team_chat", languageCode: languageCode)
+                           : "Chat"),
                     systemImage: "bubble.left.and.bubble.right.fill",
-                    tint: FGColor.accentGreen
+                    tint: isTeamLinkedGame
+                        ? (linkedTeamContext.flatMap { Color(fanTeamHex: $0.colorHex ?? "") } ?? FGColor.accentGreen)
+                        : FGColor.accentGreen
                 )
             }
             .buttonStyle(.plain)
             .disabled(isOpeningPickupChat)
-            .accessibilityLabel("Open pickup game chat")
-            .accessibilityHint("Opens the private chat for approved players of this pickup game")
+            .accessibilityLabel(
+                isTeamLinkedGame
+                    ? L10n.t("fan_teams_open_chat", languageCode: languageCode)
+                    : "Open pickup game chat"
+            )
+            .accessibilityHint(
+                isTeamLinkedGame
+                    ? "Opens the Team Chat for this event"
+                    : "Opens the private chat for approved players of this pickup game"
+            )
 
             if let pickupChatError, !pickupChatError.isEmpty {
                 Text(pickupChatError)
@@ -2025,10 +2884,65 @@ struct DiscoverPickupGameDetailSheet: View {
     @MainActor
     private func openPickupGameChat(for g: PickupGameRow) async {
         guard canAccessPickupGameChat else { return }
-        // Client gate only — server RLS/RPC re-checks authorization.
+        guard !isOpeningPickupChat else {
+            TeamEventChatNavigationDebug.log("navigationCancelled", detail: "reason=alreadyOpening")
+            return
+        }
         isOpeningPickupChat = true
         pickupChatError = nil
         defer { isOpeningPickupChat = false }
+
+        // Team-linked events: open the durable Team Chat (never create a pickup chat).
+        if isTeamLinkedGame {
+            TeamEventChatNavigationDebug.log(
+                "chatTapped",
+                detail: "eventID=\(g.id.uuidString.lowercased()) teamID=\(linkedTeamContext?.teamId.uuidString.lowercased() ?? "nil")"
+            )
+            do {
+                let teamId = linkedTeamContext?.teamId
+                // Prefer in-context Team Detail Chat tab when a handler is provided.
+                if let teamId, let onRequestTeamDetailChatTab {
+                    let accepted = onRequestTeamDetailChatTab(teamId, g.id)
+                    if accepted {
+                        TeamEventChatNavigationDebug.log(
+                            "eventDetailDismissRequested",
+                            detail: "teamID=\(teamId.uuidString.lowercased()) eventID=\(g.id.uuidString.lowercased())"
+                        )
+                        dismiss()
+                        return
+                    }
+                    TeamEventChatNavigationDebug.log(
+                        "navigationCancelled",
+                        detail: "reason=teamChatTabUnavailable teamID=\(teamId.uuidString.lowercased())"
+                    )
+                    pickupChatError = L10n.t("fan_teams_open_chat", languageCode: languageCode)
+                    return
+                }
+
+                let conversationId: UUID
+                if let existing = linkedTeamContext?.groupConversationId {
+                    conversationId = existing
+                } else if let resolved = try await FanTeamsService().teamChatConversationId(forPickupGameId: g.id) {
+                    conversationId = resolved
+                } else {
+                    pickupChatError = L10n.t("fan_teams_open_chat", languageCode: languageCode)
+                    return
+                }
+                // Discover / Calendar / Following: open the Team conversation in global Chat.
+                chatViewModel.pendingGroupOpenConversationId = conversationId
+#if DEBUG
+                print(
+                    "[TeamEventChat] openTeamChat gameId=\(g.id.uuidString.lowercased()) " +
+                    "conversationId=\(conversationId.uuidString.lowercased()) via=globalChatTab"
+                )
+#endif
+                dismiss()
+            } catch {
+                pickupChatError = Self.userFacingPickupChatOpenError(error)
+            }
+            return
+        }
+
         do {
             let conversationId = try await GroupChatService().ensurePickupGameConversation(pickupGameId: g.id)
             pickupChatConversationId = conversationId
@@ -2038,6 +2952,13 @@ struct DiscoverPickupGameDetailSheet: View {
             print("[PickupGameChat] opened gameId=\(g.id.uuidString.lowercased()) conversationId=\(conversationId.uuidString.lowercased())")
 #endif
         } catch {
+            // Server may reject Team-linked ensure calls after 20260964 — fall through to Team Chat.
+            if await viewModel.isPickupGameLinkedToFanTeam(pickupGameId: g.id),
+               let conversationId = try? await FanTeamsService().teamChatConversationId(forPickupGameId: g.id) {
+                chatViewModel.pendingGroupOpenConversationId = conversationId
+                dismiss()
+                return
+            }
             pickupChatError = Self.userFacingPickupChatOpenError(error)
 #if DEBUG
             print("[PickupGameChat] openFailed gameId=\(g.id.uuidString.lowercased()) error=\(error.localizedDescription)")
@@ -2049,7 +2970,7 @@ struct DiscoverPickupGameDetailSheet: View {
         let title = {
             let raw = g.title.trimmingCharacters(in: .whitespacesAndNewlines)
             if !raw.isEmpty { return raw }
-            return AppSportCatalog.displayLabel(forSportToken: g.sport)
+            return g.sportIdentityLabel(languageCode: languageCode)
         }()
         let when: String = {
             let date = pickupDateText(for: g)
@@ -2073,7 +2994,7 @@ struct DiscoverPickupGameDetailSheet: View {
         return PickupGameChatContext(
             pickupGameId: g.id,
             title: title,
-            sportLabel: AppSportCatalog.displayLabel(forSportToken: g.sport),
+            sportLabel: g.sportIdentityLabel(languageCode: languageCode),
             whenLabel: when,
             locationLabel: location,
             approvedParticipantCount: approvedCount,
@@ -2201,6 +3122,114 @@ struct DiscoverPickupGameDetailSheet: View {
                 .font(FGTypography.body)
                 .foregroundStyle(pickupDetailMainInk)
         }
+    }
+
+    @ViewBuilder
+    private func pickupStandaloneMyResponseCard(for g: PickupGameRow) -> some View {
+        if isCreator { EmptyView() }
+        else {
+            let status: PickupGameDetailMyResponseCard.Status = {
+                if !viewModel.isAuthenticatedForSocialFeatures { return .signedOut }
+                if !viewModel.canJoinPickupGames { return .businessGated }
+                if let req = myRequest {
+                    switch req.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                    case "approved": return .going
+                    case "pending": return .pending
+                    case "rejected", "cancelled", "withdrawn":
+                        return shouldShowRequestToJoin(for: g) ? .none : .cantGo
+                    default: break
+                    }
+                }
+                if shouldShowRequestToJoin(for: g) { return .none }
+                if g.isPickupFullForDiscover { return .full }
+                return .none
+            }()
+            PickupGameDetailMyResponseCard(
+                status: status,
+                languageCode: languageCode,
+                statusTitle: myRequest.map {
+                    $0.statusDisplayTitle(languageCode: appLanguageRaw)
+                },
+                isBusy: isCancellingRequest,
+                showsJoinCTA: shouldShowRequestToJoin(for: g),
+                onJoin: {
+                    joinError = nil
+                    showJoinComposer = true
+                },
+                onChangeResponse: {
+                    guard let req = myRequest else { return }
+                    let st = req.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    let intent: PickupJoinWithdrawConfirmState.PickupJoinWithdrawIntent = {
+                        switch st {
+                        case "pending": return .pending
+                        case "approved": return .approved
+                        default: return .declined
+                        }
+                    }()
+                    withdrawConfirm = PickupJoinWithdrawConfirmState(
+                        requestId: req.id,
+                        pickupGameId: gameId,
+                        intent: intent
+                    )
+                }
+            )
+        }
+    }
+
+    private func pickupStandaloneWhosGoingCard(
+        for g: PickupGameRow,
+        onViewAll: @escaping () -> Void
+    ) -> some View {
+        let roster = viewModel.pickupGameRosterByGameId[g.id]
+        let goingCount = roster?.playingTotal
+            ?? PickupGameRosterPresentation.playingDisplayCount(approvedJoinCount: g.approvedJoinCount)
+        let maybeCount = roster?.pending.count ?? 0
+        let cantGoCount = roster?.declinedMembers.count ?? 0
+        let stackMembers = roster?.stackMembers ?? fallbackOrganizerStack(for: g)
+        let spots = String(
+            format: L10n.t(
+                "pickup_detail_spots_needed_format",
+                languageCode: languageCode
+            ),
+            locale: Locale(identifier: languageCode),
+            g.pickupOpenSlotsRemaining,
+            g.playersNeededClamped
+        )
+        return PickupGameDetailWhosGoingCard(
+            languageCode: languageCode,
+            stackMembers: stackMembers,
+            goingCount: goingCount,
+            maybeCount: maybeCount,
+            cantGoCount: cantGoCount,
+            spotsNeededLine: spots,
+            onViewAll: onViewAll
+        )
+    }
+
+    private func pickupStandaloneOrganizerCard(
+        for g: PickupGameRow,
+        creatorLabel: String?
+    ) -> some View {
+        let uid = g.creator_user_id
+        let displayName = (creatorLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let shownName = displayName.isEmpty ? "—" : displayName
+        let summary = viewModel.pickupOrganizerSummary(for: uid)
+        return PickupGameDetailOrganizerCard(
+            displayName: shownName,
+            thumbnailURL: viewModel.pickupOrganizerAvatarThumbnailForDetail(userId: uid),
+            fullURL: viewModel.pickupOrganizerAvatarFullForDetail(userId: uid),
+            refreshToken: viewModel.pickupOrganizerAvatarRefreshTokenForDetail(userId: uid),
+            summaryLine: summary?.summaryLine(languageCode: languageCode),
+            languageCode: languageCode,
+            onOpenProfile: {
+                viewModel.presentPublicProfile(
+                    userId: uid,
+                    context: "pickup_detail_organizer",
+                    isSelfPreview: uid == viewModel.currentUserAuthId
+                )
+            }
+        )
+        .accessibilityLabel(pickupOrganizerDetailAccessibilityLabel(displayName: shownName, summary: summary))
     }
 
     @ViewBuilder
@@ -2498,13 +3527,76 @@ struct PickupOrganizerRequestsSheet: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
 
     @State private var rows: [PickupGameRequestRow] = []
     @State private var loadError: String?
     @State private var busyRequestId: UUID?
+    @State private var pendingFullCapacityApprove: PickupGameRequestRow?
 
     private var useCompactRequestCopy: Bool {
         horizontalSizeClass == .compact
+    }
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
+
+    private var liveGame: PickupGameRow {
+        viewModel.resolvedPickupGameRow(for: game.id) ?? game
+    }
+
+    private var teamIdentity: PickupDiscoverTeamIdentity? {
+        viewModel.pickupDiscoverTeamIdentityByGameId[liveGame.id]
+    }
+
+    private var eventTitle: String {
+        FanGeoJoinRequestEventIdentity.primaryTitle(
+            gameTitle: liveGame.title,
+            eventTypeLabel: liveGame.gameFormat.displayTitle(languageCode: languageCode),
+            matchupLabel: eventMatchup,
+            languageCode: languageCode
+        )
+    }
+
+    private var eventMatchup: String? {
+        FanGeoJoinRequestEventIdentity.matchupLabel(
+            homeTeamName: teamIdentity?.teamName,
+            opponentName: liveGame.opponent_name,
+            languageCode: languageCode
+        )
+    }
+
+    private var eventCapacityLabel: String? {
+        FanGeoJoinRequestEventIdentity.capacityLabel(
+            approvedJoinCount: liveGame.approved_join_count,
+            maxPlayers: liveGame.max_players,
+            playersNeeded: liveGame.playersNeededClamped,
+            isTeamLinked: teamIdentity != nil,
+            languageCode: languageCode
+        )
+    }
+
+    private var isEventAtCapacity: Bool {
+        FanGeoJoinRequestEventIdentity.isAtCapacity(
+            approvedJoinCount: liveGame.approved_join_count,
+            maxPlayers: liveGame.max_players,
+            playersNeeded: liveGame.playersNeededClamped,
+            isTeamLinked: teamIdentity != nil
+        )
+    }
+
+    private var eventWhenLabel: String? {
+        FanGeoActionCenterCopy.formattedEventWhen(
+            PickupGameModels.parseSupabaseTimestamptz(liveGame.game_start_at),
+            languageCode: languageCode
+        )
+    }
+
+    private var eventLocationLabel: String? {
+        let label = PickupGameMeaningfulChange.locationDisplayLabel(for: liveGame)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return label.isEmpty ? nil : label
     }
 
     private var pendingRows: [PickupGameRequestRow] {
@@ -2533,6 +3625,16 @@ struct PickupOrganizerRequestsSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    organizerEventContextCard
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                } header: {
+                    Text(L10n.t("pickup_join_review_event_section", languageCode: languageCode))
+                        .textCase(nil)
+                }
+
                 if let loadError, !loadError.isEmpty {
                     Text(loadError)
                         .font(FGTypography.caption)
@@ -2610,6 +3712,25 @@ struct PickupOrganizerRequestsSheet: View {
             .task { await reload() }
             .onChange(of: viewModel.pickupOrganizerRequestsSyncGeneration) { _, _ in
                 Task { await reload() }
+            }
+            .confirmationDialog(
+                L10n.t("pickup_join_full_confirm_title", languageCode: languageCode),
+                isPresented: Binding(
+                    get: { pendingFullCapacityApprove != nil },
+                    set: { if !$0 { pendingFullCapacityApprove = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(L10n.t("Approve", languageCode: languageCode)) {
+                    guard let req = pendingFullCapacityApprove else { return }
+                    pendingFullCapacityApprove = nil
+                    Task { await decide(req, approve: true, confirmedOverCapacity: true) }
+                }
+                Button(L10n.t("Cancel", languageCode: languageCode), role: .cancel) {
+                    pendingFullCapacityApprove = nil
+                }
+            } message: {
+                Text(L10n.t("pickup_join_full_confirm_message", languageCode: languageCode))
             }
             .onAppear {
                 PickupGameStartedStateDebug.log(
@@ -2709,7 +3830,7 @@ struct PickupOrganizerRequestsSheet: View {
             if isPending {
                 HStack(spacing: FGSpacing.sm) {
                     Button {
-                        Task { await decide(req, approve: true) }
+                        requestApprove(req)
                     } label: {
                         if busyRequestId == req.id {
                             ProgressView()
@@ -2764,7 +3885,96 @@ struct PickupOrganizerRequestsSheet: View {
         await viewModel.loadPendingPickupGameJoinRequestCountForCreator(resyncRealtimeSubscription: false)
     }
 
-    private func decide(_ req: PickupGameRequestRow, approve: Bool) async {
+    private var organizerEventContextCard: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.md) {
+            HStack(alignment: .top, spacing: FGSpacing.md) {
+                SportArtworkIconView(sport: liveGame.sport, diameter: 52)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 6) {
+                    GameFormatBadgeView(
+                        format: liveGame.gameFormat,
+                        colorScheme: colorScheme
+                    )
+                    Text(eventTitle)
+                        .font(FGTypography.cardTitle)
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let matchup = eventMatchup,
+                       matchup.caseInsensitiveCompare(eventTitle) != .orderedSame {
+                        Text(matchup)
+                            .font(FGTypography.caption.weight(.semibold))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    if let teamName = teamIdentity?.teamName {
+                        let team = teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !team.isEmpty {
+                            Text(team)
+                                .font(FGTypography.caption)
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                        }
+                    }
+                }
+            }
+            if let eventWhenLabel {
+                labeledReviewRow(
+                    title: L10n.t("pickup_join_review_date_section", languageCode: languageCode),
+                    value: eventWhenLabel,
+                    systemImage: "calendar"
+                )
+            }
+            if let eventLocationLabel {
+                labeledReviewRow(
+                    title: L10n.t("pickup_join_review_location_section", languageCode: languageCode),
+                    value: eventLocationLabel,
+                    systemImage: "mappin.and.ellipse"
+                )
+            }
+            if let eventCapacityLabel {
+                labeledReviewRow(
+                    title: L10n.t("pickup_join_review_capacity_section", languageCode: languageCode),
+                    value: eventCapacityLabel,
+                    systemImage: "person.3.fill",
+                    emphasize: isEventAtCapacity
+                )
+            }
+        }
+        .padding(FGSpacing.lg)
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.55 : 0.4), lineWidth: 1)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func labeledReviewRow(
+        title: String,
+        value: String,
+        systemImage: String,
+        emphasize: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(title, systemImage: systemImage)
+                .font(FGTypography.caption.weight(.semibold))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+            Text(value)
+                .font(FGTypography.body.weight(emphasize ? .semibold : .regular))
+                .foregroundStyle(emphasize ? FGColor.dangerRed : FGColor.primaryText(colorScheme))
+        }
+    }
+
+    private func requestApprove(_ req: PickupGameRequestRow) {
+        if isEventAtCapacity {
+            pendingFullCapacityApprove = req
+            return
+        }
+        Task { await decide(req, approve: true, confirmedOverCapacity: false) }
+    }
+
+    private func decide(_ req: PickupGameRequestRow, approve: Bool, confirmedOverCapacity: Bool = false) async {
         busyRequestId = req.id
         loadError = nil
         defer { busyRequestId = nil }

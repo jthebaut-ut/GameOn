@@ -1,5 +1,6 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "./apns_client.ts"
+import { applyPushArtwork, pickChatGroupArtwork, pickTeamLogo } from "./push_artwork.ts"
 import {
   authorizeSportsWorkerRequest,
   describeAuthCandidateClasses,
@@ -300,6 +301,7 @@ async function handleDirectMessage(
   if (conversation.business_id) customData.business_id = conversation.business_id
   if (conversation.venue_id) customData.venue_id = conversation.venue_id
   if (chatType === "venue") customData.conversation_title = alert.title
+  applyPushArtwork(customData, senderIdentity.avatarURL, "user", senderId)
 
   try {
     const { sent, invalidated } = await sendToRecipientTokens(
@@ -416,6 +418,19 @@ async function handleGroupMessage(
     if (pickupTitle) conversationTitle = pickupTitle
   }
 
+  let teamLogoURL: string | null = null
+  if (fanTeamId) {
+    const { data: teamArt } = await admin
+      .from("fan_teams")
+      .select("logo_url,logo_thumbnail_url")
+      .eq("id", fanTeamId)
+      .maybeSingle()
+    teamLogoURL = pickTeamLogo(
+      (teamArt as { logo_thumbnail_url?: string | null } | null)?.logo_thumbnail_url,
+      (teamArt as { logo_url?: string | null } | null)?.logo_url,
+    )
+  }
+
   let totalSent = 0
   let totalInvalidated = 0
   let deliveredRecipients = 0
@@ -487,6 +502,20 @@ async function handleGroupMessage(
     if (conversation.pickup_game_id) {
       customData.pickup_game_id = conversation.pickup_game_id as string
     }
+    const groupArtworkURL = pickChatGroupArtwork({
+      groupImageURL: null,
+      teamLogoURL,
+      senderAvatarURL: senderIdentity.avatarURL,
+    })
+    const groupArtworkKind = teamLogoURL && groupArtworkURL === teamLogoURL
+      ? "team"
+      : "user"
+    applyPushArtwork(
+      customData,
+      groupArtworkURL,
+      groupArtworkKind,
+      groupArtworkKind === "team" ? fanTeamId : senderId,
+    )
 
     try {
       const { sent, invalidated } = await sendToRecipientTokens(

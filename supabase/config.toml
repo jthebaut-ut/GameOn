@@ -444,6 +444,13 @@ verify_jwt = false
 import_map = "./functions/sync-live-matches/deno.json"
 entrypoint = "./functions/sync-live-matches/index.ts"
 
+[functions.sync-sports-provider-artwork]
+enabled = true
+# Fail-closed worker auth (service role / cron secret). Never invoke from iOS JWTs.
+verify_jwt = false
+import_map = "./functions/sync-sports-provider-artwork/deno.json"
+entrypoint = "./functions/sync-sports-provider-artwork/index.ts"
+
 [functions.pro-game-score-alert-worker]
 enabled = true
 verify_jwt = false
@@ -474,3 +481,8 @@ entrypoint = "./functions/notify-fangeo-plus-award/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/notify-business-pro-award/index.ts"
+
+[functions.notify-session-replaced]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/notify-session-replaced/index.ts"

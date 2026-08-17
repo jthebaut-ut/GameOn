@@ -1,156 +1,134 @@
-IMPLEMENTATION REPORT — Create Team logo/photo selection
-Date: 2026-08-09
-Status: Complete (no SQL applied, no commit, no push)
+FANGEO — FAN PROFILE “MESSAGE” BUTTON DID NOT OPEN CHAT
 
-================================================================================
-1. Existing Edit Team logo path reused
-================================================================================
+Date: 2026-08-12
+No commit. No push. No schema / SQL / notification / friendship / layout changes.
 
-Edit Team (`EditFanTeamSheet`) already owns the authoritative pipeline:
+────────────────────────────────────────────────────────────────
+1) EXACT ROOT CAUSE
+────────────────────────────────────────────────────────────────
+Two defects stacked:
 
-- PhotosPicker → loadTransferable(Data) → local `pendingImageData` + `localPreviewImage`
-- Preview via `FanTeamMarkView` (local preview overrides remote URLs)
-- On Save only:
-  - `FanTeamsService.uploadTeamLogo(teamId:imageData:)`
-    - bucket: `fan-team-logos`
-    - path: `{team_id}/logo-{uuid}.jpg` + companion `_thumb.jpg`
-    - compression: `ImageCompression.jpegDataForUpload` presets `.avatar` / `.avatarThumbnail`
-  - `FanTeamsService.updateTeamIdentity` → RPC `update_fan_team_identity`
-    (`logo_url` / `logo_thumbnail_url`)
-  - `FanTeamIdentityChangeCenter.postIdentityChange`
-  - `DiscoverMapImageCache` warm for versioned display URLs
-  - best-effort Storage cleanup of replaced/removed objects via `MapViewModel`
+A) Data: `messageFriend` called `startDirectConversationWithFriend` (canonical
+   RPC) but discarded the returned conversation UUID (`_ = try await …`).
+   It then set `chatViewModel.pendingDmOpenPreview` to
+   `userPreviewForMessaging`, which never included `dmConversationId`.
 
-Create Team now reuses this exact upload + identity-update + cache/realtime path.
-No second bucket, path scheme, compression pipeline, or identity RPC.
+B) Consume: Chat’s `consumePendingDmOpenPreviewIfNeeded` required
+   `preview.dmConversationId`. When it was nil it cleared the pending seed
+   and returned (`missing_conversation_id`). The conversation existed (or
+   was created) but navigation never ran.
 
-================================================================================
-2. Create Team UI changes
-================================================================================
+Fan Profile is a dedicated UIWindow overlay
+(`PublicProfileOverlayWindowPresenter`), not a SwiftUI sheet. Dismiss was
+already called (`onDismiss()`), but Chat dropped the pending open before
+the conversation could appear. The overlay was not the primary bug; the
+missing conversation id + consume guard was.
 
-`CreateFanTeamSheet` (My Teams → Create Team):
+────────────────────────────────────────────────────────────────
+2) FAN PROFILE MESSAGE ACTION BEFORE
+────────────────────────────────────────────────────────────────
+PublicProfileRedesignHero.onMessage
+  → PublicUserProfilePreviewView.messageFriend(_:)
 
-- Logo section at the top of the form
-- Live `FanTeamMarkView` (size 88) reacting to:
-  - selected local photo (priority)
-  - sport + Team color fallback mark when no photo
-- Controls:
-  - no photo → “Add Photo”
-  - photo selected → “Change Photo” + “Remove Photo”
-- Same visual language as Edit Team photo chrome
-- Logo remains optional (Create never requires a photo)
+Before:
+  1. Guard `isFriendActionInFlight`
+  2. `startDirectConversationWithFriend(friendUserId:)`  // result discarded
+  3. `refreshInboxSummaries` + `ensureSignedInSocialRealtimeIfNeeded`
+  4. `pendingDmOpenPreview = userPreviewForMessaging`  // no conversation id
+  5. `onDismiss()`  // overlay animates out (~320ms)
+  6. Chat consume sees nil conversation id → drop pending → stay on profile
+     or return to previous tab with no DM
 
-Accessibility:
-- Preview: “Team logo”
-- Add / Change / Remove: “Add Team Photo” / “Change Team Photo” / “Remove Team Photo”
-- Edit Team a11y labels aligned to the same wording
+Button was tappable. Create/fetch could succeed. Result was never consumed.
 
-================================================================================
-3. Local pending-image behavior
-================================================================================
+────────────────────────────────────────────────────────────────
+3) CANONICAL DM HELPER REUSED
+────────────────────────────────────────────────────────────────
+Same path as Teams roster Message / pickup roster Message / Chat pending opens:
 
-- Picker selections stay in memory (`pendingImageData` / `localPreviewImage`)
-- Changing the photo before Create only replaces local state
-- Remove Photo clears local state; fallback mark returns
-- Nothing is uploaded until Create succeeds and `team_id` exists
-- Policy helper: `FanTeamCreateLogoPolicy.shouldUploadAfterCreate`
+  ChatViewModel.startDirectConversationWithFriend
+    → DirectChatService.startDirectConversation
+      → RPC `start_direct_conversation` (idempotent; no duplicate rows)
 
-================================================================================
-4. Create → upload → identity-update sequence
-================================================================================
+  Then app-level navigation:
+    pendingDmOpenPreview (with dmConversationId)
+    → MainTabView selects Chat tab
+    → consumePendingDmOpenPreviewIfNeeded
+    → openDirectChatRoute (same helper as Friends / search / Fans Live Now)
+    → DirectChatView (existing fetchExisting + startDirectConversation)
 
-1. `create_fan_team` via `FanTeamsService.createTeam` (logo URLs always nil;
-   invitations + Team Chat created by existing RPC)
-2. If a final local image is still selected:
-   a. `uploadTeamLogo(teamId:imageData:)` → `fan-team-logos/{team_id}/…`
-   b. `updateTeamIdentity(... logoURL/logoThumbnailURL ...)`
-      with `updateCompetitionLevel: false` (competition already set at create)
-   c. post `FanTeamIdentityChange` when My Teams list can resolve conversation id
-   d. warm image cache for immediate marks
-3. Continue existing `onCreated` → My Teams refresh → open Team Detail
+No second create path.
 
-Order preference honored: create Team → logo update → invitation processing already
-happened inside create RPC, then logo is attached ASAP for surfaces that refresh.
+────────────────────────────────────────────────────────────────
+4) NAVIGATION / PRESENTATION FIX
+────────────────────────────────────────────────────────────────
+1. Keep the returned `conversationId` and seed
+   `userPreviewForMessaging(conversationId:)`.
+2. Set `pendingDmOpenPreview`, clear in-flight, then `onDismiss()` so the
+   overlay leaves and Chat can show the thread.
+3. Consume no longer drops a pending open with a nil conversation id.
+   It still prefers conversation-stable identity when the id is present;
+   otherwise `openDirectChatRoute` lets DirectChatView resolve/create.
 
-================================================================================
-5. Failure semantics
-================================================================================
+Sequence:
+  Tap Message
+  → canonical start/open
+  → pendingDmOpenPreview with conversation id
+  → dismiss Fan Profile overlay
+  → Chat tab + openDirectChatRoute
+  → conversation visible
 
-- Create RPC fails → no upload attempted
-- Create succeeds, upload fails → Team kept; friendly warning:
-  “Team created, but the photo couldn’t be uploaded. You can add it later.”
-  Fallback sport/color mark used
-- Upload succeeds, identity update fails → best-effort delete of newly uploaded
-  full + thumb objects; same friendly warning; Team kept
-- Team is never deleted solely because logo attach failed
+No timing hacks. Existing pending-preview + overlay dismiss coordination.
 
-================================================================================
-6. Storage path / security
-================================================================================
+Duplicate taps: `isFriendActionInFlight` still disables Message while
+resolving. Failure restores the button and shows
+“Couldn't open chat. Try again.” (existing copy). Profile is not a fallback.
 
-Unchanged:
-- Bucket: `fan-team-logos`
-- Path: `{team_id}/logo-{uuid}.jpg` (+ `_thumb`)
-- Existing Storage RLS / Owner-Manager identity update RPC only
-- No public arbitrary upload path; no temporary global logo staging bucket
+────────────────────────────────────────────────────────────────
+5) FILES MODIFIED
+────────────────────────────────────────────────────────────────
+  GameOn/PublicUserProfilePreviewView.swift
+  GameOn/RecoveredSocialChatViews.swift
+  GameOn/ContentView.swift
+  GameOn/PublicProfileMessageNavigationSelfTests.swift  (new)
+  IMPLEMENTATION_REPORT.txt
 
-================================================================================
-7. Cache / realtime behavior
-================================================================================
+────────────────────────────────────────────────────────────────
+6) DUPLICATE-CONVERSATION PROTECTION
+────────────────────────────────────────────────────────────────
+- RPC `start_direct_conversation` is already idempotent.
+- DirectChatView still does fetchExisting before create.
+- Route identity is `dm-c-<conversationId>` when known, else `dm-p-<peer>`.
+- ChatConversationOpenGate ignores in-flight duplicate opens.
+- Consume skips if that conversation is already the active route.
 
-After successful logo attach:
-- `FanTeamIdentityChangeCenter.postIdentityChange` (same as Edit)
-- My Teams / Detail / Chat listeners already apply identity changes
-- Versioned display URLs + `DiscoverMapImageCache` warm for immediate logo
-- Parent Create completion still refreshes My Teams so invitations / cards
-  pick up authoritative logo URLs
+────────────────────────────────────────────────────────────────
+7) TEST RESULTS
+────────────────────────────────────────────────────────────────
+DEBUG self-tests (PublicProfileMessageNavigationSelfTests):
+  - preview without conversation id is incomplete
+  - Message seed attaches canonical conversation id
+  - existing DM route is conversation-stable
+  - repeated seed == one route identity
+  - new DM seed is peer-stable
 
-================================================================================
-8. Files modified
-================================================================================
+Manual checklist (product behavior, unchanged rules):
+  1. Friend + existing DM → opens that conversation
+  2. Friend + no DM → RPC create once, then open
+  3. Non-friend → Message stays disabled (friends-only); unchanged
+  4. Double tap → in-flight guard + stable route
+  5. Profile from Chat / Discover / Suggested Fans / Mutual Friends → same
+     overlay + same pending path
+  6. Back from conversation dismisses Chat push; overlay already gone
+  7. No second inbox row (idempotent RPC)
+  8. Friends / Poke / overflow menu unchanged
 
-- GameOn/MyTeamsChatViews.swift
-  (CreateFanTeamSheet logo UI + staged upload; FanTeamCreateLogoPolicy;
-   create info banner; mapViewModel wiring)
-- GameOn/EditFanTeamSheet.swift
-  (a11y labels aligned with Create)
-- GameOn/FanTeamsService.swift
-  (createTeam comment documents staged logo attach)
-- GameOn/FanTeamsSelfTests.swift
-  (create logo staging policy tests)
-- GameOn/Localizable.xcstrings
-  (add/change/remove a11y, Team logo a11y, upload-failure warning, footer copy)
-- IMPLEMENTATION_REPORT.txt (this file)
+────────────────────────────────────────────────────────────────
+8) BUILD RESULT
+────────────────────────────────────────────────────────────────
+xcodebuild -scheme GameOn -configuration Debug \
+  -destination 'platform=iOS Simulator,name=iPhone 16' \
+  -derivedDataPath /tmp/GameOnDerivedDataProfileMessage
+→ ** BUILD SUCCEEDED **
 
-================================================================================
-9. SQL / backend changes
-================================================================================
-
-NONE.
-
-Reused:
-- `create_fan_team`
-- Storage bucket `fan-team-logos`
-- `update_fan_team_identity`
-
-No backend blocker found for staged create → upload → identity update.
-
-================================================================================
-10. Tests
-================================================================================
-
-- `FanTeamCreateLogoPolicy` unit coverage in `FanTeamsSelfTests`
-  (no upload for nil/empty; upload only with non-empty local data;
-   Add vs Change title/a11y keys)
-- Manual matrix A–N remains the product verification checklist
-  (no-logo create, logo create, change-before-create, remove-before-create,
-   upload failure warning, invitations, My Teams/Detail/Chat marks,
-   later Edit replace/remove, cache, device/appearance)
-
-================================================================================
-11. xcodebuild result
-================================================================================
-
-BUILD SUCCEEDED
-
-BUILD SUCCEEDED
+No commit. No push.

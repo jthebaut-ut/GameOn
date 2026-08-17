@@ -19,6 +19,13 @@ struct SportsDataSources {
     static let sources: [SportsDataSourceConfig] = [
 
         // MARK: - TheSportsDB
+        //
+        // Live scores / schedules / statuses do NOT use this key.
+        // Those come from Supabase `live_matches`, filled by `sync-live-matches`
+        // with the paid `THESPORTSDB_API_KEY` secret.
+        //
+        // This client entry is only the free test key for `SportsAPIService`
+        // venue-calendar `eventsday.php`. Artwork must not use this path.
 
         SportsDataSourceConfig(
             provider: .theSportsDB,

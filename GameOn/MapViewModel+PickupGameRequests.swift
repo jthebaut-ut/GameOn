@@ -64,6 +64,19 @@ extension MapViewModel {
         return pickupGamesFollowingTabCache[id]
     }
 
+    func applyTeamEventScoringPatch(gameId: UUID, row: PickupGameRow) {
+        if selectedPickupGameForMap?.id == gameId {
+            selectedPickupGameForMap = row
+        }
+        if let index = pickupGamesForDiscoverMap.firstIndex(where: { $0.id == gameId }) {
+            pickupGamesForDiscoverMap[index] = row
+        }
+        if let index = myPickupGamesForSettings.firstIndex(where: { $0.id == gameId }) {
+            myPickupGamesForSettings[index] = row
+        }
+        pickupGamesFollowingTabCache[gameId] = row
+    }
+
     @discardableResult
     func createPickupGameInvites(
         game: PickupGameRow,
@@ -726,7 +739,7 @@ extension MapViewModel {
 #if DEBUG
         print("[PickupPlayingClear] gameId=\(pickupGameId.uuidString.lowercased()) userCleared=true")
 #endif
-        showSocialActionToast("Removed from Going", isError: false)
+        showSocialActionToast(L10n.t("removed_from_my_sports"), isError: false)
     }
 
     func isPickupFollowingPlayingCompletedUserCleared(pickupGameId: UUID) -> Bool {
@@ -1606,16 +1619,168 @@ extension MapViewModel {
         mergePickupInsertedLocally(row)
     }
 
-    /// Opens pickup detail from a chat share card. Detail sheet loads/fetches the row if needed.
-    func presentSharedPickupGameDetail(gameId: UUID) {
-        pendingSharedPickupGameDetailToken = PickupDetailNavigationToken(id: gameId)
+    /// Opens canonical pickup detail from an in-app chat share card (any tab).
+    func presentSharedPickupGameDetail(
+        gameId: UUID,
+        presentationMode: PickupDetailPresentationMode = .standalonePickup,
+        seededTeamContext: PickupGameTeamCreationContext? = nil
+    ) {
+        pendingSharedPickupGameDetailToken = pickupDetailNavigationToken(
+            for: gameId,
+            preferredMode: presentationMode,
+            seededTeamContext: seededTeamContext
+        )
 #if DEBUG
-        print("[PickupShareDebug] presentDetail gameId=\(gameId.uuidString.lowercased())")
+        print(
+            "[PickupShareDebug] presentDetail gameId=\(gameId.uuidString.lowercased()) " +
+            "mode=\(pendingSharedPickupGameDetailToken?.presentationMode.rawValue ?? "nil")"
+        )
 #endif
+    }
+
+    /// Resolves Team Event vs standalone Pickup before first detail frame when identity is known.
+    func pickupDetailNavigationToken(
+        for gameId: UUID,
+        preferredMode: PickupDetailPresentationMode = .standalonePickup,
+        seededTeamContext: PickupGameTeamCreationContext? = nil
+    ) -> PickupDetailNavigationToken {
+        let resolvedMode: PickupDetailPresentationMode = {
+            if preferredMode == .teamEvent || seededTeamContext != nil { return .teamEvent }
+            if pickupDiscoverTeamIdentityByGameId[gameId] != nil { return .teamEvent }
+            return .standalonePickup
+        }()
+        let seeded: PickupGameTeamCreationContext? = {
+            if let seededTeamContext { return seededTeamContext }
+            guard let identity = pickupDiscoverTeamIdentityByGameId[gameId] else { return nil }
+            return PickupGameTeamCreationContext(
+                teamId: identity.teamId,
+                teamName: identity.teamName,
+                teamSport: identity.teamSport,
+                logoURL: identity.logoURL,
+                logoThumbnailURL: identity.logoThumbnailURL,
+                colorHex: identity.colorHex
+            )
+        }()
+        if let seeded {
+            seedPickupDiscoverTeamIdentityIfNeeded(gameId: gameId, from: seeded)
+        }
+        return PickupDetailNavigationToken(
+            id: gameId,
+            presentationMode: resolvedMode,
+            seededTeamContext: seeded
+        )
+    }
+
+    /// Keeps Discover/Going team-identity lookups aligned when callers already know Team linkage.
+    func seedPickupDiscoverTeamIdentityIfNeeded(
+        gameId: UUID,
+        from context: PickupGameTeamCreationContext
+    ) {
+        let name = context.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        if let existing = pickupDiscoverTeamIdentityByGameId[gameId],
+           existing.teamId == context.teamId {
+            return
+        }
+        pickupDiscoverTeamIdentityByGameId[gameId] = PickupDiscoverTeamIdentity(
+            pickupGameId: gameId,
+            teamId: context.teamId,
+            teamName: name,
+            teamSport: context.teamSport,
+            colorHex: context.colorHex,
+            logoURL: context.logoURL,
+            logoThumbnailURL: context.logoThumbnailURL,
+            displayRefreshToken: nil
+        )
+    }
+
+    /// APNs Team Schedule / pickup change tap: Team → Schedule → event when `team_id` present.
+    @MainActor
+    func handlePickupGameChangeNotificationDeepLink(
+        pickupGameId: UUID,
+        teamId: UUID?,
+        rsvpResetRequired: Bool
+    ) {
+        if rsvpResetRequired {
+            invalidateFanTeamSelfRSVPCache(for: pickupGameId)
+            pickupGameRosterByGameId[pickupGameId] = nil
+        }
+        if let teamId {
+            pendingSharedPickupGameDetailToken = nil
+            pendingTeamScheduleEventDeepLink = PendingTeamScheduleEventDeepLink(
+                teamId: teamId,
+                pickupGameId: pickupGameId
+            )
+#if DEBUG
+            print(
+                "[TeamScheduleNotification] presentTeamScheduleEvent " +
+                "team_id=\(teamId.uuidString.lowercased()) " +
+                "event_id=\(pickupGameId.uuidString.lowercased())"
+            )
+#endif
+        } else {
+            pendingTeamScheduleEventDeepLink = nil
+            presentSharedPickupGameDetail(gameId: pickupGameId)
+        }
+    }
+
+    @MainActor
+    func clearPendingTeamScheduleEventDeepLink() {
+        pendingTeamScheduleEventDeepLink = nil
+    }
+
+    @MainActor
+    func invalidateFanTeamSelfRSVPCache(for pickupGameId: UUID) {
+        fanTeamSelfRSVPByGameId[pickupGameId] = nil
     }
 
     func clearSharedPickupGameDetailPresentation() {
         pendingSharedPickupGameDetailToken = nil
+    }
+
+    /// Action Center join-approval Review: Team Schedule game + requests when team-linked, else requests sheet.
+    @MainActor
+    func presentOrganizerJoinApprovalFromActionCenter(pickupGameId: UUID, teamId: UUID?) {
+        pendingOpenGoingHostingApprovals = false
+        pendingHostingApprovalPickupGameId = nil
+        if let teamId {
+            pendingOrganizerJoinRequestsGameToken = nil
+            pendingTeamScheduleJoinApproval = PendingTeamScheduleJoinApprovalDeepLink(
+                teamId: teamId,
+                pickupGameId: pickupGameId
+            )
+#if DEBUG
+            ActionCenterRouteDebug.log(
+                kind: "joinApproval",
+                pickupGameId: pickupGameId,
+                teamId: teamId,
+                presentation: "teamScheduleJoinApproval",
+                mapViewModelInjected: true
+            )
+#endif
+        } else {
+            pendingTeamScheduleJoinApproval = nil
+            pendingOrganizerJoinRequestsGameToken = PickupDetailNavigationToken(id: pickupGameId)
+#if DEBUG
+            ActionCenterRouteDebug.log(
+                kind: "joinApproval",
+                pickupGameId: pickupGameId,
+                teamId: nil,
+                presentation: "organizerRequests",
+                mapViewModelInjected: true
+            )
+#endif
+        }
+    }
+
+    @MainActor
+    func clearPendingTeamScheduleJoinApproval() {
+        pendingTeamScheduleJoinApproval = nil
+    }
+
+    @MainActor
+    func clearPendingOrganizerJoinRequestsPresentation() {
+        pendingOrganizerJoinRequestsGameToken = nil
     }
 
     /// Ensures a shared pickup id is in local caches when RLS allows reading it.
@@ -1655,6 +1820,7 @@ extension MapViewModel {
     ) async {
         guard canFanUsePickupGamesUI, let uid = currentUserAuthId else {
             pendingPickupGameJoinRequestCount = 0
+            pendingPickupJoinApprovalSummaries = []
             await stopPickupJoinRequestBadgeRealtime()
 #if DEBUG
             print("[SmoothPerf] operation=pendingPickupRequestBadge skipped=notEligible durationMs=0 coalesced=false rowCount=0")
@@ -1717,6 +1883,7 @@ extension MapViewModel {
             let ids = rows.map(\.id)
             guard !ids.isEmpty else {
                 pendingPickupGameJoinRequestCount = 0
+                pendingPickupJoinApprovalSummaries = []
                 await stopPickupJoinRequestBadgeRealtime()
                 lastPendingPickupJoinRequestCountLoadAt = Date()
                 lastPendingPickupJoinRequestCountUserId = uid
@@ -1727,15 +1894,22 @@ extension MapViewModel {
                 return
             }
 
-            let response = try await supabase
+            let pendingRows: [PickupGameRequestRow] = try await supabase
                 .from("pickup_game_requests")
-                .select("id", count: .exact)
-                .in("pickup_game_id", values: ids)
+                .select(pickupGameRequestsSelectColumns)
+                .in("pickup_game_id", values: ids.map { $0.uuidString.lowercased() })
                 .eq("status", value: "pending")
+                .order("created_at", ascending: false)
+                .limit(200)
                 .execute()
-            pendingPickupGameJoinRequestCount = response.count ?? 0
+                .value
+            pendingPickupGameJoinRequestCount = pendingRows.count
             lastPendingPickupJoinRequestCountLoadAt = Date()
             lastPendingPickupJoinRequestCountUserId = uid
+            await publishPendingPickupJoinApprovalSummaries(
+                pendingRows: pendingRows,
+                hostedGameIds: ids
+            )
 
             if resyncRealtimeSubscription {
                 await syncPickupJoinRequestBadgeRealtimeSubscription(trackedGameIds: ids)
@@ -1751,6 +1925,105 @@ extension MapViewModel {
             print("[SmoothPerf] operation=pendingPickupRequestBadge skipped=error durationMs=\(ms) coalesced=false rowCount=\(pendingPickupGameJoinRequestCount)")
 #endif
         }
+    }
+
+    /// Builds Action Center join-approval cards from one pending-request batch + game caches.
+    @MainActor
+    private func publishPendingPickupJoinApprovalSummaries(
+        pendingRows: [PickupGameRequestRow],
+        hostedGameIds: [UUID]
+    ) async {
+        guard !pendingRows.isEmpty else {
+            pendingPickupJoinApprovalSummaries = []
+            return
+        }
+
+        let missingGameIds = Set(pendingRows.map(\.pickup_game_id))
+            .subtracting(Set(myPickupGamesForSettings.map(\.id)))
+            .subtracting(Set(pickupGamesFollowingTabCache.keys))
+        if !missingGameIds.isEmpty {
+            do {
+                let rows: [PickupGameRow] = try await supabase
+                    .from("pickup_games")
+                    .select(pickupGamesSelectColumns)
+                    .in("id", values: missingGameIds.map { $0.uuidString.lowercased() })
+                    .limit(200)
+                    .execute()
+                    .value
+                for row in rows {
+                    pickupGamesFollowingTabCache[row.id] = row
+                }
+            } catch {
+#if DEBUG
+                print("[PickupRequest] actionCenter game hydrate failed:", error)
+#endif
+            }
+        }
+
+        let languageCode = L10n.normalizedLanguageCode(
+            UserDefaults.standard.string(forKey: L10n.appLanguageKey)
+        )
+        var summaries: [FanGeoActionJoinApprovalInput] = []
+        summaries.reserveCapacity(pendingRows.count)
+        for request in pendingRows {
+            let game = myPickupGamesForSettings.first(where: { $0.id == request.pickup_game_id })
+                ?? pickupGamesFollowingTabCache[request.pickup_game_id]
+                ?? resolvedPickupGameRow(for: request.pickup_game_id)
+            let team = pickupDiscoverTeamIdentityByGameId[request.pickup_game_id]
+            let requester = request.requesterNameForUI.trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = game?.title.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let profile = pickupJoinRequesterProfileByUserId[request.requester_user_id]
+            let avatar = (profile?.avatar_thumbnail_url ?? profile?.avatar_url)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let matchup = FanGeoJoinRequestEventIdentity.matchupLabel(
+                homeTeamName: team?.teamName,
+                opponentName: game?.opponent_name,
+                languageCode: languageCode
+            )
+            let isTeamLinked = team != nil
+            let capacity = game.flatMap { row in
+                FanGeoJoinRequestEventIdentity.capacityLabel(
+                    approvedJoinCount: row.approved_join_count,
+                    maxPlayers: row.max_players,
+                    playersNeeded: row.playersNeededClamped,
+                    isTeamLinked: isTeamLinked,
+                    languageCode: languageCode
+                )
+            }
+            let atCapacity = game.map { row in
+                FanGeoJoinRequestEventIdentity.isAtCapacity(
+                    approvedJoinCount: row.approved_join_count,
+                    maxPlayers: row.max_players,
+                    playersNeeded: row.playersNeededClamped,
+                    isTeamLinked: isTeamLinked
+                )
+            } ?? false
+            summaries.append(
+                FanGeoActionJoinApprovalInput(
+                    requestId: request.id,
+                    pickupGameId: request.pickup_game_id,
+                    requesterUserId: request.requester_user_id,
+                    requesterName: requester.isEmpty ? L10n.t("Fan", languageCode: languageCode) : requester,
+                    requesterAvatarURL: (avatar?.isEmpty == false) ? avatar : nil,
+                    gameTitle: title.isEmpty ? L10n.t("Pickup", languageCode: languageCode) : title,
+                    teamName: team?.teamName,
+                    teamId: team?.teamId,
+                    eventTypeLabel: game?.gameFormat.displayTitle(languageCode: languageCode),
+                    startAt: game.flatMap { PickupGameModels.parseSupabaseTimestamptz($0.game_start_at) },
+                    locationLabel: {
+                        guard let game else { return nil }
+                        let label = PickupGameMeaningfulChange.locationDisplayLabel(for: game)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        return label.isEmpty ? nil : label
+                    }(),
+                    matchupLabel: matchup,
+                    capacityLabel: capacity,
+                    isAtCapacity: atCapacity
+                )
+            )
+        }
+        pendingPickupJoinApprovalSummaries = summaries
+        _ = hostedGameIds
     }
 
     func stopPickupJoinRequestBadgeRealtime() async {
@@ -2324,14 +2597,12 @@ extension MapViewModel {
     }
 
     private func locationLineForFollowingPickupCard(game: PickupGameRow) -> String {
-        let addr = game.address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let loc = [game.city, game.state]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
-        if !addr.isEmpty, !loc.isEmpty { return "\(addr) · \(loc)" }
-        if !addr.isEmpty { return addr }
-        return loc
+        FanTeamScheduleLocationPresentation.displayLocation(
+            venueName: nil,
+            address: game.address,
+            city: game.city,
+            state: game.state
+        )
     }
 
     func pickupGameCalendarAddressLine(_ game: PickupGameRow) -> String {

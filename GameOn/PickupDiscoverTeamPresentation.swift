@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Team identity attached to a Discover-visible Pickup Game (from
 /// `list_pickup_discover_team_identities` or RLS fallback). Not a parallel game model.
@@ -88,7 +89,11 @@ enum PickupDiscoverTeamPresentation {
         identity: PickupDiscoverTeamIdentity?,
         game: PickupGameRow
     ) -> Bool {
-        shouldShowPublicAvailability(
+        let policy = FanTeamEventPresentation.policy(for: game.gameFormat)
+        if isTeamLinked(identity), !policy.showsSpotsLeft {
+            return false
+        }
+        return shouldShowPublicAvailability(
             isTeamLinked: isTeamLinked(identity),
             isOutsideRecruiting: isOutsideRecruiting(for: game)
         )
@@ -101,6 +106,20 @@ enum PickupDiscoverTeamPresentation {
     ) -> Bool {
         if !isTeamLinked { return true }
         return isOutsideRecruiting
+    }
+
+    static func shouldOfferOutsideJoinCTA(
+        identity: PickupDiscoverTeamIdentity?,
+        game: PickupGameRow
+    ) -> Bool {
+        let policy = FanTeamEventPresentation.policy(for: game.gameFormat)
+        if isTeamLinked(identity), !policy.allowsTeamOutsideRecruitment {
+            return false
+        }
+        return shouldOfferOutsideJoinCTA(
+            isTeamLinked: isTeamLinked(identity),
+            isOutsideRecruiting: isOutsideRecruiting(for: game)
+        )
     }
 
     static func previewPrimaryCTATitleKey(
@@ -136,6 +155,77 @@ enum PickupDiscoverTeamPresentation {
             return parts.joined(separator: ", ")
         }
         return "Pickup \(sportLabel), \(pickupLocalizedSpotsLeft(spotsNeeded, languageCode: languageCode)), \(gameTitle)"
+    }
+}
+
+/// Schedule → Play list-card presentation for Team-linked vs standalone pickups.
+/// Pure mapping over already-loaded identity + row — no network.
+enum CalendarPlayPickupCardPresentation {
+    static func eventTypeLabel(
+        for game: PickupGameRow,
+        languageCode: String
+    ) -> String {
+        game.gameFormat.scheduleFormSummaryLabel(languageCode: languageCode)
+    }
+
+    static func teamAccent(
+        identity: PickupDiscoverTeamIdentity?,
+        colorScheme: ColorScheme
+    ) -> Color {
+        FanTeamColorTheme.pickupDiscoverPreviewAccent(
+            colorHex: identity?.colorHex,
+            colorScheme: colorScheme
+        )
+    }
+
+    static func shouldShowSpotsLine(
+        identity: PickupDiscoverTeamIdentity?,
+        game: PickupGameRow
+    ) -> Bool {
+        PickupDiscoverTeamPresentation.shouldShowPublicAvailability(
+            identity: identity,
+            game: game
+        )
+    }
+
+    /// Primary title on the card: Team name when linked, otherwise pickup title.
+    static func primaryTitle(
+        eventTitle: String,
+        identity: PickupDiscoverTeamIdentity?
+    ) -> String {
+        if let identity {
+            let name = identity.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty { return name }
+        }
+        return eventTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func accessibilityLabel(
+        eventTitle: String,
+        identity: PickupDiscoverTeamIdentity?,
+        game: PickupGameRow?,
+        dateTimeLine: String,
+        addressLine: String,
+        capacityMeta: String,
+        languageCode: String
+    ) -> String {
+        var parts: [String] = []
+        if let identity {
+            parts.append(identity.teamName)
+            if let game {
+                parts.append(eventTypeLabel(for: game, languageCode: languageCode))
+            }
+        } else {
+            let title = eventTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty { parts.append(title) }
+        }
+        let when = dateTimeLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !when.isEmpty { parts.append(when) }
+        let whereLine = addressLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !whereLine.isEmpty { parts.append(whereLine) }
+        let capacity = capacityMeta.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !capacity.isEmpty { parts.append(capacity) }
+        return parts.joined(separator: ". ")
     }
 }
 

@@ -94,6 +94,8 @@ struct SettingsVenueAuthSheet: View {
     @Binding var venuePassword: String
     @Binding var showVenueRegisterMode: Bool
     var onRequestVenueProfileDashboard: () -> Void
+    /// Landing Sign In → Business opens the existing sign-in form. Settings keeps `.choice`.
+    var preferredEntryMode: BusinessAuthEntryMode = .choice
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
@@ -300,7 +302,7 @@ struct SettingsVenueAuthSheet: View {
         if showVenueRegisterMode {
             businessAuthEntryMode = .register
         } else {
-            businessAuthEntryMode = .choice
+            businessAuthEntryMode = preferredEntryMode
         }
     }
 }

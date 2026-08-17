@@ -56,7 +56,17 @@ extension MapViewModel {
                 AccountActivationPerf.log("staleResultIgnored context=fanIdentityPreferences")
                 return
             }
-            currentUserFanIdentityPreferences = rows.first?.fan_identity_preferences ?? .empty
+            let next = rows.first?.fan_identity_preferences ?? .empty
+            if currentUserFanIdentityPreferences != next {
+                currentUserFanIdentityPreferences = next
+#if DEBUG
+                ProfileOpenPerf.statePublished(name: "fanIdentityPreferences")
+#endif
+            } else {
+#if DEBUG
+                ProfileOpenPerf.duplicatePublishSkipped(name: "fanIdentityPreferences")
+#endif
+            }
             lastFanIdentityPreferencesLoadAt = Date()
             lastFanIdentityPreferencesLoadUserId = authId
         } catch {

@@ -1325,7 +1325,7 @@ private struct BusinessVenueDashboardActionCard: View {
     }
 }
 
-/// Read-only favorite-team card for the Business Dashboard — profile card chrome without trophy / Make My Team / remove.
+/// Read-only favorite-team card for the Business Dashboard — profile card chrome without trophy / Make Favorite Team / remove.
 private struct BusinessDashboardFavoriteTeamCard: View {
     @Environment(\.colorScheme) private var colorScheme
 

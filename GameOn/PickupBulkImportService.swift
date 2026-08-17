@@ -29,7 +29,10 @@ enum PickupBulkImportService {
         defer {
             if didAccess { url.stopAccessingSecurityScopedResource() }
         }
-        let rawRows = try PickupBulkImportParser.parseFile(at: url)
+        let rawRows = try PickupBulkImportParser.parseFile(
+            at: url,
+            prefersTeamWorksheet: creationContext.isTeamSourced
+        )
         let rows = await PickupBulkImportValidator.validate(
             rawRows: rawRows,
             viewModel: viewModel,
@@ -99,7 +102,12 @@ enum PickupBulkImportService {
                     maxPlayers: row.maxPlayers,
                     gameFormat: row.gameType,
                     competitionLevel: row.competitionLevel,
-                    isVisible: isVisible
+                    isVisible: isVisible,
+                    opponentName: FanTeamScheduleMatchup.persistableOpponent(
+                        format: row.gameType,
+                        opponentName: row.opponentName
+                    ),
+                    claimsPickupCreateXP: !isTeamSourced
                 )
 
                 if isTeamSourced, let team {
@@ -108,6 +116,12 @@ enum PickupBulkImportService {
                             teamId: team.teamId,
                             pickupGameId: insertedRow.id
                         )
+                        if row.gameType != .announcement {
+                            await viewModel.awardFanXP(
+                                source: FanXPSource.teamEventCreated,
+                                sourceId: insertedRow.id
+                            )
+                        }
                     } catch {
                         // Same orphan cleanup as Manual Team create.
                         try? await viewModel.deletePickupGame(id: insertedRow.id)

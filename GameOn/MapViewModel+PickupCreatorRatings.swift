@@ -104,6 +104,19 @@ extension MapViewModel {
         pickupCreatorRatingDeferredGameIds.remove(pickupGameId)
     }
 
+    /// Presents the existing ``PickupCreatorRatingPromptCard`` via MainTabView sheet (no second rating flow).
+    @MainActor
+    func presentPickupCreatorRatingPrompt(pickupGameId: UUID) {
+        ensurePickupCreatorRatingSessionScoped()
+        undefferPickupCreatorRatingPrompt(pickupGameId: pickupGameId)
+        pendingPickupCreatorRatingPromptToken = PickupDetailNavigationToken(id: pickupGameId)
+    }
+
+    @MainActor
+    func clearPendingPickupCreatorRatingPromptPresentation() {
+        pendingPickupCreatorRatingPromptToken = nil
+    }
+
     /// Client gate mirroring backend eligibility (approved joiner, not organizer, completed end).
     /// Does not mutate session state — safe to call from SwiftUI body.
     func pickupCreatorRatingEligibility(
@@ -802,10 +815,19 @@ extension MapViewModel {
 
     @MainActor
     private func applyMyPickupOrganizerSummary(_ summary: PickupOrganizerSummary, userId: UUID) {
-        myPickupOrganizerSummary = summary
         myPickupOrganizerSummaryLoadedForUserId = userId
         lastMyPickupOrganizerSummaryRefreshAt = Date()
         applyCachedPickupOrganizerSummary(summary, userId: userId, fetchedAt: Date())
+        if myPickupOrganizerSummary == summary {
+#if DEBUG
+            ProfileOpenPerf.duplicatePublishSkipped(name: "pickupOrganizerSummary")
+#endif
+            return
+        }
+        myPickupOrganizerSummary = summary
+#if DEBUG
+        ProfileOpenPerf.statePublished(name: "pickupOrganizerSummary")
+#endif
 #if DEBUG
         print("[PickupOrganizerSummary] own hosted=\(summary.hostedCount) ratings=\(summary.ratingCount) avg=\(summary.averageRating.map { String(format: "%.1f", $0) } ?? "nil") lastCreated=\(summary.lastPickupGameCreatedAt?.description ?? "nil")")
 #endif

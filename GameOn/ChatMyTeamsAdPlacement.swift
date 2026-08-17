@@ -1,6 +1,6 @@
 import Foundation
 
-/// In-feed native ad slot for Chat → My Teams list (not DM threads / inbox Chats).
+/// In-feed native ad slot for Teams home → My Teams list (not DM threads / inbox Chats).
 enum ChatMyTeamsListItem: Identifiable {
     case team(FanTeamSummary)
     case nativeAd(ChatMyTeamsNativeAdSlot)
@@ -19,8 +19,10 @@ struct ChatMyTeamsNativeAdSlot: Hashable {
     let ordinal: Int
     let insertedAfterTeamPosition: Int
 
+    /// Stable across relationship filters so CompactNativeAdCard can reuse loaded ads.
+    /// Identity is ordinal-based (not after-position) — All/Managing/Joined share slot 0, 1, …
     var id: String {
-        "chat-my-teams-native-ad-\(insertedAfterTeamPosition)"
+        "chat-my-teams-native-ad-ordinal-\(ordinal)"
     }
 
     var slotIndex: Int {
@@ -31,9 +33,12 @@ struct ChatMyTeamsNativeAdSlot: Hashable {
 enum ChatMyTeamsAdPlacement {
     /// Dedicated AdMob slot base (venue comments 0–1, chat inbox 2, Going Pro 3+).
     static let nativeAdSlotIndexBase = 10
-    /// Ad after first team, then every additional 5 teams (1, 6, 11, …).
-    static let firstAdAfterTeamPosition = 1
-    static let recurringInterval = 5
+    /// Single-team list: ad directly under the only Team card.
+    static let firstAdAfterSingleTeamPosition = 1
+    /// Multi-team list: first ad after the second Team.
+    static let firstAdAfterMultipleTeamsPosition = 2
+    /// Additional ads every N Team cards after the first insertion.
+    static let recurringInterval = 3
     static let placementID = "chat.myTeamsFeed"
 
     /// Cached insertion positions for an identical team-id fingerprint (avoids ad remount churn).
@@ -52,10 +57,16 @@ enum ChatMyTeamsAdPlacement {
     }
 
     /// 1-based team positions after which an ad is inserted.
+    /// - 0 teams → none
+    /// - 1 team → after 1
+    /// - 2+ teams → after 2, then every `recurringInterval` (2, 5, 8, …)
     static func insertionPositions(for teamCount: Int) -> [Int] {
         guard teamCount > 0 else { return [] }
+        let first = teamCount == 1
+            ? firstAdAfterSingleTeamPosition
+            : firstAdAfterMultipleTeamsPosition
         return Array(stride(
-            from: firstAdAfterTeamPosition,
+            from: first,
             through: teamCount,
             by: recurringInterval
         ))
@@ -72,10 +83,15 @@ enum ChatMyTeamsAdPlacement {
         teams.map { $0.id.uuidString.lowercased() }.joined(separator: "|")
     }
 
+    /// Final Teams feed pipeline step: insert native ads into an already filtered + searched list.
+    /// Callers must apply relationship filter and search BEFORE invoking this.
     static func listItems(for teams: [FanTeamSummary]) -> [ChatMyTeamsListItem] {
         guard FanGeoAdPolicy.shouldInsertAdsInFeeds() else {
             return teams.map { .team($0) }
         }
+        // Empty filtered/search results → never inject ads.
+        guard !teams.isEmpty else { return [] }
+
         let fp = fingerprint(for: teams)
         let positions: [Int]
         if fp == cachedFingerprint, let cachedPositions {
@@ -98,7 +114,8 @@ enum ChatMyTeamsAdPlacement {
         })
 
         // Always rebuild team rows from current summaries so identity updates stay live;
-        // stable ad slot ids prevent unnecessary CompactNativeAdCard remounts.
+        // ordinal-stable ad slot ids prevent unnecessary CompactNativeAdCard remounts
+        // when switching All ↔ Managing ↔ Joined with overlapping slot counts.
         var items: [ChatMyTeamsListItem] = []
         items.reserveCapacity(teams.count + slots.count)
 

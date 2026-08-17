@@ -97,15 +97,20 @@ enum CompactGameTimeFormatter {
     ]
 }
 
-/// Discover tab map layer: venue pins vs pickup game pins (session-only; not persisted).
+/// Discover tab map layer: Watch (venues) vs Play (pickup).
+/// Persisted via ``MapViewModel`` UserDefaults; fallback default is Play.
 enum DiscoverMapContentMode: String, CaseIterable, Identifiable, Equatable {
     case venues
     case pickupGames
 
     var id: String { rawValue }
+
+    /// Product default when no saved preference exists.
+    static let productDefault: DiscoverMapContentMode = .pickupGames
 }
 
 /// Pickup-only map layer: user-created games vs physical places to play.
+/// Persisted via ``MapViewModel`` UserDefaults; fallback default is Places.
 enum DiscoverPickupSubMode: String, CaseIterable, Identifiable, Equatable {
     /// Broad browsing (places to play). Listed first for UI / VoiceOver order.
     case places
@@ -113,6 +118,9 @@ enum DiscoverPickupSubMode: String, CaseIterable, Identifiable, Equatable {
     case games
 
     var id: String { rawValue }
+
+    /// Product default when no saved preference exists.
+    static let productDefault: DiscoverPickupSubMode = .places
 
     var title: String {
         switch self {

@@ -21,6 +21,7 @@ struct ProGameFinalNotificationEvent {
     let body: String
     let awayTeam: String
     let homeTeam: String
+    let snapshot: FanGeoProGameInboxSnapshot?
 }
 
 struct ProGameHalftimeNotificationEvent {
@@ -28,6 +29,7 @@ struct ProGameHalftimeNotificationEvent {
     let body: String
     let awayTeam: String
     let homeTeam: String
+    let snapshot: FanGeoProGameInboxSnapshot?
 }
 
 struct ProGamePredictionResultNotificationEvent {
@@ -44,6 +46,7 @@ struct ProGameScoreUpdateNotificationEvent {
     let body: String
     let awayTeam: String
     let homeTeam: String
+    let snapshot: FanGeoProGameInboxSnapshot?
 }
 
 struct ProGameScoreCorrectionNotificationEvent {
@@ -356,7 +359,26 @@ final class GameReminderNotificationService {
         content.subtitle = matchupTitle
         content.body = ProGameNotificationFormatting.kickoffStartingBody
         content.sound = .default
-        ProGameNotificationDeepLinkPayload.apply(to: content, matchID: event.identifier)
+        await applyProGameInboxSnapshot(
+            FanGeoProGameInboxSnapshot(
+                kind: .kickoff,
+                matchID: event.identifier,
+                homeTeam: event.homeTeam,
+                awayTeam: event.awayTeam,
+                homeScore: 0,
+                awayScore: 0,
+                scoringTeam: nil,
+                league: nil,
+                sport: event.sport,
+                matchStatus: "SCHEDULED",
+                clock: nil,
+                homeBadgeURL: nil,
+                awayBadgeURL: nil,
+                homeProviderId: nil,
+                awayProviderId: nil
+            ),
+            to: content
+        )
 
         let components = Calendar.current.dateComponents(
             [.year, .month, .day, .hour, .minute, .second],
@@ -707,6 +729,7 @@ final class GameReminderNotificationService {
         content.title = ProGameNotificationFormatting.finalScoreTitle
         content.body = event.body
         content.sound = .default
+        await applyProGameInboxSnapshot(event.snapshot, to: content)
 
         let identifier = proGameFinalIdentifier(for: event.identifier)
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
@@ -735,6 +758,7 @@ final class GameReminderNotificationService {
         content.title = ProGameNotificationFormatting.halftimeTitle
         content.body = event.body
         content.sound = .default
+        await applyProGameInboxSnapshot(event.snapshot, to: content)
 
         let identifier = proGameHalftimeIdentifier(for: event.identifier)
         center.removePendingNotificationRequests(withIdentifiers: [identifier])
@@ -804,6 +828,7 @@ final class GameReminderNotificationService {
         content.title = event.title
         content.body = event.body
         content.sound = .default
+        await applyProGameInboxSnapshot(event.snapshot, to: content)
 
         let request = UNNotificationRequest(
             identifier: proGameScoreUpdateIdentifier(for: event.identifier, scoreToken: event.scoreToken),
@@ -881,6 +906,29 @@ final class GameReminderNotificationService {
         } catch {
             print("[ProGameCardNotificationDebug] gameId=\(event.identifier) cardType=\(event.cardType.stableToken) eventKey=\(event.eventKey) notificationSent=false dedupeHit=false error=\(error.localizedDescription)")
         }
+    }
+
+    private func applyProGameInboxSnapshot(
+        _ snapshot: FanGeoProGameInboxSnapshot?,
+        to content: UNMutableNotificationContent
+    ) async {
+        let matchID = snapshot?.matchID
+        if let matchID, !matchID.isEmpty {
+            ProGameNotificationDeepLinkPayload.apply(to: content, matchID: matchID)
+        }
+        guard let snapshot else { return }
+        var merged = content.userInfo
+        for (key, value) in snapshot.userInfoFields() {
+            merged[key] = value
+        }
+        if let artwork = FanGeoPushArtworkSelection.from(snapshot: snapshot) {
+            FanGeoPushArtwork.merge(
+                FanGeoPushArtwork.fields(url: artwork.url, kind: artwork.kind),
+                into: &merged
+            )
+        }
+        content.userInfo = merged
+        await FanGeoPushArtworkAttachment.apply(to: content, userInfo: content.userInfo)
     }
 
     private func reminderIdentifier(for eventId: UUID) -> String {

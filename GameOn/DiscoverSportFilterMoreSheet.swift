@@ -35,9 +35,7 @@ enum DiscoverSportFilterRowLayout {
     static func compactRowItems(selectedSport: String) -> [CompactItem] {
         var items: [CompactItem] = [CompactItem(id: "all", kind: .all)]
         if selectedSport != "All", !isDefaultPopularSport(selectedSport) {
-            let display = selectedSport == selectedSport.lowercased()
-                ? AppSportCatalog.displayLabel(forSportToken: selectedSport)
-                : selectedSport
+            let display = AppSportCatalog.displayLabel(forSportToken: selectedSport, compact: true)
             items.append(CompactItem(id: "pin-\(selectedSport)", kind: .sport(selection: selectedSport, display: display)))
         }
         for pair in popularPairs {

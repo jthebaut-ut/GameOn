@@ -3,65 +3,114 @@ import SwiftUI
 // MARK: - Shared informational catalog (not authoritative for awarding)
 
 /// Display-only XP rule. Award amounts remain server-authoritative via
-/// `public.fan_xp_amount_for_source` / `claim_fan_xp` (`20260870`).
+/// `public.fan_xp_amount_for_source` / `claim_fan_xp` (`20260870` / `20260996`).
 struct FanXpRule: Identifiable, Equatable, Sendable {
+    enum Section: String, Equatable, Sendable, CaseIterable {
+        case general
+        case pickup
+        case teams
+
+        var titleKey: String { "fan_xp_section_\(rawValue)" }
+    }
+
     /// Canonical `xp_events.source` / `FanXPSource` string.
     let id: String
     let titleKey: String
     let frequencyKey: String
-    /// Points from `fan_xp_amount_for_source` — informational mirror only.
-    let points: Int
+    let section: Section
     /// Call-site / SQL evidence for audits (not shown in UI).
     let awardEvidence: String
+
+    /// Points from `FanXPSource.expectedAmount` — must match `fan_xp_amount_for_source`.
+    var points: Int { FanXPSource.expectedAmount(for: id) }
 }
 
 /// Single catalog so own and public profile sheets cannot drift.
 enum FanXpCatalog {
-    /// Implemented rules only. Linked to SQL + Swift claim sites.
+    /// Implemented rules only. Linked to SQL + Swift claim/trigger sites.
     static let implementedRules: [FanXpRule] = [
         FanXpRule(
             id: FanXPSource.favoriteVenue,
             titleKey: "fan_xp_rule_favorite_venue_title",
             frequencyKey: "fan_xp_freq_per_unique_venue",
-            points: 2,
+            section: .general,
             awardEvidence: "SQL fan_xp_amount_for_source('favorite_venue'); MapViewModel+Favorites.awardFanXP"
         ),
         FanXpRule(
             id: FanXPSource.venueEventInterest,
             titleKey: "fan_xp_rule_venue_event_interest_title",
             frequencyKey: "fan_xp_freq_per_eligible_event",
-            points: 5,
+            section: .general,
             awardEvidence: "SQL fan_xp_amount_for_source('venue_event_interest'); MapViewModel+VenueEventSocial.awardFanXP"
+        ),
+        FanXpRule(
+            id: FanXPSource.friendConnected,
+            titleKey: "fan_xp_rule_friend_connected_title",
+            frequencyKey: "fan_xp_freq_per_friendship",
+            section: .general,
+            awardEvidence: "SQL fan_xp_amount_for_source('friend_connected'); ChatViewModel.awardFriendConnectedXP"
         ),
         FanXpRule(
             id: FanXPSource.pickupCreate,
             titleKey: "fan_xp_rule_pickup_create_title",
             frequencyKey: "fan_xp_freq_per_pickup_hosted",
-            points: 20,
+            section: .pickup,
             awardEvidence: "SQL fan_xp_amount_for_source('pickup_create'); MapViewModel+PickupGames.awardFanXP"
         ),
         FanXpRule(
             id: FanXPSource.pickupJoinApproved,
             titleKey: "fan_xp_rule_pickup_join_title",
             frequencyKey: "fan_xp_freq_per_approved_join",
-            points: 10,
+            section: .pickup,
             awardEvidence: "SQL fan_xp_amount_for_source('pickup_join_approved'); MapViewModel+PickupGameRequests.awardFanXP"
         ),
         FanXpRule(
             id: FanXPSource.pickupComplete,
             titleKey: "fan_xp_rule_pickup_complete_title",
             frequencyKey: "fan_xp_freq_per_completed_pickup",
-            points: 15,
+            section: .pickup,
             awardEvidence: "SQL fan_xp_amount_for_source('pickup_complete'); MapViewModel+PickupCreatorRatings.awardFanXP"
         ),
         FanXpRule(
-            id: FanXPSource.friendConnected,
-            titleKey: "fan_xp_rule_friend_connected_title",
-            frequencyKey: "fan_xp_freq_per_friendship",
-            points: 5,
-            awardEvidence: "SQL fan_xp_amount_for_source('friend_connected'); ChatViewModel.awardFriendConnectedXP"
+            id: FanXPSource.teamCreated,
+            titleKey: "fan_xp_rule_team_created_title",
+            frequencyKey: "fan_xp_freq_once_per_team_created",
+            section: .teams,
+            awardEvidence: "SQL fan_xp_amount_for_source('team_created'); trigger fan_xp_team_created_trg"
+        ),
+        FanXpRule(
+            id: FanXPSource.teamJoinPlayer,
+            titleKey: "fan_xp_rule_team_join_player_title",
+            frequencyKey: "fan_xp_freq_once_per_team_as_player",
+            section: .teams,
+            awardEvidence: "SQL fan_xp_amount_for_source('team_join_player'); trigger fan_xp_team_join_player_trg"
+        ),
+        FanXpRule(
+            id: FanXPSource.teamEventCreated,
+            titleKey: "fan_xp_rule_team_event_created_title",
+            frequencyKey: "fan_xp_freq_per_valid_team_event",
+            section: .teams,
+            awardEvidence: "SQL fan_xp_amount_for_source('team_event_created'); trigger fan_xp_team_event_linked_trg"
+        ),
+        FanXpRule(
+            id: FanXPSource.teamEventCompletedPlayer,
+            titleKey: "fan_xp_rule_team_event_completed_player_title",
+            frequencyKey: "fan_xp_freq_per_completed_team_event_played",
+            section: .teams,
+            awardEvidence: "SQL fan_xp_amount_for_source('team_event_completed_player'); trigger fan_xp_team_event_completed_trg"
+        ),
+        FanXpRule(
+            id: FanXPSource.teamEventCompletedOrganizer,
+            titleKey: "fan_xp_rule_team_event_completed_organizer_title",
+            frequencyKey: "fan_xp_freq_per_completed_team_event_organized",
+            section: .teams,
+            awardEvidence: "SQL fan_xp_amount_for_source('team_event_completed_organizer'); trigger fan_xp_team_event_completed_trg"
         ),
     ]
+
+    static func rules(in section: FanXpRule.Section) -> [FanXpRule] {
+        implementedRules.filter { $0.section == section }
+    }
 }
 
 // MARK: - Compact profile line
@@ -148,20 +197,27 @@ struct FanXpInfoSheet: View {
                         .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 4, trailing: 16))
                 }
 
-                Section {
-                    ForEach(rules) { rule in
-                        FanXpRuleRow(rule: rule, languageCode: languageCode)
+                ForEach(FanXpRule.Section.allCases, id: \.self) { section in
+                    let sectionRules = FanXpCatalog.rules(in: section)
+                    if !sectionRules.isEmpty {
+                        Section {
+                            ForEach(sectionRules) { rule in
+                                FanXpRuleRow(rule: rule, languageCode: languageCode)
+                            }
+                        } header: {
+                            Text(L10n.t(section.titleKey, languageCode: languageCode))
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                .textCase(nil)
+                        } footer: {
+                            if section == FanXpRule.Section.allCases.last {
+                                Text(L10n.t("fan_xp_info_footer", languageCode: languageCode))
+                                    .font(.caption)
+                                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                                    .padding(.top, 4)
+                            }
+                        }
                     }
-                } header: {
-                    Text(L10n.t("fan_xp_how_to_earn", languageCode: languageCode))
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .textCase(nil)
-                } footer: {
-                    Text(L10n.t("fan_xp_info_footer", languageCode: languageCode))
-                        .font(.caption)
-                        .foregroundStyle(FGColor.mutedText(colorScheme))
-                        .padding(.top, 4)
                 }
             }
             .listStyle(.insetGrouped)
@@ -203,6 +259,17 @@ private struct FanXpRuleRow: View {
         )
     }
 
+    private var pointsColor: Color {
+        switch rule.section {
+        case .teams:
+            return Color(red: 0.55, green: 0.35, blue: 0.85)
+        case .pickup:
+            return FGColor.accentBlue
+        case .general:
+            return FGColor.primaryText(colorScheme)
+        }
+    }
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
@@ -218,7 +285,7 @@ private struct FanXpRuleRow: View {
 
             Text(pointsLabel)
                 .font(.body.weight(.semibold).monospacedDigit())
-                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .foregroundStyle(pointsColor)
                 .multilineTextAlignment(.trailing)
         }
         .accessibilityElement(children: .combine)

@@ -87,8 +87,15 @@ extension MapViewModel {
     }
 
     /// Opens the public-profile overlay for the signed-in fan (same path as viewing another fan).
+    /// When ``currentUserDiscoverableByFans`` is false, the overlay shows a polished hidden empty
+    /// state instead of rendering a broken/empty public profile preview.
     func presentOwnPublicProfilePreview() {
         guard let authId = currentUserAuthId else { return }
+#if DEBUG
+        print(
+            "[PublicProfilePreviewGate] ownPreview discoverable_by_fans=\(currentUserDiscoverableByFans)"
+        )
+#endif
         presentPublicProfile(
             userId: authId,
             context: "own_public_profile_preview",

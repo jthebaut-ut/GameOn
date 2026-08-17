@@ -5,13 +5,28 @@ import MapKit
 
 enum PickupGameFormMode: Identifiable, Equatable {
     case add
+    /// Team Schedule → Make Announcement (dedicated create path; `game_format = announcement`).
+    case addTeamAnnouncement
     case edit(PickupGameRow)
 
     var id: String {
         switch self {
         case .add: return "pickup-form-add"
+        case .addTeamAnnouncement: return "pickup-form-add-team-announcement"
         case .edit(let row): return "pickup-form-\(row.id.uuidString)"
         }
+    }
+
+    var isCreate: Bool {
+        switch self {
+        case .add, .addTeamAnnouncement: return true
+        case .edit: return false
+        }
+    }
+
+    var forcesTeamAnnouncement: Bool {
+        if case .addTeamAnnouncement = self { return true }
+        return false
     }
 }
 
@@ -64,24 +79,6 @@ struct SettingsPickupGamesListSheet: View {
                             .listRowInsets(EdgeInsets(top: 10, leading: 20, bottom: 10, trailing: 20))
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
-                        }
-                    } header: {
-                        if viewModel.pendingPickupGameJoinRequestCount > 0 {
-                            HStack(alignment: .center, spacing: FGSpacing.sm) {
-                                Image(systemName: "person.crop.circle.badge.clock")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(Color.orange)
-                                Text(
-                                    viewModel.pendingPickupGameJoinRequestCount == 1
-                                        ? "1 player asked to join a game you host — review below."
-                                        : "\(viewModel.pendingPickupGameJoinRequestCount) players asked to join games you host — review below."
-                                )
-                                .font(FGTypography.caption.weight(.semibold))
-                                .foregroundStyle(FGColor.primaryText(colorScheme))
-                                .fixedSize(horizontal: false, vertical: true)
-                            }
-                            .padding(.vertical, 6)
-                            .textCase(nil)
                         }
                     }
                 }
@@ -158,6 +155,7 @@ struct SettingsPickupGamesListSheet: View {
             Task { await viewModel.loadMyPickupGamesForSettings() }
         }) { game in
             PickupOrganizerRequestsSheet(viewModel: viewModel, game: game)
+                .environmentObject(viewModel)
         }
         .alert("Cancel this pickup game?", isPresented: Binding(
             get: { deleteTarget != nil },
@@ -1965,7 +1963,7 @@ private struct PickupFormRowDivider: View {
     }
 }
 
-private struct PickupFormIconBadge: View {
+struct PickupFormIconBadge: View {
     let systemImage: String
     var accent: Color = FGColor.intentPlay
 
@@ -2135,6 +2133,7 @@ struct SettingsPickupGameFormView: View {
 
     @State private var title: String = ""
     @State private var sport: String = "Soccer"
+    @State private var sportSubtype: String? = nil
     @State private var gameDate: Date = Date()
     @State private var gameTime: Date = Date()
     @State private var endTime: Date = Date().addingTimeInterval(2 * 3600)
@@ -2143,6 +2142,8 @@ struct SettingsPickupGameFormView: View {
     @State private var city: String = ""
     @State private var state: String = ""
     @State private var zipCode: String = ""
+    /// ISO country from Team location / map pin when known (not persisted on pickup_games).
+    @State private var appliedLocationCountryCode: String = ""
     @State private var description: String = ""
     @State private var playEnvironment: PickupPlayEnvironment = .either
     @State private var skillLevel: PickupGameSkillLevel = .casual
@@ -2163,10 +2164,12 @@ struct SettingsPickupGameFormView: View {
     /// Team create / Team-linked edit: optional outside recruiting (maps to `players_needed` / `max_players`).
     @State private var needsAdditionalPlayers: Bool = false
     /// Public = Discover for everyone; Private = authorized viewers only (`is_visible=false`).
+    /// Standalone pickup always persists public; this flag is only user-editable for Team events.
     @State private var isPublicDiscover: Bool = true
     @State private var isSaving = false
     @State private var errorText: String?
     @State private var showPickupMapLocationPicker = false
+    @State private var showTeamChooseLocationPicker = false
     @State private var showManualAddressEntry = false
     @State private var showSportPicker = false
     @State private var showGameDatePopover = false
@@ -2184,11 +2187,27 @@ struct SettingsPickupGameFormView: View {
     @State private var creationTab: PickupGameCreationTab = .manual
     @State private var gameFormat: GameType = .pickup
     @State private var pollCreatePermission: PickupPollCreatePermission = .organizerOnly
+    /// Free-text opponent for Team competitive formats. Kept across format switches in-session.
+    @State private var opponentName: String = ""
+    @State private var hasArrivalTime: Bool = false
+    @State private var arrivalTime: Date = Date()
+    @State private var showTeamMoreOptions = false
+    @State private var showTeamTimeEditor = false
+    @State private var lastAutoSuggestedTitle: String = ""
+    @State private var titleManuallyCustomized = false
+    @State private var teamScheduleValidationAnchor: String?
+    @State private var showOpponentEditor = false
+    @State private var opponentEditorDraft: String = ""
     /// Edit path: Team context resolved from `fan_team_game_links` when `creationContext` is `.standard`.
     @State private var linkedTeamFormContext: PickupGameTeamCreationContext?
 
     private var organizerPostStartLockedRow: PickupGameRow? {
-        if case .edit(let row) = mode, row.hasPickupGameStarted(), isCurrentUserCreator(of: row) {
+        guard case .edit(let row) = mode, row.hasPickupGameStarted() else { return nil }
+        // Pickup creators keep the post-start Manage Game lock.
+        if isCurrentUserCreator(of: row) { return row }
+        // Team-linked started events use the same intentional lock for Team managers
+        // (Owner/Manager editing via Team permissions, not creator_user_id).
+        if creationContext.isTeamSourced || linkedTeamFormContext != nil {
             return row
         }
         return nil
@@ -2230,7 +2249,8 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var hasCompleteTypedAddress: Bool {
-        !trimmedAddress.isEmpty && !trimmedCity.isEmpty && !trimmedState.isEmpty && !trimmedZipCode.isEmpty
+        // International: street + locality are enough. Region/postal optional (not every country uses them).
+        !trimmedAddress.isEmpty && !trimmedCity.isEmpty
     }
 
     private var typedAddressLine: String {
@@ -2279,10 +2299,7 @@ struct SettingsPickupGameFormView: View {
     /// Create-only. Team-only games skip acknowledgement; Team recruiting + standalone require it.
     private var requiresPickupSafetyAcknowledgment: Bool {
         PickupTeamSafetyPresentation.requiresAcknowledgment(
-            isCreate: {
-                if case .add = mode { return true }
-                return false
-            }(),
+            isCreate: mode.isCreate && !mode.forcesTeamAnnouncement && !isAnnouncementForm,
             isTeamLinked: isTeamLinkedForm,
             needsAdditionalPlayers: needsAdditionalPlayers
         )
@@ -2431,18 +2448,41 @@ struct SettingsPickupGameFormView: View {
 
     private var shouldShowCreationTabs: Bool {
         // Same Manual | CSV Import shell for normal Pickup and Team → Schedule Game.
+        // Dedicated Announcement composer never shows CSV / format switching.
         if case .add = mode { return true }
         return false
     }
 
     private var shouldShowGameFormatPicker: Bool {
+        // Create Schedule Event / Create Pickup show Event Type; Announcement composer hides it.
+        if mode.forcesTeamAnnouncement { return false }
+        // Post-start Manage Game keeps core scheduling fields locked (including Event Type).
+        if isOrganizerPostStartManage { return false }
         if case .add = mode { return true }
+        // Future Team + standalone edits: Event Type stays editable before start.
+        if case .edit = mode { return true }
         return false
+    }
+
+    private var showsTeamIdentityHeader: Bool {
+        creationContext.isTeamSourced && creationContext.team != nil
+            && (shouldShowCreationTabs || mode.forcesTeamAnnouncement || isAnnouncementForm)
     }
 
     /// Team Schedule create, or edit of a game linked via `fan_team_game_links`.
     private var isTeamLinkedForm: Bool {
         creationContext.isTeamSourced || linkedTeamFormContext != nil
+    }
+
+    /// Progressive creation layout shared by Team Schedule and standalone Pickup.
+    /// Post-start organizer manage keeps the classic locked form.
+    private var usesTeamScheduleProgressiveLayout: Bool {
+        !isOrganizerPostStartManage
+    }
+
+    /// Team purple vs Pickup orange — scoped to this form's chrome only.
+    private var formAccent: Color {
+        isTeamLinkedForm ? FGColor.intentTeams : FGColor.intentPlay
     }
 
     /// Prefer explicit Schedule Game context; otherwise use link-resolved Team identity for edit.
@@ -2451,28 +2491,128 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var showsTeamOutsideRecruitmentHowYouPlayFields: Bool {
-        PickupTeamHowYouPlayPresentation.showsOutsideRecruitmentFields(
+        guard teamEventPolicy.showsHowYouPlay else { return false }
+        return PickupTeamHowYouPlayPresentation.showsOutsideRecruitmentFields(
             isTeamLinked: isTeamLinkedForm,
             needsAdditionalPlayers: needsAdditionalPlayers
         )
     }
 
+    /// Team-linked format policy (sport-aware opponent / scoring); standalone Pickup uses gameplay.
+    private var teamEventPolicy: FanTeamEventFormatPolicy {
+        guard isTeamLinkedForm else {
+            return FanTeamEventPresentation.policy(for: GameType.pickup, sport: sport)
+        }
+        return FanTeamEventPresentation.policy(for: gameFormat, sport: sport)
+    }
+
     private var availableGameFormats: [GameType] {
-        isTeamLinkedForm ? GameType.fanTeamOrganizerCases : GameType.pickupOrganizerCases
+        if isTeamLinkedForm {
+            let canAnnounce = effectiveTeamCreationContext?.canPublishAnnouncements == true
+                || (creationContext.team?.canPublishAnnouncements == true)
+            return FanTeamEventTypeCatalog.menuTypes(
+                for: sport,
+                current: gameFormat,
+                canPublishAnnouncements: canAnnounce
+            )
+        }
+        return PickupEventTypeCatalog.menuTypes(for: sport, current: gameFormat)
+    }
+
+    /// Event Type label shown in create menus (sport-aware for Team + Pickup).
+    private func eventTypeDisplayTitle(for format: GameType) -> String {
+        if isTeamLinkedForm {
+            return FanTeamEventTypeCatalog.displayTitle(
+                for: format,
+                sport: sport,
+                languageCode: languageCode
+            )
+        }
+        return PickupEventTypeCatalog.displayTitle(
+            for: format,
+            sport: sport,
+            languageCode: languageCode
+        )
+    }
+
+    private var usesParticipantAudienceWording: Bool {
+        !isTeamLinkedForm && PickupEventTypeCatalog.usesParticipantTerminology(for: sport)
+    }
+
+    private var progressiveDetailsSectionTitle: String {
+        if isTeamLinkedForm {
+            return L10n.t("team_schedule_event_details", languageCode: languageCode)
+        }
+        return L10n.t("pickup_form_section_pickup_details", languageCode: languageCode)
+    }
+
+    private var progressivePlayersSectionTitle: String {
+        if usesParticipantAudienceWording {
+            return L10n.t("pickup_form_section_participants", languageCode: languageCode)
+        }
+        return L10n.t("pickup_form_section_players", languageCode: languageCode)
+    }
+
+    private var playersNeededFieldLabel: String {
+        if usesParticipantAudienceWording {
+            return L10n.t("pickup_form_participants_needed", languageCode: languageCode)
+        }
+        return L10n.t("pickup_form_players_needed", languageCode: languageCode)
+    }
+
+    private var maxPlayersFieldLabel: String {
+        if usesParticipantAudienceWording {
+            return L10n.t("pickup_form_max_participants", languageCode: languageCode)
+        }
+        return L10n.t("pickup_form_max_players", languageCode: languageCode)
+    }
+
+    private var playersNeededCountDisplayText: String {
+        if usesParticipantAudienceWording {
+            if playersNeeded == 1 {
+                return L10n.t("pickup_form_participant_count_one", languageCode: languageCode)
+            }
+            return String(
+                format: L10n.t("pickup_form_participant_count_other_format", languageCode: languageCode),
+                playersNeeded
+            )
+        }
+        return playersNeededCountText
+    }
+
+    private var isAnnouncementForm: Bool {
+        isTeamLinkedForm && gameFormat == .announcement
     }
 
     /// Rich summary card replaces the old generic intro banner for create + edit.
     private var showsCreateIntro: Bool { false }
 
     private var showsLiveSummary: Bool {
-        !isOrganizerPostStartManage
+        !isOrganizerPostStartManage && !usesTeamScheduleProgressiveLayout
     }
 
     private var canSubmitPickupForm: Bool {
-        !isSaving
-            && (isOrganizerPostStartManage || !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            && (isOrganizerPostStartManage || hasPlacedLocationForPostButton)
+        let titleOK = isOrganizerPostStartManage
+            || !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let locationOK = isOrganizerPostStartManage
+            || isAnnouncementForm
+            || hasPlacedLocationForPostButton
+        let descriptionOK = !isAnnouncementForm
+            || !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !isSaving
+            && titleOK
+            && locationOK
+            && descriptionOK
             && (!requiresPickupSafetyAcknowledgment || pickupSafetyAcknowledged)
+            && (isOrganizerPostStartManage || !requiresOpponentForSubmit || hasOpponentForSubmit)
+    }
+
+    private var requiresOpponentForSubmit: Bool {
+        isTeamLinkedForm && teamEventPolicy.requiresOpponent
+    }
+
+    private var hasOpponentForSubmit: Bool {
+        FanTeamScheduleMatchup.trimmedOpponent(opponentName) != nil
     }
 
     private var postReadinessMessage: String? {
@@ -2480,8 +2620,14 @@ struct SettingsPickupGameFormView: View {
         if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return L10n.t("pickup_form_ready_add_title", languageCode: languageCode)
         }
-        if !hasPlacedLocationForPostButton {
+        if isAnnouncementForm, description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return L10n.t("team_announcement_ready_add_message", languageCode: languageCode)
+        }
+        if !isAnnouncementForm, !hasPlacedLocationForPostButton {
             return L10n.t("pickup_form_ready_choose_location", languageCode: languageCode)
+        }
+        if requiresOpponentForSubmit && !hasOpponentForSubmit {
+            return L10n.t("pickup_form_ready_add_opponent", languageCode: languageCode)
         }
         if requiresPickupSafetyAcknowledgment && !pickupSafetyAcknowledged {
             return L10n.t("pickup_form_ready_acknowledge_safety", languageCode: languageCode)
@@ -2490,8 +2636,11 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var navigationTitleText: String {
+        if mode.forcesTeamAnnouncement || (isAnnouncementForm && mode.isCreate == false) {
+            return L10n.t("fan_teams_make_announcement_nav_title", languageCode: languageCode)
+        }
         switch mode {
-        case .add:
+        case .add, .addTeamAnnouncement:
             if creationContext.isTeamSourced {
                 return L10n.t("fan_teams_schedule_game", languageCode: languageCode)
             }
@@ -2500,18 +2649,68 @@ struct SettingsPickupGameFormView: View {
             if isOrganizerPostStartManage {
                 return L10n.t("pickup_form_nav_manage", languageCode: languageCode)
             }
+            if isTeamLinkedForm {
+                return L10n.t("fan_teams_schedule_game", languageCode: languageCode)
+            }
             return L10n.t("pickup_form_nav_edit", languageCode: languageCode)
         }
     }
 
     private var confirmationActionTitle: String {
-        mode == .add
+        if mode.isCreate, isTeamLinkedForm {
+            return teamSchedulePostActionTitle
+        }
+        return mode.isCreate
             ? L10n.t("pickup_form_post", languageCode: languageCode)
             : L10n.t("pickup_form_save", languageCode: languageCode)
     }
 
+    private var teamSchedulePostActionTitle: String {
+        if isAnnouncementForm {
+            return L10n.t("team_announcement_post_action", languageCode: languageCode)
+        }
+        if teamEventPolicy.usesGenericDetailLabels {
+            return L10n.t("team_schedule_post_event", languageCode: languageCode)
+        }
+        switch gameFormat {
+        case .practice:
+            return L10n.t("team_schedule_post_practice", languageCode: languageCode)
+        case .tryout:
+            return L10n.t("team_schedule_post_tryout", languageCode: languageCode)
+        default:
+            return L10n.t("team_schedule_post_game", languageCode: languageCode)
+        }
+    }
+
+    private var moreOptionsSummaryLine: String {
+        if isTeamLinkedForm {
+            return L10n.t("team_schedule_more_options_subtitle", languageCode: languageCode)
+        }
+        return L10n.t("pickup_form_more_options_subtitle", languageCode: languageCode)
+    }
+
+    private var arrivalTimePayload: Date? {
+        guard hasArrivalTime else { return nil }
+        return VenueOwnerGameScheduleValidation.combinedLocalStart(
+            gameDate: gameDate,
+            gameStartTime: arrivalTime
+        )
+    }
+
     private var summarySportLabel: String {
-        AppSportCatalog.displayLabel(forSportToken: sport)
+        SportSubtypeCatalog.identityLine(
+            sport: sport,
+            subtype: sportSubtype,
+            languageCode: languageCode
+        )
+    }
+
+    private var availableSportSubtypes: [SportSubtypeCatalog.Subtype] {
+        SportSubtypeCatalog.subtypes(forSport: sport)
+    }
+
+    private var showsSportSubtypePicker: Bool {
+        !availableSportSubtypes.isEmpty && !isOrganizerPostStartManage
     }
 
     private var summarySportEmoji: String {
@@ -2519,7 +2718,18 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var summaryFormatLabel: String {
-        gameFormat.scheduleFormSummaryLabel(languageCode: languageCode)
+        if isTeamLinkedForm {
+            return FanTeamEventTypeCatalog.displayTitle(
+                for: gameFormat,
+                sport: sport,
+                languageCode: languageCode
+            )
+        }
+        return PickupEventTypeCatalog.displayTitle(
+            for: gameFormat,
+            sport: sport,
+            languageCode: languageCode
+        )
     }
 
     private var summaryFormatEmoji: String {
@@ -2620,11 +2830,11 @@ struct SettingsPickupGameFormView: View {
     }
 
     private var gameFormatFormSection: some View {
-        PickupFormFieldRow(systemImage: gameFormat.systemImage, label: L10n.t("pickup_form_game_format", languageCode: languageCode)) {
+        PickupFormFieldRow(systemImage: gameFormat.systemImage, label: L10n.t("pickup_form_event_type", languageCode: languageCode)) {
             Menu {
                 Picker(selection: $gameFormat) {
                     ForEach(availableGameFormats, id: \.self) { type in
-                        Label(type.displayTitle(languageCode: languageCode), systemImage: type.systemImage)
+                        Label(eventTypeDisplayTitle(for: type), systemImage: type.systemImage)
                             .tag(type)
                     }
                 } label: {
@@ -2634,11 +2844,11 @@ struct SettingsPickupGameFormView: View {
                 HStack(spacing: 6) {
                     Image(systemName: gameFormat.systemImage)
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(FGColor.intentPlay)
+                        .foregroundStyle(formAccent)
                         .accessibilityHidden(true)
-                    Text(gameFormat.scheduleFormSummaryLabel(languageCode: languageCode))
+                    Text(eventTypeDisplayTitle(for: gameFormat))
                         .font(.system(size: 15, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.intentPlay)
+                        .foregroundStyle(formAccent)
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
                     Image(systemName: "chevron.up.chevron.down")
@@ -2647,9 +2857,106 @@ struct SettingsPickupGameFormView: View {
                         .accessibilityHidden(true)
                 }
             }
-            .accessibilityLabel(L10n.t("pickup_form_game_format", languageCode: languageCode))
-            .accessibilityValue(gameFormat.scheduleFormSummaryLabel(languageCode: languageCode))
+            .accessibilityLabel(L10n.t("pickup_form_event_type", languageCode: languageCode))
+            .accessibilityValue(eventTypeDisplayTitle(for: gameFormat))
         }
+    }
+
+    private var matchupHomeTeamName: String {
+        let name = effectiveTeamCreationContext?.teamName.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? "—" : name
+    }
+
+    private var matchupOpponentDisplayValue: String {
+        if let opp = FanTeamScheduleMatchup.trimmedOpponent(opponentName) {
+            return opp
+        }
+        return L10n.t("pickup_form_add_opponent", languageCode: languageCode)
+    }
+
+    private var matchupOpponentFormSection: some View {
+        Button {
+            opponentEditorDraft = opponentName
+            showOpponentEditor = true
+        } label: {
+            HStack(alignment: .center, spacing: FGSpacing.sm) {
+                PickupFormIconBadge(systemImage: "shield.lefthalf.filled", accent: formAccent)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.t("pickup_form_matchup", languageCode: languageCode))
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(matchupHomeTeamName)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                        Text(L10n.t("fan_team_schedule_vs", languageCode: languageCode))
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(FGColor.mutedText(colorScheme))
+                        Text(matchupOpponentDisplayValue)
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .foregroundStyle(
+                                FanTeamScheduleMatchup.trimmedOpponent(opponentName) == nil
+                                    ? formAccent
+                                    : FGColor.primaryText(colorScheme)
+                            )
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                }
+                Spacer(minLength: FGSpacing.sm)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(FGColor.mutedText(colorScheme))
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, FGSpacing.md)
+            .padding(.vertical, 10)
+            .frame(minHeight: 44, alignment: .center)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(L10n.t("pickup_form_opponent", languageCode: languageCode))
+        .accessibilityValue(matchupOpponentDisplayValue)
+        .accessibilityHint(L10n.t("pickup_form_add_opponent", languageCode: languageCode))
+    }
+
+    private var opponentEditorSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField(
+                        L10n.t("pickup_form_opponent", languageCode: languageCode),
+                        text: $opponentEditorDraft
+                    )
+                    .textInputAutocapitalization(.words)
+                    .autocorrectionDisabled(false)
+                    .submitLabel(.done)
+                } footer: {
+                    Text(L10n.t("pickup_form_opponent_footer", languageCode: languageCode))
+                        .font(.footnote)
+                }
+            }
+            .navigationTitle(L10n.t("pickup_form_opponent", languageCode: languageCode))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L10n.t("pickup_form_cancel", languageCode: languageCode)) {
+                        showOpponentEditor = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("Done", languageCode: languageCode)) {
+                        opponentName = opponentEditorDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        showOpponentEditor = false
+                        refreshTeamScheduleSuggestedTitleIfNeeded()
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+        }
+        .presentationDetents([.medium])
     }
 
     private var ageRangeSummary: String {
@@ -2743,6 +3050,7 @@ struct SettingsPickupGameFormView: View {
                             .padding(FGSpacing.md)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(FGColor.dangerRed.opacity(0.10), in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+                            .id("teamScheduleValidationBanner")
                     }
 
                     if isOrganizerPostStartManage {
@@ -2764,38 +3072,48 @@ struct SettingsPickupGameFormView: View {
                         pickupFormLiveSummaryCard
                     }
 
-                    // Natural order: What → When → Where → Who → How → Extra.
-                    pickupFormGameSection
-                    pickupFormWhenSection
-
-                    if !isOrganizerPostStartManage {
-                        pickupFormWhereSection
+                    if usesTeamScheduleProgressiveLayout {
+                        teamScheduleProgressiveManualContent
                     } else {
-                        pickupFormWhereLockedSection
-                    }
+                        // Natural order: What → When → Where → Who → How → Extra.
+                        pickupFormGameSection
+                        pickupFormWhenSection
 
-                    if isTeamLinkedForm {
-                        pickupFormTeamPlayersSection
-                    } else {
-                        pickupFormPlayersSection
-                    }
+                        if !isOrganizerPostStartManage {
+                            pickupFormWhereSection
+                        } else {
+                            pickupFormWhereLockedSection
+                        }
 
-                    if !isOrganizerPostStartManage {
-                        pickupFormHowYouPlaySection
-                        pickupFormPollPermissionsSection
-                        pickupFormDescriptionSection
-                        pickupFormSafetySection
-                        pickupFormCostSection
-                    } else {
-                        pickupFormDetailsLockedSection
-                    }
+                        if isTeamLinkedForm {
+                            pickupFormTeamPlayersSection
+                        } else {
+                            pickupFormPlayersSection
+                        }
 
-                    if let postReadinessMessage {
-                        Text(postReadinessMessage)
-                            .font(.system(size: 13, weight: .medium, design: .rounded))
-                            .foregroundStyle(FGColor.intentPlay)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .accessibilityLabel(postReadinessMessage)
+                        if !isOrganizerPostStartManage {
+                            if teamEventPolicy.showsHowYouPlay {
+                                pickupFormHowYouPlaySection
+                            }
+                            if teamEventPolicy.isGameplayEvent {
+                                pickupFormPollPermissionsSection
+                            }
+                            pickupFormDescriptionSection
+                            if teamEventPolicy.isGameplayEvent {
+                                pickupFormSafetySection
+                                pickupFormCostSection
+                            }
+                        } else {
+                            pickupFormDetailsLockedSection
+                        }
+
+                        if let postReadinessMessage {
+                            Text(postReadinessMessage)
+                                .font(.system(size: 13, weight: .medium, design: .rounded))
+                                .foregroundStyle(formAccent)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityLabel(postReadinessMessage)
+                        }
                     }
                 }
                 .frame(maxWidth: 680)
@@ -2811,6 +3129,13 @@ struct SettingsPickupGameFormView: View {
                     proxy.scrollTo("pickupFormTitleField", anchor: .center)
                 }
             }
+            .onChange(of: teamScheduleValidationAnchor) { _, anchor in
+                guard let anchor else { return }
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo(anchor, anchor: .center)
+                }
+                teamScheduleValidationAnchor = nil
+            }
         }
         .fanGeoScreenBackground()
         .sheet(isPresented: $showSportPicker) {
@@ -2822,6 +3147,1013 @@ struct SettingsPickupGameFormView: View {
                 onSelectSport: { sport = $0 }
             )
         }
+        .sheet(isPresented: $showOpponentEditor) {
+            opponentEditorSheet
+        }
+        .sheet(isPresented: $showTeamMoreOptions) {
+            teamScheduleMoreOptionsSheet
+        }
+        .sheet(isPresented: $showTeamTimeEditor) {
+            teamScheduleTimeEditorSheet
+        }
+        .onChange(of: sport) { _, newSport in
+            sportSubtype = SportSubtypeCatalog.ensuringValidSelection(sportSubtype, sport: newSport)
+            refreshPickupSuggestedTitleIfNeeded()
+            guard usesTeamScheduleProgressiveLayout else { return }
+            if isTeamLinkedForm {
+                let canAnnounce = effectiveTeamCreationContext?.canPublishAnnouncements == true
+                    || (creationContext.team?.canPublishAnnouncements == true)
+                let next = FanTeamEventTypeCatalog.ensuringValidSelection(
+                    gameFormat,
+                    sport: newSport,
+                    canPublishAnnouncements: canAnnounce
+                )
+                if next != gameFormat {
+                    gameFormat = next
+                }
+            } else {
+                let next = PickupEventTypeCatalog.ensuringValidSelection(gameFormat, sport: newSport)
+                if next != gameFormat {
+                    gameFormat = next
+                }
+            }
+        }
+        .onChange(of: opponentName) { _, _ in
+            refreshTeamScheduleSuggestedTitleIfNeeded()
+        }
+        .onChange(of: gameFormat) { _, _ in
+            refreshTeamScheduleSuggestedTitleIfNeeded()
+            if usesTeamScheduleProgressiveLayout, isTeamLinkedForm {
+                let policy = FanTeamEventPresentation.policy(for: gameFormat, sport: sport)
+                if !policy.allowsTeamOutsideRecruitment {
+                    // Recruiting is format-gated; Public/Private stays independent.
+                    needsAdditionalPlayers = false
+                    let inactive = PickupTeamOutsideRecruiting.inactivePersistence()
+                    playersNeeded = inactive.playersNeeded
+                    useMaxPlayers = false
+                    maxPlayers = inactive.maxPlayers ?? maxPlayers
+                }
+                if !policy.requiresOpponent {
+                    opponentName = ""
+                }
+            }
+        }
+        .onChange(of: title) { _, newValue in
+            guard usesTeamScheduleProgressiveLayout, isTeamLinkedForm else { return }
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let auto = lastAutoSuggestedTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed == auto {
+                titleManuallyCustomized = false
+            } else {
+                titleManuallyCustomized = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var teamScheduleProgressiveManualContent: some View {
+        if isAnnouncementForm {
+            teamScheduleAnnouncementProgressiveContent
+        } else {
+            teamScheduleGameDetailsSection
+                .id("teamScheduleGameDetails")
+
+            teamScheduleWhenSection
+                .id("teamScheduleWhen")
+
+            teamScheduleWhereSection
+                .id("teamScheduleWhere")
+
+            if !isTeamLinkedForm {
+                pickupProgressivePlayersSection
+                    .id("pickupProgressivePlayers")
+            }
+
+            teamScheduleMoreOptionsRow
+                .id("teamScheduleMoreOptions")
+
+            if requiresPickupSafetyAcknowledgment {
+                pickupFormSafetySection
+            } else if usesTeamOnlySafetyNote {
+                teamSchedulePrivacyFooter
+            }
+
+            teamSchedulePostButton
+
+            if let postReadinessMessage {
+                Text(postReadinessMessage)
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundStyle(formAccent)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityLabel(postReadinessMessage)
+                    .id("teamScheduleReadiness")
+            }
+        }
+    }
+
+    private var pickupProgressivePlayersSection: some View {
+        TeamScheduleFormSectionCard(title: progressivePlayersSectionTitle) {
+            playersNeededStepperRows
+            PickupFormRowDivider()
+            maxPlayersToggleRows
+        }
+        .animation(.easeInOut(duration: 0.2), value: useMaxPlayers)
+        .animation(.easeInOut(duration: 0.2), value: usesParticipantAudienceWording)
+    }
+
+    /// Announcement create/edit: title + message only (date defaults to now; no game fields).
+    @ViewBuilder
+    private var teamScheduleAnnouncementProgressiveContent: some View {
+        TeamScheduleFormSectionCard(title: L10n.t("team_announcement_form_section", languageCode: languageCode)) {
+            if shouldShowGameFormatPicker {
+                teamScheduleFormatRow
+                PickupFormRowDivider()
+            }
+
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .center, spacing: FGSpacing.sm) {
+                    PickupFormIconBadge(systemImage: "megaphone.fill", accent: formAccent)
+                    Text(L10n.t("team_announcement_title_label", languageCode: languageCode))
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                    Spacer(minLength: FGSpacing.sm)
+                    TextField(
+                        L10n.t("team_announcement_title_placeholder", languageCode: languageCode),
+                        text: $title
+                    )
+                    .multilineTextAlignment(.trailing)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(formAccent)
+                    .focused($isTitleFieldFocused)
+                    .id("pickupFormTitleField")
+                    .accessibilityLabel(L10n.t("team_announcement_title_label", languageCode: languageCode))
+                    .accessibilityHint(L10n.t("team_announcement_title_placeholder", languageCode: languageCode))
+                }
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.vertical, 10)
+                .frame(minHeight: 44)
+            }
+            .id("teamScheduleTitle")
+
+            PickupFormRowDivider()
+
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                HStack(spacing: FGSpacing.sm) {
+                    PickupFormIconBadge(systemImage: "text.alignleft", accent: formAccent)
+                    Text(L10n.t("team_announcement_message_label", languageCode: languageCode))
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                    Spacer(minLength: 0)
+                }
+                TextField(
+                    L10n.t("team_announcement_message_placeholder", languageCode: languageCode),
+                    text: $description,
+                    axis: .vertical
+                )
+                .lineLimit(4...12)
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .accessibilityLabel(L10n.t("team_announcement_message_label", languageCode: languageCode))
+                .accessibilityHint(L10n.t("team_announcement_message_placeholder", languageCode: languageCode))
+            }
+            .padding(FGSpacing.md)
+            .id("teamScheduleAnnouncementMessage")
+        }
+
+        teamSchedulePostButton
+
+        if let postReadinessMessage {
+            Text(postReadinessMessage)
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(formAccent)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(postReadinessMessage)
+                .id("teamScheduleReadiness")
+        }
+    }
+
+    private var teamScheduleGameDetailsSection: some View {
+        TeamScheduleFormSectionCard(title: progressiveDetailsSectionTitle) {
+            // Title
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .center, spacing: FGSpacing.sm) {
+                    PickupFormIconBadge(systemImage: "pencil", accent: formAccent)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(L10n.t("pickup_form_title_label", languageCode: languageCode))
+                            .font(.system(size: 16, weight: .regular))
+                            .foregroundStyle(FGColor.primaryText(colorScheme))
+                        Text(L10n.t("team_schedule_title_subtitle", languageCode: languageCode))
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    }
+                    Spacer(minLength: FGSpacing.sm)
+                    TextField(
+                        L10n.t("pickup_form_title_placeholder", languageCode: languageCode),
+                        text: $title
+                    )
+                    .multilineTextAlignment(.trailing)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(formAccent)
+                    .focused($isTitleFieldFocused)
+                    .id("pickupFormTitleField")
+                }
+                .padding(.horizontal, FGSpacing.md)
+                .padding(.vertical, 10)
+                .frame(minHeight: 44)
+            }
+            .id("teamScheduleTitle")
+
+            if PickupGameEditPrivacyPolicy.showsVisibilityControl(isTeamLinked: isTeamLinkedForm) {
+                PickupFormRowDivider()
+                teamScheduleVisibilityRow
+                    .id("teamScheduleVisibility")
+            }
+
+            PickupFormRowDivider()
+
+            // Sport
+            Button {
+                showSportPicker = true
+            } label: {
+                TeamScheduleSubtitleRow(
+                    systemImage: "sportscourt.fill",
+                    accent: formAccent,
+                    label: L10n.t("pickup_form_sport_label", languageCode: languageCode),
+                    subtitle: L10n.t("team_schedule_sport_subtitle", languageCode: languageCode),
+                    value: {
+                        let emoji = summarySportEmoji
+                        return emoji.isEmpty ? summarySportLabel : "\(emoji) \(summarySportLabel)"
+                    }(),
+                    valueIsPlaceholder: false
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(L10n.t("pickup_form_sport_label", languageCode: languageCode)), \(summarySportLabel)"
+            )
+
+            if showsSportSubtypePicker {
+                PickupFormRowDivider()
+                sportSubtypeFormRow
+                    .id("teamScheduleSportSubtype")
+            }
+
+            if shouldShowGameFormatPicker {
+                PickupFormRowDivider()
+                teamScheduleFormatRow
+            }
+
+            if teamEventPolicy.showsOpponentField {
+                PickupFormRowDivider()
+                matchupOpponentFormSection
+                    .id("teamScheduleMatchup")
+            }
+        }
+    }
+
+    private var teamScheduleFormatRow: some View {
+        HStack(alignment: .center, spacing: FGSpacing.sm) {
+            PickupFormIconBadge(systemImage: "trophy.fill", accent: formAccent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(L10n.t("pickup_form_event_type", languageCode: languageCode))
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+                Text(L10n.t("pickup_form_event_type_subtitle", languageCode: languageCode))
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+            }
+            Spacer(minLength: FGSpacing.sm)
+            Menu {
+                ForEach(availableGameFormats, id: \.self) { format in
+                    Button {
+                        gameFormat = format
+                    } label: {
+                        Label(
+                            eventTypeDisplayTitle(for: format),
+                            systemImage: format.systemImage
+                        )
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(eventTypeDisplayTitle(for: gameFormat))
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(formAccent)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                }
+            }
+            .accessibilityLabel(L10n.t("pickup_form_event_type", languageCode: languageCode))
+            .accessibilityValue(eventTypeDisplayTitle(for: gameFormat))
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 10)
+        .frame(minHeight: 44)
+        .id("teamScheduleFormat")
+    }
+
+    /// Compact settings-style Visibility row for Team Schedule only.
+    private var teamScheduleVisibilityRow: some View {
+        let segmented = GameOnSegmentedControl(
+            tabs: [
+                GameOnSegmentedTab(
+                    id: true,
+                    title: L10n.t("pickup_form_visibility_public", languageCode: languageCode),
+                    systemImage: "globe",
+                    tint: formAccent,
+                    accessibilityLabel: L10n.t("pickup_form_visibility_public", languageCode: languageCode)
+                ),
+                GameOnSegmentedTab(
+                    id: false,
+                    title: L10n.t("pickup_form_visibility_private", languageCode: languageCode),
+                    systemImage: "lock.fill",
+                    tint: formAccent,
+                    accessibilityLabel: L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+                ),
+            ],
+            selection: $isPublicDiscover,
+            accent: formAccent,
+            fillsWidth: false,
+            titleMinimumScaleFactor: 0.72,
+            tabHorizontalPadding: 6,
+            isCompact: true
+        )
+        .layoutPriority(1)
+        .accessibilityLabel(L10n.t("pickup_form_visibility", languageCode: languageCode))
+        .accessibilityValue(
+            isPublicDiscover
+                ? L10n.t("pickup_form_visibility_public", languageCode: languageCode)
+                : L10n.t("pickup_form_visibility_private", languageCode: languageCode)
+        )
+
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: FGSpacing.sm) {
+                teamScheduleVisibilityLabel
+                Spacer(minLength: FGSpacing.sm)
+                segmented
+                    .frame(maxWidth: 220)
+            }
+
+            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                teamScheduleVisibilityLabel
+                segmented
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 10)
+        .frame(minHeight: 44, alignment: .center)
+    }
+
+    private var teamScheduleVisibilityLabel: some View {
+        HStack(alignment: .center, spacing: FGSpacing.sm) {
+            PickupFormIconBadge(
+                systemImage: isPublicDiscover ? "globe" : "lock.fill",
+                accent: formAccent
+            )
+            Text(L10n.t("pickup_form_visibility", languageCode: languageCode))
+                .font(.system(size: 16, weight: .regular))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .allowsTightening(true)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private var teamScheduleWhenSection: some View {
+        TeamScheduleFormSectionCard(title: L10n.t("pickup_form_section_when", languageCode: languageCode)) {
+            Button {
+                showGameDatePopover = true
+            } label: {
+                TeamScheduleSubtitleRow(
+                    systemImage: "calendar",
+                    accent: formAccent,
+                    label: L10n.t("pickup_form_date_label", languageCode: languageCode),
+                    subtitle: L10n.t(
+                        isTeamLinkedForm
+                            ? "team_schedule_date_subtitle_event"
+                            : "team_schedule_date_subtitle",
+                        languageCode: languageCode
+                    ),
+                    value: summaryDateText
+                )
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showGameDatePopover) {
+                pickupGameDatePopover
+            }
+            .accessibilityLabel(
+                "\(L10n.t("pickup_form_date_label", languageCode: languageCode)), \(summaryDateText)"
+            )
+
+            PickupFormRowDivider()
+
+            Button {
+                showTeamTimeEditor = true
+            } label: {
+                TeamScheduleSubtitleRow(
+                    systemImage: "clock.fill",
+                    accent: formAccent,
+                    label: L10n.t("team_schedule_time_label", languageCode: languageCode),
+                    subtitle: L10n.t("team_schedule_time_subtitle", languageCode: languageCode),
+                    value: summaryTimeRangeText.replacingOccurrences(of: "–", with: " – ")
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(L10n.t("team_schedule_time_label", languageCode: languageCode)), \(summaryTimeRangeText)"
+            )
+            .id("teamScheduleTime")
+        }
+    }
+
+    private var teamScheduleWhereSection: some View {
+        TeamScheduleFormSectionCard(title: L10n.t("pickup_form_section_where", languageCode: languageCode)) {
+            Button {
+                openTeamScheduleLocationPicker()
+            } label: {
+                TeamScheduleSubtitleRow(
+                    systemImage: "mappin.and.ellipse",
+                    accent: formAccent,
+                    label: L10n.t("pickup_form_location_label", languageCode: languageCode),
+                    subtitle: L10n.t(
+                        isTeamLinkedForm
+                            ? "team_schedule_location_subtitle_event"
+                            : "team_schedule_location_subtitle",
+                        languageCode: languageCode
+                    ),
+                    value: hasAnyLocationInput
+                        ? summaryLocationPrimary
+                        : L10n.t("pickup_form_choose_location", languageCode: languageCode),
+                    valueIsPlaceholder: !hasAnyLocationInput
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(L10n.t("pickup_form_location_label", languageCode: languageCode)), \(hasAnyLocationInput ? summaryLocationPrimary : L10n.t("pickup_form_choose_location", languageCode: languageCode))"
+            )
+            .id("teamScheduleLocation")
+
+            if let coordinate = teamScheduleMapPreviewCoordinate {
+                teamScheduleLocationMapPreview(coordinate: coordinate)
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.bottom, FGSpacing.sm)
+            }
+
+            if hasAnyLocationInput, let foot = locationGuidanceFootnote {
+                Text(foot)
+                    .font(FGTypography.caption)
+                    .foregroundStyle(hasValidMapPinLocation ? FGColor.accentBlue : FGColor.accentYellow)
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.bottom, FGSpacing.sm)
+            }
+        }
+    }
+
+    /// Compact preview under Location — Team Schedule progressive layout only.
+    /// Reuses draft coordinates already on the form (map pin / address preview). No geocode.
+    private var teamScheduleMapPreviewCoordinate: CLLocationCoordinate2D? {
+        guard usesTeamScheduleProgressiveLayout else { return nil }
+        guard let preview = pickupLocationPreview else { return nil }
+        let coordinate = preview.coordinate
+        guard Self.isValidTeamScheduleMapPreviewCoordinate(coordinate) else { return nil }
+        return coordinate
+    }
+
+    private static func isValidTeamScheduleMapPreviewCoordinate(_ coordinate: CLLocationCoordinate2D) -> Bool {
+        guard isValidPickupCoordinate(coordinate) else { return false }
+        // Match FanGeo Team location policy: Null Island is not a real pin.
+        if coordinate.latitude == 0, coordinate.longitude == 0 { return false }
+        return coordinate.latitude.isFinite && coordinate.longitude.isFinite
+    }
+
+    private func openTeamScheduleLocationPicker() {
+        if effectiveTeamCreationContext != nil {
+            showTeamChooseLocationPicker = true
+        } else {
+            showPickupMapLocationPicker = true
+        }
+    }
+
+    private func teamScheduleLocationMapPreview(coordinate: CLLocationCoordinate2D) -> some View {
+        let region = MKCoordinateRegion(
+            center: coordinate,
+            span: MKCoordinateSpan(latitudeDelta: 0.012, longitudeDelta: 0.012)
+        )
+        let addressLabel = summaryLocationPrimary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a11yLabel: String = {
+            if addressLabel.isEmpty {
+                return L10n.t("team_schedule_map_preview_a11y_fallback", languageCode: languageCode)
+            }
+            return String(
+                format: L10n.t("team_schedule_map_preview_a11y_format", languageCode: languageCode),
+                locale: Locale(identifier: languageCode),
+                addressLabel
+            )
+        }()
+
+        return Button {
+            openTeamScheduleLocationPicker()
+        } label: {
+            Map(initialPosition: .region(region), interactionModes: []) {
+                Marker(addressLabel.isEmpty ? " " : addressLabel, coordinate: coordinate)
+                    .tint(formAccent)
+            }
+            .mapStyle(.standard(elevation: .flat))
+            .frame(height: 136)
+            .frame(maxWidth: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    .strokeBorder(formAccent.opacity(0.28), lineWidth: 1)
+            }
+            // Remount when the draft pin moves so the camera/pin stay in sync.
+            .id("teamScheduleMapPreview-\(coordinate.latitude)-\(coordinate.longitude)")
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(a11yLabel)
+        .accessibilityHint(L10n.t("team_schedule_map_preview_a11y_hint", languageCode: languageCode))
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var teamScheduleMoreOptionsRow: some View {
+        Button {
+            showTeamMoreOptions = true
+        } label: {
+            TeamScheduleSubtitleRow(
+                systemImage: "gearshape.fill",
+                accent: formAccent,
+                label: L10n.t("team_schedule_more_options", languageCode: languageCode),
+                subtitle: moreOptionsSummaryLine,
+                value: "",
+                valueIsPlaceholder: true
+            )
+        }
+        .buttonStyle(.plain)
+        .background(
+            FGAdaptiveSurface.cardElevated,
+            in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                .strokeBorder(FGColor.divider(colorScheme).opacity(colorScheme == .dark ? 0.35 : 0.4), lineWidth: 0.5)
+        }
+        .softCardShadow()
+        .accessibilityHint(moreOptionsSummaryLine)
+    }
+
+    private var teamSchedulePostButton: some View {
+        Button {
+            Task { await save() }
+        } label: {
+            HStack(spacing: 10) {
+                if isSaving {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: isAnnouncementForm ? "megaphone.fill" : "calendar.badge.plus")
+                        .font(.system(size: 17, weight: .semibold))
+                }
+                Text(mode.isCreate ? confirmationActionTitle : L10n.t("pickup_form_save", languageCode: languageCode))
+                    .font(.system(size: 17, weight: .bold, design: .rounded))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(formAccent.opacity(canSubmitPickupForm ? 1 : 0.45), in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSubmitPickupForm)
+        .accessibilityLabel(mode.isCreate ? confirmationActionTitle : L10n.t("pickup_form_save", languageCode: languageCode))
+    }
+
+    private var teamSchedulePrivacyFooter: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(FGColor.mutedText(colorScheme))
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+            Text(visibilityHelpText)
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var teamScheduleTimeEditorSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    DatePicker(
+                        L10n.t("pickup_form_starts_label", languageCode: languageCode),
+                        selection: startTimeBinding,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .tint(formAccent)
+                    DatePicker(
+                        L10n.t("pickup_form_ends_label", languageCode: languageCode),
+                        selection: endTimeBinding,
+                        displayedComponents: .hourAndMinute
+                    )
+                    .tint(formAccent)
+                } footer: {
+                    Text(L10n.t("team_schedule_time_editor_footer", languageCode: languageCode))
+                }
+            }
+            .navigationTitle(L10n.t("team_schedule_time_label", languageCode: languageCode))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("Done", languageCode: languageCode)) {
+                        showTeamTimeEditor = false
+                    }
+                    .fontWeight(.semibold)
+                    .foregroundStyle(formAccent)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private var teamScheduleMoreOptionsSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    TeamScheduleFormSectionCard(title: L10n.t("team_schedule_more_options", languageCode: languageCode)) {
+                        // Description
+                        NavigationLink {
+                            Form {
+                                Section {
+                                    TextField(
+                                        L10n.t("pickup_form_description_placeholder", languageCode: languageCode),
+                                        text: $description,
+                                        axis: .vertical
+                                    )
+                                    .lineLimit(5...16)
+                                } footer: {
+                                    Text(L10n.t("pickup_form_description_helper", languageCode: languageCode))
+                                }
+                            }
+                            .navigationTitle(L10n.t("pickup_form_description", languageCode: languageCode))
+                            .navigationBarTitleDisplayMode(.inline)
+                        } label: {
+                            TeamScheduleSubtitleRow(
+                                systemImage: "list.clipboard",
+                                accent: formAccent,
+                                label: L10n.t("pickup_form_description", languageCode: languageCode),
+                                subtitle: L10n.t("team_schedule_description_subtitle", languageCode: languageCode),
+                                value: {
+                                    let t = description.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    return t.isEmpty
+                                        ? L10n.t("team_schedule_add", languageCode: languageCode)
+                                        : t
+                                }(),
+                                valueIsPlaceholder: description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            )
+                        }
+                        .buttonStyle(.plain)
+
+                        PickupFormRowDivider()
+
+                        // Arrival time (optional metadata; Team + Pickup)
+                        VStack(alignment: .leading, spacing: 0) {
+                            HStack(alignment: .center, spacing: FGSpacing.sm) {
+                                PickupFormIconBadge(systemImage: "alarm", accent: formAccent)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(L10n.t("team_schedule_arrival_time", languageCode: languageCode))
+                                        .font(.system(size: 16, weight: .regular))
+                                        .foregroundStyle(FGColor.primaryText(colorScheme))
+                                    Text(L10n.t("team_schedule_arrival_time_subtitle", languageCode: languageCode))
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                }
+                                Spacer(minLength: FGSpacing.sm)
+                                Toggle("", isOn: $hasArrivalTime)
+                                    .labelsHidden()
+                                    .tint(formAccent)
+                                Text(
+                                    hasArrivalTime
+                                        ? arrivalTime.formatted(date: .omitted, time: .shortened)
+                                        : L10n.t("team_schedule_arrival_none", languageCode: languageCode)
+                                )
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(hasArrivalTime ? FGColor.secondaryText(colorScheme) : formAccent)
+                            }
+                            .padding(.horizontal, FGSpacing.md)
+                            .padding(.vertical, 10)
+                            .frame(minHeight: 44)
+
+                            if hasArrivalTime {
+                                DatePicker(
+                                    "",
+                                    selection: $arrivalTime,
+                                    displayedComponents: .hourAndMinute
+                                )
+                                .labelsHidden()
+                                .tint(formAccent)
+                                .padding(.horizontal, FGSpacing.md)
+                                .padding(.bottom, FGSpacing.sm)
+                            }
+                        }
+                        .animation(.easeInOut(duration: 0.2), value: hasArrivalTime)
+
+                        if teamEventPolicy.showsHowYouPlay {
+                            PickupFormRowDivider()
+                            PickupFormSelectionFieldRow(
+                                systemImage: "building.2.fill",
+                                accent: formAccent,
+                                label: L10n.t("pickup_form_indoor_outdoor", languageCode: languageCode),
+                                valueText: playEnvironment.displayTitle(languageCode: languageCode)
+                            ) {
+                                Picker(selection: $playEnvironment) {
+                                    ForEach(PickupPlayEnvironment.allCases) { env in
+                                        Text(env.displayTitle(languageCode: languageCode)).tag(env)
+                                    }
+                                } label: {
+                                    EmptyView()
+                                }
+                            }
+                        }
+
+                        if !isTeamLinkedForm, teamEventPolicy.showsHowYouPlay {
+                            // Standalone Pickup: skill / welcome / age always under More Options.
+                            PickupFormRowDivider()
+                            PickupFormSelectionFieldRow(
+                                systemImage: "chart.bar.fill",
+                                accent: formAccent,
+                                label: L10n.t("pickup_form_skill_level", languageCode: languageCode),
+                                valueText: skillLevel.displayTitle(languageCode: languageCode)
+                            ) {
+                                Picker(selection: $skillLevel) {
+                                    ForEach(PickupGameSkillLevel.allCases) { level in
+                                        Text(level.displayTitle(languageCode: languageCode)).tag(level)
+                                    }
+                                } label: {
+                                    EmptyView()
+                                }
+                            }
+                            PickupFormRowDivider()
+                            PickupFormSelectionFieldRow(
+                                systemImage: "person.2.fill",
+                                accent: formAccent,
+                                label: L10n.t("pickup_form_whos_welcome", languageCode: languageCode),
+                                valueText: participantPreference.displayTitle(languageCode: languageCode)
+                            ) {
+                                Picker(selection: $participantPreference) {
+                                    ForEach(PickupParticipantPreference.allCases) { pref in
+                                        Text(pref.displayTitle(languageCode: languageCode)).tag(pref)
+                                    }
+                                } label: {
+                                    EmptyView()
+                                }
+                            }
+                            PickupFormRowDivider()
+                            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                                ageRangeControls
+                            }
+                            .padding(FGSpacing.md)
+                        } else if teamEventPolicy.allowsTeamOutsideRecruitment {
+                            PickupFormRowDivider()
+                            PickupFormFieldRow(
+                                systemImage: "person.badge.plus",
+                                accent: formAccent,
+                                label: L10n.t("pickup_form_need_additional_players", languageCode: languageCode)
+                            ) {
+                                Toggle("", isOn: $needsAdditionalPlayers)
+                                    .labelsHidden()
+                                    .tint(formAccent)
+                                    .accessibilityLabel(L10n.t("pickup_form_need_additional_players", languageCode: languageCode))
+                            }
+
+                            if needsAdditionalPlayers {
+                                PickupFormRowDivider()
+                                playersNeededStepperRows
+                                PickupFormRowDivider()
+                                maxPlayersToggleRows
+                                PickupFormRowDivider()
+                                PickupFormSelectionFieldRow(
+                                    systemImage: "chart.bar.fill",
+                                    accent: formAccent,
+                                    label: L10n.t("pickup_form_skill_level", languageCode: languageCode),
+                                    valueText: skillLevel.displayTitle(languageCode: languageCode)
+                                ) {
+                                    Picker(selection: $skillLevel) {
+                                        ForEach(PickupGameSkillLevel.allCases) { level in
+                                            Text(level.displayTitle(languageCode: languageCode)).tag(level)
+                                        }
+                                    } label: {
+                                        EmptyView()
+                                    }
+                                }
+                                PickupFormRowDivider()
+                                PickupFormSelectionFieldRow(
+                                    systemImage: "person.2.fill",
+                                    accent: formAccent,
+                                    label: L10n.t("pickup_form_whos_welcome", languageCode: languageCode),
+                                    valueText: participantPreference.displayTitle(languageCode: languageCode)
+                                ) {
+                                    Picker(selection: $participantPreference) {
+                                        ForEach(PickupParticipantPreference.allCases) { pref in
+                                            Text(pref.displayTitle(languageCode: languageCode)).tag(pref)
+                                        }
+                                    } label: {
+                                        EmptyView()
+                                    }
+                                }
+                                PickupFormRowDivider()
+                                VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                                    ageRangeControls
+                                }
+                                .padding(FGSpacing.md)
+                            }
+                        }
+
+                        if teamEventPolicy.showsCompetitionLevel {
+                            PickupFormRowDivider()
+                            pickupFormCompetitionLevelRow
+                        }
+
+                        if !isTeamLinkedForm, teamEventPolicy.isGameplayEvent {
+                            PickupFormRowDivider()
+                            pickupProgressivePollPermissionsRows
+                        }
+
+                        if teamEventPolicy.isGameplayEvent {
+                            PickupFormRowDivider()
+                            VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                                Text(L10n.t("pickup_form_cost", languageCode: languageCode))
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                GameOnSegmentedControl(
+                                    tabs: PickupCostKind.allCases.map { kind in
+                                        GameOnSegmentedTab(
+                                            id: kind,
+                                            title: kind.title(languageCode: languageCode),
+                                            tint: formAccent
+                                        )
+                                    },
+                                    selection: $costKind,
+                                    accent: formAccent,
+                                    titleMinimumScaleFactor: 0.85
+                                )
+                                if costKind == .paid {
+                                    TextField(L10n.t("pickup_form_amount_usd", languageCode: languageCode), text: $entryFeeText)
+                                        .keyboardType(.decimalPad)
+                                    Text(L10n.t("pickup_form_paid_fee_hint", languageCode: languageCode))
+                                        .font(FGTypography.caption)
+                                        .foregroundStyle(FGColor.secondaryText(colorScheme))
+                                }
+                            }
+                            .padding(FGSpacing.md)
+                        }
+                    }
+
+                    HStack(alignment: .top, spacing: FGSpacing.sm) {
+                        Image(systemName: "info.circle.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(formAccent)
+                            .accessibilityHidden(true)
+                        Text(L10n.t("pickup_form_auto_delete_notice", languageCode: languageCode))
+                            .font(FGTypography.caption)
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(FGSpacing.md)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        formAccent.opacity(colorScheme == .dark ? 0.16 : 0.10),
+                        in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    )
+                }
+                .padding(.horizontal, FGSpacing.lg)
+                .padding(.top, FGSpacing.sm)
+                .padding(.bottom, FGSpacing.xxl)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .fanGeoScreenBackground()
+            .navigationTitle(L10n.t("team_schedule_more_options", languageCode: languageCode))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        showTeamMoreOptions = false
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(formAccent)
+                    }
+                    .accessibilityLabel(L10n.t("pickup_form_cancel", languageCode: languageCode))
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(L10n.t("Done", languageCode: languageCode)) {
+                        showTeamMoreOptions = false
+                    }
+                    .fontWeight(.semibold)
+                    .foregroundStyle(formAccent)
+                }
+            }
+            .onChange(of: needsAdditionalPlayers) { _, enabled in
+                if enabled, playersNeeded <= PickupTeamOutsideRecruiting.inactivePlayersNeededFloor {
+                    playersNeeded = 2
+                }
+                // Recruiting is independent of Public/Private — do not snap visibility.
+            }
+        }
+    }
+
+    private func refreshPickupSuggestedTitleIfNeeded() {
+        guard !isTeamLinkedForm else { return }
+        guard SportSubtypeCatalog.hasSubtypes(forSport: sport) else { return }
+        guard let suggested = SportSubtypeCatalog.suggestedTitle(
+            sport: sport,
+            subtype: sportSubtype,
+            languageCode: languageCode
+        ) else { return }
+        guard TeamScheduleTitleSuggestion.shouldReplaceTitle(
+            currentTitle: title,
+            lastAutoSuggested: lastAutoSuggestedTitle
+        ) else { return }
+        title = suggested
+        lastAutoSuggestedTitle = suggested
+    }
+
+    @ViewBuilder
+    private var sportSubtypeFormRow: some View {
+        HStack(alignment: .center, spacing: FGSpacing.sm) {
+            PickupFormIconBadge(systemImage: "slider.horizontal.3", accent: formAccent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(SportSubtypeCatalog.pickerTitle(forSport: sport, languageCode: languageCode))
+                    .font(.system(size: 16, weight: .regular))
+                    .foregroundStyle(FGColor.primaryText(colorScheme))
+            }
+            Spacer(minLength: FGSpacing.sm)
+            Menu {
+                ForEach(availableSportSubtypes) { option in
+                    Button {
+                        sportSubtype = option.id
+                        refreshPickupSuggestedTitleIfNeeded()
+                    } label: {
+                        Label(
+                            L10n.t(option.labelKey, languageCode: languageCode),
+                            systemImage: option.systemImage
+                        )
+                    }
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Text(
+                        SportSubtypeCatalog.displayLabel(
+                            forSubtype: sportSubtype ?? "",
+                            sport: sport,
+                            languageCode: languageCode
+                        )
+                    )
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(formAccent)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(FGColor.mutedText(colorScheme))
+                }
+            }
+            .accessibilityLabel(SportSubtypeCatalog.pickerTitle(forSport: sport, languageCode: languageCode))
+            .accessibilityValue(
+                SportSubtypeCatalog.displayLabel(
+                    forSubtype: sportSubtype ?? "",
+                    sport: sport,
+                    languageCode: languageCode
+                )
+            )
+        }
+        .padding(.horizontal, FGSpacing.md)
+        .padding(.vertical, 10)
+        .frame(minHeight: 44)
+    }
+
+    private func refreshTeamScheduleSuggestedTitleIfNeeded() {
+        guard usesTeamScheduleProgressiveLayout, isTeamLinkedForm else { return }
+        guard let suggested = TeamScheduleTitleSuggestion.suggestedTitle(
+            homeTeamName: matchupHomeTeamName == "—" ? (effectiveTeamCreationContext?.teamName ?? "") : matchupHomeTeamName,
+            opponentName: opponentName,
+            format: gameFormat,
+            languageCode: languageCode
+        ) else { return }
+        guard TeamScheduleTitleSuggestion.shouldReplaceTitle(
+            currentTitle: title,
+            lastAutoSuggested: lastAutoSuggestedTitle
+        ) || (!titleManuallyCustomized && title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || (!titleManuallyCustomized && title == effectiveTeamCreationContext?.teamName)
+        else { return }
+        title = suggested
+        lastAutoSuggestedTitle = suggested
+        titleManuallyCustomized = false
     }
 
     private var pickupFormIntroRow: some View {
@@ -2850,25 +4182,25 @@ struct SettingsPickupGameFormView: View {
         )
     }
 
-    /// Team → Schedule Game only: unmistakable identity before Manual | CSV.
+    /// Team → Schedule Game only: compact identity before Manual | CSV.
     @ViewBuilder
     private var pickupFormTeamIdentityCard: some View {
         if let team = creationContext.team {
             let meta = team.scheduleHeaderMetaLine(languageCode: languageCode)
-            HStack(alignment: .center, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
                 FanTeamMarkView(
                     sport: team.teamSport,
                     logoURL: team.logoURL,
                     logoThumbnailURL: team.logoThumbnailURL,
                     colorHex: team.colorHex,
-                    size: 56,
+                    size: 44,
                     preferDetailURL: false
                 )
                 .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(team.teamName)
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
                         .foregroundStyle(FGColor.primaryText(colorScheme))
                         .lineLimit(2)
                         .minimumScaleFactor(0.85)
@@ -2877,22 +4209,23 @@ struct SettingsPickupGameFormView: View {
                     if !meta.isEmpty {
                         Text(meta)
                             .font(.system(size: 13, weight: .semibold, design: .rounded))
-                            .foregroundStyle(FGColor.intentPlay.opacity(colorScheme == .dark ? 0.95 : 0.9))
+                            .foregroundStyle(formAccent.opacity(colorScheme == .dark ? 0.95 : 0.9))
                             .lineLimit(2)
                             .minimumScaleFactor(0.85)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 14)
-            .fanTeamIdentityCardChrome(
-                colorHex: team.colorHex,
-                colorScheme: colorScheme,
-                cornerRadius: FGRadius.medium,
-                baseOpacityDark: 0.78,
-                baseOpacityLight: 0.98
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                FGAdaptiveSurface.cardElevated,
+                in: RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
             )
+            .overlay {
+                RoundedRectangle(cornerRadius: FGRadius.medium, style: .continuous)
+                    .strokeBorder(formAccent.opacity(colorScheme == .dark ? 0.35 : 0.22), lineWidth: 1)
+            }
             .softCardShadow()
             .accessibilityElement(children: .combine)
             .accessibilityLabel(team.scheduleHeaderAccessibilityLabel(languageCode: languageCode))
@@ -3070,15 +4403,29 @@ struct SettingsPickupGameFormView: View {
                 .accessibilityAddTraits(.isButton)
             }
 
-            PickupFormRowDivider()
-            pickupFormVisibilityRows
+            if showsSportSubtypePicker {
+                PickupFormRowDivider()
+                sportSubtypeFormRow
+            }
+
+            if PickupGameEditPrivacyPolicy.showsVisibilityControl(isTeamLinked: isTeamLinkedForm) {
+                PickupFormRowDivider()
+                pickupFormVisibilityRows
+            }
 
             if shouldShowGameFormatPicker {
                 PickupFormRowDivider()
                 gameFormatFormSection
             }
 
-            if !isOrganizerPostStartManage {
+            if isTeamLinkedForm,
+               teamEventPolicy.showsOpponentField,
+               !isOrganizerPostStartManage {
+                PickupFormRowDivider()
+                matchupOpponentFormSection
+            }
+
+            if !isOrganizerPostStartManage, teamEventPolicy.showsCompetitionLevel {
                 PickupFormRowDivider()
                 pickupFormCompetitionLevelRow
             }
@@ -3201,42 +4548,59 @@ struct SettingsPickupGameFormView: View {
             }
             .padding(FGSpacing.md)
 
-            PickupFormRowDivider()
-
-            PickupFormFieldRow(
-                systemImage: "person.badge.plus",
-                label: L10n.t("pickup_form_need_additional_players", languageCode: languageCode)
-            ) {
-                Toggle("", isOn: $needsAdditionalPlayers)
-                    .labelsHidden()
-                    .tint(FGColor.intentPlay)
-                    .accessibilityLabel(L10n.t("pickup_form_need_additional_players", languageCode: languageCode))
-            }
-
-            if needsAdditionalPlayers {
+            if teamEventPolicy.allowsTeamOutsideRecruitment {
                 PickupFormRowDivider()
-                VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                    Text(L10n.t("pickup_form_section_additional_players", languageCode: languageCode))
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(FGColor.secondaryText(colorScheme))
-                        .padding(.horizontal, FGSpacing.md)
-                        .padding(.top, FGSpacing.sm)
-                    playersNeededStepperRows
-                    PickupFormRowDivider()
-                    maxPlayersToggleRows
+
+                PickupFormFieldRow(
+                    systemImage: "person.badge.plus",
+                    label: L10n.t("pickup_form_need_additional_players", languageCode: languageCode)
+                ) {
+                    Toggle("", isOn: $needsAdditionalPlayers)
+                        .labelsHidden()
+                        .tint(FGColor.intentPlay)
+                        .accessibilityLabel(L10n.t("pickup_form_need_additional_players", languageCode: languageCode))
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+
+                if needsAdditionalPlayers {
+                    PickupFormRowDivider()
+                    VStack(alignment: .leading, spacing: FGSpacing.sm) {
+                        Text(L10n.t("pickup_form_section_additional_players", languageCode: languageCode))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(FGColor.secondaryText(colorScheme))
+                            .padding(.horizontal, FGSpacing.md)
+                            .padding(.top, FGSpacing.sm)
+                        playersNeededStepperRows
+                        PickupFormRowDivider()
+                        maxPlayersToggleRows
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            } else {
+                Text(L10n.t("pickup_form_team_event_rsvp_only_help", languageCode: languageCode))
+                    .font(FGTypography.caption)
+                    .foregroundStyle(FGColor.secondaryText(colorScheme))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, FGSpacing.md)
+                    .padding(.bottom, FGSpacing.md)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: needsAdditionalPlayers)
         .animation(.easeInOut(duration: 0.2), value: useMaxPlayers)
+        .animation(.easeInOut(duration: 0.2), value: gameFormat)
         .onChange(of: needsAdditionalPlayers) { _, enabled in
             if enabled, playersNeeded <= PickupTeamOutsideRecruiting.inactivePlayersNeededFloor {
                 playersNeeded = 2
             }
-            // Team-only (OFF): snap visibility to Private so hidden recruiting state cannot leave a Public shell.
-            if !enabled, isTeamLinkedForm {
-                isPublicDiscover = false
+            // Recruiting is independent of Public/Private — do not snap visibility.
+        }
+        .onChange(of: gameFormat) { _, newFormat in
+            let policy = FanTeamEventPresentation.policy(for: newFormat, sport: sport)
+            if isTeamLinkedForm, !policy.allowsTeamOutsideRecruitment {
+                needsAdditionalPlayers = false
+                let inactive = PickupTeamOutsideRecruiting.inactivePersistence()
+                playersNeeded = inactive.playersNeeded
+                useMaxPlayers = false
+                maxPlayers = inactive.maxPlayers ?? maxPlayers
             }
         }
     }
@@ -3245,7 +4609,8 @@ struct SettingsPickupGameFormView: View {
     private var playersNeededStepperRows: some View {
         PickupFormFieldRow(
             systemImage: "person.2.fill",
-            label: L10n.t("pickup_form_players_needed", languageCode: languageCode)
+            accent: formAccent,
+            label: playersNeededFieldLabel
         ) {
             HStack(spacing: 10) {
                 Button {
@@ -3261,12 +4626,12 @@ struct SettingsPickupGameFormView: View {
                 .disabled(playersNeeded <= 1)
                 .accessibilityLabel(L10n.t("pickup_form_decrease_players", languageCode: languageCode))
 
-                Text(playersNeededCountText)
+                Text(playersNeededCountDisplayText)
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .foregroundStyle(FGColor.primaryText(colorScheme))
                     .frame(minWidth: 72)
                     .multilineTextAlignment(.center)
-                    .accessibilityLabel(playersNeededCountText)
+                    .accessibilityLabel(playersNeededCountDisplayText)
 
                 Button {
                     playersNeeded = min(20, playersNeeded + 1)
@@ -3288,11 +4653,12 @@ struct SettingsPickupGameFormView: View {
     private var maxPlayersToggleRows: some View {
         PickupFormFieldRow(
             systemImage: "person.3.fill",
+            accent: formAccent,
             label: L10n.t("pickup_form_set_max_capacity", languageCode: languageCode)
         ) {
             Toggle("", isOn: $useMaxPlayers)
                 .labelsHidden()
-                .tint(FGColor.intentPlay)
+                .tint(formAccent)
                 .accessibilityLabel(L10n.t("pickup_form_set_max_capacity", languageCode: languageCode))
         }
 
@@ -3300,7 +4666,8 @@ struct SettingsPickupGameFormView: View {
             PickupFormRowDivider()
             PickupFormFieldRow(
                 systemImage: "number",
-                label: L10n.t("pickup_form_max_players", languageCode: languageCode)
+                accent: formAccent,
+                label: maxPlayersFieldLabel
             ) {
                 HStack(spacing: 8) {
                     Text("\(maxPlayers)")
@@ -3309,7 +4676,7 @@ struct SettingsPickupGameFormView: View {
                         .monospacedDigit()
                     Stepper("", value: $maxPlayers, in: 1...100)
                         .labelsHidden()
-                        .accessibilityLabel(L10n.t("pickup_form_max_players", languageCode: languageCode))
+                        .accessibilityLabel(maxPlayersFieldLabel)
                         .accessibilityValue("\(maxPlayers)")
                 }
             }
@@ -3408,22 +4775,11 @@ struct SettingsPickupGameFormView: View {
                         accessibilityLabel: L10n.t("pickup_form_visibility_private", languageCode: languageCode)
                     ),
                 ],
-                selection: Binding(
-                    get: { isPublicDiscover },
-                    set: { newValue in
-                        // Team roster-only games cannot be Public while recruiting is OFF.
-                        if newValue, isTeamLinkedForm, !needsAdditionalPlayers {
-                            isPublicDiscover = false
-                            return
-                        }
-                        isPublicDiscover = newValue
-                    }
-                ),
+                selection: $isPublicDiscover,
                 accent: FGColor.intentPlay,
                 titleMinimumScaleFactor: 0.78
             )
             .accessibilityLabel(L10n.t("pickup_form_visibility", languageCode: languageCode))
-            .disabled(isTeamLinkedForm && !needsAdditionalPlayers)
 
             Text(visibilityHelpText)
                 .font(FGTypography.caption)
@@ -3432,7 +4788,7 @@ struct SettingsPickupGameFormView: View {
                 .accessibilityLabel(visibilityHelpText)
         }
         .padding(FGSpacing.md)
-        .animation(.easeInOut(duration: 0.2), value: needsAdditionalPlayers)
+        .animation(.easeInOut(duration: 0.2), value: isPublicDiscover)
     }
 
     /// Team create/edit with a Team default: compact inherited chrome until Override.
@@ -3551,34 +4907,39 @@ struct SettingsPickupGameFormView: View {
 
     private var pickupFormPollPermissionsSection: some View {
         PickupFormSectionCard(title: L10n.t("pickup_poll_permissions_section", languageCode: languageCode)) {
-            VStack(alignment: .leading, spacing: FGSpacing.sm) {
-                Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(FGColor.primaryText(colorScheme))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityAddTraits(.isHeader)
-
-                GameOnSegmentedControl(
-                    tabs: PickupPollCreatePermission.allCases.map { option in
-                        GameOnSegmentedTab(
-                            id: option,
-                            title: option.title(languageCode: languageCode),
-                            tint: FGColor.intentPlay
-                        )
-                    },
-                    selection: $pollCreatePermission,
-                    accent: FGColor.intentPlay,
-                    titleMinimumScaleFactor: 0.78
-                )
-                .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
-
-                Text(L10n.t("pickup_poll_permissions_footer", languageCode: languageCode))
-                    .font(FGTypography.caption)
-                    .foregroundStyle(FGColor.secondaryText(colorScheme))
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(FGSpacing.md)
+            pickupProgressivePollPermissionsRows
         }
+    }
+
+    /// Shared poll-permission controls (classic section card or progressive More Options).
+    private var pickupProgressivePollPermissionsRows: some View {
+        VStack(alignment: .leading, spacing: FGSpacing.sm) {
+            Text(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(FGColor.primaryText(colorScheme))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.isHeader)
+
+            GameOnSegmentedControl(
+                tabs: PickupPollCreatePermission.allCases.map { option in
+                    GameOnSegmentedTab(
+                        id: option,
+                        title: option.title(languageCode: languageCode),
+                        tint: formAccent
+                    )
+                },
+                selection: $pollCreatePermission,
+                accent: formAccent,
+                titleMinimumScaleFactor: 0.78
+            )
+            .accessibilityLabel(L10n.t("pickup_poll_permissions_who_can_create", languageCode: languageCode))
+
+            Text(L10n.t("pickup_poll_permissions_footer", languageCode: languageCode))
+                .font(FGTypography.caption)
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(FGSpacing.md)
     }
 
     private var pickupFormWhereSection: some View {
@@ -3648,10 +5009,10 @@ struct SettingsPickupGameFormView: View {
                             .lineLimit(1...3)
                         TextField(L10n.t("pickup_form_city", languageCode: languageCode), text: cityBinding)
                         HStack(spacing: FGSpacing.sm) {
-                            TextField(L10n.t("pickup_form_state", languageCode: languageCode), text: stateBinding)
-                            TextField(L10n.t("pickup_form_zip", languageCode: languageCode), text: zipCodeBinding)
+                            TextField(L10n.t("team_location_region", languageCode: languageCode), text: stateBinding)
+                            TextField(L10n.t("team_location_postal", languageCode: languageCode), text: zipCodeBinding)
                                 .textInputAutocapitalization(.characters)
-                                .keyboardType(.numbersAndPunctuation)
+                                .keyboardType(.default)
                         }
                     }
                     .font(.system(size: 15))
@@ -3690,10 +5051,10 @@ struct SettingsPickupGameFormView: View {
                             .lineLimit(1...3)
                         TextField(L10n.t("pickup_form_city", languageCode: languageCode), text: cityBinding)
                         HStack(spacing: FGSpacing.sm) {
-                            TextField(L10n.t("pickup_form_state", languageCode: languageCode), text: stateBinding)
-                            TextField(L10n.t("pickup_form_zip", languageCode: languageCode), text: zipCodeBinding)
+                            TextField(L10n.t("team_location_region", languageCode: languageCode), text: stateBinding)
+                            TextField(L10n.t("team_location_postal", languageCode: languageCode), text: zipCodeBinding)
                                 .textInputAutocapitalization(.characters)
-                                .keyboardType(.numbersAndPunctuation)
+                                .keyboardType(.default)
                         }
                     }
                     .font(.system(size: 15))
@@ -3732,12 +5093,12 @@ struct SettingsPickupGameFormView: View {
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
             PickupFormRowDivider()
-            PickupFormFieldRow(systemImage: "map", label: L10n.t("pickup_form_state", languageCode: languageCode)) {
+            PickupFormFieldRow(systemImage: "map", label: L10n.t("team_location_region", languageCode: languageCode)) {
                 Text(trimmedState.isEmpty ? "—" : trimmedState)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
             PickupFormRowDivider()
-            PickupFormFieldRow(systemImage: "number", label: L10n.t("pickup_form_zip", languageCode: languageCode)) {
+            PickupFormFieldRow(systemImage: "number", label: L10n.t("team_location_postal", languageCode: languageCode)) {
                 Text(trimmedZipCode.isEmpty ? "—" : trimmedZipCode)
                     .foregroundStyle(FGColor.secondaryText(colorScheme))
             }
@@ -3863,28 +5224,28 @@ struct SettingsPickupGameFormView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if shouldShowCreationTabs {
-                if creationContext.isTeamSourced, creationContext.team != nil {
-                    pickupFormTeamIdentityCard
-                        .padding(.horizontal, FGSpacing.lg)
-                        .padding(.top, FGSpacing.md)
-                        .padding(.bottom, FGSpacing.sm)
-                }
+            if showsTeamIdentityHeader {
+                pickupFormTeamIdentityCard
+                    .padding(.horizontal, FGSpacing.lg)
+                    .padding(.top, FGSpacing.md)
+                    .padding(.bottom, FGSpacing.sm)
+            }
 
+            if shouldShowCreationTabs {
                 GameOnSegmentedControl(
                     tabs: PickupGameCreationTab.allCases.map { tab in
                         GameOnSegmentedTab(
                             id: tab,
                             title: tab.title(languageCode: languageCode),
-                            tint: FGColor.intentPlay
+                            tint: formAccent
                         )
                     },
                     selection: $creationTab,
-                    accent: FGColor.intentPlay,
+                    accent: formAccent,
                     titleMinimumScaleFactor: 0.85
                 )
                 .padding(.horizontal, FGSpacing.lg)
-                .padding(.top, creationContext.isTeamSourced ? FGSpacing.xs : FGSpacing.md)
+                .padding(.top, showsTeamIdentityHeader ? FGSpacing.xs : FGSpacing.md)
                 .padding(.bottom, FGSpacing.sm)
             }
 
@@ -3919,7 +5280,7 @@ struct SettingsPickupGameFormView: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button(L10n.t("pickup_form_cancel", languageCode: languageCode)) { onFinished(); dismiss() }
-                    .foregroundStyle(FGColor.intentPlay)
+                    .foregroundStyle(formAccent)
             }
             if !shouldShowCreationTabs || creationTab == .manual {
                 ToolbarItem(placement: .confirmationAction) {
@@ -3934,7 +5295,7 @@ struct SettingsPickupGameFormView: View {
                             .background {
                                 if canSubmitPickupForm {
                                     Capsule(style: .continuous)
-                                        .fill(FGColor.intentPlay)
+                                        .fill(formAccent)
                                 }
                             }
                     }
@@ -3977,7 +5338,7 @@ struct SettingsPickupGameFormView: View {
                 viewModel: viewModel,
                 initialCoordinate: pickMapSeedCoordinate,
                 onCancel: { showPickupMapLocationPicker = false },
-                onConfirm: { coord, street, cityName, stateAbbr, postalCode in
+                onConfirm: { coord, street, cityName, stateAbbr, postalCode, country in
                     appliedPickupPlacePrefill = nil
                     if let s = street, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         address = s
@@ -3991,6 +5352,9 @@ struct SettingsPickupGameFormView: View {
                     if let zip = postalCode, !zip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         zipCode = zip
                     }
+                    if let country, !country.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        appliedLocationCountryCode = BusinessLocationCountryPolicy.normalizedStoredCountryCode(country)
+                    }
                     mapPinnedCoordinate = coord
                     coordinatesLockedFromMap = true
                     addressPreviewCoordinate = nil
@@ -3998,6 +5362,21 @@ struct SettingsPickupGameFormView: View {
                     showPickupMapLocationPicker = false
                 }
             )
+        }
+        .sheet(isPresented: $showTeamChooseLocationPicker) {
+            if let team = effectiveTeamCreationContext {
+                FanTeamChooseLocationSheet(
+                    viewModel: viewModel,
+                    teamId: team.teamId,
+                    canManageLocations: team.canManageTeamLocations,
+                    initialCoordinate: pickMapSeedCoordinate,
+                    onCancel: { showTeamChooseLocationPicker = false },
+                    onSelect: { selection in
+                        applyTeamLocationSelection(selection)
+                        showTeamChooseLocationPicker = false
+                    }
+                )
+            }
         }
         .confirmationDialog(
             "Another pickup game is already scheduled at this location during a similar time. Do you still want to post yours?",
@@ -4121,7 +5500,7 @@ struct SettingsPickupGameFormView: View {
 
     private func applyModeToFields() {
         switch mode {
-        case .add:
+        case .add, .addTeamAnnouncement:
             title = ""
             sport = AppSportCatalog.formPickerSportsOrdered.first ?? "Soccer"
             let now = Date()
@@ -4134,9 +5513,13 @@ struct SettingsPickupGameFormView: View {
             state = ""
             zipCode = ""
             description = ""
-            gameFormat = creationContext.isTeamSourced
-                ? GameType.defaultForTeamCreate
-                : GameType.defaultForNormalCreate
+            if mode.forcesTeamAnnouncement {
+                gameFormat = .announcement
+            } else {
+                gameFormat = creationContext.isTeamSourced
+                    ? GameType.defaultForTeamCreate
+                    : GameType.defaultForNormalCreate
+            }
             playEnvironment = .either
             skillLevel = .casual
             competitionLevel = nil
@@ -4156,19 +5539,33 @@ struct SettingsPickupGameFormView: View {
                 isTeamSourcedCreate: creationContext.isTeamSourced
             )
             pollCreatePermission = .organizerOnly
+            opponentName = ""
+            hasArrivalTime = false
+            arrivalTime = Date()
+            lastAutoSuggestedTitle = ""
+            titleManuallyCustomized = false
             coordinatesLockedFromMap = false
             mapPinnedCoordinate = nil
             addressPreviewCoordinate = nil
             addressPreviewAddressLine = ""
             pickupSafetyAcknowledged = false
             showManualAddressEntry = false
-            if let pickupPlacePrefill {
+            if let pickupPlacePrefill, !mode.forcesTeamAnnouncement {
                 applyPickupPlacePrefill(pickupPlacePrefill)
             }
             applyTeamCreationContextPrefillIfNeeded()
+#if DEBUG
+            if mode.forcesTeamAnnouncement {
+                print(
+                    "[TeamScheduleActionDebug] announcementComposerPresented " +
+                    "teamID=\(creationContext.team?.teamId.uuidString.lowercased() ?? "nil")"
+                )
+            }
+#endif
         case .edit(let row):
             title = row.title
             sport = row.sport
+            sportSubtype = SportSubtypeCatalog.ensuringValidSelection(row.sport_subtype, sport: row.sport)
             if let start = PickupGameModels.parseSupabaseTimestamptz(row.game_start_at) {
                 gameDate = start
                 gameTime = start
@@ -4233,6 +5630,16 @@ struct SettingsPickupGameFormView: View {
                 maxPlayers: row.max_players
             )
             pollCreatePermission = row.pollCreatePermission
+            opponentName = FanTeamScheduleMatchup.trimmedOpponent(row.opponent_name) ?? ""
+            if let arrival = row.arrival_time.flatMap({ PickupGameModels.parseSupabaseTimestamptz($0) }) {
+                hasArrivalTime = true
+                arrivalTime = arrival
+            } else {
+                hasArrivalTime = false
+                arrivalTime = Date()
+            }
+            lastAutoSuggestedTitle = ""
+            titleManuallyCustomized = true
             isPublicDiscover = row.is_visible
             if let latitude = row.latitude,
                let longitude = row.longitude {
@@ -4288,10 +5695,16 @@ struct SettingsPickupGameFormView: View {
         let teamSport = team.teamSport.trimmingCharacters(in: .whitespacesAndNewlines)
         if !teamSport.isEmpty {
             sport = teamSport
+            sportSubtype = SportSubtypeCatalog.ensuringValidSelection(sportSubtype, sport: teamSport)
         }
-        let teamName = team.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !teamName.isEmpty {
-            title = teamName
+        // Announcement composer starts blank; Schedule Event still prefills Practice title.
+        if !mode.forcesTeamAnnouncement {
+            let teamName = team.teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !teamName.isEmpty {
+                title = teamName
+                lastAutoSuggestedTitle = teamName
+                titleManuallyCustomized = false
+            }
         }
         // Initialize once from Team default (resolved value persisted on save).
         competitionLevel = PickupTeamCompetitionInheritance.initialGameLevel(
@@ -4299,6 +5712,9 @@ struct SettingsPickupGameFormView: View {
         )
         // Inherited chrome only when Team has a concrete default.
         competitionLevelOverrideActive = team.competitionLevel == nil
+        if !mode.forcesTeamAnnouncement {
+            refreshTeamScheduleSuggestedTitleIfNeeded()
+        }
     }
 
     private func applyPickupPlacePrefill(_ place: PickupPlaceRow) {
@@ -4308,6 +5724,8 @@ struct SettingsPickupGameFormView: View {
         } else if viewModel.selectedSport != "All" {
             sport = viewModel.selectedSport
         }
+        sportSubtype = SportSubtypeCatalog.ensuringValidSelection(sportSubtype, sport: sport)
+        refreshPickupSuggestedTitleIfNeeded()
 
         let trimmedName = place.name.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedName.isEmpty {
@@ -4571,17 +5989,64 @@ struct SettingsPickupGameFormView: View {
             return
         }
 
-        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTitle: String = {
+            let raw = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !raw.isEmpty { return raw }
+            return SportSubtypeCatalog.suggestedTitle(
+                sport: sport,
+                subtype: sportSubtype,
+                languageCode: languageCode
+            )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }()
         guard !trimmedTitle.isEmpty else {
-            errorText = "Title is required."
+            errorText = L10n.t("pickup_form_ready_add_title", languageCode: languageCode)
+            teamScheduleValidationAnchor = usesTeamScheduleProgressiveLayout ? "teamScheduleTitle" : "pickupFormTitleField"
+            return
+        }
+        if requiresOpponentForSubmit,
+           FanTeamScheduleMatchup.persistableOpponent(
+            format: gameFormat,
+            opponentName: opponentName,
+            sport: sport
+           ) == nil {
+            errorText = L10n.t("pickup_form_ready_add_opponent", languageCode: languageCode)
+            teamScheduleValidationAnchor = "teamScheduleMatchup"
             return
         }
         if requiresPickupSafetyAcknowledgment && !pickupSafetyAcknowledged {
             errorText = "Acknowledge the pickup safety notice before posting."
             return
         }
-        if VenueOwnerGameScheduleValidation.isPastSchedule(gameDate: gameDate, gameStartTime: gameTime) {
+        if isAnnouncementForm {
+            let body = description.trimmingCharacters(in: .whitespacesAndNewlines)
+            if body.isEmpty {
+                errorText = L10n.t("team_announcement_ready_add_message", languageCode: languageCode)
+                teamScheduleValidationAnchor = "teamScheduleAnnouncementMessage"
+                return
+            }
+            if body.count > 2000 {
+                errorText = L10n.t("team_announcement_message_too_long", languageCode: languageCode)
+                return
+            }
+        }
+        if !isAnnouncementForm,
+           VenueOwnerGameScheduleValidation.isPastSchedule(gameDate: gameDate, gameStartTime: gameTime) {
             errorText = VenueOwnerGameScheduleValidation.futureDateTimeMessage
+            teamScheduleValidationAnchor = "teamScheduleWhen"
+            return
+        }
+        if !isAnnouncementForm, !hasPlacedLocationForPostButton {
+            errorText = L10n.t("pickup_form_ready_choose_location", languageCode: languageCode)
+            teamScheduleValidationAnchor = "teamScheduleLocation"
+            return
+        }
+        let startProbe = VenueOwnerGameScheduleValidation.combinedLocalStart(gameDate: gameDate, gameStartTime: gameTime)
+        let endProbe = isAnnouncementForm
+            ? startProbe.addingTimeInterval(60)
+            : combinedEndDate(start: startProbe)
+        if !isAnnouncementForm, endProbe <= startProbe {
+            errorText = L10n.t("team_schedule_end_after_start", languageCode: languageCode)
+            teamScheduleValidationAnchor = "teamScheduleTime"
             return
         }
 
@@ -4647,8 +6112,10 @@ struct SettingsPickupGameFormView: View {
         isSaving = true
         defer { isSaving = false }
 
-        let start = combinedStartDate()
-        let end = combinedEndDate(start: start)
+        let start = isAnnouncementForm ? Date() : combinedStartDate()
+        let end = isAnnouncementForm
+            ? start.addingTimeInterval(60)
+            : combinedEndDate(start: start)
 
         let missingZip = trimmedZipCode.isEmpty
 #if DEBUG
@@ -4657,40 +6124,96 @@ struct SettingsPickupGameFormView: View {
             print("[PickupLocationDebug] zipMissingAllowed=true cityMissing=\(trimmedCity.isEmpty)")
         }
 #endif
-        guard hasCompleteTypedAddress || hasValidMapPinLocation else {
-            errorText = "Enter an address or pick a location from the map."
-            return
-        }
-
-        let addressLine = [trimmedAddress, trimmedCity, trimmedState, trimmedZipCode]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
-
-        let latFinal: Double
-        let lonFinal: Double
-        if hasValidMapPinLocation, let pin = mapPinnedCoordinate {
-            latFinal = pin.latitude
-            lonFinal = pin.longitude
+        let latFinal: Double?
+        let lonFinal: Double?
+        let addr: String
+        let c: String
+        let st: String
+        if isAnnouncementForm {
+            // Announcements are not venue events — persist without inventing a location.
+            // Never write (0,0): that is Null Island and must not look like a real pin.
+            latFinal = nil
+            lonFinal = nil
+            addr = ""
+            c = ""
+            st = ""
         } else {
-            guard let coord = await viewModel.geocodeAddress(addressLine) else {
-                errorText = "Could not find that address. Please check the street address, city, and state."
+            guard hasCompleteTypedAddress || hasValidMapPinLocation else {
+                errorText = "Enter an address or pick a location from the map."
+                teamScheduleValidationAnchor = "teamScheduleLocation"
                 return
             }
-            latFinal = coord.latitude
-            lonFinal = coord.longitude
-        }
 
-        let addr = trimmedAddress
-        let c = trimmedCity
-        let st = Self.storedStateWithZip(state: trimmedState, zipCode: trimmedZipCode)
+            let addressLine = [trimmedAddress, trimmedCity, trimmedState, trimmedZipCode]
+                .filter { !$0.isEmpty }
+                .joined(separator: ", ")
+
+            if hasValidMapPinLocation, let pin = mapPinnedCoordinate {
+                latFinal = pin.latitude
+                lonFinal = pin.longitude
+            } else {
+                guard let coord = await viewModel.geocodeAddress(addressLine) else {
+                    errorText = "Could not find that address. Please check the street address, city, and state."
+                    return
+                }
+                latFinal = coord.latitude
+                lonFinal = coord.longitude
+            }
+
+            addr = trimmedAddress
+            c = trimmedCity
+            st = Self.storedStateWithZip(state: trimmedState, zipCode: trimmedZipCode)
+        }
 
         let desc = description.trimmingCharacters(in: .whitespacesAndNewlines)
 
         do {
             var createdFromPickupPlace: PickupGameRow?
             switch mode {
-            case .add:
-                if !skipConflictCheck {
+            case .add, .addTeamAnnouncement:
+#if DEBUG
+                print(
+                    "[PickupLocationDebug] coordinatesSaved=true latitude=\(latFinal?.description ?? "nil") " +
+                    "longitude=\(lonFinal?.description ?? "nil") source=\(appliedPickupPlacePrefill == nil ? "manual" : "pickup_place")"
+                )
+                if let appliedPickupPlacePrefill {
+                    print(
+                        "[PickupHostPrefillDebug] savedPickupPlaceLocation=true " +
+                        "placeId=\(appliedPickupPlacePrefill.id.uuidString.lowercased()) address=\(addr) city=\(c) " +
+                        "state=\(st) zip=\(trimmedZipCode) latitude=\(latFinal?.description ?? "nil") " +
+                        "longitude=\(lonFinal?.description ?? "nil")"
+                    )
+                }
+#endif
+                let isTeamCreate = creationContext.isTeamSourced
+                if isTeamCreate, !GameType.fanTeamLinkableCases.contains(gameFormat) {
+                    errorText = L10n.t("pickup_form_team_format_error", languageCode: languageCode)
+                    return
+                }
+                if isAnnouncementForm, creationContext.team?.canPublishAnnouncements != true {
+                    errorText = L10n.t("team_announcement_permission_denied", languageCode: languageCode)
+#if DEBUG
+                    print(
+                        "[TeamAnnouncement] permissionResult=denied clientGate " +
+                        "teamID=\(creationContext.team?.teamId.uuidString.lowercased() ?? "nil")"
+                    )
+#endif
+                    return
+                }
+#if DEBUG
+                if isAnnouncementForm {
+                    print(
+                        "[TeamAnnouncement] publishStart " +
+                        "teamID=\(creationContext.team?.teamId.uuidString.lowercased() ?? "nil") " +
+                        "authorID=\(viewModel.currentUserAuthId?.uuidString.lowercased() ?? "nil")"
+                    )
+                    print(
+                        "[TeamScheduleActionDebug] announcementPostStarted " +
+                        "teamID=\(creationContext.team?.teamId.uuidString.lowercased() ?? "nil")"
+                    )
+                }
+#endif
+                if !isAnnouncementForm, !skipConflictCheck {
                     if try await viewModel.findOverlappingPickupGameAtLocation(
                         newStart: start,
                         newEnd: end,
@@ -4704,22 +6227,13 @@ struct SettingsPickupGameFormView: View {
                         return
                     }
                 }
-#if DEBUG
-                print("[PickupLocationDebug] coordinatesSaved=true latitude=\(latFinal) longitude=\(lonFinal) source=\(appliedPickupPlacePrefill == nil ? "manual" : "pickup_place")")
-                if let appliedPickupPlacePrefill {
-                    print("[PickupHostPrefillDebug] savedPickupPlaceLocation=true placeId=\(appliedPickupPlacePrefill.id.uuidString.lowercased()) address=\(addr) city=\(c) state=\(st) zip=\(trimmedZipCode) latitude=\(latFinal) longitude=\(lonFinal)")
-                }
-#endif
-                let isTeamCreate = creationContext.isTeamSourced
-                if isTeamCreate, !GameType.fanTeamLinkableCases.contains(gameFormat) {
-                    errorText = L10n.t("pickup_form_team_format_error", languageCode: languageCode)
-                    return
-                }
-                let createdVisibility = PickupGameEditPrivacyPolicy.resolvedIsVisible(
-                    formIsPublic: isPublicDiscover,
-                    isTeamLinked: isTeamLinkedForm,
-                    needsAdditionalPlayers: needsAdditionalPlayers
-                )
+                let createdVisibility = isAnnouncementForm
+                    // Announcement composer has no Public/Private control — privacy-safe Private.
+                    ? false
+                    : PickupGameEditPrivacyPolicy.resolvedIsVisible(
+                        formIsPublic: isPublicDiscover,
+                        isStandalonePickup: !isTeamLinkedForm
+                    )
                 let created = try await viewModel.insertPickupGame(
                     title: trimmedTitle,
                     sport: sport,
@@ -4743,7 +6257,15 @@ struct SettingsPickupGameFormView: View {
                     gameFormat: gameFormat,
                     competitionLevel: competitionLevel,
                     pollCreatePermission: pollCreatePermission,
-                    isVisible: createdVisibility
+                    isVisible: createdVisibility,
+                    opponentName: FanTeamScheduleMatchup.persistableOpponent(
+                        format: gameFormat,
+                        opponentName: opponentName,
+                        sport: sport
+                    ),
+                    arrivalTime: arrivalTimePayload,
+                    sportSubtype: sportSubtype,
+                    claimsPickupCreateXP: !isTeamCreate
                 )
                 if let team = creationContext.team, isTeamCreate {
                     do {
@@ -4751,7 +6273,50 @@ struct SettingsPickupGameFormView: View {
                             teamId: team.teamId,
                             pickupGameId: created.id
                         )
+                        if gameFormat != .announcement {
+                            await viewModel.awardFanXP(
+                                source: FanXPSource.teamEventCreated,
+                                sourceId: created.id
+                            )
+                        }
+                        await recordTeamLocationUsageAfterSuccessfulPersist(
+                            teamId: team.teamId,
+                            address: addr,
+                            city: c,
+                            state: st,
+                            latitude: latFinal,
+                            longitude: lonFinal
+                        )
+#if DEBUG
+                        if isAnnouncementForm {
+                            print(
+                                "[TeamAnnouncement] persistSuccess " +
+                                "announcementID=\(created.id.uuidString.lowercased()) " +
+                                "teamID=\(team.teamId.uuidString.lowercased())"
+                            )
+                            print(
+                                "[TeamScheduleActionDebug] announcementPostSucceeded " +
+                                "teamID=\(team.teamId.uuidString.lowercased()) " +
+                                "announcementID=\(created.id.uuidString.lowercased())"
+                            )
+                        }
+#endif
                     } catch {
+#if DEBUG
+                        if isAnnouncementForm {
+                            print(
+                                "[TeamAnnouncement] persistFailure " +
+                                "announcementID=\(created.id.uuidString.lowercased()) " +
+                                "teamID=\(team.teamId.uuidString.lowercased()) " +
+                                "error=\(error.localizedDescription)"
+                            )
+                            print(
+                                "[TeamScheduleActionDebug] announcementPostFailed " +
+                                "teamID=\(team.teamId.uuidString.lowercased()) " +
+                                "error=\(error.localizedDescription)"
+                            )
+                        }
+#endif
                         try? await viewModel.deletePickupGame(id: created.id)
                         throw error
                     }
@@ -4761,17 +6326,37 @@ struct SettingsPickupGameFormView: View {
                     createdFromPickupPlace = created
                 }
             case .edit(let row):
+                if isAnnouncementForm {
+                    let canPublish = creationContext.team?.canPublishAnnouncements == true
+                        || effectiveTeamCreationContext?.canPublishAnnouncements == true
+                    guard canPublish else {
+                        errorText = L10n.t("team_announcement_permission_denied", languageCode: languageCode)
+#if DEBUG
+                        print(
+                            "[TeamAnnouncement] permissionResult=denied_edit clientGate " +
+                            "announcementID=\(row.id.uuidString.lowercased())"
+                        )
+#endif
+                        return
+                    }
+                }
                 let gameStartISO = PickupGameModels.encodeSupabaseTimestamptz(start)
                 let endISO = PickupGameModels.encodeSupabaseTimestamptz(end)
                 let removeISO = PickupGameModels.encodedPickupRemoveAfterAt(forEncodedGameStart: gameStartISO)
-                let resolvedVisibility = PickupGameEditPrivacyPolicy.resolvedIsVisible(
-                    formIsPublic: isPublicDiscover,
-                    isTeamLinked: isTeamLinkedForm,
-                    needsAdditionalPlayers: needsAdditionalPlayers
-                )
+                let resolvedVisibility = isAnnouncementForm
+                    // Announcement composer has no Public/Private control — keep Private.
+                    ? false
+                    : PickupGameEditPrivacyPolicy.resolvedIsVisible(
+                        formIsPublic: isPublicDiscover,
+                        isStandalonePickup: !isTeamLinkedForm
+                    )
                 let patch = PickupGameFullUpdate(
                     title: trimmedTitle,
                     sport: sport,
+                    sport_subtype: SportSubtypeCatalog.normalizedSubtype(
+                        sport: sport,
+                        subtype: sportSubtype
+                    ),
                     description: desc.isEmpty ? nil : desc,
                     game_format: gameFormat.rawValue,
                     competition_level: competitionLevel?.rawValue,
@@ -4794,9 +6379,25 @@ struct SettingsPickupGameFormView: View {
                     max_players: maxP,
                     cleanup_delay_hours: PickupGameAutoRemoval.hoursAfterGameStart,
                     remove_after_at: removeISO,
-                    poll_create_permission: pollCreatePermission.rawValue
+                    poll_create_permission: pollCreatePermission.rawValue,
+                    opponent_name: FanTeamScheduleMatchup.persistableOpponent(
+                        format: gameFormat,
+                        opponentName: opponentName,
+                        sport: sport
+                    ),
+                    arrival_time: PickupNullableTimestamptz(date: arrivalTimePayload)
                 )
                 try await viewModel.updatePickupGame(id: row.id, full: patch)
+                if let teamId = effectiveTeamCreationContext?.teamId {
+                    await recordTeamLocationUsageAfterSuccessfulPersist(
+                        teamId: teamId,
+                        address: addr,
+                        city: c,
+                        state: st,
+                        latitude: latFinal,
+                        longitude: lonFinal
+                    )
+                }
             }
             if let createdFromPickupPlace {
                 await viewModel.refreshPickupGameAfterDiscoverPickupPlaceCreate(createdFromPickupPlace)
@@ -4807,6 +6408,60 @@ struct SettingsPickupGameFormView: View {
             dismiss()
         } catch {
             errorText = error.localizedDescription
+        }
+    }
+
+    private func applyTeamLocationSelection(_ selection: FanTeamLocationSelection) {
+        appliedPickupPlacePrefill = nil
+        let street = selection.persistableAddress
+        if !street.isEmpty {
+            address = street
+        }
+        if !selection.city.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            city = selection.city
+        }
+        if !selection.state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            state = selection.state
+        }
+        if !selection.zipCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            zipCode = selection.zipCode
+        }
+        appliedLocationCountryCode = selection.countryCode
+        mapPinnedCoordinate = selection.coordinate
+        coordinatesLockedFromMap = true
+        addressPreviewCoordinate = nil
+        addressPreviewAddressLine = ""
+    }
+
+    /// Recent usage is recorded only after the event row (and Team link, on create) succeeds.
+    private func recordTeamLocationUsageAfterSuccessfulPersist(
+        teamId: UUID,
+        address: String,
+        city: String,
+        state: String,
+        latitude: Double?,
+        longitude: Double?
+    ) async {
+        guard !isAnnouncementForm else { return }
+        guard let latitude, let longitude else { return }
+        do {
+            _ = try await FanTeamLocationService().upsertUsageFromFormFields(
+                teamId: teamId,
+                placeName: nil,
+                address: address.isEmpty ? nil : address,
+                city: city.isEmpty ? nil : city,
+                state: state.isEmpty ? nil : state,
+                latitude: latitude,
+                longitude: longitude,
+                providerPlaceId: nil,
+                postalCode: trimmedZipCode.isEmpty ? nil : trimmedZipCode,
+                countryCode: appliedLocationCountryCode.isEmpty ? nil : appliedLocationCountryCode
+            )
+        } catch {
+            TeamLocationDebug.log(
+                "recentUsageUpsert",
+                detail: "teamID=\(teamId.uuidString.lowercased()) softFail=\(error.localizedDescription)"
+            )
         }
     }
 }

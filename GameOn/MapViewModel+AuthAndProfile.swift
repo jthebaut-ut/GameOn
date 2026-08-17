@@ -948,6 +948,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserMyTeamsProfileVisibility = .productDefault
         currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         isAuthSessionRestoringForProfilePresentation = false
@@ -1079,6 +1080,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserMyTeamsProfileVisibility = .productDefault
         currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
@@ -1443,6 +1445,7 @@ extension MapViewModel {
                     if applied {
                         print("USER PROFILE LOADED")
                         await refreshProfileXP()
+                        await loadMyTeamsProfileVisibilityIfNeeded()
                     }
                     return applied
                 }
@@ -1537,6 +1540,8 @@ extension MapViewModel {
         fanIdentityPreferencesLoadTask = nil
         lastFanIdentityPreferencesLoadAt = nil
         lastFanIdentityPreferencesLoadUserId = nil
+        lastMyTeamsProfileVisibilityLoadAt = nil
+        lastMyTeamsProfileVisibilityLoadUserId = nil
         lastMyPickupOrganizerSummaryRefreshAt = nil
         currentUserHomeCrowdVenueId = nil
         currentUserHomeCrowdVenue = nil
@@ -1548,6 +1553,7 @@ extension MapViewModel {
         currentUserHomeRegion = ""
         currentUserHomeCountry = ""
         currentUserShowHomeCity = false
+        currentUserMyTeamsProfileVisibility = .productDefault
         currentUserGenderRaw = ""
         currentUserProfileBackgroundKey = .fangeo
         currentUserLiveVisibilityEnabled = true
@@ -1558,7 +1564,9 @@ extension MapViewModel {
         isUpdatingLiveVisibilitySetting = false
         isUpdatingProfileDiscoverabilitySetting = false
         isUpdatingActivityStatusVisibilitySetting = false
+        let logoutAuthId = currentUserAuthId
         currentUserAuthId = nil
+        clearActionCenterDismissalsFromMemory()
         FanGeoUserEntitlements.reset()
         clearUnseenPokesBadgeState()
         clearPendingPokeNotificationDeepLink()
@@ -1573,6 +1581,9 @@ extension MapViewModel {
         favoriteTeamProGames = []
         favoriteTeamProGameAlertOverrides = [:]
         FavoriteTeamsStore.clearAppStorage()
+        if let logoutAuthId {
+            FanTeamPlayerInfoSelectionStore.clearAll(forUserId: logoutAuthId)
+        }
         favoriteTeamsHydrationGeneration &+= 1
         clearBusinessFavoriteTeamState()
         favoriteVenueIDs = []
@@ -1601,9 +1612,17 @@ extension MapViewModel {
         // Clear residual local cache only (never restart GPS / never network stop here).
         ChatLiveLocationManager.shared.clearLocalLiveLocationStateAfterLogout()
         pendingPickupCreatorRatingNotificationDeepLink = nil
+        pendingPickupCreatorRatingPromptToken = nil
         pendingPickupPlayingHighlightGameID = nil
         pendingSharedPickupGameDetailToken = nil
         pendingSharedProGameDetailMatch = nil
+        pendingOpenGoingPickupInvites = false
+        pendingOpenGoingHostingApprovals = false
+        pendingHostingApprovalPickupGameId = nil
+        pendingTeamScheduleJoinApproval = nil
+        pendingTeamScheduleEventDeepLink = nil
+        pendingOrganizerJoinRequestsGameToken = nil
+        pendingScheduleActivityPickupGameId = nil
         clearPendingSaveProGameIntent()
         presentSaveProGameSignInPrompt = false
 
@@ -1613,6 +1632,7 @@ extension MapViewModel {
         markPickupDiscoverMapDataDirtyForNextRefresh()
         selectedPickupGameForMap = nil
         clearDiscoverPickupTeamScopeForLogout()
+        resetDiscoverMapModePreferencesForLogout()
         myPickupGamesForSettings = []
         myRemovedPickupGamesForSettings = []
         pickupOrganizerJoinStatsByGameId = [:]
@@ -1650,7 +1670,11 @@ extension MapViewModel {
         lastPendingPickupJoinRequestCountLoadAt = nil
         lastPendingPickupJoinRequestCountUserId = nil
         pendingPickupGameJoinRequestCount = 0
+        pendingPickupJoinApprovalSummaries = []
+        pendingHostingApprovalPickupGameId = nil
+        pendingScheduleActivityPickupGameId = nil
         myPickupGameJoinRequestCards = []
+        goingPlayTeamParticipations = []
         incomingPickupGameInvites = []
         pickupGamesFollowingTabCache.removeAll()
         pickupJoinRequestLatestByPickupGameIdForFan.removeAll()
@@ -2567,6 +2591,15 @@ extension MapViewModel {
         )
 #endif
         currentUserNationalTeam = profile.nationalTeamIdentity
+        if let countryName = profile.nationalTeamIdentity?.countryName {
+            Task {
+                await SportsArtworkEnrichmentService.shared.enrichNamedTeam(
+                    name: countryName,
+                    sport: nil,
+                    league: nil
+                )
+            }
+        }
         applyCurrentUserHomeCityFromProfile(profile)
         applyCurrentUserGenderFromProfile(profile)
         currentUserProfileBackgroundKey = profile.resolvedProfileBackgroundKey
@@ -5692,6 +5725,138 @@ extension MapViewModel {
 #endif
             return "Couldn’t save your home city. Please try again."
         }
+    }
+
+    @discardableResult
+    func saveMyTeamsProfileVisibility(_ visibility: FanTeamProfileVisibility) async -> String? {
+        do {
+            let saved = try await FanTeamsService().setMyTeamsProfileVisibility(visibility)
+            await MainActor.run {
+                currentUserMyTeamsProfileVisibility = saved
+                lastMyTeamsProfileVisibilityLoadAt = Date()
+                lastMyTeamsProfileVisibilityLoadUserId = currentUserAuthId
+                markMyTeamsVisibilityUserChoice(saved)
+                if let uid = currentUserAuthId {
+                    PublicUserProfileProcessCache.invalidate(userId: uid, reason: "my_teams_visibility")
+                }
+                publicProfileBioRevision &+= 1
+            }
+            return nil
+        } catch {
+#if DEBUG
+            print("[ProfileMyTeams] set visibility failed: \(error.localizedDescription)")
+#endif
+            // Soft-fail when SQL not applied yet — keep local draft so Edit Profile still feels responsive.
+            await MainActor.run {
+                currentUserMyTeamsProfileVisibility = visibility
+                markMyTeamsVisibilityUserChoice(visibility)
+            }
+            return nil
+        }
+    }
+
+    func loadMyTeamsProfileVisibilityIfNeeded() async {
+        guard let uid = currentUserAuthId else { return }
+        if lastMyTeamsProfileVisibilityLoadUserId == uid,
+           let last = lastMyTeamsProfileVisibilityLoadAt,
+           Date().timeIntervalSince(last) < 5 * 60 {
+#if DEBUG
+            ProfileOpenPerf.cacheHit(name: "myTeamsVisibility")
+#endif
+            return
+        }
+        let payload = await FanTeamsService().listProfileFanTeamMemberships(targetUserId: uid)
+        var visibility = payload.visibility
+
+        // Legacy product default was only_me. Promote never-chosen rows to Everyone.
+        // Preserve intentional picker choices stored in UserDefaults (especially Only Me).
+        // Friends / Team Members / Everyone on the server are never treated as the legacy default.
+        if shouldUpgradeLegacyMyTeamsOnlyMeDefault(visibility: visibility, userId: uid) {
+            if await saveMyTeamsProfileVisibilityWithoutMarkingExplicit(.everyone) == nil {
+                visibility = .everyone
+            }
+        }
+
+        await MainActor.run {
+            lastMyTeamsProfileVisibilityLoadAt = Date()
+            lastMyTeamsProfileVisibilityLoadUserId = uid
+            if currentUserMyTeamsProfileVisibility != visibility {
+                currentUserMyTeamsProfileVisibility = visibility
+#if DEBUG
+                ProfileOpenPerf.statePublished(name: "myTeamsVisibility")
+#endif
+            } else {
+#if DEBUG
+                ProfileOpenPerf.duplicatePublishSkipped(name: "myTeamsVisibility")
+#endif
+            }
+        }
+    }
+
+    /// Persists visibility without treating the write as an explicit user picker choice (legacy upgrade path).
+    @discardableResult
+    private func saveMyTeamsProfileVisibilityWithoutMarkingExplicit(
+        _ visibility: FanTeamProfileVisibility
+    ) async -> String? {
+        do {
+            let saved = try await FanTeamsService().setMyTeamsProfileVisibility(visibility)
+            await MainActor.run {
+                currentUserMyTeamsProfileVisibility = saved
+                if let uid = currentUserAuthId {
+                    PublicUserProfileProcessCache.invalidate(userId: uid, reason: "my_teams_visibility")
+                }
+                publicProfileBioRevision &+= 1
+            }
+            return nil
+        } catch {
+#if DEBUG
+            print("[ProfileMyTeams] legacy default upgrade failed: \(error.localizedDescription)")
+#endif
+            await MainActor.run {
+                currentUserMyTeamsProfileVisibility = visibility
+            }
+            return nil
+        }
+    }
+
+    /// Intentional Edit Profile picker selection (raw value). Distinct from the legacy bool flag.
+    private func myTeamsVisibilityUserChoiceKey(userId: UUID) -> String {
+        "fanGeo.myTeamsVisibility.userChoice.\(userId.uuidString.lowercased())"
+    }
+
+    /// Legacy bool written by earlier builds (including unintended Edit Profile re-saves of only_me).
+    private func myTeamsVisibilityLegacyExplicitBoolKey(userId: UUID) -> String {
+        "fanGeo.myTeamsVisibility.explicitlyChosen.\(userId.uuidString.lowercased())"
+    }
+
+    @MainActor
+    private func markMyTeamsVisibilityUserChoice(_ visibility: FanTeamProfileVisibility, userId: UUID? = nil) {
+        guard let uid = userId ?? currentUserAuthId else { return }
+        UserDefaults.standard.set(visibility.rawValue, forKey: myTeamsVisibilityUserChoiceKey(userId: uid))
+        // Keep legacy bool in sync for older code paths / diagnostics.
+        UserDefaults.standard.set(true, forKey: myTeamsVisibilityLegacyExplicitBoolKey(userId: uid))
+    }
+
+    private func storedMyTeamsVisibilityUserChoice(userId: UUID) -> FanTeamProfileVisibility? {
+        guard let raw = UserDefaults.standard.string(forKey: myTeamsVisibilityUserChoiceKey(userId: userId)) else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return FanTeamProfileVisibility.parse(trimmed)
+    }
+
+    /// Upgrade only_me when it is still the unset/legacy default — not an intentional Only Me choice.
+    private func shouldUpgradeLegacyMyTeamsOnlyMeDefault(
+        visibility: FanTeamProfileVisibility,
+        userId: UUID
+    ) -> Bool {
+        guard visibility == .legacyProductDefault else { return false }
+        // Only preserve Only Me when the user explicitly selected it in Edit Profile.
+        if storedMyTeamsVisibilityUserChoice(userId: userId) == .onlyMe {
+            return false
+        }
+        return true
     }
 
     @discardableResult

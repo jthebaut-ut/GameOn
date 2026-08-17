@@ -66,7 +66,7 @@ enum MemoryAuditProbe {
 
     private static func installDarwinRemoteHooks() {
         let center = CFNotificationCenterGetDarwinNotifyCenter()
-        let tabs = ["discover", "live", "calendar", "following", "chat", "account"]
+        let tabs = ["discover", "live", "calendar", "teams", "chat", "account"]
         for tab in tabs {
             let name = "com.jt.fangio.memoryaudit.tab.\(tab)" as CFString
             CFNotificationCenterAddObserver(

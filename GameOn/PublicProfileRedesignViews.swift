@@ -142,9 +142,11 @@ struct PublicProfileOwnerPreviewNotice: View {
 // MARK: - Shared below-hero section stack
 
 /// Canonical public-profile section order below the hero (own preview + other-user).
+/// `myTeam` = primary favorite club (Utah Jazz). `myFanTeams` = FanGeo memberships (JT).
 enum PublicProfileBelowHeroSectionOrder: Int, CaseIterable {
     case mutualFriends
     case myTeam
+    case myFanTeams
     case pickupGames
     case teamsIFollow
     case sportsIPlay
@@ -173,6 +175,14 @@ enum PublicProfileSectionVisibility {
     static func showsTeamsIFollow(data: PublicUserProfileData, isSelfPreview: Bool) -> Bool {
         !data.orderedFavoriteTeamsForPublicProfile.isEmpty || isSelfPreview
     }
+
+    /// FanGeo Fan Team memberships (not Favorite Teams). Hide empty public cards.
+    static func showsMyFanTeams(data: PublicUserProfileData, isSelfPreview: Bool) -> Bool {
+        if !data.fanTeamMemberships.isEmpty { return true }
+        // Owner self-preview may still show empty caption via own ProfileIdentityCard;
+        // public stack hides empties.
+        return false
+    }
 }
 
 /// One shared below-hero renderer for self-preview and another-user public profiles.
@@ -184,6 +194,12 @@ struct PublicProfileBelowHeroStack: View {
     let onAddSports: (() -> Void)?
     let onViewHomeWatchSpot: (() -> Void)?
     let onChooseHomeWatchSpot: (() -> Void)?
+    var onOpenFanTeam: ((ProfileFanTeamMembership) -> Void)? = nil
+    @AppStorage(L10n.appLanguageKey) private var appLanguageRaw = L10n.defaultLanguageCode
+
+    private var languageCode: String {
+        L10n.normalizedLanguageCode(appLanguageRaw)
+    }
 
     private var sportItems: [PublicProfileOpenToItem] {
         PublicProfileOpenToSplit.sportItems(from: data.openToItems)
@@ -209,6 +225,15 @@ struct PublicProfileBelowHeroStack: View {
                let model = data.myTeamDisplayModel {
                 PublicProfileMyTeamSection(model: model, team: myTeam)
                     .frame(maxWidth: .infinity)
+            }
+
+            if PublicProfileSectionVisibility.showsMyFanTeams(data: data, isSelfPreview: isSelfPreview) {
+                PublicProfileMyTeamsSection(
+                    memberships: data.fanTeamMemberships,
+                    languageCode: languageCode,
+                    onOpenTeam: onOpenFanTeam
+                )
+                .frame(maxWidth: .infinity)
             }
 
             PublicProfilePickupGamesSection(data: data)
@@ -916,7 +941,7 @@ struct PublicProfileFanSnapshotView: View {
     }
 }
 
-// MARK: - My Team (authoritative primary favorite)
+// MARK: - Favorite Team (authoritative primary favorite club — not FanGeo memberships)
 
 struct PublicProfileMyTeamSection: View {
     let model: MyTeamDisplayModel
@@ -937,6 +962,11 @@ struct PublicProfileMyTeamSection: View {
                     .textCase(.uppercase)
                     .tracking(0.4)
             }
+
+            Text(L10n.t("profile_favorite_team_subtitle", languageCode: appLanguageRaw))
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundStyle(FGColor.secondaryText(colorScheme))
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(alignment: .center, spacing: 12) {
                 SportsIdentityArtworkView(favoriteTeam: team, diameter: 48)
@@ -1046,7 +1076,7 @@ struct PublicProfileTeamsIFollowSection: View {
                     .foregroundStyle(FGColor.primaryText(colorScheme))
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 10) {
+                    LazyHStack(alignment: .top, spacing: cardStyle.cardSpacing) {
                         ForEach(teams) { team in
                             FavoriteTeamRichCard(
                                 team: team,

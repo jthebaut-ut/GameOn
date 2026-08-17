@@ -2326,6 +2326,29 @@ nonisolated enum GoingActivationPerf {
 /// `nonisolated` so it is callable from the `DiscoverMapImageCache` actor and from
 /// detached decode tasks without hopping to the MainActor.
 nonisolated enum ImagePerf {
+    struct Counters: Sendable, Equatable {
+        var downloadsStarted: Int
+        var downloadsCompleted: Int
+        var memoryCacheHits: Int
+        var decodes: Int
+
+        static let zero = Counters(
+            downloadsStarted: 0,
+            downloadsCompleted: 0,
+            memoryCacheHits: 0,
+            decodes: 0
+        )
+
+        func subtracting(_ other: Counters) -> Counters {
+            Counters(
+                downloadsStarted: max(0, downloadsStarted - other.downloadsStarted),
+                downloadsCompleted: max(0, downloadsCompleted - other.downloadsCompleted),
+                memoryCacheHits: max(0, memoryCacheHits - other.memoryCacheHits),
+                decodes: max(0, decodes - other.decodes)
+            )
+        }
+    }
+
 #if DEBUG
     private static let lock = NSLock()
     private static var downloadsStarted = 0
@@ -2474,6 +2497,23 @@ nonisolated enum ImagePerf {
     static func waiterCancelled() {
 #if DEBUG
         bump { waitersCancelled += 1 }
+#endif
+    }
+
+    /// Point-in-time counters without resetting (Profile first-open timeline).
+    static func currentCounters() -> Counters {
+#if DEBUG
+        lock.lock()
+        let value = Counters(
+            downloadsStarted: downloadsStarted,
+            downloadsCompleted: downloadsCompleted,
+            memoryCacheHits: memoryCacheHits,
+            decodes: decodes
+        )
+        lock.unlock()
+        return value
+#else
+        return .zero
 #endif
     }
 

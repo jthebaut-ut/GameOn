@@ -27,7 +27,10 @@ enum FanTeamSafetySelfTests {
     private static func testOwnerCannotShowLeave() {
         precondition(!FanTeamMemberRole.owner.canLeaveTeam, "Owners must not see Leave Team")
         precondition(FanTeamMemberRole.manager.canLeaveTeam)
+        precondition(FanTeamMemberRole.headCoach.canLeaveTeam)
+        precondition(FanTeamMemberRole.assistantCoach.canLeaveTeam)
         precondition(FanTeamMemberRole.captain.canLeaveTeam)
+        precondition(FanTeamMemberRole.assistantCaptain.canLeaveTeam)
         precondition(FanTeamMemberRole.member.canLeaveTeam)
 
         let ownerSummary = FanTeamSummary(

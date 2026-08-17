@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2"
 import { ApnsClient, type PushTokenRow } from "../_shared/apns_client.ts"
+import { applyPushArtwork, pickTeamLogo } from "../_shared/push_artwork.ts"
 import {
   authorizeSportsWorkerRequest,
   describeAuthCandidateClasses,
@@ -22,8 +23,11 @@ import { resolveExistingDeliveryClaim } from "./claim_state.ts"
  * pg_net_request_id). Claim treats queued as claimable; sent/skipped/failed as
  * already_claimed (idempotent; no duplicate APNs).
  *
- * Auth: Bearer SERVICE_ROLE_KEY / SUPABASE_SERVICE_ROLE_KEY, or
- *       x-cron-secret matching FAN_TEAM_INVITATION_PUSH_CRON_SECRET.
+ * Auth: authorizeSportsWorkerRequest (same as pickup / member-change).
+ *   SQL 20260993 sends dual-key Authorization: Bearer + apikey from Vault
+ *   (fangeo_service_role_key preferred). Accepts JWT Bearer, sb_secret apikey,
+ *   or x-cron-secret / x-fangeo-cron-secret matching
+ *   FAN_TEAM_INVITATION_PUSH_CRON_SECRET. Does not weaken auth.
  *
  * Alert copy (authoritative profiles + fan_teams.name):
  *   title = "Jennifer (@jennifer)" | "Jennifer" | "@jennifer" | "FanGeo User"
@@ -57,6 +61,8 @@ type TeamRow = {
   id: string
   name: string
   is_active: boolean | null
+  logo_url?: string | null
+  logo_thumbnail_url?: string | null
 }
 
 type ProfileRow = {
@@ -276,7 +282,7 @@ Deno.serve(async (req) => {
 
   const { data: team, error: teamError } = await admin
     .from("fan_teams")
-    .select("id,name,is_active")
+    .select("id,name,is_active,logo_url,logo_thumbnail_url")
     .eq("id", row.team_id)
     .maybeSingle()
 
@@ -378,6 +384,12 @@ Deno.serve(async (req) => {
     invited_by_user_id: inviterId,
     event_id: eventId,
   }
+  applyPushArtwork(
+    customData,
+    pickTeamLogo(teamRow.logo_thumbnail_url, teamRow.logo_url),
+    "team",
+    row.team_id,
+  )
 
   let sent = 0
   let invalidated = 0

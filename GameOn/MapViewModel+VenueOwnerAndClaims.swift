@@ -931,6 +931,7 @@ extension MapViewModel {
             await persistAccountModeForActiveAuthSession(.businessOwner)
 
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+            await registerFanActiveSessionOnLogin()
 
             if recordVenueGuidelinesAcceptance {
                 UserDefaults.standard.set(true, forKey: "venueGuidelinesAccepted")
@@ -1271,6 +1272,7 @@ extension MapViewModel {
 
             await persistAccountModeForActiveAuthSession(.businessOwner)
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+            await registerFanActiveSessionOnLogin()
             if draft.recordVenueGuidelinesAcceptance {
                 UserDefaults.standard.set(true, forKey: "venueGuidelinesAccepted")
             }
@@ -1602,6 +1604,7 @@ extension MapViewModel {
             await persistAccountModeForActiveAuthSession(.businessOwner)
 
             clearExplicitLogoutMarkerAfterManualAuthSucceeded()
+            await registerFanActiveSessionOnLogin()
 
             await MainActor.run {
                 completeSafeLoginSuccess(generation: generation, accountKind: "business")

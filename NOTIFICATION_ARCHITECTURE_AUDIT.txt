@@ -1,0 +1,1312 @@
+FANGEO — COMPLETE PUSH NOTIFICATION INFRASTRUCTURE AUDIT
+Date: 2026-08-12
+Scope: GameOn / FanGeo iOS + Supabase SQL + Edge Functions
+Mode: READ-ONLY. No code changes, no migrations created, no deploy, no commit, no push.
+
+This audit answers whether FanGeo should consolidate every notification
+pipeline into one canonical infrastructure, and what that would take.
+
+
+==============================================================================
+EXECUTIVE SUMMARY
+==============================================================================
+
+FanGeo does NOT have one notification system. It has three overlapping
+stacks plus several leftover one-off workers:
+
+  A) Durable FanGeo Inbox  (fan_notification_inbox + live Action Needed queries)
+  B) Server APNs workers   (~15 Edge functions, ~12 SQL queue helpers)
+  C) iOS local notifications (GameReminderNotificationService — reminders,
+     ratings, some pro-game cards)
+
+A and B are intentionally independent (correct). The problem is that B is
+not one worker: it is a family of near-copies that share some pieces
+(_shared/apns_client.ts, authorizeSportsWorkerRequest) and bypass them in
+others (Bearer-only SQL, local authorizeInvocation, a second ApnsClient
+inside pro-game-score-alert-worker).
+
+The last three production bugs (pickup change, team member-change, team
+invitation) all failed at the SAME layer: SQL pg_net auth headers vs
+hosted Edge secret class. Inbox succeeded; APNs never ran. That is the
+clearest argument for consolidation.
+
+Recommendation: YES, move to one canonical push + inbox backbone, in
+PHASES. Do not rewrite every worker in one PR. First finish the auth
+header cutover (the known 401 class), then extract a shared queue SQL
+helper and a shared worker runtime. Keep notification-specific logic
+as content/recipient/mute/deeplink plugins.
+
+Current architecture is NOT maintainable long-term. Every new type
+reimplements queue + auth + claim + token loop + copy + deeplink and
+can silently ship the obsolete Bearer-only pattern.
+
+
+==============================================================================
+PART 1 — INVENTORY
+==============================================================================
+
+Legend
+  Inbox table = public.fan_notification_inbox via upsert_fan_notification_inbox
+  Inbox live  = FanGeo Inbox Action Needed projected from live domain rows
+                (not fan_notification_inbox)
+  Dual-key    = Authorization Bearer + apikey (same Vault value)
+  XOR-headers = public.push_worker_auth_headers: apikey OR Bearer, not both
+  Bearer-only = Authorization Bearer only (20260942-class; known 401 risk)
+  Shared APNs = supabase/functions/_shared/apns_client.ts
+  Shared auth = authorizeSportsWorkerRequest in sports_worker_auth.ts
+  Local auth  = per-function authorizeInvocation comparing Bearer to
+                SERVICE_ROLE_KEY / SUPABASE_SERVICE_ROLE_KEY only
+
+Latest queue rewrites as of this audit (local tree; some not applied):
+  20260988 pickup change dual-key
+  20260990 member-change dual-key + inbox
+  20260991 clear team inbox on membership loss (prepared)
+  20260992 join-request decision via pickup pipeline (prepared)
+  20260993 invitation dual-key (prepared, not applied)
+
+
+------------------------------------------------------------------------------
+1. PICKUP INVITATION
+------------------------------------------------------------------------------
+SQL/RPC:        create_pickup_game_invites(uuid, uuid[], text)
+                create_pickup_game_invites_from_fan_team(uuid, uuid, text)
+                (20260803, rewritten 20260938)
+Event:          INSERT public.pickup_game_invites (pending)
+Queue:          NONE — no pg_net, no Edge
+Edge:           NONE
+Auth:           n/a
+Token lookup:   n/a
+APNs sender:    NONE
+Inbox writer:   Inbox live (FanGeoActionCenter .pickupInvitation from
+                pending pickup_game_invites). Not fan_notification_inbox.
+Deep-link:      .goingPickupInvites (in-app). No APNs payload.
+Dedupe:         unique invite rows / already_invited SQL
+Logging:        [PickupInviteDebug] client; no server push log
+Retry:          n/a
+Notes:          Invitation exists in Inbox Action Needed only. No outside-app
+                banner. This is a product gap vs Team invitations.
+
+------------------------------------------------------------------------------
+2. PICKUP JOIN REQUEST (organizer: someone wants to join)
+------------------------------------------------------------------------------
+SQL/RPC:        pickup join / request insert (pickup_game_requests)
+Event:          pending request row
+Queue/Edge:     NONE for the organizer alert
+Inbox writer:   Inbox live (.joinApproval from pending organizer requests)
+APNs:           NONE to organizer
+Deep-link:      .goingHostingApprovals
+Notes:          Organizer sees Action Needed in-app only. No APNs.
+
+------------------------------------------------------------------------------
+3. PICKUP JOIN APPROVED / DECLINED (requester)
+------------------------------------------------------------------------------
+SQL/RPC:        organizer approve/reject on pickup_game_requests
+Event:          AFTER trigger pickup_game_requests_after_decision_notify
+                (20260992, prepared) INSERT pickup_game_update_events
+                change_kinds = join_request_decision
+                notification_type = join_request_approved | join_request_rejected
+Queue:          queue_pickup_game_change_push_notification(uuid)
+                latest: 20260988 dual-key
+Edge:           notify-pickup-game-change
+Auth:           authorizeSportsWorkerRequest
+                SQL: dual-key Bearer+apikey, Vault fangeo_service_role_key first
+Token lookup:   targeted user_push_tokens for recipient_user_ids (join
+                decisions skip the usual roster fan-out)
+APNs:           shared ApnsClient.send
+Inbox:          fanout_fan_notification_inbox_for_pickup_update_event
+                (rewritten in 20260992)
+Deep-link:      PickupGameChangeNotificationDeepLink
+                source=pickup_game_change_notification
+Dedupe:         pickup_game_update_events.fingerprint + inbox deduplication_key
+                + Edge claim on update event
+Logging:        [PickupGameChangePush]
+Retry:          push_delivery_status=retryable; retry_pickup_game_change_push_notifications
+Mute:           skip team mute for join decisions
+
+------------------------------------------------------------------------------
+4. PICKUP GAME CREATED (standalone pickup, not Team schedule)
+------------------------------------------------------------------------------
+SQL/RPC:        create pickup game RPCs
+Event:          generally NO pickup_game_update_events "created" for a
+                normal standalone create (no fan-out to strangers)
+Queue/Edge:     none for "you were invited" (see #1) and none for
+                "a public game appeared nearby"
+Inbox/APNs:     none
+Notes:          "Created" APNs exists for TEAM schedule create only (see #12).
+
+------------------------------------------------------------------------------
+5. PICKUP GAME UPDATED (time / location / details)
+------------------------------------------------------------------------------
+SQL/RPC:        pickup edit RPCs (20260911 lineage)
+Event:          INSERT pickup_game_update_events
+                change_kinds: start, end, location, title, status, ...
+Queue:          queue_pickup_game_change_push_notification (20260988 dual-key)
+Edge:           notify-pickup-game-change
+Auth:           shared authorizer + dual-key SQL
+Token lookup:   list_pickup_game_change_push_tokens RPC
+                (roster + invites accepted/maybe; exclude editor)
+APNs:           shared ApnsClient
+Copy:           pickup_game_change_push_alert.ts (inline, not chat_push_preview)
+Inbox:          fanout_fan_notification_inbox_for_pickup_update_event
+                kind_raw=scheduleChange destination=scheduleActivity
+Deep-link:      PickupGameChangeNotificationDeepLink → schedule / going
+Dedupe:         fingerprint on update_events; inbox deduplication_key;
+                APNs custom data includes deduplication_key (20260983)
+Logging:        [PickupGameChangePush]
+Retry:          retryable + retry_pickup_game_change_push_notifications(int)
+Mute:           fan_team_members.push_notifications_muted in Edge
+                (team-attached events)
+
+------------------------------------------------------------------------------
+6. PICKUP CANCELLED
+------------------------------------------------------------------------------
+Same pipeline as #5.
+change_kinds includes status / cancelled.
+Inbox kind_raw=eventCancellation.
+APNs title "Game cancelled" / team variant "{member} has been cancelled."
+
+------------------------------------------------------------------------------
+7. TEAM INVITATION
+------------------------------------------------------------------------------
+SQL/RPC:        invite_fan_team_members / add_fan_team_members /
+                create_fan_team / resend_fan_team_invitation
+                (20260929, 20260942)
+Event:          INSERT fan_team_invitations status=pending
+                + gen_random_uuid() event_id for push ledger
+Queue:          queue_fan_team_invitation_push_notification(uuid, uuid, text)
+                PRODUCTION last applied: 20260942 Bearer-only,
+                Vault SUPABASE_SERVICE_ROLE_KEY first
+                LOCAL PREPARED: 20260993 dual-key, fangeo_service_role_key first
+Edge:           notify-fan-team-invitation
+Auth:           Edge already authorizeSportsWorkerRequest
+                SQL (applied) Bearer-only → 401 invalid_secret class
+Token lookup:   user_push_tokens where user_id=invitee AND is_active
+APNs:           shared ApnsClient
+Copy:           buildFanTeamInvitationPushAlert (chat_push_preview.ts)
+                title=inviter identity; body="Invited you to join {Team}"
+Inbox:          Inbox live from list_my_pending_fan_team_invitations
+                NOT fan_notification_inbox. Independent of APNs (proven).
+Deep-link:      FanTeamInvitationNotificationDeepLink
+                source=team_invitation → Teams → Invites
+Dedupe:         fan_team_invitation_push_deliveries PK event_id
+                claim treats queued as claimable; sent/skipped/failed exist
+Logging:        [FanTeamInvitationPush]
+Retry:          none. 401 leaves status=queued; no cron replay.
+                New event_id required (resend / cancel+reinvite).
+Mute:           not applied (invitee is not a member yet)
+Prefs:          user_notification_preferences.fan_team_invitation_notifications_enabled
+
+------------------------------------------------------------------------------
+8. TEAM INVITATION ACCEPTED
+------------------------------------------------------------------------------
+SQL/RPC:        accept invitation RPCs (20260929/42 lineage)
+Event:          invitation status=accepted; membership insert
+Queue/Edge:     NONE to the inviter
+Inbox/APNs:     none
+Notes:          Inviter is not notified outside the roster UI.
+
+------------------------------------------------------------------------------
+9. TEAM INVITATION DECLINED
+------------------------------------------------------------------------------
+Same as #8 — no push, no inbox item for the inviter.
+
+------------------------------------------------------------------------------
+10. TEAM ANNOUNCEMENTS
+------------------------------------------------------------------------------
+SQL/RPC:        create team announcement / schedule type announcement
+                (20260976, 20260982)
+Event:          queue_team_event_created_push_notification →
+                INSERT pickup_game_update_events
+                notification_type=team_announcement
+Queue:          queue_pickup_game_change_push_notification (dual-key 20260988)
+Edge:           notify-pickup-game-change (same mega-worker as pickup edits)
+Auth/tokens/APNs/inbox/retry: same as #5
+Copy:           created-class + announcement flags
+Deep-link:      pickup_game_change_notification / scheduleActivity
+                Inbox presentation: FanGeoActionCenterTeamNotificationPresentation
+                announcement subtitle
+Notes:          Team announcements ride the pickup-change bus. No dedicated
+                notify-fan-team-announcement worker.
+
+------------------------------------------------------------------------------
+11. TEAM SCHEDULE CHANGES (time / location / RSVP reset)
+------------------------------------------------------------------------------
+SQL/RPC:        team event edit (20260974, 20260954 recipients)
+Event:          pickup_game_update_events (shared table)
+Queue/Edge:     same as #5 (notify-pickup-game-change)
+Inbox:          fanout pickup path, kind_raw=scheduleChange
+Mute:           per-team push mute in Edge
+Recipients:     active fan_team_members (not pickup_game_invites alone)
+
+------------------------------------------------------------------------------
+12. TEAM EVENT CREATED (game / practice / other formats)
+------------------------------------------------------------------------------
+SQL/RPC:        create team schedule item
+                queue_team_event_created_push_notification(uuid,uuid,uuid)
+                latest: 20260982
+Event:          pickup_game_update_events
+                notification_type = team_game_created | team_event_created
+Queue/Edge:     pickup-change pipeline
+Inbox:          yes (scheduleChange)
+APNs:           "created" class copy in pickup_game_change_push_alert.ts
+
+------------------------------------------------------------------------------
+13. TEAM EVENT CANCELLED
+------------------------------------------------------------------------------
+Same as #6/#11. Cancelled status on the shared pickup/team event row
+→ pickup_game_update_events → notify-pickup-game-change.
+Inbox kind_raw=eventCancellation.
+
+------------------------------------------------------------------------------
+14. TEAM MEMBER REMOVED
+------------------------------------------------------------------------------
+SQL/RPC:        remove member RPCs (20260958, restored 20260990)
+Event:          INSERT fan_team_member_change_events
+                change_kind=removed_from_team
+                recipient_user_ids = [removed user]
+Queue:          queue_fan_team_member_change_push_notification
+                = inbox hook + queue_fan_team_member_change_push_notification_apns
+                APNs latest: 20260990 dual-key
+Edge:           notify-fan-team-member-change
+Auth:           authorizeSportsWorkerRequest + dual-key SQL
+Token lookup:   user_push_tokens for recipient_user_ids, is_active
+APNs:           shared ApnsClient
+Copy:           member_change_push_alert.ts (reuses pickup alert date helpers)
+Inbox:          fanout_fan_notification_inbox_for_member_change_event
+                destination=teamsHome
+Deep-link:      FanTeamMemberChangeNotificationDeepLink
+Dedupe:         fan_team_member_change_push_deliveries (event_id, recipient)
+                inbox dedup key includes event_id
+Logging:        [FanTeamMemberChangePush] / [FanTeamMemberChangeDebug]
+Retry:          ledger queued/failed; no pickup-style retry cron
+Notes:          20260991 (prepared) also clears that user's team-scoped
+                inbox rows on membership loss (cleared_at).
+
+------------------------------------------------------------------------------
+15. TEAM ROLE CHANGED
+------------------------------------------------------------------------------
+Same worker/queue/inbox as #14.
+change_kind=team_role_changed
+Dedupe key includes event_id so successive role changes are distinct.
+
+------------------------------------------------------------------------------
+16. TEAM ADMINISTRATOR GRANTED / REMOVED
+------------------------------------------------------------------------------
+Separate change_kinds on fan_team_member_change_events (added 20260990):
+  team_admin_granted | team_admin_removed
+Also reflected in team_role_changed payload booleans
+(administrator / previous_administrator via fan_team_is_administrator_preset).
+Same Edge + inbox path as #14/#15.
+Mute: member-change treats admin grant/remove as mandatory (mute skipped).
+Copy/presentation: member_change_push_alert + Action Center team chrome.
+
+------------------------------------------------------------------------------
+17. TEAM MEMBER LEFT (voluntary)
+------------------------------------------------------------------------------
+SQL/RPC:        leave_fan_team (20260957, hooks 20260970/91)
+Event:          fan_team_member_left events
+Queue:          queue_fan_team_member_left_push_notification
+                = inbox_hook + queue_fan_team_member_left_push_notification_apns
+                APNs SQL still Bearer-only (20260957), Vault
+                SUPABASE_SERVICE_ROLE_KEY first — NOT dual-key
+Edge:           notify-fan-team-member-left
+Auth:           Edge uses authorizeSportsWorkerRequest
+                SQL still Bearer-only → same 401 class as invitation
+Token/APNs:     shared ApnsClient + user_push_tokens
+Inbox:          fanout_fan_notification_inbox_for_member_left_event
+Deep-link:      FanTeamMemberLeftNotificationDeepLink
+Dedupe:         fan_team_member_left_push_deliveries
+Retry:          none
+Notes:          High-risk remaining sibling of the invitation/pickup bug.
+
+------------------------------------------------------------------------------
+18. TEAM DELETED
+------------------------------------------------------------------------------
+SQL/RPC:        delete_fan_team (20260933, diagnostics 20260945)
+Event:          fan_team_deletion_events
+Queue:          queue_fan_team_deleted_push_notification
+                Bearer-only (20260945)
+Edge:           notify-fan-team-deleted
+Auth:           Edge authorizeSportsWorkerRequest; SQL Bearer-only
+Inbox:          NONE (team is gone; 20260991 would clear inbox on leave,
+                not on delete specifically)
+Deep-link:      FanTeamDeletedNotificationDeepLink
+Dedupe:         fan_team_deleted_push_deliveries
+Retry:          none
+
+------------------------------------------------------------------------------
+19. FRIEND REQUEST
+------------------------------------------------------------------------------
+SQL/RPC:        friendship_ensure_pending / related (20260921)
+Event:          pending friendship + event_id
+Queue:          queue_friend_request_push_notification
+                latest: 20260923 XOR push_worker_auth_headers
+                (apikey if sb_secret_*, else Bearer — not dual-key)
+Edge:           notify-friend-request
+Auth:           authorizeSportsWorkerRequest
+                SQL XOR-headers: if Vault is JWT and Edge only has
+                sb_secret, still 401 (same class unless JWT is mirrored)
+Token/APNs:     shared ApnsClient
+Copy:           buildFriendRequestPushAlert
+Inbox:          Inbox live (.friendRequest). Not fan_notification_inbox.
+Deep-link:      FriendRequestNotificationDeepLink → chatFriendRequests
+Dedupe:         friend_request_push_deliveries
+Retry:          none
+Prefs:          friend request notification preference if present
+
+------------------------------------------------------------------------------
+20. FRIEND REQUEST ACCEPTED
+------------------------------------------------------------------------------
+SQL/RPC:        accept friendship
+Queue/Edge:     NONE
+Inbox/APNs:     none
+Notes:          Requester is not pushed. They learn via friends list / chat.
+
+------------------------------------------------------------------------------
+21. CHAT MESSAGES (DM, group, venue, pickup/team event chat)
+------------------------------------------------------------------------------
+SQL/RPC:        send_direct_message / send_group_message (and wrappers)
+Event:          message row insert
+Queue:          queue_chat_message_push_notification(uuid, text, text)
+                queue_direct_message_push_notification(uuid) delegates
+                latest headers: 20260923 XOR push_worker_auth_headers
+Edge:           notify-chat-message (canonical)
+                notify-direct-message (compat adapter, same handler)
+Auth:           handleChatMessagePushRequest → authorizeSportsWorkerRequest
+                cron: CHAT_MESSAGE_PUSH_CRON_SECRET /
+                      DIRECT_MESSAGE_PUSH_CRON_SECRET
+Token lookup:   user_push_tokens is_active; skip sender; team mute via
+                fan_team_push_mute.ts
+APNs:           shared ApnsClient
+Copy:           buildDirectChatPushAlert / buildGroupChatPushAlert
+Inbox:          NOT fan_notification_inbox. Chat unread is the chat inbox.
+Deep-link:      ChatMessageNotificationDeepLink /
+                DirectMessageNotificationDeepLink
+Dedupe:         chat_message_push_deliveries (message + recipient)
+Logging:        [ChatMessagePush]
+Retry:          claim/exists; no cron replay
+Notes:          Polls and location shares in chat are pushed as message
+                kinds (structured preview), not a separate worker.
+
+------------------------------------------------------------------------------
+22. MENTIONS
+------------------------------------------------------------------------------
+No dedicated mention RPC, queue, Edge, inbox type, or APNs source.
+If "@name" appears in a chat message, it is only a chat push (#21).
+No mention-specific mute, deeplink, or inbox card.
+
+------------------------------------------------------------------------------
+23. POLLS
+------------------------------------------------------------------------------
+Pickup/team polls: in-app poll UI + chat/event surfaces.
+Chat polls: pushed as chat message kind via #21 (preview "poll").
+No notify-poll worker. Creating a poll does not enqueue
+pickup_game_update_events unless it is also a schedule change.
+
+------------------------------------------------------------------------------
+24. RATINGS (pickup creator rating)
+------------------------------------------------------------------------------
+SQL/RPC:        submit_pickup_creator_rating (20260877/83) — submit only
+Event:          eligibility computed client-side after game end
+Queue/Edge:     NONE
+APNs:           NONE (server)
+Local iOS:      GameReminderNotificationService schedules
+                UNMutableNotificationContent
+                source=pickup_creator_rating_notification
+Inbox:          Inbox live (.pendingPickupRating)
+Deep-link:      PickupCreatorRatingNotificationDeepLink
+                destination .goingPendingRating
+Notes:          This is a local-notification path, not APNs. It will not
+                fire if the device never scheduled it (force-quit after
+                eligibility but before schedule is OK if already scheduled;
+                new device / reinstall misses it until app runs).
+
+------------------------------------------------------------------------------
+25. LIVE / PRO GAME NOTIFICATIONS
+------------------------------------------------------------------------------
+A) Server worker
+   Edge:        pro-game-score-alert-worker
+   Auth:        LOCAL authorizeInvocation (Bearer == SERVICE_ROLE_KEY)
+   APNs:        LOCAL ApnsClient class (~line 3178) — NOT shared
+   Tokens:      user_push_tokens
+   Types:       score, final, halftime, kickoff, cards, corrections,
+                prediction results (internal fan-out in one file)
+   Inbox:       none (not FanGeo Inbox)
+   Deep-link:   ProGameNotificationDeepLink /
+                MapViewModel+ProGameNotificationDeepLink
+   Retry:       worker-internal; not the pickup retry helper
+   Logging:     worker-local
+
+B) iOS local reminders
+   GameReminderNotificationService: kickoff reminders, favorite-team
+   reminders, score/final/halftime local copies, pickup ratings (#24)
+   These can DUPLICATE or DIVERGE from the server worker.
+
+C) sync-live-matches
+   Auth: authorizeSportsWorkerRequest
+   Purpose: ingest live scores; may enqueue the score-alert worker
+   Not itself an APNs sender for social events.
+
+------------------------------------------------------------------------------
+26. PRESENCE ("Fans Live Now")
+------------------------------------------------------------------------------
+No APNs. In-app Chat / map presence. Opening chat is a navigation
+fix, not a push pipeline. live_visibility_mode is a privacy setting,
+not a notification type.
+
+------------------------------------------------------------------------------
+27. PROFILE POKE
+------------------------------------------------------------------------------
+SQL/RPC:        poke_profile(uuid) (20260925)
+Event:          INSERT profile_pokes
+Queue:          queue_profile_poke_push_notification — Bearer-only
+Edge:           notify-poke
+Auth:           Edge authorizeSportsWorkerRequest; SQL Bearer-only
+Token/APNs:     shared ApnsClient
+Copy:           buildPokePushAlert
+Inbox:          Inbox live (.poke / hasUnseenPokes) + destination accountPokes
+                Not reliably written to fan_notification_inbox
+Deep-link:      PokeNotificationDeepLink
+Dedupe:         profile_poke_push_deliveries PK poke_id
+Retry:          none
+Prefs:          poke_notifications_enabled
+Notes:          Same Bearer-only 401 risk as invitation.
+
+------------------------------------------------------------------------------
+28. FANGEO OFFICIAL ANNOUNCEMENT
+------------------------------------------------------------------------------
+SQL/RPC:        admin publish + queue_fangeo_announcement_push_notification
+                (20260833 / 20260834)
+Queue headers:  Bearer-only + optional FANGEO_ANNOUNCEMENT_PUSH_CRON_SECRET
+Edge:           notify-fangeo-announcement
+Auth:           LOCAL authorizeInvocation (Bearer == SERVICE_ROLE_KEY)
+                does NOT use authorizeSportsWorkerRequest
+APNs:           shared ApnsClient
+Inbox:          none (or not the durable fan_notification_inbox path)
+Deep-link:      FanGeoAnnouncementNotificationDeepLink
+Dedupe:         announcement delivery tracking inside the worker
+Retry:          limited
+Notes:          Highest auth-fragility among broadcast workers.
+
+------------------------------------------------------------------------------
+29. SUPPORT REPLY (to the ticket owner)
+------------------------------------------------------------------------------
+SQL/RPC:        admin_send_support_message →
+                queue_support_reply_push_notification
+                (20260829–20260832)
+Queue:          Bearer-only + SUPPORT_REPLY_PUSH_CRON_SECRET
+Edge:           notify-support-reply
+Auth:           LOCAL authorizeInvocation
+APNs:           shared ApnsClient
+Copy:           hardcoded "FanGeo Support replied"
+Inbox:          none (support ticket UI)
+Deep-link:      SupportReplyNotificationDeepLink
+Dedupe:         per conversation/message in worker
+Notes:          Same 401 class if Vault JWT ≠ hosted SERVICE_ROLE_KEY.
+
+------------------------------------------------------------------------------
+30. SUPPORT REQUEST (user → admin)
+------------------------------------------------------------------------------
+Edge:           notify-support-request
+Channel:        Resend EMAIL to ADMIN_EMAIL_TO
+Auth:           user JWT (auth.getUser), not sports worker
+APNs/Inbox:     none
+Not a fan-facing push.
+
+------------------------------------------------------------------------------
+31. FANGEO+ AWARD / BUSINESS PRO AWARD
+------------------------------------------------------------------------------
+SQL:            queue_fangeo_plus_award_push_notification (20260841)
+                queue_business_pro_award_push_notification (20260842)
+Queue:          Bearer-only
+Edge:           notify-fangeo-plus-award
+                notify-business-pro-award
+Auth:           LOCAL authorizeInvocation
+APNs:           shared ApnsClient
+Inbox:          none
+Deep-link:      FanGeoPlusAwardNotificationDeepLink /
+                BusinessProAwardNotificationDeepLink
+Dedupe:         award-specific delivery rows
+
+------------------------------------------------------------------------------
+32. VENUE CLAIM (admin email, not fan APNs)
+------------------------------------------------------------------------------
+Edge:           notify-venue-claim, review-venue-claim,
+                venue-claim-approve, venue-claim-reject
+Channel:        admin email (Resend)
+Inbox live:     .businessClaim Action Needed for the business user
+                (client projection, not APNs)
+APNs:           none
+
+------------------------------------------------------------------------------
+33. MODERATION / COMMENT ALERTS
+------------------------------------------------------------------------------
+Edge:           notify-moderation-report, notify-comment-moderation-alert
+Channel:        admin email
+APNs:           none
+SQL:            queue_moderation_report_email (pg_net email, not APNs)
+
+------------------------------------------------------------------------------
+34. GROUP CHAT INVITATION
+------------------------------------------------------------------------------
+SQL:            20260868 group invitations (pending, 30-day expiry)
+Queue/Edge:     NONE found
+Inbox/APNs:     none (in-app group invite UI only)
+
+------------------------------------------------------------------------------
+35. ACCOUNT / BUSINESS DELETION JOBS
+------------------------------------------------------------------------------
+queue_account_deletion_finalize / queue_business_account_deletion_finalize
+Edge: finalize-account-deletion / finalize-business-account-deletion
+Not user-facing notifications. Privileged ops workers.
+
+
+==============================================================================
+INVENTORY MATRIX (compressed)
+==============================================================================
+
+Type                         Inbox          APNs worker                      SQL headers        Shared auth
+---------------------------  -------------  -------------------------------  -----------------  ------------
+Pickup invite                live AN        NONE                             —                  —
+Join request (organizer)     live AN        NONE                             —                  —
+Join approved/declined       table (92)     notify-pickup-game-change        dual-key 88        YES
+Pickup updated               table          notify-pickup-game-change        dual-key 88        YES
+Pickup cancelled             table          notify-pickup-game-change        dual-key 88        YES
+Team invite                  live AN        notify-fan-team-invitation       Bearer 42 / 93*    YES
+Team invite accepted         none           NONE                             —                  —
+Team invite declined         none           NONE                             —                  —
+Team announcement            table          notify-pickup-game-change        dual-key 88        YES
+Team schedule change         table          notify-pickup-game-change        dual-key 88        YES
+Team event created           table          notify-pickup-game-change        dual-key 88        YES
+Team event cancelled         table          notify-pickup-game-change        dual-key 88        YES
+Member removed               table          notify-fan-team-member-change    dual-key 90        YES
+Role / admin change          table          notify-fan-team-member-change    dual-key 90        YES
+Member left                  table          notify-fan-team-member-left      Bearer 57          YES
+Team deleted                 none           notify-fan-team-deleted          Bearer 45          YES
+Friend request               live AN        notify-friend-request            XOR 23             YES
+Friend accepted              none           NONE                             —                  —
+Chat / DM / group            chat unread    notify-chat-message (+ DM stub)  XOR 23             YES
+Mentions                     none           NONE                             —                  —
+Polls                        chat/in-app    via chat if message              XOR 23             YES
+Ratings                      live AN        iOS LOCAL only                   —                  —
+Pro/live scores              none           pro-game-score-alert-worker      cron/Bearer        LOCAL
+Presence                     none           NONE                             —                  —
+Poke                         live           notify-poke                      Bearer 25          YES
+FanGeo announcement          none           notify-fangeo-announcement       Bearer 33/34       LOCAL
+Support reply                ticket UI      notify-support-reply             Bearer 32          LOCAL
+Plus / Pro awards            none           notify-*-award                   Bearer 41/42       LOCAL
+Venue claim                  live AN        email only                       —                  —
+Moderation                   none           email only                       —                  —
+Group invite                 in-app         NONE                             —                  —
+
+* 20260993 prepared, not applied.
+AN = Action Needed tab. table = fan_notification_inbox.
+
+
+==============================================================================
+PART 2 — PIPELINE DIAGRAM
+==============================================================================
+
+CURRENT (as implemented)
+
+  [Business RPC / trigger]
+           |
+           +--(optional) INSERT domain row (invitation, request, message, poke)
+           |
+           +--(some types) INSERT event table
+           |     pickup_game_update_events
+           |     fan_team_member_change_events
+           |     fan_team_member_left_* / deletion_events
+           |     * _push_deliveries ledgers
+           |
+           +--(SOME types) fanout / upsert_fan_notification_inbox  <== SHARED INBOX WRITER
+           |     ALWAYS independent of APNs success  (GOOD)
+           |
+           +--(SOME types) SKIP inbox; iOS projects LIVE rows   <== SECOND INBOX SOURCE
+           |     team invites, pickup invites, friend requests,
+           |     join approvals, ratings, pokes
+           |
+           +--(SOME types) queue_*_push_notification  <== MANY COPIED HELPERS
+                 |  Vault URL + secret lookup (TWO orderings)
+                 |  headers: dual-key | XOR | Bearer-only     <== FRAGILE
+                 |  net.http_post /functions/v1/<worker>
+                 v
+           [pg_net] ----HTTP----> [Edge Function]
+                                      |
+                                      +-- auth: authorizeSportsWorkerRequest  <== SHARED (good workers)
+                                      |    OR local authorizeInvocation       <== LEGACY
+                                      |
+                                      +-- claim delivery ledger (per-table, copied)
+                                      +-- prefs / mute (inconsistent)
+                                      +-- token query (copied .from("user_push_tokens"))
+                                      +-- copy builder (chat_push_preview OR pickup alert OR hardcoded)
+                                      +-- ApnsClient.fromEnvironment().send()  <== SHARED
+                                      |    EXCEPT pro-game-score-alert-worker local clone
+                                      +-- invalidate bad tokens
+                                      +-- log prefix per worker
+                                      v
+                                    APNs  (sandbox vs production per token.environment)
+
+  PARALLEL iOS LOCAL STACK (does not use SQL/Edge)
+    GameReminderNotificationService
+      → UNUserNotificationCenter
+      → ratings, game reminders, some pro-game cards
+
+  PARALLEL EMAIL STACK
+    notify-support-request / notify-venue-claim / notify-moderation-report
+      → Resend (admin)
+
+HIGHLIGHTS
+
+  SHARED
+    - _shared/apns_client.ts (most workers)
+    - _shared/sports_worker_auth.ts (newer social/team workers)
+    - _shared/chat_push_preview.ts (chat, friend, poke, team invite)
+    - _shared/fan_team_push_mute.ts (chat + pickup/team change)
+    - upsert_fan_notification_inbox
+    - user_push_tokens table + environment column
+    - iOS deep-link *NotificationDeepLink.swift pattern (repeated, not shared type)
+
+  DUPLICATED
+    - ~12 queue_* SQL functions (Vault lookup + pg_net boilerplate)
+    - delivery claim insert/update per worker
+    - token loop + invalidate
+    - logging helpers
+    - authorizeInvocation copies (announcement, support, awards, pro-game)
+
+  INCONSISTENT
+    - SQL headers: dual-key vs XOR vs Bearer-only
+    - Vault order: fangeo_service_role_key first vs SUPABASE_SERVICE_ROLE_KEY first
+    - Inbox: table fan-out vs live query vs none
+    - Retry: only pickup has retry_pickup_game_change_push_notifications
+    - Auth: shared authorizer vs local compare
+    - Copy: shared preview helpers vs pickup_game_change_push_alert.ts vs hardcoded
+    - Deep-link keys: source/type/ids differ per family
+    - Cron secret names: one per worker (~10 secrets)
+
+  LEGACY
+    - notify-direct-message (compat stub; OK to keep)
+    - push_worker_auth_headers XOR helper (20260923) — superseded conceptually
+      by dual-key but still used by chat + friend
+    - local authorizeInvocation workers
+    - pro-game-score-alert-worker embedded ApnsClient
+    - GoingActionCenter leftover models (Going Action Needed UI removed;
+      FanGeo Inbox is source of truth)
+
+  DEAD / UNUSED FOR FAN PUSH
+    - notify-support-request (email)
+    - venue-claim / moderation email workers
+    - finalize-* deletion workers
+    - import-games / cleanup-expired-game-social (ops)
+
+  NOTIFICATION-SPECIFIC (should remain specific)
+    - recipient selection
+    - title/body
+    - mute/prefs
+    - deep-link destination
+    - inbox category (Action Needed vs Notifications)
+    - dedupe key shape
+
+
+==============================================================================
+PART 3 — CANONICAL COMPONENTS
+==============================================================================
+
+1) One canonical APNs sender
+   Status: MOSTLY CANONICAL
+   Evidence: _shared/apns_client.ts used by invitation, pickup-change,
+   member-change, member-left, deleted, friend, poke, chat, announcement,
+   support-reply, awards.
+   Exception: pro-game-score-alert-worker ships a second ApnsClient.
+   Exception: iOS GameReminderNotificationService is a third sender
+   (local, not APNs HTTP).
+
+2) One canonical authorization helper
+   Status: DUPLICATED / NEEDS CONSOLIDATION
+   Shared: authorizeSportsWorkerRequest (correct: JWT Bearer, sb_secret
+   apikey, cron). Used by the newer social/team workers.
+   Legacy: local authorizeInvocation in
+     notify-fangeo-announcement
+     notify-support-reply
+     notify-fangeo-plus-award
+     notify-business-pro-award
+     pro-game-score-alert-worker
+   SQL not aligned: only 3 queues send dual-key (pickup, member-change,
+   invitation-prepared). Chat/friend use XOR. Others Bearer-only.
+
+3) One canonical token lookup
+   Status: DUPLICATED
+   Pattern is the same query copied everywhere:
+     user_push_tokens where user_id in (...) and is_active = true
+   Pickup-change uses list_pickup_game_change_push_tokens RPC instead
+   (good for recipient rules, still a second access path).
+   No shared TypeScript helper like loadActivePushTokens(admin, userIds).
+
+4) One canonical queue format
+   Status: NEEDS CONSOLIDATION
+   Three header strategies, two Vault orderings, many body shapes:
+     {update_event_id}
+     {invitation_id, event_id, kind}
+     {event_id}
+     {message_id, message_source, chat_type}
+     {friendship_id, event_id}
+     {poke_id}
+     {announcement_id}
+     {conversation_id, message_id}
+   push_worker_auth_headers (20260923) was an attempt at canonical
+   headers but is XOR, not dual-key, and was not adopted by later
+   team/pickup queues (they inlined dual-key instead).
+
+5) One canonical inbox writer
+   Status: MOSTLY CANONICAL WRITER, DUPLICATED SOURCES
+   Writer: upsert_fan_notification_inbox is the only table writer.
+   Fanout helpers: pickup, member-change, member-left.
+   But Action Needed also merges LIVE domain queries (invites, friends,
+   join approvals, ratings). That split is a product feature (durable
+   vs pending-state), not a bug — but it is a second pipeline.
+
+6) One canonical logging system
+   Status: DUPLICATED
+   Per-worker LOG_PREFIX strings. sportsWorkerAuthLog is shared for
+   auth only. No shared delivery logger (token id, env, APNs status,
+   reason, apns-id) — each worker copies the loop.
+
+7) One canonical retry strategy
+   Status: NEEDS CONSOLIDATION
+   Only pickup_game_update_events has retryable +
+   retry_pickup_game_change_push_notifications.
+   Invitation/member-left/poke/friend/chat: fire-and-forget.
+   A 401 leaves ledger=queued and never replays.
+
+8) One canonical dedupe strategy
+   Status: DUPLICATED
+   Inbox: (user_id, deduplication_key) unique — good, but key recipes
+   differ per fanout.
+   APNs: one delivery table per worker (8+ tables).
+   Pickup: fingerprint on event row.
+   Invitation: event_id UUID generated per invite/resend.
+   Chat: (message_id, recipient).
+   No shared "exactly-once per (type, subject, recipient)" helper.
+
+9) One canonical deep-link model
+   Status: DUPLICATED
+   Common idea: userInfo.source + entity ids. ~15 Swift files, each
+   with its own keys (invitation_id vs pickup_game_id vs event_id vs
+   friendship_id). No shared NotificationDeepLink protocol.
+   Inbox destinations (teamsInvites, scheduleActivity, teamsHome, …)
+   are a second mapping that must stay in sync with APNs custom data.
+
+
+==============================================================================
+PART 4 — IDENTIFY FRAGILITY
+==============================================================================
+
+This is the production failure mode already proven three times:
+
+  Inbox / domain write succeeds
+    → queue runs
+    → pg_net POSTs with a header the hosted Edge will not accept
+    → 401 invalid_secret
+    → token lookup never runs
+    → APNs never sent
+    → user sees Inbox, not iOS banner
+
+Places a type can succeed while a sibling fails
+(because it bypasses the common infrastructure):
+
+A) SQL AUTH HEADERS (highest current risk)
+   Dual-key (safe with shared authorizer):
+     queue_pickup_game_change_push_notification          20260988
+     queue_fan_team_member_change_push_notification_apns 20260990
+     queue_fan_team_invitation_push_notification         20260993 PREPARED
+   XOR (unsafe if Vault JWT and Edge only has sb_secret):
+     queue_chat_message_push_notification                20260923
+     queue_direct_message_push_notification              20260923
+     queue_friend_request_push_notification              20260923
+   Bearer-only (same invitation bug class):
+     queue_profile_poke_push_notification                20260925
+     queue_fan_team_member_left_push_notification_apns   20260957
+     queue_fan_team_deleted_push_notification            20260945
+     queue_support_reply_push_notification               20260832
+     queue_fangeo_announcement_push_notification         20260834
+     queue_fangeo_plus_award_push_notification           20260841
+     queue_business_pro_award_push_notification          20260842
+
+B) EDGE AUTH IMPLEMENTATION
+   Shared authorizer: invitation, pickup-change, member-change,
+   member-left, team-deleted, friend, poke, chat handler.
+   Local Bearer==SERVICE_ROLE_KEY: announcement, support-reply,
+   plus-award, business-pro-award, pro-game-score-alert-worker.
+   Dual-key SQL cannot save a worker that never reads `apikey`.
+
+C) VAULT SECRET NAME / ORDER
+   Safe order (fangeo_service_role_key first): 88, 90, 93.
+   Unsafe order (SUPABASE_SERVICE_ROLE_KEY first): 42, 45, 57, 25,
+   older announcement/support/award queues.
+   If Vault SUPABASE_SERVICE_ROLE_KEY was rotated to sb_secret_* and
+   fangeo_service_role_key still holds the JWT, Bearer-only + first-match
+   can send the wrong class.
+
+D) QUEUE PAYLOAD SHAPES
+   Each worker parses a different JSON body. A shared retry cron cannot
+   blindly re-POST without a common envelope
+   ({ worker, event_id, payload }).
+
+E) TOKEN QUERIES
+   Most: is_active + user_id.
+   Pickup-change: dedicated RPC (correct for membership/invite rules).
+   Join decisions: targeted ids, skip mute.
+   Inconsistency is OK for recipient RULES, not for the token table
+   access itself (should be one helper).
+
+F) APNs ENVIRONMENT
+   Shared client uses token.environment (sandbox|production) per row.
+   Local pro-game client + iOS local notifications can disagree with
+   that mapping. Stale active tokens still 200 from APNs.
+
+G) LOGGING
+   Cannot grep one prefix for "all APNs 401s". Invitation logs
+   [FanTeamInvitationPush], pickup [PickupGameChangePush], etc.
+   Auth failures look the same but live in different function logs.
+
+H) RETRY
+   Pickup can be replayed. Invitation/member-left/poke cannot.
+   After a platform auth outage, only pickup heals.
+
+I) DEDUPE
+   Re-invite vs resend vs edit fingerprint vs message id — all custom.
+   Risk of duplicate APNs if a worker is retried without claim, or
+   missed APNs if claim treats queued as already_claimed (invitation
+   specifically treats queued as claimable — good and unique).
+
+J) INBOX vs APNs COVERAGE
+   Types with Inbox but no APNs: pickup invite, join request (organizer),
+   ratings (local only), friend accept (neither), team invite accept.
+   Types with APNs but no durable inbox: chat, poke (mostly live),
+   team deleted, awards, announcements, support reply, pro-game.
+   Users experience "sometimes Inbox, sometimes banner, sometimes both,
+   sometimes neither" depending on type — not a single product rule.
+
+K) iOS LOCAL vs SERVER
+   Ratings and some live-game alerts can appear from local scheduling
+   even when the server worker is down — and can miss when the app
+   never ran. Do not use local notifications as a workaround for
+   social APNs (standing product rule).
+
+
+==============================================================================
+PART 5 — RECOMMENDED ARCHITECTURE
+==============================================================================
+
+Do not merge all Edge functions into one mega-function in a single
+cutover. Keep thin worker entrypoints (or one worker with a type
+switch) but share EVERYTHING below the type plugin.
+
+Target:
+
+  Business event (RPC / trigger)
+       │
+       ▼
+  Canonical emit_notification_event(type, payload, recipients, ...)
+       │  writes notification_events (one table)
+       │
+       ├──────────────────────────────┐
+       ▼                              ▼
+  Canonical inbox fan-out        Canonical push enqueue
+  upsert_fan_notification_inbox  queue_notification_push
+  (skip if type is live-only     (always dual-key headers
+   Action Needed: invites,        + fangeo_service_role_key first
+   friend requests, ratings)      + both cron header names)
+       │                              │
+       ▼                              ▼
+  FanGeo Inbox                   pg_net → notify-fangeo-push
+  Action Needed | Notifications       │
+                                      ▼
+                               authorizeSportsWorkerRequest
+                                      │
+                                      ▼
+                               load plugin(type)
+                                 recipients (if not already snapshotted)
+                                 title/body
+                                 deep-link custom data
+                                 mute / prefs
+                                 inbox category (already written)
+                                 dedupe key
+                                      │
+                                      ▼
+                               loadActivePushTokens(userIds)
+                               ApnsClient.send (shared only)
+                                      │
+                                      ▼
+                               delivery_log
+                                 (event_id, user_id, token_id, env,
+                                  http_status, apns_reason, apns_id)
+                               retry if retryable (auth/network/5xx)
+                               do not retry 410/Unregistered (invalidate)
+
+Notification-specific plugin fields ONLY:
+  - recipients
+  - title / body
+  - deep-link
+  - mute rules
+  - notification category (Action Needed vs Notifications vs chat-only)
+  - dedupe key
+
+Shared, never reimplemented:
+  - Vault lookup + dual-key headers
+  - worker auth
+  - token load + environment routing
+  - APNs client
+  - delivery claim
+  - structured logs
+  - retry cron
+  - inbox upsert
+
+Live Action Needed types (team invite, pickup invite, friend request,
+join approval, pending rating) should KEEP querying live domain state
+for the card (so accept/decline/expiry disappear immediately). They
+may ALSO write a durable Notifications-tab history row if product
+wants history, but APNs must still go through the canonical queue.
+
+Chat should stay on the same auth/token/APNs/retry backbone even if
+it does not write fan_notification_inbox (chat unread is the inbox).
+
+Pro-game / live scores can stay a separate *content* plugin but MUST
+drop the local ApnsClient and local authorizeInvocation.
+
+iOS local notifications remain valid for TIME-BASED reminders
+(kickoff in 30 minutes) that cannot wait for a server event. They
+must not replace server APNs for social/team/pickup events.
+
+
+==============================================================================
+PART 6 — RISK ANALYSIS
+==============================================================================
+
+Implementation difficulty: MEDIUM–HIGH
+  Not because APNs is hard — because there are ~15 workers, ~12 queues,
+  ~8 delivery tables, and two inbox sources. The shared pieces already
+  exist (ApnsClient, authorizer, inbox upsert). The work is mechanical
+  alignment plus careful recipient/copy tests.
+
+Regression risk: HIGH if done as one rewrite
+  Chat volume is high; a shared worker bug would silence DMs, group
+  chat, team chat, pickup chat at once. Pickup/team schedule already
+  shares one worker — that concentration already bit copy/recipient
+  bugs. Auth-header-only changes are LOW risk (proven by 88/90/93).
+
+Rollout strategy: MULTIPLE PHASES (required)
+
+  Phase 0 — Stop the bleeding (days)
+    Apply prepared 20260993 (invitation dual-key) + redeploy
+    notify-fan-team-invitation.
+    Forward-migrate member-left, team-deleted, poke to dual-key
+    (same SQL pattern as 88/90/93). Do not touch copy or recipients.
+    Redeploy those three Edge functions only if comments/auth import
+    need confirming they already use authorizeSportsWorkerRequest
+    (member-left, deleted, poke already do).
+
+  Phase 1 — Remaining SQL headers (1 week)
+    Chat + friend: change push_worker_auth_headers to dual-key
+    (Bearer AND apikey) OR stop using it and inline dual-key.
+    Announcement / support-reply / awards: dual-key SQL + migrate
+    those Edge functions from authorizeInvocation to
+    authorizeSportsWorkerRequest. Do not weaken auth.
+
+  Phase 2 — Shared SQL queue primitive (1–2 weeks)
+    CREATE queue_fangeo_push(p_function text, p_body jsonb, ...)
+    that owns Vault + dual-key + cron headers + request_id.
+    Thin wrappers keep current function names so RPCs do not change.
+    One migration; no behavior change if bodies/URLs stay identical.
+
+  Phase 3 — Shared worker runtime (2–3 weeks)
+    Extract loadActivePushTokens, claimDelivery(generic table or
+    one delivery_log), sendToTokens, sportsWorkerAuthLog+delivery log.
+    Point existing workers at the helpers WITHOUT merging them yet.
+    Delete pro-game local ApnsClient.
+
+  Phase 4 — Optional single worker (later)
+    notify-fangeo-push with type switch + plugins.
+    Keep old function URLs as 3-line adapters (like notify-direct-message)
+    so SQL does not have to move in the same deploy.
+
+  Phase 5 — Product coverage (separate, optional)
+    Decide which gaps are product vs bugs:
+      pickup invite APNs
+      organizer join-request APNs
+      friend accepted APNs
+      team invite accepted APNs
+      mentions
+    Each is a plugin + inbox rule, not a new pipeline.
+
+Do NOT combine Phase 0/1 with copy/deeplink/inbox redesigns.
+That is how the last regressions happened.
+
+Estimated effort
+  Phase 0:  0.5–1 day remaining (93 apply + 3 sibling dual-key migrations)
+  Phase 1:  2–4 days
+  Phase 2:  3–5 days
+  Phase 3:  1–2 weeks
+  Phase 4:  1 week (optional)
+  Phase 5:  product-driven
+  Tests:    Deno auth/header/copy tests per worker + iOS Debug only if
+            deeplink keys change (they should not in 0–3)
+
+App rebuild: NO for phases 0–3 if custom data keys stay stable.
+
+
+==============================================================================
+PART 7 — FINAL RECOMMENDATION
+==============================================================================
+
+1) Should FanGeo move to one canonical notification infrastructure?
+
+   YES — incrementally. The destination is one emit → inbox + queue →
+   one authorizer → plugin copy → one ApnsClient → one delivery log.
+   The destination is NOT "one giant Edge file next week."
+
+2) Is the current architecture maintainable long-term?
+
+   NO. It is already producing the same production defect on every
+   worker that still uses Bearer-only SQL or local Edge auth. Adding
+   "one more notify-*" will copy the obsolete pattern unless a shared
+   queue primitive exists. Pickup-change is already a mega-worker
+   carrying pickup edits, team schedule, announcements, and join
+   decisions — that is consolidation without a plugin boundary, which
+   is the wrong kind of consolidation (high coupling, shared failure).
+
+3) Biggest weaknesses today
+
+   - Three SQL auth header dialects (dual-key / XOR / Bearer-only)
+   - Two Edge auth implementations (shared vs local compare)
+   - Two Vault secret orderings
+   - Retry only on pickup
+   - 401s leave queued rows that never replay
+   - Two inbox sources (table vs live) undocumented as a platform rule
+   - Second ApnsClient in pro-game-score-alert-worker
+   - ~10 cron secrets and ~8 delivery tables
+   - Coverage holes: pickup invite, join-request-to-organizer, friend
+     accept, team invite accept, mentions — look like "notification
+     types" in the product but are not on the APNs bus
+   - iOS local ratings/reminders can be mistaken for APNs success
+
+4) Biggest benefits of consolidation
+
+   - One place to fix auth (the last three P0s disappear as a class)
+   - One retry/ops story after Edge or APNs outages
+   - One log query for "did this user get a banner"
+   - New types become a plugin (recipients + copy + deeplink + mute)
+     instead of a new migration + new Edge function + new Swift file
+     + new cron secret
+   - Inbox and APNs stay independent (already correct) but both are
+     invoked from the same emit helper so one cannot be forgotten
+   - Dual-key + shared authorizer stays fail-closed (no weaker auth)
+
+5) Would this reduce future notification bugs?
+
+   YES for infrastructure bugs (auth, tokens, environment, retry,
+   "Inbox worked but no banner").
+   PARTIALLY for product bugs (wrong recipients, wrong copy, wrong
+   mute). Those stay in plugins and still need tests — but they stop
+   being blocked by a 401 that looks like a token problem.
+
+
+==============================================================================
+APPENDIX A — EDGE FUNCTION CATALOG
+==============================================================================
+
+APNs / user-facing push
+  notify-pickup-game-change          shared auth, shared APNs, inbox via SQL
+  notify-fan-team-invitation         shared auth, shared APNs, inbox live
+  notify-fan-team-member-change      shared auth, shared APNs, inbox SQL
+  notify-fan-team-member-left        shared auth, shared APNs, inbox SQL
+  notify-fan-team-deleted            shared auth, shared APNs, no inbox
+  notify-friend-request              shared auth, shared APNs, inbox live
+  notify-poke                        shared auth, shared APNs, inbox live
+  notify-chat-message                shared auth, shared APNs, chat inbox
+  notify-direct-message              adapter → chat handler
+  notify-fangeo-announcement         LOCAL auth, shared APNs
+  notify-support-reply               LOCAL auth, shared APNs
+  notify-fangeo-plus-award           LOCAL auth, shared APNs
+  notify-business-pro-award          LOCAL auth, shared APNs
+  pro-game-score-alert-worker        LOCAL auth, LOCAL ApnsClient
+
+Email / admin (not fan APNs)
+  notify-support-request
+  notify-venue-claim
+  notify-moderation-report
+  notify-comment-moderation-alert
+  review-venue-claim / venue-claim-approve / venue-claim-reject
+
+Ops (not notifications)
+  sync-live-matches
+  import-games
+  cleanup-expired-game-social
+  finalize-account-deletion
+  finalize-business-account-deletion
+
+
+==============================================================================
+APPENDIX B — iOS DEEP-LINK FILES
+==============================================================================
+
+  FanTeamInvitationNotificationDeepLink.swift
+  FanTeamMemberChangeNotificationDeepLink.swift
+  FanTeamMemberLeftNotificationDeepLink.swift
+  FanTeamDeletedNotificationDeepLink.swift
+  PickupGameChangeNotificationDeepLink.swift
+  PickupCreatorRatingNotificationDeepLink.swift   (local)
+  FriendRequestNotificationDeepLink.swift
+  ChatMessageNotificationDeepLink.swift
+  DirectMessageNotificationDeepLink.swift
+  PokeNotificationDeepLink.swift
+  FanGeoAnnouncementNotificationDeepLink.swift
+  SupportReplyNotificationDeepLink.swift
+  FanGeoPlusAwardNotificationDeepLink.swift
+  BusinessProAwardNotificationDeepLink.swift
+  ProGameNotificationDeepLink.swift
+  MapViewModel+ProGameNotificationDeepLink.swift
+  MapViewModel+PokeNotificationDeepLink.swift
+  MapViewModel+FanGeoAnnouncementNotificationDeepLink.swift
+  MapViewModel+SupportReplyNotificationDeepLink.swift
+  MapViewModel+FanGeoPlusAwardNotificationDeepLink.swift
+  MapViewModel+BusinessProAwardNotificationDeepLink.swift
+
+Inbox destinations (separate from APNs keys):
+  teamsInvites, goingPickupInvites, chatFriendRequests,
+  goingHostingApprovals, goingPendingRating, scheduleActivity,
+  teamsHome, accountPokes, accountBusinessClaim
+
+
+==============================================================================
+APPENDIX C — SHARED CODE PATHS
+==============================================================================
+
+  supabase/functions/_shared/apns_client.ts
+  supabase/functions/_shared/sports_worker_auth.ts
+  supabase/functions/_shared/sports_worker_auth_test.ts
+  supabase/functions/_shared/service_role_auth.ts
+  supabase/functions/_shared/service_role_dual_key_auth_test.ts
+  supabase/functions/_shared/chat_push_preview.ts
+  supabase/functions/_shared/chat_message_push_handler.ts
+  supabase/functions/_shared/fan_team_push_mute.ts
+  supabase/functions/notify-pickup-game-change/pickup_game_change_push_alert.ts
+  supabase/functions/notify-fan-team-member-change/member_change_push_alert.ts
+  GameOn/FanGeoNotificationInboxService.swift
+  GameOn/FanGeoActionCenterModels.swift
+  GameOn/GameReminderNotificationService.swift   (local, parallel)
+
+
+==============================================================================
+APPENDIX D — WHAT NOT TO DO
+==============================================================================
+
+  - Do not add Swift local-notification workarounds for Team/Pickup/
+    Friend social events.
+  - Do not create a second invitation or pickup APNs sender.
+  - Do not fold Inbox into APNs or vice versa (independence is correct).
+  - Do not weaken worker authentication to "make push work."
+  - Do not edit already-applied migrations; forward-migrate only.
+  - Do not rewrite notify-pickup-game-change into the shared runtime
+    in the same PR as auth-header fixes.
+  - Do not assume token failure until Edge authorization is proven
+    successful (standing incident rule).
+
+
+==============================================================================
+APPENDIX E — ADDENDA (post-inventory pass)
+==============================================================================
+Corrections and extra facts from the SQL-queue, Edge-worker, and iOS
+deep-link inventories. No application code was changed for this appendix.
+
+E1. Inbox is SQL-written, never Edge-written
+  No notify-* function INSERTs fan_notification_inbox.
+  notify-fan-team-member-change only READS existing inbox rows to stamp
+  inbox_id / deduplication_key onto APNs custom data.
+  notify-pickup-game-change sends inbox_dedupe_key on the payload only.
+
+E2. config.toml verify_jwt coverage is incomplete
+  Listed with verify_jwt=false: import-games, venue-claim-approve/reject,
+  sync-live-matches, pro-game-score-alert-worker, notify-support-reply,
+  notify-fangeo-announcement, notify-fangeo-plus-award,
+  notify-business-pro-award.
+  NOT listed (comments say deploy --no-verify-jwt): pickup-change,
+  invitation, member-change, member-left, team-deleted, friend, poke,
+  chat-message, direct-message.
+  Hosted default verify_jwt=true can 401 pg_net even after dual-key SQL
+  if those functions were not deployed with --no-verify-jwt.
+  Phase 0/1 must confirm deploy flags, not only headers.
+
+E3. Claim / ledger strength (Edge)
+  Strong: pickup (event claim + per-user already_sent), invitation
+  (queued-aware claim_state), member-change/left/deleted, chat unique
+  row, awards CAS push_attempted_at, score delivery table.
+  None: notify-fangeo-announcement (full re-fanout on re-invoke),
+  notify-support-reply (no ledger).
+
+E4. Pro-game score worker has no APNs custom data
+  Local ApnsClient.send(token, alert) only — no source/type/ids.
+  iOS ProGameNotificationDeepLink therefore cannot route server score
+  pushes by payload. Local 1-second GameReminder notifications for
+  final/halftime/score/card often also lack userInfo, so tap does not
+  open Schedule. This is a deep-link hole, not just a duplicate sender.
+
+E5. Join-decision token path skips pickup RPC filters
+  Targeted user_push_tokens query for join_request_approved/rejected
+  does not use list_pickup_game_change_push_tokens, so it skips that
+  RPC’s prefs / banned / deleted filters. Intentional targeting, but
+  not the same safety net as the default roster path.
+
+E6. notify-pickup-game-change log uses auth.source
+  index.ts ~667 interpolates auth.source while the in-scope result is
+  invocation. That log line can throw after a successful send.
+  Not an APNs-delivery bug; it is a worker-runtime footgun.
+
+E7. 20260923 restored the DM Edge URL
+  queue_direct_message_push_notification POSTs notify-direct-message
+  (compat adapter). queue_chat_message_push_notification POSTs
+  notify-chat-message. Both share chat_message_push_handler.ts.
+  XOR push_worker_auth_headers still applies to both.
+
+E8. iOS foreground suppress (FanSpotApp willPresent)
+  Always suppress banner: team_invitation, team_deleted,
+  member_left_team, member_change, direct_message, friend_request, poke.
+  Conditional: chat_message only if that conversation is already open.
+  Pickup/team schedule change is NOT suppressed (banner + inbox ingest).
+  Inbox ingest skips Action Needed sources so they never land on the
+  Notifications tab: team_invitation, friend_request, pickup invite,
+  pickup_creator_rating, join_request.
+
+E9. No UNNotificationCategory
+  Zero setNotificationCategories / actionable Accept-Decline buttons.
+  All interaction is tap → deep link.
+
+E10. Local reminder deep-link holes
+  Venue “Game starting soon” (fangeo.gameReminder.) has no source key.
+  Most pro live locals fire UNTimeIntervalNotificationTrigger(1) with
+  no userInfo. Rating reminder and pro kickoff/favorite reminders do
+  stamp a source.
+
+E11. Highest-risk leftover 401 class (unchanged, confirmed)
+  Dual-key + fangeo_service_role_key first: pickup 88, member-change 90,
+  invitation 93 (prepared).
+  Still Bearer-only or XOR: member-left 57, team-deleted 45, poke 25,
+  support-reply 32, announcement 34, awards 41/42, chat/friend 23,
+  deletion finalize.
+  Family B Edge (announcement, support-reply, awards, score worker)
+  still uses local SERVICE_ROLE_KEY compare and does not read apikey.
+  Dual-key SQL cannot save those workers until they switch to
+  authorizeSportsWorkerRequest.
+
+E12. Member-change kinds (20260990 CHECK)
+  player_number_set|changed|removed
+  preferred_position_set|changed|removed
+  team_role_changed
+  removed_from_event | added_back_to_event
+  removed_from_team
+  team_admin_granted | team_admin_removed
+
+
+==============================================================================
+END OF AUDIT
+==============================================================================
